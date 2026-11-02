@@ -106,6 +106,17 @@ pub enum QueueState {
     Server(Arc<crate::queue::ServerState>),
 }
 
+impl QueueState {
+    /// Returns `true` while a stream on this path has a receiver its app still holds, so that
+    /// a reader or a writer on this side may wait on the peer.
+    pub fn has_open_stream(&self) -> bool {
+        match self {
+            Self::Client(state) => state.has_open_slot(),
+            Self::Server(state) => state.has_open_slot(),
+        }
+    }
+}
+
 impl SizeOf for Entry {
     fn size(&self) -> usize {
         let Entry {

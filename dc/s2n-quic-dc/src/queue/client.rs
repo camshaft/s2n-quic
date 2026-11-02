@@ -28,7 +28,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     task::{Context, Poll, Waker},
@@ -110,6 +110,11 @@ pub struct ClientState {
     /// Per-stream unbacked initial recv window — bytes a peer may send before
     /// any pool-backed window grants flow. Configured at endpoint construction.
     pub(crate) initial_recv_window: u64,
+    /// How many allocated slots still have a receiver the app holds: counted up when
+    /// `alloc_local` opens a slot, and down when the second of its receivers is dropped.
+    /// While it isn't zero, a stream on this path may wait on the peer, so the send idle
+    /// wheel probes the path while it is quiet (`send_idle_wheel_drain`).
+    open_slots: AtomicUsize,
 }
 
 impl ClientState {
@@ -120,12 +125,24 @@ impl ClientState {
             free: Mutex::new(ClientFreeList::new()),
             peer_free: sync::free_list::FreeList::new(max_peer_queues),
             initial_recv_window,
+            open_slots: AtomicUsize::new(0),
         }
     }
 
     fn next_binding_id(&self) -> VarInt {
         let id = self.next_binding.fetch_add(1, Ordering::Relaxed);
         VarInt::new(id).expect("binding_id overflow")
+    }
+
+    /// Returns `true` while an allocated slot still has a receiver the app holds.
+    pub(crate) fn has_open_slot(&self) -> bool {
+        self.open_slots.load(Ordering::Relaxed) > 0
+    }
+
+    /// Counts a slot down once the second of its receivers is dropped.
+    pub(crate) fn on_slot_freed(&self) {
+        let previous = self.open_slots.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "a slot was freed more often than it was opened");
     }
 
     /// Allocate a queue slot, waiting for a peer-side free ID if needed.
@@ -187,6 +204,7 @@ impl ClientState {
             free.push_freed(index);
             return None;
         }
+        self.open_slots.fetch_add(1, Ordering::Relaxed);
 
         let slot_ptr = slot_ref.as_ptr();
         let local_queue_id = VarInt::new(index as u64).expect("slot index exceeds VarInt range");
@@ -446,6 +464,24 @@ mod tests {
         let state = test_state(100);
         state.free.lock().unwrap().close();
         assert!(try_alloc(&state).is_none());
+    }
+
+    #[test]
+    fn open_slot_counts_until_both_receivers_drop() {
+        let state = test_state(10);
+        assert!(!state.has_open_slot());
+
+        let AllocResult {
+            stream, control, ..
+        } = try_alloc(&state).unwrap();
+        assert!(state.has_open_slot());
+        drop(stream);
+        assert!(
+            state.has_open_slot(),
+            "the control receiver still holds the slot"
+        );
+        drop(control);
+        assert!(!state.has_open_slot());
     }
 
     // ── ClientDispatch ──────────────────────────────────────────────────────

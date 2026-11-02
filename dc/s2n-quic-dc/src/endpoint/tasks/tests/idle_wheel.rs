@@ -34,6 +34,12 @@ type SetupSend = (
 );
 
 fn setup_send() -> SetupSend {
+    setup_send_with_frame_receiver(true)
+}
+
+/// As `setup_send`, where `open` false closes the frame submission channel at once, so that it
+/// refuses each probe the drain submits.
+fn setup_send_with_frame_receiver(open: bool) -> SetupSend {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
     let send_caches: IdMap<LocalSendSocketId, _> = vec![Rc::new(RefCell::new(send::Cache::new(
@@ -52,6 +58,18 @@ fn setup_send() -> SetupSend {
     let ack_completions_tx = ack_completions_tx.into_list_sender();
     let (peer_dead_tx, peer_dead_rx) = unsync::new::<tasks::PeerDead>();
     let q_gauge = registry.register_queue_gauge("test.idle_wheel");
+    // The drain submits its probes of quiet paths here; nothing delivers them in these
+    // tests, as for a peer that doesn't answer.
+    let (frame_tx, frame_rx) = frame::submission_channel(1);
+    if open {
+        async move {
+            let _frame_rx = frame_rx;
+            core::future::pending::<()>().await
+        }
+        .spawn();
+    } else {
+        drop(frame_rx);
+    }
 
     tasks::send_idle_wheel_drain(
         idle_wheel_rx,
@@ -65,6 +83,7 @@ fn setup_send() -> SetupSend {
         ack_completions_tx,
         peer_dead_tx,
         crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
+        frame_tx,
         registry.register("idle.send.expired"),
         registry.register("idle.send.rescheduled"),
         registry.register_nominal_timer("idle.send.lifetime", "send.0"),
@@ -292,6 +311,341 @@ fn send_idle_wheel_no_inflight_does_not_mark_dead() {
         }
         .primary()
         .spawn();
+    });
+}
+
+/// Opens a stream on the client entry `pse`; it stays open until the returned receivers drop.
+fn open_stream(pse: &crate::path::secret::map::Entry) -> impl Sized {
+    let crate::path::secret::map::entry::QueueState::Client(state) = pse.queue_state() else {
+        panic!("test_entry builds a client entry");
+    };
+    state
+        .alloc_local(VarInt::ZERO)
+        .expect("the client state allocates a slot")
+}
+
+/// A send context with no unacknowledged packet, on a quiet path with an open stream: the idle
+/// wheel probes the peer half an idle timeout into the quiet period, and since the peer doesn't
+/// answer, it marks the peer dead at the idle timeout, which resets the stream
+/// (`peer_dead_broadcast`) in place of leaving it waiting on a peer it can't reach.
+#[test]
+fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_stream() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+        let stream = open_stream(&pse);
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        let idle = pse.idle_timeout();
+        {
+            let mut c = ctx.borrow_mut();
+            c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + idle / 2);
+        }
+        let _ = idle_wheel_tx.send(ctx.clone());
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            // Half an idle timeout in, the quiet path is probed and the context kept.
+            (idle / 2 + 3.s()).sleep().await;
+            assert!(
+                ctx.borrow().idle_probe_for.is_some(),
+                "the idle wheel should probe a quiet path with an open stream"
+            );
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                1,
+                "the context should wait for the probe's answer"
+            );
+
+            // At the idle timeout, the unanswered probe marks the peer dead.
+            (idle / 2).sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a peer that doesn't answer the probe of an open stream should be marked dead"
+            );
+            drop(stream);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// The same quiet path with an open stream, whose idle check first runs more than a wheel tick
+/// after its idle deadline, as after this side was suspended: the peer marks this side dead
+/// under the same rule by then, so the idle wheel marks the peer dead at once, instead of probing
+/// a peer that could answer though it has reset its end of the stream.
+#[test]
+fn send_idle_wheel_marks_dead_an_open_stream_whose_idle_check_runs_late() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        let start = precision::Clock::now(&clock);
+        pse.touch_activity(start);
+        let stream = open_stream(&pse);
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        let idle = pse.idle_timeout();
+        ctx.borrow_mut().idle_wheel.target_time = Some(start + idle);
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            // The check is armed for the idle deadline, but reaches the wheel only 3 s after it.
+            (idle + 3.s()).sleep().await;
+            let _ = idle_wheel_tx.send(ctx.clone());
+            3.s().sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+            assert!(
+                ctx.borrow().idle_probe_for.is_none(),
+                "a path whose idle check runs late isn't probed"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "an open stream whose idle check runs late should mark the peer dead"
+            );
+            drop(stream);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A quiet path whose idle check was armed at the full idle timeout, as where its first stream
+/// opened after the check was armed, and which no probe has reached by the deadline: the check
+/// runs on time, so the idle wheel probes the peer then, and marks it dead only where the probe
+/// goes unanswered for half an idle timeout more.
+#[test]
+fn send_idle_wheel_probes_an_open_stream_whose_check_was_armed_at_the_full_idle_timeout() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        let start = precision::Clock::now(&clock);
+        pse.touch_activity(start);
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        let idle = pse.idle_timeout();
+        ctx.borrow_mut().idle_wheel.target_time = Some(start + idle);
+        let _ = idle_wheel_tx.send(ctx.clone());
+        let stream = open_stream(&pse);
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            // At the idle deadline the quiet path is probed, and the context kept.
+            (idle + 3.s()).sleep().await;
+            assert!(
+                ctx.borrow().idle_probe_for.is_some(),
+                "the idle wheel should probe a quiet path with an open stream at its deadline"
+            );
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                1,
+                "the context should wait for the probe's answer"
+            );
+
+            // Half an idle timeout later, the unanswered probe marks the peer dead.
+            (idle / 2).sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted once the probe goes unanswered"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a peer that doesn't answer the probe should be marked dead"
+            );
+            drop(stream);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A quiet path probed while its stream was open, whose stream closes before the idle timeout:
+/// the unanswered probe shows that the peer can't be reached, as an unacknowledged packet does,
+/// so the idle wheel marks the peer dead at the idle timeout though no stream is open by then.
+#[test]
+fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_after_its_stream_closes() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+        let stream = open_stream(&pse);
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        let idle = pse.idle_timeout();
+        {
+            let mut c = ctx.borrow_mut();
+            c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + idle / 2);
+        }
+        let _ = idle_wheel_tx.send(ctx.clone());
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            // Half an idle timeout in, the quiet path is probed; then the stream closes.
+            (idle / 2 + 3.s()).sleep().await;
+            assert!(
+                ctx.borrow().idle_probe_for.is_some(),
+                "the idle wheel should probe a quiet path with an open stream"
+            );
+            drop(stream);
+            assert!(!pse.queue_state().has_open_stream());
+
+            // At the idle timeout, the unanswered probe marks the peer dead.
+            (idle / 2).sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "an unanswered probe should mark the peer dead after its stream closes"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A probe that the frame submission channel refuses, as once its receiver has closed it: the
+/// drain doesn't record a refused probe, and tries it again at the next wheel tick instead of
+/// waiting for the idle deadline on a probe that never went out.
+#[test]
+fn send_idle_wheel_retries_a_probe_the_submission_channel_refuses() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
+            setup_send_with_frame_receiver(false);
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+        let stream = open_stream(&pse);
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        let idle = pse.idle_timeout();
+        let start = precision::Clock::now(&clock);
+        {
+            let mut c = ctx.borrow_mut();
+            c.idle_wheel.target_time = Some(start + idle / 2);
+        }
+        let _ = idle_wheel_tx.send(ctx.clone());
+
+        let send_caches = send_caches.clone();
+        async move {
+            // Half an idle timeout in, the probe is refused: it isn't recorded, and the context
+            // is checked again at the next wheel tick instead of at the idle deadline.
+            (idle / 2 + 3.s()).sleep().await;
+            assert!(
+                ctx.borrow().idle_probe_for.is_none(),
+                "a refused probe shouldn't be recorded"
+            );
+            let deadline = start + idle;
+            assert!(
+                ctx.borrow()
+                    .idle_wheel
+                    .target_time
+                    .is_some_and(|next_check| next_check.nanos < deadline.nanos),
+                "a refused probe should be tried again before the idle deadline"
+            );
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                1,
+                "the context should be kept while the probe is tried again"
+            );
+            drop(stream);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A send context first arms its idle check half an idle timeout out while its path has an
+/// open stream, so that the idle wheel can probe the quiet path before the idle timeout
+/// decides, and a full idle timeout out otherwise.
+#[test]
+fn send_context_with_an_open_stream_arms_its_idle_check_at_half_the_idle_timeout() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, _idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        let idle = pse.idle_timeout();
+        let now = precision::Clock::now(&clock);
+
+        let _ = ctx.borrow_mut().wheel_interest(&clock);
+        assert_eq!(ctx.borrow().idle_wheel.target_time, Some(now + idle));
+
+        let _stream = open_stream(&pse);
+        let _ = ctx.borrow_mut().wheel_interest(&clock);
+        assert_eq!(ctx.borrow().idle_wheel.target_time, Some(now + idle / 2));
     });
 }
 

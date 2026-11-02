@@ -34,7 +34,10 @@ use super::{
 };
 use crate::{endpoint::msg, intrusive};
 use s2n_quic_core::varint::VarInt;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use crate::path::secret::map::Entry as PathSecretEntry;
 
@@ -74,6 +77,11 @@ pub struct ServerState {
     /// before any pool-backed window grants flow. Configured at endpoint
     /// construction; passed into slot bind to seed `initial_window_remaining`.
     pub(crate) initial_recv_window: u64,
+    /// How many bound slots still have a receiver the app holds: counted up when a binding
+    /// opens a slot, and down when the second of its receivers is dropped. While it isn't
+    /// zero, a stream on this path may wait on the peer, so the send idle wheel probes the
+    /// path while it is quiet (`send_idle_wheel_drain`).
+    open_slots: AtomicUsize,
 }
 
 impl ServerState {
@@ -83,6 +91,7 @@ impl ServerState {
             freed: FreedInner::new(),
             max_queue_id: max_queues.as_u64().saturating_sub(1),
             initial_recv_window,
+            open_slots: AtomicUsize::new(0),
         }
     }
 
@@ -92,6 +101,17 @@ impl ServerState {
             state: self.clone(),
             view: SenderView::new(),
         }
+    }
+
+    /// Returns `true` while a bound slot still has a receiver the app holds.
+    pub(crate) fn has_open_slot(&self) -> bool {
+        self.open_slots.load(Ordering::Relaxed) > 0
+    }
+
+    /// Counts a slot down once the second of its receivers is dropped.
+    pub(crate) fn on_slot_freed(&self) {
+        let previous = self.open_slots.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "a slot was freed more often than it was opened");
     }
 
     /// Push Reset into all allocated slots.
@@ -164,6 +184,7 @@ impl ServerView {
                 release_bytes,
             }),
             BindState::NewBinding(waker) => {
+                self.state.open_slots.fetch_add(1, Ordering::Relaxed);
                 let slot_ptr = slot.as_ptr();
                 let on_free = OnFree::Server {
                     path_entry: path_entry.clone(),
@@ -242,6 +263,7 @@ impl ServerView {
         // Slot is unallocated — bind it (tombstone re-checked under the lock).
         match slot.allocate_and_open(binding_id, self.state.initial_recv_window) {
             Ok(super::slot::AllocateOutcome::Allocated) => {
+                self.state.open_slots.fetch_add(1, Ordering::Relaxed);
                 let slot_ptr = slot.as_ptr();
                 let on_free = OnFree::Server {
                     path_entry: path_entry.clone(),
@@ -644,5 +666,46 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Ok(BindResult::NewBinding { .. })));
+    }
+
+    #[test]
+    fn open_slot_counts_until_both_receivers_drop() {
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+        assert!(!server.state.has_open_slot());
+
+        // A slot bound by a QueueMsg init.
+        let result = server.bind_for_msg(v(0), v(5), &path_entry, &mut tx);
+        let Ok(BindResult::NewBinding {
+            stream, control, ..
+        }) = result
+        else {
+            panic!("expected NewBinding");
+        };
+        assert!(server.state.has_open_slot());
+        drop(stream);
+        assert!(
+            server.state.has_open_slot(),
+            "the control receiver still holds the slot"
+        );
+        drop(control);
+        assert!(!server.state.has_open_slot());
+
+        // A slot bound with its first stream entry.
+        let result =
+            server.bind_and_send_stream(v(1), v(1), make_stream_entry(), &path_entry, &mut tx);
+        let Ok(BindResult::NewBinding {
+            stream, control, ..
+        }) = result
+        else {
+            panic!("expected NewBinding");
+        };
+        assert!(server.state.has_open_slot());
+        drop(control);
+        assert!(
+            server.state.has_open_slot(),
+            "the stream receiver still holds the slot"
+        );
+        drop(stream);
+        assert!(!server.state.has_open_slot());
     }
 }

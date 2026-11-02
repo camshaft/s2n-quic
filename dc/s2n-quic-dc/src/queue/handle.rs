@@ -237,6 +237,7 @@ impl core::fmt::Debug for ControlReceiver {
 fn reclaim(queue_id: VarInt, on_free: &mut OnFree) {
     match on_free {
         OnFree::Client { state } => {
+            state.on_slot_freed();
             state
                 .free
                 .lock()
@@ -253,6 +254,7 @@ fn reclaim(queue_id: VarInt, on_free: &mut OnFree) {
                 debug_assert!(false, "OnFree::Server on non-server entry");
                 return;
             };
+            server_state.on_slot_freed();
             server_state.freed.record(queue_id, path_entry, endpoint_tx);
         }
     }

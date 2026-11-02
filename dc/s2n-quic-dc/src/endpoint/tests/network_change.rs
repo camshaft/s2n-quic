@@ -67,8 +67,8 @@ struct FirstStream {
     /// Where set, the host waits on it after `mid_stream` and then writes one byte on the
     /// stream. The phone sends on it right after the change, which drops the byte, so the host
     /// holds a packet the phone hasn't acknowledged and marks the phone dead once its idle
-    /// timeout passes after the phone's last packet (`send_idle_wheel_drain` marks a peer dead
-    /// only with unacknowledged packets).
+    /// timeout passes after the phone's last packet (`send_idle_wheel_drain` marks dead a peer
+    /// that leaves packets unacknowledged).
     write_after_change: Option<oneshot::Receiver<()>>,
     /// How the host's read of the upload ended: the bytes read before its end, or the error.
     read: Option<oneshot::Sender<io::Result<u64>>>,
@@ -429,11 +429,11 @@ fn address_change_mid_stream_times_out() {
 /// delivery resumes, the dead-peer cooldown still holds, so a connect is refused at once with
 /// `TimedOut`. Once the cooldown has passed, the work completes on a new connection.
 ///
-/// The test doesn't assert how the host's read of the first upload ends: the host marks the
-/// phone dead only where it has packets the phone hasn't acknowledged when the suspension
-/// starts, which depends on when it sent its last MAX_DATA.
-/// `reading_only_phone_across_a_suspension_ends_or_completes` is the case of a side that has
-/// none.
+/// The host's read of the first upload ends in `TimedOut` too. Whether the host has packets the
+/// phone hasn't acknowledged when the suspension starts depends on when it sent its last
+/// MAX_DATA; where it has none, its stream is open, so its idle wheel probes the quiet path, and
+/// the suspended phone doesn't answer. Either way the host marks the phone dead at its idle
+/// timeout.
 #[test]
 fn suspension_mid_stream_times_out_then_completes_on_a_new_connection() {
     // Snapshot disabled: the test waits through idle timeouts, and its trace would be large.
@@ -451,10 +451,11 @@ fn suspension_mid_stream_times_out_then_completes_on_a_new_connection() {
         }
 
         let (mid_stream, mid_stream_rx) = oneshot::channel();
+        let (host_read, host_read_rx) = oneshot::channel();
         spawn_host(FirstStream {
             mid_stream,
             write_after_change: None,
-            read: None,
+            read: Some(host_read),
         });
 
         async move {
@@ -487,6 +488,15 @@ fn suspension_mid_stream_times_out_then_completes_on_a_new_connection() {
                 io::ErrorKind::TimedOut,
             )
             .await;
+            // The host's read of the first upload ends within an idle timeout of the phone's
+            // errors, so within three idle timeouts of the suspension's start.
+            assert_error_kind(
+                "the host's read of the upload",
+                timeout(idle, host_read_rx)
+                    .await
+                    .map(|sent| sent.expect("the host reports its read")),
+                io::ErrorKind::TimedOut,
+            );
             resumed.await.expect("the suspension ends");
 
             let connect = phone.connect("server:0", ACCEPTOR_ID);
@@ -519,11 +529,11 @@ const SECOND_UPDATE: &[u8] = b"second update";
 /// longer than the idle timeout, the host sends its second update. The host has packets the
 /// phone hasn't acknowledged, so it marks the phone dead and fails them, and its writer doesn't
 /// send a reset to a dead peer. The phone doesn't have any packet the host hasn't acknowledged,
-/// so it doesn't mark the host dead. As the endpoint stands, the phone's read of the second
-/// update stays pending after delivery resumes, so the test is ignored until the endpoint ends
-/// that read. It asserts that the read completes, or ends in an error, within its bound.
+/// but its stream is open, so its idle wheel probes the quiet path half an idle timeout after it
+/// last heard from the host. The host doesn't answer, so the phone marks the host dead at its
+/// idle timeout, before delivery resumes, and the read of the second update ends in `TimedOut`
+/// within the suspension.
 #[test]
-#[ignore = "the phone's read stays pending: a side without unacknowledged packets doesn't mark its peer dead, and its peer doesn't reset the stream"]
 fn reading_only_phone_across_a_suspension_ends_or_completes() {
     // Snapshot disabled: the test waits through idle timeouts, and its trace would be large.
     let _guard = crate::testing::without_snapshots();
@@ -616,23 +626,108 @@ fn reading_only_phone_across_a_suspension_ends_or_completes() {
                 .spawn()
             };
 
-            // Within the suspension, and an idle timeout and the dead-peer cooldown after it,
-            // the read of the second update completes or ends in an error.
-            let bound = suspension + idle + DEFAULT_DEAD_PEER_COOLDOWN;
+            // The phone marks the host dead at its idle timeout, before delivery resumes.
             let read = read_to_end(&mut reader, &mut updates);
-            let rest = timeout(bound, read).await;
+            assert_error_kind(
+                "the phone's read of the second update",
+                timeout(suspension, read).await,
+                io::ErrorKind::TimedOut,
+            );
             resumed.await.expect("the suspension ends");
-            match rest {
-                Err(_elapsed) => panic!(
-                    "the read of the second update was still pending {bound:?} after the suspension started"
-                ),
-                Ok(Ok(())) => assert_eq!(&updates[FIRST_UPDATE.len()..], SECOND_UPDATE),
-                Ok(Err(err)) => assert_ne!(
-                    err.kind(),
-                    io::ErrorKind::Other,
-                    "the read of the second update ended in an error without a kind: {err:?}"
-                ),
+            drop(writer);
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
+/// A stream that stays quiet for longer than the idle timeout while both sides are reachable.
+///
+/// The phone sends a request and reads the host's first update; then no data goes either way
+/// for two idle timeouts, and the host sends its second update with FIN. Neither side has an
+/// unacknowledged packet while the stream is quiet, so each side's idle wheel probes the quiet
+/// path, the other side answers, and neither side marks the other dead: the phone reads the
+/// second update.
+#[test]
+fn quiet_stream_outlives_the_idle_timeout_while_both_sides_are_reachable() {
+    // Snapshot disabled: the test waits through idle timeouts, and its trace would be large.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (go, go_rx) = oneshot::channel::<()>();
+
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(ACCEPTOR_ID, 8)
+                .expect("acceptor registration failed");
+            let mut go_rx = Some(go_rx);
+
+            while let Some(stream) = acceptor.recv().await {
+                let go_rx = go_rx.take();
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut request = BytesMut::with_capacity(64);
+                    read_to_end(&mut reader, &mut request)
+                        .await
+                        .expect("host read of the request");
+
+                    let mut first = Bytes::from_static(FIRST_UPDATE);
+                    writer
+                        .write_all_from(&mut first)
+                        .await
+                        .expect("host write of the first update");
+
+                    if let Some(go_rx) = go_rx {
+                        if go_rx.await.is_ok() {
+                            let mut second = Bytes::from_static(SECOND_UPDATE);
+                            writer
+                                .write_all_from_fin(&mut second)
+                                .await
+                                .expect("host write of the second update");
+                        }
+                    }
+                }
+                .spawn();
             }
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let mut phone = Client::new();
+            let stream = phone
+                .connect("server:0", ACCEPTOR_ID)
+                .await
+                .expect("connect");
+            let idle = host_idle_timeout(&phone, stream.peer_addr());
+            let (mut reader, mut writer) = stream.into_split();
+
+            let mut request = Bytes::from_static(b"subscribe");
+            writer
+                .write_all_from_fin(&mut request)
+                .await
+                .expect("phone write of the request");
+
+            let mut updates = BytesMut::with_capacity(64);
+            while updates.len() < FIRST_UPDATE.len() {
+                let n = timeout(idle, reader.read_into(&mut updates))
+                    .await
+                    .expect("the read of the first update was still pending at its bound")
+                    .expect("phone read of the first update");
+                assert_ne!(n, 0, "the host ended the stream before its first update");
+            }
+            assert_eq!(&updates[..], FIRST_UPDATE);
+
+            // The stream stays quiet for two idle timeouts.
+            (idle * 2).sleep().await;
+            let _ = go.send(());
+
+            timeout(idle, read_to_end(&mut reader, &mut updates))
+                .await
+                .expect("the read of the second update was still pending at its bound")
+                .expect("the phone's read of the second update");
+            assert_eq!(&updates[FIRST_UPDATE.len()..], SECOND_UPDATE);
             drop(writer);
         }
         .group("client")
