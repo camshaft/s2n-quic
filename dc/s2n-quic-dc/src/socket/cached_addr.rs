@@ -60,7 +60,7 @@ impl<S: super::recv::Socket> super::recv::Socket for CachedAddr<S> {
     }
 
     #[inline]
-    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+    fn raw_fd(&self) -> Option<super::fd::Raw> {
         self.socket.raw_fd()
     }
 }
