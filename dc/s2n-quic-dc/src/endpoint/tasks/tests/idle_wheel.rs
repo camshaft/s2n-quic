@@ -623,6 +623,84 @@ fn send_idle_wheel_retries_a_probe_the_submission_channel_refuses() {
     });
 }
 
+/// A send context that a stale key's invalidation removed from the cache stays on the idle
+/// wheel until its idle deadline, and the retransmission of its frames makes a newer context
+/// for the same path. The invalidated context's expiry leaves that newer context as it is: the
+/// cache keeps it, and its frames aren't failed.
+#[test]
+fn send_idle_wheel_expiry_of_an_invalidated_context_keeps_its_paths_newer_context() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+        let id = *pse.id();
+
+        let invalidated = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        let idle = pse.idle_timeout();
+        let start = precision::Clock::now(&clock);
+        invalidated.borrow_mut().idle_wheel.target_time = Some(start + idle);
+        let _ = idle_wheel_tx.send(invalidated.clone());
+
+        let key_id = invalidated.borrow().credentials.key_id;
+        let (mut retransmit_tx, _retransmit_rx) = unsync::new::<Frame>();
+        let _ = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .invalidate_stale_key(
+                &id,
+                LocalSenderId::from_index(0),
+                key_id,
+                &mut retransmit_tx,
+            )
+            .expect("the cache should hold the context the stale key invalidates");
+        assert!(invalidated.borrow().invalidated);
+
+        let newer = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!Rc::ptr_eq(&newer, &invalidated));
+        newer.borrow_mut().queues[1].push_back(test_frame(&pse));
+
+        let send_caches = send_caches.clone();
+        async move {
+            (idle + 3.s()).sleep().await;
+            // The idle wheel holds the invalidated context until its expiry, and drops it there.
+            assert_eq!(
+                Rc::strong_count(&invalidated),
+                1,
+                "the idle wheel should have expired the invalidated context"
+            );
+            let cache = send_caches[LocalSendSocketId::new(0)].borrow();
+            assert_eq!(
+                cache.context_count(),
+                1,
+                "the cache should keep the newer context"
+            );
+            assert!(
+                cache.get(&id).is_some_and(|ctx| Rc::ptr_eq(&ctx, &newer)),
+                "the cache should still hold the newer context for the path"
+            );
+            drop(cache);
+            assert!(
+                !newer.borrow().invalidated,
+                "the newer context shouldn't be invalidated"
+            );
+            assert_eq!(
+                newer.borrow().queues[1].len(),
+                1,
+                "the newer context's frame shouldn't be failed"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// A send context first arms its idle check half an idle timeout out while its path has an
 /// open stream, so that the idle wheel can probe the quiet path before the idle timeout
 /// decides, and a full idle timeout out otherwise.
