@@ -111,23 +111,22 @@ impl Provider {
         )?;
         let state = Arc::new(state);
 
-        // The map asks for a handshake in the background: the cleaner's periodic rehandshake, an
-        // accepted UnknownPathSecret or ReplayDetected, and a client path the endpoint's send
-        // idle wheel marks dead.
+        // TODO re-enable this
+        let _ = server_name;
         // Avoid holding onto the state unintentionally after it's no longer needed.
-        let weak = Arc::downgrade(&state);
-        map.register_request_handshake(Box::new(move |peer, reason| {
-            let state = weak.upgrade()?;
-            let runtime = state.runtime.as_ref().map(|v| &v.0)?;
-            let client = state.client.clone();
-            let server_name = server_name.clone();
-            Some(runtime.spawn(async move {
-                if let Err(HandshakeFailed { .. }) = client.connect(peer, reason, server_name).await
-                {
-                    // failure has already been logged, no further action required.
-                }
-            }))
-        }));
+        // let weak = Arc::downgrade(&state);
+        // map.register_request_handshake(Box::new(move |peer, reason| {
+        //     let state = weak.upgrade()?;
+        //     let runtime = state.runtime.as_ref().map(|v| &v.0)?;
+        //     let client = state.client.clone();
+        //     let server_name = server_name.clone();
+        //     Some(runtime.spawn(async move {
+        //         if let Err(HandshakeFailed { .. }) = client.connect(peer, reason, server_name).await
+        //         {
+        //             // failure has already been logged, no further action required.
+        //         }
+        //     }))
+        // }));
 
         Ok(Self { state })
     }
