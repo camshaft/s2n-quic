@@ -342,15 +342,16 @@ fn the_dead_mark_resets_only_the_streams_it_owes_a_reset_of() {
 
 /// The send idle wheel records the resets it owes before it marks the peer dead
 /// ([`Entry::mark_dead_owing_resets`]), so that a packet from the peer that arrives between the
-/// two writes doesn't clear the mark and take an empty set. In each round one thread marks the
-/// entry dead owing a reset of one stream, while another thread touches the entry's activity,
-/// as a receive worker does for each packet, until a touch clears the mark: the touch that
-/// clears it finds the reset. With the two writes the other way round, a touch between them
-/// clears the mark before the reset is recorded, and some round fails.
+/// two writes doesn't find a mark to clear, and the packet that clears the mark finds the
+/// resets. The stream to record comes from an iterator that, as the record reads it, touches the
+/// entry's activity, as a receive worker does for a packet that arrives while the reset is
+/// recorded, and checks that the touch doesn't clear a mark. The test runs on one thread: with
+/// the two writes the other way round, that touch clears the mark before the reset is recorded,
+/// and the test fails on every run.
 #[test]
 fn the_packet_that_clears_a_dead_mark_finds_the_resets_owed_before_it() {
-    const ROUNDS: usize = 500;
-    let entry = Arc::new(test_entry_with_senders(0));
+    let entry = test_entry_with_senders(0);
+    let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
     let t0: crate::time::precision::Timestamp =
         (unsafe { Timestamp::from_duration(Duration::from_secs(100)) }).into();
     let stream = OwedReset {
@@ -360,28 +361,25 @@ fn the_packet_that_clears_a_dead_mark_finds_the_resets_owed_before_it() {
         },
         binding_id: VarInt::from_u8(1),
     };
-    let barrier = Arc::new(std::sync::Barrier::new(2));
 
-    let marker = {
-        let entry = entry.clone();
-        let barrier = barrier.clone();
-        std::thread::spawn(move || {
-            for _ in 0..ROUNDS {
-                barrier.wait();
-                // No cooldown, so that each round marks the entry again.
-                entry.mark_dead_owing_resets(t0, Duration::ZERO, [stream]);
-                barrier.wait();
-            }
-        })
-    };
+    let failed = core::iter::once_with(|| {
+        // A packet from the peer that arrives while the reset is recorded.
+        assert!(
+            !entry.touch_activity(t0),
+            "a packet that arrives as the reset is recorded must not clear a dead mark"
+        );
+        stream
+    });
+    assert_eq!(
+        entry.mark_dead_owing_resets(t0, cooldown, failed),
+        (1, Some(vec![])),
+        "the mark should take effect, and owe the stream once"
+    );
 
-    for round in 0..ROUNDS {
-        barrier.wait();
-        while !entry.touch_activity(t0) {
-            core::hint::spin_loop();
-        }
-        assert_eq!(entry.take_owed_resets(), vec![stream], "round {round}");
-        barrier.wait();
-    }
-    marker.join().unwrap();
+    let t1 = t0 + Duration::from_secs(1);
+    assert!(
+        entry.touch_activity(t1),
+        "the first packet after the mark clears it"
+    );
+    assert_eq!(entry.take_owed_resets(), vec![stream]);
 }
