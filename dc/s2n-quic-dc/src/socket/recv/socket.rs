@@ -31,7 +31,7 @@ pub trait Socket: crate::socket::LocalAddr + Send + 'static {
     /// bach socket) return `None` and always fall back to the cooperative syscall recv path. The
     /// default returns `None`; the UDP-backed wrappers forward the real descriptor.
     #[inline]
-    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+    fn raw_fd(&self) -> Option<fd::Raw> {
         None
     }
 }
@@ -49,7 +49,7 @@ impl<T: Socket + Sync> Socket for std::sync::Arc<T> {
     }
 
     #[inline]
-    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+    fn raw_fd(&self) -> Option<fd::Raw> {
         (**self).raw_fd()
     }
 }
@@ -78,7 +78,7 @@ pub trait BindOnWorker: crate::socket::LocalAddr {
     /// [`Socket::raw_fd`]). The io_uring recv backend adopts a socket by this fd *before* binding, so
     /// it must be reachable on the unbound socket.
     #[inline]
-    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+    fn raw_fd(&self) -> Option<fd::Raw> {
         None
     }
 
@@ -95,7 +95,7 @@ impl<T: Socket> BindOnWorker for T {
     type Bound = T;
 
     #[inline]
-    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+    fn raw_fd(&self) -> Option<fd::Raw> {
         Socket::raw_fd(self)
     }
 
@@ -110,8 +110,8 @@ where
     T: udp::Socket,
 {
     #[inline]
-    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
-        Some(std::os::fd::AsRawFd::as_raw_fd(&self.0))
+    fn raw_fd(&self) -> Option<fd::Raw> {
+        Some(fd::AsRaw::as_raw(&self.0))
     }
 
     #[inline]
@@ -158,7 +158,7 @@ where
 /// This wrapper registers the socket fd with tokio's reactor via [`AsyncFd`](tokio::io::unix::AsyncFd)
 /// so `poll_recv` registers the task's waker on `WouldBlock` and the worker is woken when the fd is
 /// readable — letting the endpoint run its data plane on tokio without busy-polling.
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", unix))]
 pub struct Tokio<T> {
     // Registered with the tokio reactor at construction time (see `Tokio::new`), which runs during
     // endpoint setup under the caller's tokio runtime. `FdRef` borrows the raw fd rather than owning
@@ -174,10 +174,10 @@ pub struct Tokio<T> {
 
 /// Non-owning `AsRawFd` holder so the `AsyncFd` can register readiness without taking ownership of
 /// the UDP socket (which the wrapper retains for `udp::recv`).
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", unix))]
 struct FdRef(std::os::fd::RawFd);
 
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", unix))]
 impl std::os::fd::AsRawFd for FdRef {
     #[inline]
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
@@ -185,7 +185,7 @@ impl std::os::fd::AsRawFd for FdRef {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", unix))]
 impl<T: std::os::fd::AsRawFd> Tokio<T> {
     /// Wrap `inner` and register its fd with the current tokio runtime's reactor for read readiness.
     ///
@@ -219,7 +219,7 @@ impl<T: udp::Socket> crate::socket::LocalAddr for Tokio<T> {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", unix))]
 impl<T> Socket for Tokio<T>
 where
     T: udp::Socket + std::os::fd::AsRawFd,
@@ -269,6 +269,105 @@ where
     }
 }
 
+/// A recv socket driven by the tokio runtime's IO reactor, on Windows.
+///
+/// As on Unix, `poll_recv` registers the task's waker when the socket has no datagram, and the
+/// reactor wakes the worker when the socket is readable. tokio's reactor doesn't register a raw
+/// socket on Windows, so this holds a second handle to `inner`'s socket as a
+/// [`tokio::net::UdpSocket`], whose readiness `poll_recv` waits on, and receives on `inner` through
+/// its `try_io`, which re-arms that readiness when a receive doesn't find a datagram.
+#[cfg(all(feature = "tokio", windows))]
+pub struct Tokio<T> {
+    // A duplicate of `inner`'s socket handle, registered with the tokio reactor at construction
+    // time (see `Tokio::new`). It owns its own handle, so its drop closes that handle alone, and
+    // `inner` keeps the socket open for as long as `Self` lives.
+    io: tokio::net::UdpSocket,
+    inner: T,
+}
+
+#[cfg(all(feature = "tokio", windows))]
+impl<T: udp::Socket> Tokio<T> {
+    /// Wrap `inner` and register a duplicate of its socket handle with the current tokio runtime's
+    /// reactor for read readiness.
+    ///
+    /// Must be called from within a tokio runtime (endpoint setup runs under one): the duplicate
+    /// binds to that runtime's IO driver, which drives readiness for the socket thereafter.
+    ///
+    /// `inner` must own the socket its `as_raw` returns and return that same socket on every call,
+    /// as `std::net::UdpSocket` does: the duplicate is made from that handle.
+    #[inline]
+    pub fn new(inner: T) -> io::Result<Self> {
+        use std::os::windows::io::BorrowedSocket;
+
+        // SAFETY: `inner` owns the socket `as_raw` returns and holds it open for this call, and the
+        // borrow ends once the duplicate is made.
+        let socket = unsafe { BorrowedSocket::borrow_raw(fd::AsRaw::as_raw(&inner)) };
+        let socket = std::net::UdpSocket::from(socket.try_clone_to_owned()?);
+        socket.set_nonblocking(true)?;
+        let io = tokio::net::UdpSocket::from_std(socket)?;
+        Ok(Self { io, inner })
+    }
+}
+
+#[cfg(all(feature = "tokio", windows))]
+impl<T> Socket for Tokio<T>
+where
+    T: udp::Socket,
+{
+    #[inline]
+    fn raw_fd(&self) -> Option<fd::Raw> {
+        Some(fd::AsRaw::as_raw(&self.inner))
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context,
+        addr: &mut Addr,
+        cmsg: &mut cmsg::Receiver,
+        buffer: &mut [IoSliceMut],
+    ) -> Poll<io::Result<usize>> {
+        ensure!(!buffer.is_empty(), Ok(0).into());
+
+        debug_assert!(
+            buffer.iter().any(|s| !s.is_empty()),
+            "trying to recv into an empty buffer"
+        );
+
+        loop {
+            match self.io.poll_recv_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+
+            // `try_io` clears the readiness when the receive returns `WouldBlock`, so the next
+            // `poll_recv_ready` registers our waker and returns `Pending` until the reactor reports
+            // the socket readable again.
+            let res = self.io.try_io(tokio::io::Interest::READABLE, || {
+                udp::recv(
+                    &self.inner,
+                    &mut *addr,
+                    &mut *cmsg,
+                    &mut *buffer,
+                    fd::Flags::default(),
+                )
+            });
+
+            match res {
+                Ok(0) => continue,
+                Ok(len) => return Ok(len).into(),
+                Err(ref e)
+                    if [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted]
+                        .contains(&e.kind()) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err).into(),
+            }
+        }
+    }
+}
+
 /// The unbound tokio recv socket [`Config::tokio`](crate::endpoint::socket::Config::tokio) hands to
 /// the endpoint: it holds the raw UDP socket but defers the [`AsyncFd`](tokio::io::unix::AsyncFd)
 /// construction to [`BindOnWorker::bind_on_worker`], which runs on the worker so the `AsyncFd`
@@ -301,7 +400,7 @@ impl<T: udp::Socket> crate::socket::LocalAddr for TokioUnbound<T> {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(all(feature = "tokio", unix))]
 impl<T> BindOnWorker for TokioUnbound<T>
 where
     T: udp::Socket + std::os::fd::AsRawFd,
@@ -311,6 +410,24 @@ where
     #[inline]
     fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
         Some(std::os::fd::AsRawFd::as_raw_fd(&self.0))
+    }
+
+    #[inline]
+    fn bind_on_worker(self) -> io::Result<Self::Bound> {
+        Tokio::new(self.0)
+    }
+}
+
+#[cfg(all(feature = "tokio", windows))]
+impl<T> BindOnWorker for TokioUnbound<T>
+where
+    T: udp::Socket,
+{
+    type Bound = Tokio<T>;
+
+    #[inline]
+    fn raw_fd(&self) -> Option<fd::Raw> {
+        Some(fd::AsRaw::as_raw(&self.0))
     }
 
     #[inline]
