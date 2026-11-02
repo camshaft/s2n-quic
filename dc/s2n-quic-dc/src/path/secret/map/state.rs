@@ -916,6 +916,14 @@ where
         self.register_request_handshake(cb);
     }
 
+    fn request_handshake(
+        &self,
+        peer: SocketAddr,
+        reason: HandshakeReason,
+    ) -> Option<JoinHandle<()>> {
+        self.request_handshake(peer, reason)
+    }
+
     fn advertised_peer_info(&self) -> Option<bytes::Bytes> {
         self.advertised_peer_info.clone()
     }
