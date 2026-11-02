@@ -1448,6 +1448,45 @@ impl Pto {
     }
 }
 
+/// What [`Cache::invalidate_stale_key`] did with a stale-key or replay notice. Test-only: tests
+/// read each outcome with [`take_stale_key_outcomes`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StaleKeyOutcome {
+    /// The cache removed the context, which sealed with the rejected key id or an older one.
+    Invalidated,
+    /// The cache doesn't hold a context for the credential.
+    NoContext,
+    /// The context already seals with a key id newer than the rejected one.
+    AlreadyAdvanced,
+}
+
+/// One outcome of [`Cache::invalidate_stale_key`], with the sender whose cache decided it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StaleKeyRecord {
+    pub sender: LocalSenderId,
+    pub outcome: StaleKeyOutcome,
+}
+
+#[cfg(test)]
+thread_local! {
+    static STALE_KEY_OUTCOMES: RefCell<Vec<StaleKeyRecord>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Takes each outcome that [`Cache::invalidate_stale_key`] recorded on this thread since the last
+/// take, oldest first.
+#[cfg(test)]
+pub(crate) fn take_stale_key_outcomes() -> Vec<StaleKeyRecord> {
+    STALE_KEY_OUTCOMES.with(|outcomes| core::mem::take(&mut *outcomes.borrow_mut()))
+}
+
+#[cfg(test)]
+fn record_stale_key_outcome(sender: LocalSenderId, outcome: StaleKeyOutcome) {
+    let record = StaleKeyRecord { sender, outcome };
+    STALE_KEY_OUTCOMES.with(|outcomes| outcomes.borrow_mut().push(record));
+}
+
 /// Per-socket cache of send contexts, keyed by credentials ID.
 ///
 /// Each send socket has its own Cache. A single peer always routes through the same
@@ -1537,6 +1576,14 @@ impl Cache {
         Some(ctx.drain_frames(Some(reason), cancelled))
     }
 
+    /// Acts on a stale-key or replay notice for `id`: removes the send context and drains its
+    /// frames into `retransmit`, so that they go out on a new context with a newer key id.
+    ///
+    /// Leaves the cache as it is where it doesn't hold a context for `id`, or where its context
+    /// already seals with a key id newer than `rejected_key_id`. Either way the notice rejects a
+    /// key id this sender no longer seals with, such as a later notice for a key id it already
+    /// acted on: the path secret map moves the sender's next key id past the rejected one before
+    /// the notice gets here, so the next context seals with a key id the peer accepts.
     pub fn invalidate_stale_key(
         &mut self,
         id: &credentials::Id,
@@ -1557,6 +1604,8 @@ impl Cache {
         }
 
         let Some(ctx) = self.contexts.get(id) else {
+            #[cfg(test)]
+            record_stale_key_outcome(sender_idx, StaleKeyOutcome::NoContext);
             trace!(
                 %id,
                 sender_idx = %self.sender_idx,
@@ -1569,6 +1618,8 @@ impl Cache {
         // If the send context's key_id is already past the rejected one, this
         // invalidation is stale (e.g. a delayed/replayed control packet) — ignore it.
         if ctx.borrow().credentials.key_id > rejected_key_id {
+            #[cfg(test)]
+            record_stale_key_outcome(sender_idx, StaleKeyOutcome::AlreadyAdvanced);
             trace!(
                 %id,
                 sender_idx = %self.sender_idx,
@@ -1581,6 +1632,8 @@ impl Cache {
 
         let ctx = self.contexts.remove(id).unwrap();
         self.send_counters.on_context_removed();
+        #[cfg(test)]
+        record_stale_key_outcome(sender_idx, StaleKeyOutcome::Invalidated);
         let mut ctx = ctx.borrow_mut();
         ctx.invalidated = true;
         debug!(
