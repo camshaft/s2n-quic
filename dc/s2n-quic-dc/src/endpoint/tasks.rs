@@ -1178,9 +1178,10 @@ where
 /// [`frame::FailureReason::PeerDead`], and `peer_dead_tx` is notified only when the idle expiry
 /// also indicates an unresponsive peer: one that left packets unacknowledged, one that didn't
 /// answer a probe while a stream on its path is open, or one whose path has an open stream and
-/// an idle check that ran more than a wheel tick late. Each stream whose frames such an expiry
-/// fails is owed a reset, which the receive path sends once a packet from the peer clears the
-/// dead mark (`Entry::owe_resets`).
+/// an idle check that ran more than a wheel tick late. Each stream that such an expiry resets on
+/// this side, each stream whose frames it fails and each stream open on the path, is owed a
+/// reset, which the receive path sends once a packet from the peer clears the dead mark
+/// (`Entry::mark_dead_owing_resets`).
 ///
 /// A context with no unacknowledged packet whose path has an open stream is probed with a Ping
 /// once in each quiet period, half an idle timeout into it, or at the idle deadline where its
@@ -1387,10 +1388,11 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let unresponsive = has_inflight || probed || open_stream;
 
                 // Keep the stream of each frame the invalidation fails. Where the peer is
-                // unresponsive, it isn't told that this side reset its streams, and its end of
-                // each may wait on this side: record each before the dead mark, so that the
-                // packet that clears the mark finds it and resets the stream
-                // (`dispatch::process`).
+                // unresponsive, the dead mark resets this side's streams on the path: those whose
+                // frames failed, and each open stream, whose frames the context may not hold at
+                // all. The peer isn't told, and its end of each may wait on this side: record each
+                // before the dead mark, so that the packet that clears the mark finds it and
+                // resets the stream (`dispatch::process`).
                 let mut failed = FailedStreams {
                     completed_tx: &mut completed_tx,
                     streams: Vec::new(),
@@ -1400,11 +1402,12 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     frame::FailureReason::PeerDead,
                     &mut failed,
                 );
-                if unresponsive {
-                    path_secret_entry.owe_resets(failed.streams);
-                }
                 let marked_dead = unresponsive
-                    && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
+                    && path_secret_entry.mark_dead_owing_resets(
+                        now,
+                        dead_peer_cooldown,
+                        failed.streams,
+                    );
 
                 if let Some((drained, discarded_bytes, pending_acks)) = result {
                     if !pending_acks.is_empty() {
