@@ -346,6 +346,20 @@ impl Context {
         }
     }
 
+    /// Checks the number of a packet that has opened on this context against the context's
+    /// replay window. Where the check passes, the packet counts as use of the path secret for the
+    /// map's eviction order, so an entry whose traffic stays on cached contexts, such as a
+    /// long-lived stream's, counts as used in each cleaner cycle.
+    #[inline]
+    pub fn on_opened_packet(
+        &mut self,
+        packet_number: VarInt,
+    ) -> Result<(), s2n_quic_core::packet::number::SlidingWindowError> {
+        self.dedup_filter.on_packet_number(packet_number)?;
+        self.path_entry.set_accessed_authenticated();
+        Ok(())
+    }
+
     /// Encode the current ACK state and produce a direct submission for the send worker.
     ///
     /// Only produces a submission when ack_state is Scheduled (new packets arrived
@@ -773,5 +787,76 @@ mod tests {
         // fails the replay check, and the cache doesn't mark the entry.
         assert!(matches!(receive(&mut other, 7), Err(CacheError::ReplayDetected)));
         assert!(!entry.take_accessed_authenticated());
+    }
+
+    /// Each packet after the first on a cached receive context, such as each later packet of a
+    /// long-lived stream, marks the path secret as used once it has opened and passed the
+    /// context's packet-number check, so that the entry counts as used in each cleaner cycle. The
+    /// cache hit alone doesn't mark it, and a replayed packet that opens doesn't either.
+    #[test]
+    fn marks_use_for_each_opened_packet_on_a_cached_context() {
+        let client_addr: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let server_addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let client = test_map(b"client");
+        let server = test_map(b"server");
+        let ids = client.test_insert_pair(
+            Entry::builder(server_addr).local(client_addr),
+            &server,
+            Entry::builder(client_addr).local(server_addr),
+        );
+
+        let mut cache = Cache::new(RecvDispatchWorkerId::new(0));
+        let clock = crate::time::testing::Clock::new(Duration::from_secs(1));
+        let route = PowerOfTwoRoute::new(1);
+        let sender = RemoteSenderId::new(VarInt::ZERO);
+        let mut control_out = Vec::new();
+        let credentials = Credentials {
+            id: ids.peer,
+            key_id: VarInt::from_u8(5),
+        };
+        // The decrypt callback opens every packet, as an authentic packet opens.
+        let mut receive = |cache: &mut Cache| {
+            cache.get_or_insert(
+                &credentials,
+                sender,
+                &server,
+                &clock,
+                SocketAddress::from(client_addr),
+                &mut control_out,
+                &route,
+                |_, _, _| Some(()),
+            )
+        };
+
+        // The first packet opens on a cache miss, which creates the context, and passes the
+        // packet-number check. A cleaner cycle then takes the bit.
+        let Ok((_, ctx, false)) = receive(&mut cache) else {
+            panic!("the first packet opens on a cache miss");
+        };
+        let entry = ctx.borrow().path_entry.clone();
+        assert!(ctx.borrow_mut().on_opened_packet(VarInt::from_u8(0)).is_ok());
+        assert!(entry.take_accessed_authenticated());
+
+        // A later packet with the same key id opens on the cached context. The cache hit alone
+        // doesn't mark the entry; the packet-number check does, where it passes.
+        let Ok((_, hit, true)) = receive(&mut cache) else {
+            panic!("a later packet opens on a cache hit");
+        };
+        assert!(Rc::ptr_eq(&hit, &ctx));
+        assert!(!entry.take_accessed_authenticated());
+        assert!(hit.borrow_mut().on_opened_packet(VarInt::from_u8(1)).is_ok());
+        assert!(entry.take_accessed_authenticated());
+
+        // A replay of that packet opens on the cached context, fails the packet-number check
+        // and doesn't mark the entry.
+        let Ok((_, hit, true)) = receive(&mut cache) else {
+            panic!("a replayed packet opens on a cache hit");
+        };
+        assert!(hit.borrow_mut().on_opened_packet(VarInt::from_u8(1)).is_err());
+        assert!(!entry.take_accessed_authenticated());
+
+        // The next packet marks it again, for the next cleaner cycle.
+        assert!(hit.borrow_mut().on_opened_packet(VarInt::from_u8(2)).is_ok());
+        assert!(entry.take_accessed_authenticated());
     }
 }
