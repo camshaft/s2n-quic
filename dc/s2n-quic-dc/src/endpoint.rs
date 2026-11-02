@@ -1609,7 +1609,7 @@ where
                 };
                 let rx = tasks::invalidation_validator(
                     bg.raw_rx,
-                    bg.path_secret_map,
+                    bg.path_secret_map.clone(),
                     bg.send_txs,
                     bg.recv_txs,
                     bg.sender_id_to_worker,
@@ -1638,8 +1638,19 @@ where
                         .receiver("task.peer_dead_broadcast")
                         .with_function("endpoint::Worker::spawn"),
                 );
-                let rx =
-                    tasks::peer_dead_broadcast(peer_dead_rx, bg.waker_sink, peer_dead_counters);
+                // A client path the idle wheel marks dead asks the handshake client registered
+                // on the map, where one is, for a new handshake with the peer in the background.
+                let path_secret_map = bg.path_secret_map;
+                let request_rehandshake = move |peer| {
+                    let reason = crate::psk::io::HandshakeReason::Remote;
+                    let _ = path_secret_map.request_handshake(peer, reason);
+                };
+                let rx = tasks::peer_dead_broadcast(
+                    peer_dead_rx,
+                    bg.waker_sink,
+                    peer_dead_counters,
+                    request_rehandshake,
+                );
                 let task_counter = counter_registry
                     .register_nominal_task("task.peer_dead_broadcast", "background")
                     .with_registration_metadata(
