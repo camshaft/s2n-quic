@@ -622,7 +622,6 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             ack_completions_tx.clone(),
             peer_dead_tx.clone(),
             dead_peer_cooldown,
-            frame_tx.clone(),
             counter_registry.register("idle.send.expired"),
             counter_registry.register("idle.send.rescheduled"),
             counter_registry.register_nominal_timer("idle.send.lifetime", &variant),
@@ -1176,13 +1175,7 @@ where
 /// the idle wheel. Expired contexts (including deadlines that fall within the current wheel
 /// tick) are invalidated from the send cache; any failed frames are completed with
 /// [`frame::FailureReason::PeerDead`], and `peer_dead_tx` is notified only when the idle expiry
-/// also indicates an unresponsive peer: one that left packets unacknowledged, or one that
-/// didn't answer the probe of a quiet path with an open stream.
-///
-/// A context with no unacknowledged packet whose path has an open stream is probed with a Ping
-/// once in each quiet period, half an idle timeout into it, or at once where the context is
-/// first checked later than that; the probe then has at least half an idle timeout to be
-/// acknowledged before the idle timeout decides. Probes go out on `frame_tx`.
+/// also indicates an unresponsive peer with inflight data.
 pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
     rx: intrusive::unsync::Receiver<send::IdleWheelAdapter>,
     idle_wheel_tx: intrusive::unsync::Sender<send::IdleWheelAdapter>,
@@ -1195,7 +1188,6 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
     mut ack_completions_tx: AckComp,
     mut peer_dead_tx: WakerSink,
     dead_peer_cooldown: core::time::Duration,
-    mut frame_tx: frame::SubmissionSender,
     idle_expired: counter::Counter,
     idle_rescheduled: counter::Counter,
     idle_lifetime: counter::Timer,
@@ -1222,44 +1214,14 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
             move |context: Rc<RefCell<send::Context>>| {
                 let now = clock.now();
                 let ctx = context.borrow();
-                let idle_timeout = ctx.path_secret_entry.idle_timeout();
-                let last_activity = ctx
-                    .last_peer_activity
-                    .max(ctx.path_secret_entry.last_activity());
-
-                // A quiet path with an open stream: this side has no unacknowledged packet, so
-                // an unreachable peer leaves nothing behind to fail, and a reader or a writer
-                // that waits on the peer would wait without end. Probe the peer with a Ping,
-                // once for each quiet period, so that the idle timeout decides on it as it
-                // decides on an unacknowledged packet. `probed` holds once the probe of the
-                // current quiet period went out; a later peer activity starts a new period.
-                let probed = ctx.idle_probe_for == Some(last_activity.nanos);
-                let wants_probe = !probed
-                    && !ctx.invalidated
-                    && !ctx.inflight.has_inflight()
-                    && ctx.path_secret_entry.queue_state().has_open_stream();
 
                 // Compute the reschedule target. If it's in a future wheel tick,
                 // reschedule and return early.
                 if !ctx.is_peer_idle(now) {
-                    let mut target = last_activity + idle_timeout;
-                    if wants_probe {
-                        // Probe half an idle timeout into the quiet period, which leaves the
-                        // other half for the probe and its retransmissions to be acknowledged
-                        // before the idle timeout decides.
-                        let probe_at = last_activity + idle_timeout / 2;
-                        if probe_at.nanos_since(now) >= wheel::SECOND_GRANULARITY_NANOS {
-                            target = probe_at;
-                        } else {
-                            drop(ctx);
-                            send_idle_probe(&context, last_activity, &mut frame_tx);
-                            let target = target.max(now + idle_timeout / 2);
-                            context.borrow_mut().idle_wheel.target_time = Some(target);
-                            let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
-                            idle_rescheduled.add(1);
-                            return;
-                        }
-                    }
+                    let last_activity = ctx
+                        .last_peer_activity
+                        .max(ctx.path_secret_entry.last_activity());
+                    let target = last_activity + ctx.path_secret_entry.idle_timeout();
                     if target.nanos_since(now) >= wheel::SECOND_GRANULARITY_NANOS {
                         drop(ctx);
                         context.borrow_mut().idle_wheel.target_time = Some(target);
@@ -1267,16 +1229,6 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                         idle_rescheduled.add(1);
                         return;
                     }
-                } else if wants_probe {
-                    // The idle timeout passed before a probe went out, as for a context first
-                    // checked at its idle timeout: probe now, and give the probe half an idle
-                    // timeout to be acknowledged.
-                    drop(ctx);
-                    send_idle_probe(&context, last_activity, &mut frame_tx);
-                    context.borrow_mut().idle_wheel.target_time = Some(now + idle_timeout / 2);
-                    let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
-                    idle_rescheduled.add(1);
-                    return;
                 }
 
                 // Expired: either is_peer_idle fired, or the target landed on
@@ -1354,12 +1306,11 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     );
                 }
 
-                // Mark the peer dead only when there is evidence the peer is unreachable:
-                // packets it never acknowledged, or the probe of a quiet path with an open
-                // stream that it didn't answer for the rest of the idle timeout. Without
-                // either, both sides simply stopped talking (natural idle) and we must not
-                // mark dead.
-                let marked_dead = (has_inflight || probed)
+                // Mark the peer dead only when we have packets in flight that
+                // were never acknowledged — that's evidence the peer is
+                // unreachable. If there are no inflight packets, both sides
+                // simply stopped talking (natural idle) and we must not mark dead.
+                let marked_dead = has_inflight
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
 
                 let result = send_caches[local_id].borrow_mut().invalidate(
@@ -1390,36 +1341,6 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
         task_counter,
     )
     .await;
-}
-
-/// Submits a Ping to the peer of `context`, the send idle wheel's probe of a quiet path that has
-/// an open stream, and records the quiet period it probes by its last peer activity.
-///
-/// The Ping goes through the frame pipeline as any frame does, so it is transmitted,
-/// retransmitted after each probe timeout, and acknowledged as any packet is: an answer
-/// refreshes the context's `last_peer_activity`, and a peer that doesn't answer leaves it
-/// unacknowledged until the idle timeout decides.
-fn send_idle_probe(
-    context: &Rc<RefCell<send::Context>>,
-    last_activity: precision::Timestamp,
-    frame_tx: &mut frame::SubmissionSender,
-) {
-    let path_secret_entry = {
-        let mut ctx = context.borrow_mut();
-        ctx.idle_probe_for = Some(last_activity.nanos);
-        ctx.path_secret_entry.clone()
-    };
-    let probe = Frame {
-        header: frame::Header::Ping,
-        payload: crate::byte_vec::ByteVec::new(),
-        path_secret_entry,
-        completion: None,
-        status: frame::TransmissionStatus::default(),
-        ttl: frame::DEFAULT_TTL,
-        enqueued_at: None,
-        flow_credits: 0,
-    };
-    let _ = frame_tx.send_batch(Entry::new(probe));
 }
 
 /// Drains the receive-side idle wheel for one receive worker.
