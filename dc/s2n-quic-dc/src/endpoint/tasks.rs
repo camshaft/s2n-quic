@@ -1402,14 +1402,14 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     frame::FailureReason::PeerDead,
                     &mut failed,
                 );
-                let (recorded, marked_dead) = if unresponsive {
+                let (recorded, reset) = if unresponsive {
                     path_secret_entry.mark_dead_owing_resets(
                         now,
                         dead_peer_cooldown,
                         failed.streams,
                     )
                 } else {
-                    (0, false)
+                    (0, None)
                 };
                 if recorded > 0 {
                     send_caches[local_id]
@@ -1433,8 +1433,11 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     counters.on_inflight_leaked_on_invalidate(discarded_bytes as u64);
                 }
 
-                if marked_dead {
-                    let _ = peer_dead_tx.send(Entry::new(PeerDead { path_secret_entry }));
+                if let Some(streams) = reset {
+                    let _ = peer_dead_tx.send(Entry::new(PeerDead {
+                        path_secret_entry,
+                        streams,
+                    }));
                 }
 
                 idle_expired.add(1);
@@ -2020,6 +2023,9 @@ where
 #[derive(Clone, Debug)]
 pub struct PeerDead {
     pub path_secret_entry: Arc<crate::path::secret::map::Entry>,
+    /// The streams open on the path as the dead mark read them, each owed a reset
+    /// (`Entry::mark_dead_owing_resets`): the streams `peer_dead_broadcast` resets on this side.
+    pub streams: Vec<crate::queue::OwedReset>,
 }
 
 #[derive(Clone)]
@@ -2028,6 +2034,9 @@ pub struct PeerDeadCounters {
     pub broadcasted: counter::Counter,
 }
 
+/// Resets on this side each stream of each dead mark (`PeerDead::streams`), the streams the mark
+/// owes the peer a reset of, and wakes their readers and writers, and the client's blocked alloc
+/// waiters.
 pub fn peer_dead_broadcast<R, WakerSink>(
     peer_dead_rx: R,
     mut waker_sink: WakerSink,
@@ -2045,12 +2054,12 @@ where
 
         match peer_dead.path_secret_entry.queue_state() {
             QueueState::Client(state) => {
-                state.broadcast_reset(IDLE_TIMEOUT, &mut |aw| {
+                state.reset_streams(&peer_dead.streams, IDLE_TIMEOUT, &mut |aw| {
                     let _ = waker_sink.send(aw);
                 });
             }
             QueueState::Server(state) => {
-                state.broadcast_reset(IDLE_TIMEOUT, &mut |aw| {
+                state.reset_streams(&peer_dead.streams, IDLE_TIMEOUT, &mut |aw| {
                     let _ = waker_sink.send(aw);
                 });
             }
