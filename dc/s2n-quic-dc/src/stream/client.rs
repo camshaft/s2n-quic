@@ -132,27 +132,6 @@ impl Client {
             .await?;
         let mut path_secret_entry = peer.into_raw();
 
-        // A cached entry whose peer was marked dead, past the dead-peer cooldown, and hasn't
-        // answered for a whole idle timeout can't recover by itself: only a packet from the peer
-        // clears the mark, and each flow we open on it goes unanswered and marks it again. Evict
-        // it and handshake again, so the peer gets fresh keys and queue state, in place of
-        // refusing flows until the process restarts.
-        if matches!(handshake_kind, crate::path::secret::HandshakeKind::Cached)
-            && path_secret_entry.is_dead_and_silent(
-                self.endpoint.clock.now(),
-                self.endpoint.path_secret_map.entry_age(&path_secret_entry),
-                self.endpoint.dead_peer_cooldown,
-            )
-        {
-            // Connects that find the same entry at once share one handshake, and a later one
-            // gets that handshake's entry, as `handshake_replacing` says.
-            let (peer, kind) = self
-                .psk
-                .handshake_replacing(peer_addr, &path_secret_entry, self.server_name.clone())
-                .await?;
-            path_secret_entry = peer.into_raw();
-            handshake_kind = kind;
-        }
         let handshake_elapsed = handshake_start.elapsed();
         let handshake_timer = match handshake_kind {
             crate::path::secret::HandshakeKind::Cached => {
