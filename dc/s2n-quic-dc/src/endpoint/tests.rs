@@ -3060,7 +3060,10 @@ fn replay_notices_after_recv_eviction_are_acted_on_once_per_send_cache() {
         acted_counted, acted,
         "the server's counter of contexts it acted on matches the outcomes: {outcomes}"
     );
-    assert!(acted >= 1, "the server didn't act on any notice: {outcomes}");
+    assert!(
+        acted >= 1,
+        "the server didn't act on any notice: {outcomes}"
+    );
     assert!(
         acts_by_sender.values().all(|&acts| acts == 1),
         "a send cache acts on one notice at most, since its next context seals with a newer key \
