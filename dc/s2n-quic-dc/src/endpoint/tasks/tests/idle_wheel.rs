@@ -924,12 +924,13 @@ fn send_idle_wheel_defers_death_for_recent_inflight() {
 /// A send context that expires with an unacknowledged packet marks its peer dead and fails the
 /// packet's frames. The peer isn't told that its streams were reset on this side, so the path
 /// owes it a reset of each stream whose frames failed, once: here two frames of one stream and
-/// one of another, beside a Ping, which belongs to no stream.
+/// one of another, beside a Ping, which belongs to no stream. The wheel counts the two streams
+/// on `send.idle.owed_resets`.
 #[test]
 fn send_idle_wheel_owes_a_reset_of_each_stream_whose_frames_it_fails_as_it_marks_the_peer_dead() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
-        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, _registry) = setup_send();
+        let (send_caches, mut idle_wheel_tx, mut completed_rx, clock, registry) = setup_send();
 
         let pse = test_entry();
         pse.touch_activity(precision::Clock::now(&clock));
@@ -1026,6 +1027,16 @@ fn send_idle_wheel_owes_a_reset_of_each_stream_whose_frames_it_fails_as_it_marks
                 owed.contains(&data_stream) && owed.contains(&max_data_stream),
                 "{owed:?}"
             );
+
+            // The wheel counts each of the two streams once, as the set records it.
+            let metrics = registry
+                .take_current_metrics_line()
+                .expect("the registry is open");
+            let recorded = metrics
+                .split(',')
+                .find_map(|metric| metric.strip_prefix("send.idle.owed_resets="))
+                .and_then(|value| value.split(' ').next());
+            assert_eq!(recorded, Some("2"), "{metrics}");
         }
         .primary()
         .spawn();

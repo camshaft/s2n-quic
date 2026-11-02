@@ -109,9 +109,12 @@ pub struct OwedResets {
 }
 
 impl OwedResets {
-    /// Adds each of `resets` that isn't owed already.
-    pub fn record(&self, resets: impl IntoIterator<Item = OwedReset>) {
-        self.streams.lock().unwrap().extend(resets);
+    /// Adds each of `resets` that isn't owed already, and returns how many it added.
+    pub fn record(&self, resets: impl IntoIterator<Item = OwedReset>) -> usize {
+        let mut streams = self.streams.lock().unwrap();
+        let before = streams.len();
+        streams.extend(resets);
+        streams.len() - before
     }
 
     /// Takes every owed reset.

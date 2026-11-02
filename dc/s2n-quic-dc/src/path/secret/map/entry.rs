@@ -443,9 +443,10 @@ impl Entry {
     /// unresponsive, until a packet from the peer clears the dead mark
     /// ([`Self::touch_activity`]): the peer isn't told that this side reset those streams, so its
     /// end of each may still wait on this side. The send idle wheel records them before it marks
-    /// the peer dead, so that the packet that clears the mark finds them.
-    pub fn owe_resets(&self, resets: impl IntoIterator<Item = OwedReset>) {
-        self.queue_state.owed_resets().record(resets);
+    /// the peer dead, so that the packet that clears the mark finds them. Returns how many of
+    /// them weren't owed already.
+    pub fn owe_resets(&self, resets: impl IntoIterator<Item = OwedReset>) -> usize {
+        self.queue_state.owed_resets().record(resets)
     }
 
     /// Takes the resets this side owes the peer, once a packet from it cleared the dead mark.

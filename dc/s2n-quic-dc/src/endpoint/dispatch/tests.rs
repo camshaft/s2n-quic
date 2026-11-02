@@ -453,3 +453,53 @@ fn slot_diag_reports_bound_vs_unallocated_state() {
         "an unbound slot must read back as unallocated with no receiver"
     );
 }
+
+/// `send_owed_resets` counts on `rx.dead_mark.owed_resets` each reset that the submission channel
+/// accepts: both resets where the channel is open, and none where its receiver is gone.
+#[test]
+fn send_owed_resets_counts_each_reset_it_submits() {
+    let owed_reset = |source: u8, dest: u8, binding: u8| crate::queue::OwedReset {
+        queue_pair: QueuePair {
+            source_queue_id: VarInt::from_u8(source),
+            dest_queue_id: VarInt::from_u8(dest),
+        },
+        binding_id: VarInt::from_u8(binding),
+    };
+    let path_entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .endpoint_type(endpoint::Type::Server)
+        .build(None);
+    let owed_resets_sent = |registry: &crate::counter::Registry| {
+        let metrics = registry
+            .take_current_metrics_line()
+            .expect("the registry is open");
+        metrics
+            .split(',')
+            .find_map(|metric| metric.strip_prefix("rx.dead_mark.owed_resets="))
+            .map(str::to_owned)
+    };
+
+    // An open channel accepts both resets.
+    let registry = crate::counter::Registry::default();
+    let dispatch_counters = counters::Dispatch::new(&registry);
+    let (mut frame_tx, _frame_rx) = crate::endpoint::frame::submission_channel(1);
+    send_owed_resets(
+        &path_entry,
+        vec![owed_reset(1, 2, 1), owed_reset(3, 4, 2)],
+        &dispatch_counters,
+        &mut frame_tx,
+    );
+    assert_eq!(owed_resets_sent(&registry).as_deref(), Some("2"));
+
+    // A channel whose receiver is gone refuses the reset, which isn't counted.
+    let registry = crate::counter::Registry::default();
+    let dispatch_counters = counters::Dispatch::new(&registry);
+    let (mut frame_tx, frame_rx) = crate::endpoint::frame::submission_channel(1);
+    drop(frame_rx);
+    send_owed_resets(
+        &path_entry,
+        vec![owed_reset(1, 2, 1)],
+        &dispatch_counters,
+        &mut frame_tx,
+    );
+    assert_eq!(owed_resets_sent(&registry), None);
+}

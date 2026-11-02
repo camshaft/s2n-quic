@@ -1401,7 +1401,18 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     &mut failed,
                 );
                 if unresponsive {
-                    path_secret_entry.owe_resets(failed.streams);
+                    let recorded = path_secret_entry.owe_resets(failed.streams);
+                    if recorded > 0 {
+                        send_caches[local_id]
+                            .borrow()
+                            .send_counters()
+                            .on_idle_owed_resets(recorded as u64);
+                        debug!(
+                            %credentials_id,
+                            recorded,
+                            "peer unresponsive - owed resets recorded"
+                        );
+                    }
                 }
                 let marked_dead = unresponsive
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
