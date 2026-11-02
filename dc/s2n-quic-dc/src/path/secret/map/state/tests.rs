@@ -541,3 +541,68 @@ fn entry_without_negotiation_has_no_application_data() {
     let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into()).build(None);
     assert!(entry.application_data().is_none());
 }
+
+/// Records the peer address of each replay event the map publishes
+#[derive(Default)]
+struct ReplayPeers(std::sync::Mutex<Vec<(&'static str, std::net::SocketAddr)>>);
+
+impl crate::event::Subscriber for ReplayPeers {
+    type ConnectionContext = ();
+
+    fn create_connection_context(
+        &self,
+        _meta: &crate::event::api::ConnectionMeta,
+        _info: &crate::event::api::ConnectionInfo,
+    ) -> Self::ConnectionContext {
+    }
+
+    fn on_replay_definitely_detected(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::ReplayDefinitelyDetected,
+    ) {
+        let peer = (&event.peer_address).into();
+        self.0.lock().unwrap().push(("definitely", peer));
+    }
+
+    fn on_replay_potentially_detected(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::ReplayPotentiallyDetected,
+    ) {
+        let peer = (&event.peer_address).into();
+        self.0.lock().unwrap().push(("potentially", peer));
+    }
+}
+
+/// Each replay `check_dedup` detects carries the address of the entry's peer
+#[test]
+fn replay_events_carry_the_peer_address() {
+    let sub = Arc::new(ReplayPeers::default());
+    let map = State::builder()
+        .with_signer(stateless_reset::Signer::new(b"secret"))
+        .with_capacity(10)
+        .with_clock(Clock)
+        .with_subscriber(sub.clone())
+        .build_state()
+        .unwrap();
+    map.cleaner.stop();
+
+    let entry = fake_entry(0);
+    let mut out = vec![];
+
+    let first = map.check_dedup(&entry, VarInt::from_u32(5), None, &mut out);
+    assert!(first.is_ok(), "{first:?}");
+    // The same key id again is definitely a replay.
+    let again = map.check_dedup(&entry, VarInt::from_u32(5), None, &mut out);
+    assert!(again.is_err(), "{again:?}");
+    // Once the replay window moves past a key id, a replay of it can't be ruled out.
+    let ahead = map.check_dedup(&entry, VarInt::from_u32(5_000), None, &mut out);
+    assert!(ahead.is_ok(), "{ahead:?}");
+    let behind = map.check_dedup(&entry, VarInt::from_u32(6), None, &mut out);
+    assert!(behind.is_err(), "{behind:?}");
+
+    let peer = *entry.peer();
+    let events = sub.0.lock().unwrap();
+    assert_eq!(*events, [("definitely", peer), ("potentially", peer)]);
+}
