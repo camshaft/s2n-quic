@@ -206,6 +206,10 @@ pub(crate) struct Send {
     pub inflight_drain_invalidate: Counter,
     pub inflight_drain_expire: Counter,
     pub inflight_leaked_on_invalidate: Summary,
+    // Stale-key and replay notices that leave this sender's cache as it is, by the condition that
+    // decides it (see `send::Cache::invalidate_stale_key`).
+    pub stale_key_no_context: Counter,
+    pub stale_key_already_advanced: Counter,
     pub probe_no_response: Counter,
     pub tx_probe_backoff: Summary,
     // Probe-shell benefit accounting. `shell_acked` counts ACKs that named a shell PN (an old
@@ -262,6 +266,9 @@ impl Send {
                 &v,
                 Unit::Byte,
             ),
+            stale_key_no_context: counters.register_nominal("send.stale_key.no_context", &v),
+            stale_key_already_advanced: counters
+                .register_nominal("send.stale_key.already_advanced", &v),
             probe_no_response: counters.register_nominal("tx.probe.no_response", &v),
             tx_probe_backoff: counters.register_nominal_summary(
                 "tx.probe.backoff",
@@ -368,6 +375,19 @@ impl Send {
         if bytes > 0 {
             self.inflight_leaked_on_invalidate.record_value(bytes);
         }
+    }
+
+    /// A stale-key or replay notice didn't find a send context for its credential.
+    #[inline]
+    pub fn on_stale_key_no_context(&self) {
+        self.stale_key_no_context.add(1);
+    }
+
+    /// A stale-key or replay notice found the send context sealing with a newer key id than the
+    /// one the notice rejects.
+    #[inline]
+    pub fn on_stale_key_already_advanced(&self) {
+        self.stale_key_already_advanced.add(1);
     }
 
     #[inline]
