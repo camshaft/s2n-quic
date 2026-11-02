@@ -23,7 +23,7 @@ use std::{
     any::Any,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -99,6 +99,9 @@ pub struct Entry {
     /// The key the peer presented, where the map checked it against its list of accepted keys
     /// (see [`Map::set_peer_keys`]).
     peer_key: Option<PeerKey>,
+    /// Whether the map revoked the path secret because the peer's key was removed from its list
+    /// of accepted keys (see [`Entry::revoke`]).
+    revoked: AtomicBool,
 }
 
 /// Per-peer queue slot state, determined by role (derived from credential_id).
@@ -128,6 +131,7 @@ impl SizeOf for Entry {
             sender_load_scores,
             queue_state: _,
             peer_key,
+            revoked: _,
         } = self;
         creation_time.size()
             + peer.size()
@@ -147,6 +151,7 @@ impl SizeOf for Entry {
             + std::mem::size_of::<QueueState>()
             + std::mem::size_of::<Option<PeerKey>>()
             + peer_key.as_ref().map_or(0, |key| key.as_spki_der().len())
+            + std::mem::size_of::<AtomicBool>()
     }
 }
 
@@ -249,6 +254,7 @@ impl Entry {
             sender_load_scores: Self::init_load_scores(socket_sender_count),
             queue_state,
             peer_key: None,
+            revoked: AtomicBool::new(false),
         }
     }
 
@@ -599,6 +605,35 @@ impl Entry {
     /// (see [`Map::set_peer_keys`]).
     pub fn peer_key(&self) -> Option<&PeerKey> {
         self.peer_key.as_ref()
+    }
+
+    /// Revokes the path secret, as the map does when it evicts it because the peer's key was
+    /// removed from its list of accepted keys.
+    ///
+    /// Each open stream on the path secret holds the entry and its keys, so the eviction alone
+    /// leaves it running. Revoking pushes a reset with `PEER_KEY_REMOVED` into each of its queue
+    /// slots, which ends its reader and its writer with that error, and makes the receive path
+    /// refuse each later packet on the path secret as one on an unknown path secret. A reader or
+    /// a writer dropped on a revoked path secret sends the peer a reset with the same error, so
+    /// the peer's half of the stream ends too. Revoking an entry again changes nothing.
+    pub(crate) fn revoke(&self) {
+        if self.revoked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let error_code = crate::endpoint::error::PEER_KEY_REMOVED;
+        // Dropping each wake token wakes its reader or writer at once.
+        let wake = &mut core::mem::drop::<crate::queue::AutoWake>;
+        match &self.queue_state {
+            QueueState::Client(state) => state.broadcast_reset(error_code, wake),
+            QueueState::Server(state) => state.broadcast_reset(error_code, wake),
+        }
+    }
+
+    /// Whether the map revoked the path secret (see [`Entry::revoke`]).
+    #[inline]
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
