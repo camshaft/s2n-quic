@@ -1635,3 +1635,113 @@ fn ack_only_segment_must_not_consume_pto_probe_budget() {
         pn0.as_u64(),
     );
 }
+
+/// Builds a Ping frame as the send idle wheel's probe of a quiet path submits it
+/// (`send_idle_probe` in endpoint/tasks.rs): no payload and no completion.
+fn make_ping_frame(entry: &Arc<PathSecretEntry>) -> crate::intrusive::Entry<Frame> {
+    Frame {
+        header: Header::Ping,
+        payload: ByteVec::new(),
+        path_secret_entry: entry.clone(),
+        completion: None,
+        status: TransmissionStatus::default(),
+        ttl: DEFAULT_TTL,
+        enqueued_at: None,
+        flow_credits: 0,
+    }
+    .into()
+}
+
+/// Sends a packet from a send context whose inflight map is empty, half an idle timeout after
+/// its last peer activity: a data frame where `data` is set, and a Ping where `ping` is set.
+/// Returns the nanoseconds of that last activity, of the send, and of the context's
+/// `last_peer_activity` after the send.
+fn last_peer_activity_after_first_packet(data: bool, ping: bool) -> (u64, u64, u64) {
+    let mtu = 1500;
+    let registry = Registry::new();
+    let (mut context, entry) = make_context(mtu, &registry);
+
+    let clock = Clock::new(Duration::from_secs(1));
+    let quiet_since = clock.get_time();
+    context.last_peer_activity = quiet_since;
+    // Half an idle timeout into the quiet period, when the send idle wheel probes it.
+    clock.advance(entry.idle_timeout() / 2);
+    let sent_at = clock.get_time();
+    assert!(
+        sent_at.nanos > quiet_since.nanos,
+        "test setup: the send comes after the last peer activity"
+    );
+
+    let completion_rx = crate::endpoint::frame::completion_channel();
+    if data {
+        context.push_back_frame(make_data_frame(&entry, completion_rx.sender()));
+    }
+    if ping {
+        context.push_back_frame(make_ping_frame(&entry));
+    }
+    assert!(
+        !context.inflight.has_inflight(),
+        "test setup: the inflight map is empty before the send"
+    );
+
+    let gso = make_gso(1);
+    let pool = pool::Pool::new(u16::MAX);
+    let mut header_buf = Vec::new();
+    let mut cancelled = Queue::new();
+    let mut ack_completions = Queue::new();
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+    let send_counters = crate::endpoint::counters::Send::new(
+        &crate::counter::Registry::default(),
+        crate::endpoint::id::LocalSenderId::from_index(0),
+    );
+    let source_sender_id = crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1));
+    let source_control_port = 443;
+    let credit_pool = unused_credit_pool();
+    let segments = assemble::<SyncRecycler, _>(
+        &mut context,
+        ImmediateQueueStatus::Empty,
+        &clock,
+        source_sender_id,
+        source_control_port,
+        &gso,
+        pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
+        &mut header_buf,
+        &mut cancelled,
+        &mut ack_completions,
+        &mut freed_batch_tx,
+        &AssemblerCounters::new(&registry),
+        &send_counters,
+        &credit_pool,
+    );
+    assert!(
+        segments.is_some(),
+        "the pending frames assemble into a packet"
+    );
+    assert!(
+        !context.has_pending(),
+        "every pending frame went into the packet"
+    );
+    assert!(
+        context.inflight.has_inflight(),
+        "the packet went into the inflight map"
+    );
+
+    let activity = context.last_peer_activity.nanos;
+    (quiet_since.nanos, sent_at.nanos, activity)
+}
+
+/// A packet of Pings alone, the send idle wheel's probe of a quiet path, goes into an empty
+/// inflight map without restarting the send context's idle clock (`last_peer_activity`), so the
+/// idle timeout of the quiet period it probes still decides on a peer that doesn't answer. A
+/// packet that carries a data frame restarts the clock, alone or beside a Ping.
+#[test]
+fn a_ping_only_packet_doesnt_restart_the_idle_clock() {
+    let (quiet_since, _sent_at, activity) = last_peer_activity_after_first_packet(false, true);
+    assert_eq!(activity, quiet_since, "a lone Ping restarted the clock");
+
+    let (_quiet_since, sent_at, activity) = last_peer_activity_after_first_packet(true, false);
+    assert_eq!(activity, sent_at, "a data frame didn't restart the clock");
+
+    let (_quiet_since, sent_at, activity) = last_peer_activity_after_first_packet(true, true);
+    assert_eq!(activity, sent_at, "data beside a Ping didn't restart it");
+}
