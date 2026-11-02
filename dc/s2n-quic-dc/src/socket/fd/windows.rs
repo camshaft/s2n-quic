@@ -689,7 +689,10 @@ fn decode_value(data: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{SocketAddr, UdpSocket};
+    use std::{
+        net::{SocketAddr, UdpSocket},
+        time::Duration,
+    };
 
     fn pair(addr: &str) -> (UdpSocket, UdpSocket) {
         let a = UdpSocket::bind(addr).unwrap();
@@ -706,6 +709,15 @@ mod tests {
             recv(socket, &mut addr, &mut cmsg, &mut iov, 0).unwrap()
         };
         (len, addr, cmsg, payload)
+    }
+
+    /// Receives one datagram into a buffer of `len` bytes, and returns what `recv` returns.
+    fn try_recv(socket: &UdpSocket, len: usize) -> io::Result<usize> {
+        let mut payload = vec![0u8; len];
+        let mut addr = Addr::default();
+        let mut cmsg = cmsg::Receiver::default();
+        let mut iov = [IoSliceMut::new(&mut payload)];
+        recv(socket, &mut addr, &mut cmsg, &mut iov, 0)
     }
 
     /// A datagram sent with `send` arrives whole at `recv`, which reports the sender's address.
@@ -797,6 +809,57 @@ mod tests {
         assert_eq!(cmsg.segment_len(), 1200);
     }
 
+    /// The control messages follow the layout `ws2def.h` sets for 64-bit Windows: a 16-byte
+    /// `WSACMSGHDR`, the data 16 bytes from the header's start (`WSA_CMSG_DATA`), and 24 bytes for
+    /// a message of 4 data bytes (`WSA_CMSG_SPACE(4)`). The expected bytes are laid out by hand
+    /// from those offsets, so a wrong layout in the encoder or in the decoder fails the test.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn control_messages_follow_the_64_bit_ws2def_layout() {
+        assert_eq!(HEADER_LEN, 16);
+        assert_eq!(DATA_OFFSET, 16);
+        assert_eq!(space(4), 24);
+
+        // Each message: `cmsg_len` in 8 bytes (`WSA_CMSG_LEN(4)`, 20), `cmsg_level` and
+        // `cmsg_type` in 4 bytes each, the 4-byte value, and 4 bytes of padding.
+        let messages = [
+            (0, IPPROTO_IPV6, IPV6_ECN, 0b11u32),
+            (24, IPPROTO_UDP, UDP_COALESCED_INFO, 1200),
+        ];
+        let mut expected = [0u8; 48];
+        for (offset, level, ty, value) in messages {
+            expected[offset..offset + 8].copy_from_slice(&20u64.to_ne_bytes());
+            expected[offset + 8..offset + 12].copy_from_slice(&level.to_ne_bytes());
+            expected[offset + 12..offset + 16].copy_from_slice(&ty.to_ne_bytes());
+            expected[offset + 16..offset + 20].copy_from_slice(&value.to_ne_bytes());
+        }
+
+        let mut control = Control::<48>::default();
+        let len = {
+            let mut encoder = Encoder::new(&mut control);
+            for (_offset, level, ty, value) in messages {
+                assert!(encoder.push(level, ty, value));
+            }
+            encoder.len
+        };
+        assert_eq!(len, expected.len());
+        assert_eq!(control.0, expected);
+
+        let mut control = Control(expected);
+        // SAFETY: an all-zero `WSAMSG` is valid.
+        let mut msg: WinSock::WSAMSG = unsafe { mem::zeroed() };
+        msg.Control = WinSock::WSABUF {
+            len: expected.len() as u32,
+            buf: control.0.as_mut_ptr(),
+        };
+
+        let mut cmsg = cmsg::Receiver::default();
+        decode_control(&msg, &mut cmsg);
+
+        assert_eq!(cmsg.ecn(), ExplicitCongestionNotification::Ce);
+        assert_eq!(cmsg.segment_len(), 1200);
+    }
+
     /// The encoder stops at the end of its buffer and writes nothing past it.
     #[test]
     fn encoder_refuses_a_message_past_the_buffer() {
@@ -850,5 +913,129 @@ mod tests {
             let (len, _from, _cmsg, received) = recv_one(&b, 1500);
             assert_eq!(&received[..len], want);
         }
+    }
+
+    /// An option the socket refuses comes back as `Support::Unsupported` with Winsock's error
+    /// code, and `configure` leaves the socket working: an IPv4 socket refuses the IPv6 ECN
+    /// option.
+    #[test]
+    fn a_refused_option_comes_back_unsupported() {
+        let (a, b) = pair("127.0.0.1:0");
+
+        let socket = b.as_raw() as WinSock::SOCKET;
+        let support = set_option(socket, IPPROTO_IPV6, IPV6_RECVECN, 1);
+        let Support::Unsupported(code) = support else {
+            panic!("an IPv4 socket accepted the IPv6 ECN option");
+        };
+        assert_ne!(code, 0);
+
+        configure(&b, u16::MAX as u32);
+
+        // The socket still sends and receives.
+        let payload = [5u8; 32];
+        let iov = [IoSlice::new(&payload)];
+        for (from, to) in [(&a, &b), (&b, &a)] {
+            let addr = Addr::new(to.local_addr().unwrap().into());
+            let sent = send(
+                from,
+                &addr,
+                ExplicitCongestionNotification::NotEct,
+                &iov,
+                None,
+                0,
+            )
+            .unwrap();
+            assert_eq!(sent, payload.len());
+
+            let (len, sender, _cmsg, received) = recv_one(to, u16::MAX as usize);
+            assert_eq!(len, payload.len());
+            assert_eq!(&received[..len], &payload[..]);
+            let sender: SocketAddr = sender.get().into();
+            assert_eq!(sender, from.local_addr().unwrap());
+        }
+    }
+
+    /// A message of two 600-byte segments arrives as two 600-byte datagrams, with its segment size
+    /// given and with the size read from its first slice: in one call with `UDP_SEND_MSG_SIZE`
+    /// where `configure` finds that the build supports send segmentation, and in a call for each
+    /// segment where it doesn't.
+    #[test]
+    fn a_message_of_two_segments_arrives_as_two_datagrams() {
+        for segment_size in [None, Some(600)] {
+            let (a, b) = pair("127.0.0.1:0");
+            // `b` isn't configured: without receive coalescing, each datagram arrives on its own.
+            b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+            let features = configure(&a, u16::MAX as u32);
+            let plan = send_plan(1200, 600, SEND_SEGMENTATION.load(Ordering::Relaxed));
+            if features.send_segmentation.is_enabled() {
+                assert_eq!(plan, SendPlan::Segmented(600));
+            } else {
+                assert_eq!(plan, SendPlan::EachSegment(600));
+            }
+
+            let to = Addr::new(b.local_addr().unwrap().into());
+            let first = [1u8; 600];
+            let second = [2u8; 600];
+            let iov = [IoSlice::new(&first), IoSlice::new(&second)];
+            let sent = send(
+                &a,
+                &to,
+                ExplicitCongestionNotification::NotEct,
+                &iov,
+                segment_size,
+                0,
+            )
+            .unwrap();
+            assert_eq!(sent, 1200);
+
+            for want in [first, second] {
+                let (len, _from, cmsg, received) = recv_one(&b, 1500);
+                assert_eq!(len, 600);
+                assert_eq!(&received[..len], &want[..]);
+                assert_eq!(cmsg.segment_len(), 0);
+            }
+        }
+    }
+
+    /// On a socket `configure` set up, which turns `SIO_UDP_CONNRESET` off, an ICMP port
+    /// unreachable for an earlier send doesn't fail the next receive, as it does on a socket left
+    /// with the Windows default.
+    #[test]
+    fn a_port_unreachable_doesnt_fail_the_next_receive() {
+        let timeout = Some(Duration::from_secs(5));
+        let not_ect = ExplicitCongestionNotification::NotEct;
+        let payload = [3u8; 32];
+        let iov = [IoSlice::new(&payload)];
+
+        // A loopback port that nothing listens on: the socket that held it is closed.
+        let closed = {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            Addr::new(socket.local_addr().unwrap().into())
+        };
+
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.set_read_timeout(timeout).unwrap();
+        let features = configure(&a, u16::MAX as u32);
+        assert_eq!(features.ignore_connreset, Support::Enabled);
+        send(&a, &closed, not_ect, &iov, None, 0).unwrap();
+
+        // On a socket `configure` didn't set up, the port unreachable for a send to the closed
+        // port fails the next receive. That socket sends after `a`, so by the time its receive
+        // fails, the port unreachable for `a`'s earlier send has arrived too.
+        let unconfigured = UdpSocket::bind("127.0.0.1:0").unwrap();
+        unconfigured.set_read_timeout(timeout).unwrap();
+        send(&unconfigured, &closed, not_ect, &iov, None, 0).unwrap();
+        let error = try_recv(&unconfigured, 1500).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(WinSock::WSAECONNRESET as i32));
+
+        // `a`'s next receive returns the next datagram that arrives.
+        let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.send_to(&payload, a.local_addr().unwrap()).unwrap();
+        let (len, from, _cmsg, received) = recv_one(&a, u16::MAX as usize);
+        assert_eq!(len, payload.len());
+        assert_eq!(&received[..len], &payload[..]);
+        let from: SocketAddr = from.get().into();
+        assert_eq!(from, c.local_addr().unwrap());
     }
 }
