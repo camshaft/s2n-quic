@@ -601,6 +601,11 @@ pub(crate) struct Context {
     /// Set when the context is invalidated (removed from cache). Prevents wheels
     /// from rearming after expiry.
     pub invalidated: bool,
+    /// The entry's count of the peer's answers on the revoked path secret (see
+    /// `Entry::on_revoked_refusal`) as it stood when this context last sent an ack-eliciting
+    /// packet. Where the entry's count differs, the peer answered after that transmission, and a
+    /// probe stops sending the resets on the revoked path secret again.
+    pub revoked_refusals_seen: u32,
     /// RTT sampler for ACK-only (read-heavy) sends.
     ///
     /// When `inflight` is empty we have no ack-eliciting packets in flight and
@@ -763,6 +768,7 @@ impl Context {
             created_at: clock.now(),
             last_peer_activity: clock.now(),
             invalidated: false,
+            revoked_refusals_seen: entry.revoked_refusals(),
             rtt_tracker: AckRttTracker::default(),
         })
     }
