@@ -382,7 +382,8 @@ fn no_memory_growth() {
 }
 
 /// An accepted UnknownPathSecret evicts a client entry whatever the map's
-/// `with_evict_on_unknown_path_secret` setting, so the client's next connect handshakes again.
+/// `with_evict_on_unknown_path_secret` setting, so the client's next connect handshakes again
+/// once the handshake queue doesn't hold a recent success for the peer.
 /// For a server entry the setting still decides.
 #[test]
 fn unknown_path_secret_evicts_client_entry_by_default() {
