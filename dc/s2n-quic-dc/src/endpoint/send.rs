@@ -1550,6 +1550,39 @@ impl Cache {
         Some(ctx.drain_frames(Some(reason), cancelled))
     }
 
+    /// Invalidates `context` as [`Self::invalidate`] does, where the cache still holds that
+    /// context for its path. Otherwise it leaves the cache as it is and returns `None`.
+    ///
+    /// The send idle wheel calls this at a context's expiry. A context that an earlier
+    /// invalidation removed from the cache, such as [`Self::invalidate_stale_key`], stays on
+    /// the idle wheel until its deadline, and by then the cache may hold a newer context for
+    /// the same path: that context and its frames are left as they are.
+    pub fn invalidate_context(
+        &mut self,
+        context: &Rc<RefCell<Context>>,
+        reason: frame::FailureReason,
+        cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
+    ) -> Option<(
+        usize,
+        usize,
+        intrusive::Queue<crate::stream::endpoint::msg::Sender>,
+    )> {
+        let id = *context.borrow().path_secret_entry.id();
+        let holds = self
+            .contexts
+            .get(&id)
+            .is_some_and(|ctx| Rc::ptr_eq(ctx, context));
+        if !holds {
+            trace!(
+                %id,
+                sender_idx = %self.sender_idx,
+                "invalidate_context: the cache holds another context for the path, or none"
+            );
+            return None;
+        }
+        self.invalidate(&id, reason, cancelled)
+    }
+
     pub fn invalidate_stale_key(
         &mut self,
         id: &credentials::Id,

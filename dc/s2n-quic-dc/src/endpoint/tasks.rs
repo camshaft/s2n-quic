@@ -1416,8 +1416,12 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     completed_tx: &mut completed_tx,
                     streams: Vec::new(),
                 };
-                let result = send_caches[local_id].borrow_mut().invalidate(
-                    &id,
+                // Invalidate this context only where the cache still holds it. An earlier
+                // invalidation, as for a stale key, removes a context from the cache and leaves
+                // it on this wheel, and the cache may hold a newer context for the path by now:
+                // that context and its frames aren't this expiry's to remove or fail.
+                let result = send_caches[local_id].borrow_mut().invalidate_context(
+                    &context,
                     frame::FailureReason::PeerDead,
                     &mut failed,
                 );
