@@ -160,12 +160,16 @@ where
 /// readable — letting the endpoint run its data plane on tokio without busy-polling.
 #[cfg(feature = "tokio")]
 pub struct Tokio<T> {
-    inner: T,
     // Registered with the tokio reactor at construction time (see `Tokio::new`), which runs during
     // endpoint setup under the caller's tokio runtime. `FdRef` borrows the raw fd rather than owning
-    // the socket, so `inner` stays usable for `udp::recv` and the socket's lifetime governs the fd
-    // (the `AsyncFd` is dropped no later than `self`).
+    // the socket, so `inner` stays usable for `udp::recv` and the socket's lifetime governs the fd.
+    //
+    // Declared before `inner`, since a struct's fields drop in declaration order: the `AsyncFd`
+    // deregisters the fd from the reactor before `inner` closes it. In the other order, another
+    // thread could open a new fd with the same number after the close and register it with the
+    // same reactor, and the deregistration would then remove that new fd's registration.
     async_fd: tokio::io::unix::AsyncFd<FdRef>,
+    inner: T,
 }
 
 /// Non-owning `AsRawFd` holder so the `AsyncFd` can register readiness without taking ownership of
@@ -304,5 +308,76 @@ where
     #[inline]
     fn bind_on_worker(self) -> io::Result<Self::Bound> {
         Tokio::new(self.0)
+    }
+}
+
+#[cfg(all(test, feature = "tokio", target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::{
+        cell::RefCell,
+        net::UdpSocket,
+        os::fd::{AsRawFd, RawFd},
+        rc::Rc,
+    };
+    use tokio::io::{unix::AsyncFd, Interest};
+
+    /// Registers `fd` with the current runtime's reactor for read readiness, then deregisters it.
+    ///
+    /// On Linux the reactor is an epoll instance, which refuses to register an fd it already holds,
+    /// so this returns an `AlreadyExists` error while another `AsyncFd` holds `fd`.
+    fn register(fd: RawFd) -> io::Result<()> {
+        // Allowed for the reason the comment in `Tokio::new` states.
+        #[allow(deprecated)]
+        let async_fd = AsyncFd::with_interest(FdRef(fd), Interest::READABLE)?;
+        drop(async_fd);
+        Ok(())
+    }
+
+    /// A socket that registers its fd with the current runtime's reactor as it drops, before it
+    /// closes the fd, and records the result.
+    struct RegisterOnDrop {
+        socket: UdpSocket,
+        registered: Rc<RefCell<Option<io::Result<()>>>>,
+    }
+
+    impl AsRawFd for RegisterOnDrop {
+        fn as_raw_fd(&self) -> RawFd {
+            self.socket.as_raw_fd()
+        }
+    }
+
+    impl Drop for RegisterOnDrop {
+        fn drop(&mut self) {
+            let result = register(self.socket.as_raw_fd());
+            *self.registered.borrow_mut() = Some(result);
+        }
+    }
+
+    /// `async_fd` deregisters the fd before `inner` drops and closes it. Declaring `inner` before
+    /// `async_fd` fails this test: `inner` then drops while `async_fd` still holds the fd, and its
+    /// registration is refused.
+    #[tokio::test]
+    async fn async_fd_deregisters_the_fd_before_inner_closes_it() {
+        let registered = Rc::new(RefCell::new(None));
+        let inner = RegisterOnDrop {
+            socket: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            registered: registered.clone(),
+        };
+        let socket = Tokio::new(inner).unwrap();
+
+        // While `async_fd` holds the fd, the reactor refuses a second registration of it: this is
+        // what `RegisterOnDrop` sees where it drops before `async_fd`.
+        let err = register(socket.inner.as_raw_fd()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(registered.borrow().is_none());
+
+        drop(socket);
+
+        let result = registered.take().expect("`inner` drops with `socket`");
+        assert!(
+            result.is_ok(),
+            "`inner` dropped while `async_fd` still held its fd: {result:?}"
+        );
     }
 }
