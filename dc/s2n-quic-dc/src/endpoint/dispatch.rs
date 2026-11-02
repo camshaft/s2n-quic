@@ -600,8 +600,8 @@ where
     }
 
     // Update activity tracking on the shared PathSecretEntry. A packet that clears a dead mark
-    // shows that the peer is reachable again: reset each stream whose frames this side failed
-    // when it marked the peer dead, since the peer's end of it may still wait on this side.
+    // shows that the peer is reachable again: reset each stream that this side reset when it
+    // marked the peer dead, since the peer's end of it may still wait on this side.
     let received_at = crate::time::precision::Clock::now(clock);
     if peer.path_entry.touch_activity(received_at) {
         let owed = peer.path_entry.take_owed_resets();
@@ -1926,8 +1926,8 @@ fn send_reset(
     let _ = frame_tx.send_batch(Entry::new(frame));
 }
 
-/// Sends the peer of `path_secret_entry` a reset of each stream of `owed`: the streams whose
-/// frames this side failed when it marked the peer dead, which the peer may still wait on. Each
+/// Sends the peer of `path_secret_entry` a reset of each stream of `owed`: the streams that this
+/// side reset when it marked the peer dead, which the peer may still wait on. Each
 /// reset is routed by the stream's queue pair and binding, without init fields, so where the
 /// peer has freed or rebound the slot since, it drops the reset as unallocated or stale, and a
 /// late reset doesn't end a newer stream.
