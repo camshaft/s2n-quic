@@ -566,7 +566,8 @@ mod tests {
     }
 
     /// `reset_streams` wakes each alloc waiter that waits for a peer queue, as `broadcast_reset`
-    /// does, so that a caller blocked on a peer marked dead checks the dead mark again.
+    /// does, so that a caller blocked on a peer marked dead checks the dead mark again. It skips a
+    /// stream whose queue is past the page table's end and goes on to wake them.
     #[test]
     fn reset_streams_wakes_blocked_alloc_waiters() {
         struct Noop;
@@ -584,9 +585,28 @@ mod tests {
             "every peer queue is taken"
         );
 
+        // No alloc reaches queue 50, so the page table doesn't hold a slot for it.
+        assert!(
+            SenderView::new().get(50, &state.pages).is_none(),
+            "queue 50 is past the page table's end"
+        );
+        let past_end = crate::queue::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: v(50),
+                dest_queue_id: v(0),
+            },
+            binding_id: v(1),
+        };
+
         let mut woken = 0;
-        state.reset_streams(&[], v(42), &mut |wake| woken += wake.is_some() as usize);
+        state.reset_streams(&[past_end], v(42), &mut |wake| {
+            woken += wake.is_some() as usize
+        });
         assert_eq!(woken, 1, "the waiter is woken");
+        assert!(
+            SenderView::new().get(50, &state.pages).is_none(),
+            "the call doesn't grow the page table to the stream it skips"
+        );
         drop(held);
     }
 }
