@@ -477,7 +477,12 @@ mod tests {
         let now = endpoint.clock.now();
         let dead_at = now - (cooldown + Duration::from_secs(1));
         assert!(entry.mark_dead_if_cooldown_elapsed(dead_at, cooldown));
-        map_clock.advance(entry.idle_timeout());
+        // The test entry builder takes the entry's creation time from the process clock, which a
+        // long test process reads past the map's test clock, so move the map's clock to one idle
+        // timeout past the entry's creation, whatever the process clock reads.
+        let map_now = s2n_quic_core::time::Clock::get_time(&map_clock);
+        let behind = entry.creation_time().saturating_duration_since(map_now);
+        map_clock.advance(behind + entry.idle_timeout());
         let now = endpoint.clock.now();
         assert!(
             entry.is_dead_and_silent(now, map.entry_age(&entry), cooldown),
