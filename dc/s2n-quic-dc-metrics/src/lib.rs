@@ -17,6 +17,12 @@ mod task;
 pub mod backend;
 pub mod format;
 
+/// CI diagnostic, not for merge: how many registries' counter and histogram storages are alive.
+#[doc(hidden)]
+pub fn channels_alive() -> usize {
+    rseq::CHANNELS_ALIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub use appender::MetricsWriter;
 pub use backend::{
     Backend, CallbackValue, Histogram, MetricInfo, MetricKind, ReportOptions, Sparsity, Toggle,
