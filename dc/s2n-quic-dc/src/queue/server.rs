@@ -82,8 +82,8 @@ pub struct ServerState {
     /// zero, a stream on this path may wait on the peer, so the send idle wheel probes the
     /// path while it is quiet (`send_idle_wheel_drain`).
     open_slots: AtomicUsize,
-    /// The resets this side owes the peer for the streams whose frames it failed when it marked
-    /// the peer dead (`path::secret::map::Entry::owe_resets`).
+    /// The resets this side owes the peer for the streams it reset when it marked the peer dead
+    /// (`path::secret::map::Entry::mark_dead_owing_resets`).
     pub(crate) owed_resets: super::OwedResets,
 }
 
@@ -129,6 +129,15 @@ impl ServerState {
             waker_sink(sw);
             waker_sink(cw);
         });
+    }
+
+    /// The stream of each bound slot whose writer recorded the peer's queue, as a reset of it
+    /// that this side owes the peer routes: the streams that `broadcast_reset` resets.
+    pub fn open_streams(&self) -> Vec<super::OwedReset> {
+        let mut streams = Vec::new();
+        let mut view = SenderView::new();
+        view.for_each_slot(&self.pages, |slot| streams.extend(slot.owed_reset()));
+        streams
     }
 }
 
@@ -711,5 +720,42 @@ mod tests {
         );
         drop(stream);
         assert!(!server.state.has_open_slot());
+    }
+
+    /// `open_streams` names the stream of each bound slot whose writer recorded the peer's
+    /// queue, as a reset of it that the server owes the client routes, and none of a freed slot.
+    #[test]
+    fn open_streams_names_each_bound_stream_whose_peer_queue_is_recorded() {
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+        let result = server.bind_for_msg(v(2), v(5), &path_entry, &mut tx);
+        let Ok(BindResult::NewBinding {
+            stream, control, ..
+        }) = result
+        else {
+            panic!("expected NewBinding");
+        };
+        assert!(
+            server.state.open_streams().is_empty(),
+            "the client's queue isn't recorded yet"
+        );
+
+        // As the stream's writer does when it is made.
+        control.set_peer_queue_id(v(8));
+        assert_eq!(
+            server.state.open_streams(),
+            vec![crate::queue::OwedReset {
+                queue_pair: crate::packet::datagram::QueuePair {
+                    source_queue_id: v(2),
+                    dest_queue_id: v(8),
+                },
+                binding_id: v(5),
+            }]
+        );
+
+        drop((stream, control));
+        assert!(
+            server.state.open_streams().is_empty(),
+            "a freed slot doesn't hold a stream"
+        );
     }
 }
