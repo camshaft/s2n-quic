@@ -319,9 +319,8 @@ fn send_plan(total: usize, segment_size: u16, segmentation: bool) -> SendPlan {
     }
 }
 
-/// Sends `buffer` as datagrams of `segment_size` bytes each, one `WSASendMsg` call a datagram,
-/// the last datagram holding what is left. Where a datagram after the first fails to send, it
-/// returns the bytes the datagrams before it sent, and the rest of the message is lost.
+/// Sends `buffer` as datagrams of `segment_size` bytes each, one `WSASendMsg` call a datagram, as
+/// [`send_each_segment`] splits it.
 fn send_segments(
     socket: WinSock::SOCKET,
     addr: &Addr,
@@ -330,6 +329,19 @@ fn send_segments(
     segment_size: u16,
     flags: Flags,
 ) -> io::Result<usize> {
+    send_each_segment(buffer, segment_size, |segment| {
+        send_one(socket, addr, ecn, segment, 0, flags)
+    })
+}
+
+/// Splits `buffer` into datagrams of `segment_size` bytes each, the last holding what is left, and
+/// hands each datagram to `send` in order. Where the first datagram fails to send, it returns that
+/// error. Where a datagram after the first fails to send, it returns the bytes the datagrams
+/// before it sent, and the rest of the message is lost.
+fn send_each_segment<F>(buffer: &[IoSlice], segment_size: u16, mut send: F) -> io::Result<usize>
+where
+    F: FnMut(&[IoSlice]) -> io::Result<usize>,
+{
     let segment_size = segment_size as usize;
     let mut segment = Vec::with_capacity(buffer.len());
     let mut sent = 0;
@@ -357,7 +369,7 @@ fn send_segments(
             break;
         }
 
-        match send_one(socket, addr, ecn, &segment, 0, flags) {
+        match send(&segment) {
             Ok(len) => sent += len,
             Err(err) if sent == 0 => return Err(err),
             Err(_) => break,
@@ -884,5 +896,49 @@ mod tests {
             let (len, _from, _cmsg, received) = recv_one(&b, 1500);
             assert_eq!(&received[..len], want);
         }
+    }
+
+    /// Where the first datagram fails to send, `send_each_segment` returns that error and doesn't
+    /// send another datagram.
+    #[test]
+    fn send_each_segment_returns_the_error_of_the_first_datagram() {
+        let first = [1u8; 15];
+        let second = [2u8; 10];
+        let iov = [IoSlice::new(&first), IoSlice::new(&second)];
+
+        let mut calls = 0;
+        let err = send_each_segment(&iov, 10, |_segment| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(WinSock::WSAEWOULDBLOCK as i32))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.raw_os_error(), Some(WinSock::WSAEWOULDBLOCK as i32));
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(calls, 1);
+    }
+
+    /// Where a datagram after the first fails to send, `send_each_segment` returns the bytes the
+    /// datagrams before it sent, and doesn't send the rest of the message.
+    #[test]
+    fn send_each_segment_stops_at_a_failure_after_the_first_datagram() {
+        let first = [1u8; 15];
+        let second = [2u8; 10];
+        let iov = [IoSlice::new(&first), IoSlice::new(&second)];
+
+        let mut calls = vec![];
+        let sent = send_each_segment(&iov, 10, |segment| {
+            let len: usize = segment.iter().map(|slice| slice.len()).sum();
+            calls.push(len);
+            if calls.len() == 1 {
+                Ok(len)
+            } else {
+                Err(io::Error::from_raw_os_error(WinSock::WSAEWOULDBLOCK as i32))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(sent, 10);
+        assert_eq!(calls, [10, 10]);
     }
 }
