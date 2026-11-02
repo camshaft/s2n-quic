@@ -426,11 +426,12 @@ mod sim_rss {
                     .unwrap_or("unknown")
                     .to_string();
                 let line = format!(
-                    "[sim-rss] test={name} secs={:.1} gap_kB={} before_kB={} peak_kB={peak_kb} after_kB={after_kb} trimmed_kB={trimmed_kb} live_before_kB={} live_after_kB={live_after_kb} endpoints_made={made} endpoints_alive={alive}\n",
+                    "[sim-rss] test={name} secs={:.1} gap_kB={} before_kB={} peak_kB={peak_kb} after_kB={after_kb} trimmed_kB={trimmed_kb} live_before_kB={} live_after_kB={live_after_kb} endpoints_made={made} endpoints_alive={alive} channels_alive={}\n",
                     self.started.elapsed().as_secs_f64(),
                     self.gap_kb,
                     self.before_kb,
                     self.live_before_kb,
+                    s2n_quic_dc_metrics::channels_alive(),
                 );
                 let _ = std::io::stderr().write_all(line.as_bytes());
             }
