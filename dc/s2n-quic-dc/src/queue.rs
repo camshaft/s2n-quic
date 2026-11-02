@@ -98,11 +98,12 @@ pub struct OwedReset {
     pub binding_id: s2n_quic_core::varint::VarInt,
 }
 
-/// The streams whose frames this side failed when it found its peer unresponsive and marked it
-/// dead, kept on the path's queue state. The peer isn't told that this side reset them, so its
-/// end of each may still wait on this side: each is reset once a packet from the peer clears the
-/// dead mark (`path::secret::map::Entry::touch_activity`). Each stream is kept once, so the set
-/// holds at most the streams whose frames failed.
+/// The streams this side reset when it found its peer unresponsive and marked it dead, kept on
+/// the path's queue state: the streams whose frames it failed, and the streams open on the path.
+/// The peer isn't told that this side reset them, so its end of each may still wait on this
+/// side: each is reset once a packet from the peer clears the dead mark
+/// (`path::secret::map::Entry::touch_activity`). Each stream is kept once, so the set holds at
+/// most the streams whose frames failed and the streams open on the path.
 #[derive(Debug, Default)]
 pub struct OwedResets {
     streams: std::sync::Mutex<std::collections::HashSet<OwedReset>>,
