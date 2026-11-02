@@ -543,7 +543,7 @@ where
                 return Err(Error::PeerStateLookup {
                     dest_addr,
                     credentials,
-                    sender_id: source_sender_id,
+                    sender_id: VarInt::ZERO,
                     control_out,
                 });
             }
@@ -576,7 +576,7 @@ where
                 return Err(Error::StaleKey {
                     dest_addr,
                     credentials,
-                    sender_id: source_sender_id,
+                    sender_id: VarInt::ZERO,
                     packet_number,
                     control_out,
                 });
