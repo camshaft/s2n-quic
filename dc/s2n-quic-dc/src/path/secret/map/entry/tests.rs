@@ -216,8 +216,8 @@ fn mark_dead_owing_resets_owes_each_failed_and_each_open_stream() {
     // The open stream's frames failed too: it is owed once all the same.
     assert_eq!(
         entry.mark_dead_owing_resets(t0, cooldown, [failed_stream, open_stream]),
-        (2, true),
-        "the first mark should take effect, and owe each of the two streams once"
+        (2, Some(vec![open_stream])),
+        "the first mark should take effect, owe both streams once, and name the open one"
     );
     let t1 = t0 + Duration::from_secs(1);
     assert!(
@@ -233,8 +233,12 @@ fn mark_dead_owing_resets_owes_each_failed_and_each_open_stream() {
 
     // A stream open on the path is owed though none of its frames failed.
     let t2 = t1 + Duration::from_secs(1);
-    let (recorded, marked) = entry.mark_dead_owing_resets(t2, cooldown, core::iter::empty());
-    assert!(marked, "the next mark should take effect");
+    let (recorded, reset) = entry.mark_dead_owing_resets(t2, cooldown, core::iter::empty());
+    assert_eq!(
+        reset,
+        Some(vec![open_stream]),
+        "the next mark should take effect, and name the open stream"
+    );
     assert_eq!(recorded, 1, "the open stream is owed");
     let t3 = t2 + Duration::from_secs(1);
     assert!(
@@ -246,8 +250,12 @@ fn mark_dead_owing_resets_owes_each_failed_and_each_open_stream() {
     // Once the stream's receivers are dropped, its slot is freed and the stream isn't owed.
     drop(open);
     let t4 = t3 + Duration::from_secs(1);
-    let (recorded, marked) = entry.mark_dead_owing_resets(t4, cooldown, core::iter::empty());
-    assert!(marked, "the next mark should take effect");
+    let (recorded, reset) = entry.mark_dead_owing_resets(t4, cooldown, core::iter::empty());
+    assert_eq!(
+        reset,
+        Some(vec![]),
+        "the next mark should take effect, and name no stream"
+    );
     assert_eq!(recorded, 0, "a freed slot's stream isn't owed");
     let t5 = t4 + Duration::from_secs(1);
     assert!(
@@ -258,6 +266,73 @@ fn mark_dead_owing_resets_owes_each_failed_and_each_open_stream() {
         entry.take_owed_resets().is_empty(),
         "a freed slot doesn't hold a stream"
     );
+}
+
+/// The dead mark resets on this side only the streams it owes the peer a reset of: the open
+/// streams that `mark_dead_owing_resets` read, which `peer_dead_broadcast` resets
+/// (`ClientState::reset_streams`). A stream whose slot is bound before its writer records the
+/// peer's queue (case 1) and a stream bound after the read (case 2) aren't reset on this side,
+/// so the peer isn't owed a reset of either, while the stream the read names is reset and owed.
+#[test]
+fn the_dead_mark_resets_only_the_streams_it_owes_a_reset_of() {
+    let entry = test_entry_with_senders(0);
+    let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+    let t0: crate::time::precision::Timestamp =
+        (unsafe { Timestamp::from_duration(Duration::from_secs(100)) }).into();
+
+    let QueueState::Client(state) = entry.queue_state() else {
+        panic!("a client entry holds client queue state");
+    };
+    let alloc = |dest_queue_id| {
+        state
+            .alloc_local(VarInt::from_u8(dest_queue_id))
+            .expect("a fresh client queue state allocates a slot")
+    };
+    let open = alloc(7);
+    // As the stream's writer does when it is made.
+    open.control.set_peer_queue_id(open.dest_queue_id);
+    let open_stream = OwedReset {
+        queue_pair: crate::packet::datagram::QueuePair {
+            source_queue_id: open.local_queue_id,
+            dest_queue_id: open.dest_queue_id,
+        },
+        binding_id: open.binding_id,
+    };
+    // Case 1: the slot is bound, and the stream's writer isn't made yet.
+    let unwritten = alloc(8);
+
+    let (recorded, reset) = entry.mark_dead_owing_resets(t0, cooldown, core::iter::empty());
+    assert_eq!(recorded, 1, "the stream whose writer recorded the peer's queue is owed");
+    let reset = reset.expect("the mark should take effect");
+    assert_eq!(reset, vec![open_stream], "the read names the owed stream alone");
+
+    // Case 2: a stream bound after the read, before the broadcast runs.
+    let late = alloc(9);
+    late.control.set_peer_queue_id(late.dest_queue_id);
+
+    // As `peer_dead_broadcast` does once it receives the mark's notice.
+    state.reset_streams(&reset, VarInt::from_u8(42), &mut |_| {});
+
+    let mut dispatch = crate::queue::ClientDispatch::new(state.clone());
+    let mut depth = |queue_id| {
+        let diag = dispatch.slot_diag(queue_id).expect("the slot exists");
+        (diag.stream_depth, diag.control_depth)
+    };
+    assert_eq!(depth(open.local_queue_id), (1, 1), "the owed stream is reset");
+    assert_eq!(depth(unwritten.local_queue_id), (0, 0), "case 1 isn't reset");
+    assert_eq!(depth(late.local_queue_id), (0, 0), "case 2 isn't reset");
+
+    let t1 = t0 + Duration::from_secs(1);
+    assert!(
+        entry.touch_activity(t1),
+        "the first packet after the mark clears it"
+    );
+    assert_eq!(
+        entry.take_owed_resets(),
+        vec![open_stream],
+        "the peer is owed a reset of the stream this side reset, and of no other"
+    );
+    drop((open, unwritten, late));
 }
 
 /// The send idle wheel records the resets it owes before it marks the peer dead
