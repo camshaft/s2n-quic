@@ -608,20 +608,31 @@ impl Entry {
     }
 
     /// Revokes the path secret, as the map does when it evicts it because the peer's key was
-    /// removed from its list of accepted keys.
+    /// removed from its list of accepted keys. Returns whether this call revoked it: revoking an
+    /// entry again changes nothing and returns false.
     ///
     /// Each open stream on the path secret holds the entry and its keys, so the eviction alone
     /// leaves it running. Revoking pushes a reset with `PEER_KEY_REMOVED` into each of its queue
     /// slots, which ends its reader and its writer with that error, and makes the receive path
-    /// refuse each later packet on the path secret as one on an unknown path secret. A reader or
-    /// a writer dropped on a revoked path secret sends the peer a reset with the same error, so
-    /// the peer's half of the stream ends too. Revoking an entry again changes nothing.
-    pub(crate) fn revoke(&self) {
+    /// refuse each later packet on the path secret as one on an unknown path secret. The map then
+    /// sends the peer an unknown path secret packet for it, which ends the peer's halves of those
+    /// streams (see [`Entry::reset_streams`]). A reader or a writer dropped on a revoked path
+    /// secret also sends the peer a reset with `PEER_KEY_REMOVED`, which ends the peer's half
+    /// where that packet didn't reach the peer.
+    pub(crate) fn revoke(&self) -> bool {
         if self.revoked.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
 
-        let error_code = crate::endpoint::error::PEER_KEY_REMOVED;
+        self.reset_streams(crate::endpoint::error::PEER_KEY_REMOVED);
+        true
+    }
+
+    /// Pushes a reset with `error_code` into each of the path secret's queue slots, which ends the
+    /// reader and the writer of each stream open on it with that error. The map calls it as it
+    /// revokes the path secret, and as the peer tells it, in a validated unknown path secret
+    /// packet, that the peer doesn't hold the path secret any longer.
+    pub(crate) fn reset_streams(&self, error_code: VarInt) {
         // Dropping each wake token wakes its reader or writer at once.
         let wake = &mut core::mem::drop::<crate::queue::AutoWake>;
         match &self.queue_state {
