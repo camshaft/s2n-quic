@@ -921,3 +921,404 @@ fn reading_phone_is_reset_once_delivery_resumes_after_the_host_marked_it_dead() 
         .spawn();
     });
 }
+
+/// A stream that the host's dead mark resets while the host holds none of its frames.
+///
+/// The first stream runs as in
+/// `reading_phone_is_reset_once_delivery_resumes_after_the_host_marked_it_dead`: the host marks
+/// the phone dead an idle timeout after the phone's last packet, and delivery resumes before
+/// the phone marks the host dead. Beside it, the phone opens a second stream once the first is
+/// set up, sends a request on it and reads the host's first update, and the host writes nothing
+/// more on it. Every packet goes through for a tenth of an idle timeout after that, so the host
+/// holds none of the second stream's frames when it marks the phone dead, and the dead mark
+/// resets the second stream on the host all the same. The phone's next packet clears the mark,
+/// so the host resets the second stream too: the phone's read of it ends in the host's reset,
+/// `TimedOut` for the host's idle timeout, within two fifths of an idle timeout, and the phone
+/// hasn't marked the host dead.
+#[test]
+fn quiet_stream_is_reset_once_delivery_resumes_after_the_host_marked_the_phone_dead() {
+    // Snapshot disabled: the test waits through idle timeouts, and its trace would be large.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        // What the network delivers: every packet, every packet but the phone's, or none.
+        const DELIVER_ALL: u8 = 0;
+        const DROP_THE_PHONES: u8 = 1;
+        const DROP_ALL: u8 = 2;
+        let delivery = Arc::new(AtomicU8::new(DELIVER_ALL));
+        {
+            let delivery = delivery.clone();
+            let mut phone_addr = MonitorHostAddr::new("client");
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let state = delivery.load(Ordering::Relaxed);
+                if state == DROP_ALL
+                    || (state == DROP_THE_PHONES && phone_addr.is_packet_source(packet))
+                {
+                    return bach::net::monitor::Command::Drop;
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        let (second, second_rx) = oneshot::channel::<()>();
+        let (third, third_rx) = oneshot::channel::<()>();
+        let (last, last_rx) = oneshot::channel::<()>();
+
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(ACCEPTOR_ID, 8)
+                .expect("acceptor registration failed");
+            let mut signals = Some((second_rx, third_rx, last_rx));
+
+            while let Some(stream) = acceptor.recv().await {
+                let signals = signals.take();
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut request = BytesMut::with_capacity(64);
+                    read_to_end(&mut reader, &mut request)
+                        .await
+                        .expect("host read of the request");
+
+                    let mut first = Bytes::from_static(FIRST_UPDATE);
+                    writer
+                        .write_all_from(&mut first)
+                        .await
+                        .expect("host write of the first update");
+
+                    // The second stream stays open on the host, which writes nothing more on it.
+                    let Some((second_rx, third_rx, last_rx)) = signals else {
+                        return core::future::pending().await;
+                    };
+                    if second_rx.await.is_ok() {
+                        let mut second = Bytes::from_static(SECOND_UPDATE);
+                        let _ = writer.write_all_from(&mut second).await;
+                    }
+                    if third_rx.await.is_ok() {
+                        let mut third = Bytes::from_static(THIRD_UPDATE);
+                        let _ = writer.write_all_from(&mut third).await;
+                    }
+                    if last_rx.await.is_ok() {
+                        let mut last = Bytes::from_static(LAST_UPDATE);
+                        let _ = writer.write_all_from_fin(&mut last).await;
+                    }
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let mut phone = Client::new();
+            let stream = phone
+                .connect("server:0", ACCEPTOR_ID)
+                .await
+                .expect("connect");
+            let host = stream.peer_addr();
+            let idle = host_idle_timeout(&phone, host);
+            let (mut reader, mut writer) = stream.into_split();
+
+            let mut request = Bytes::from_static(b"subscribe");
+            writer
+                .write_all_from_fin(&mut request)
+                .await
+                .expect("phone write of the request");
+
+            let mut updates = BytesMut::with_capacity(64);
+            read_update(&mut reader, &mut updates, FIRST_UPDATE, idle).await;
+
+            // The second stream, which the host accepts after the first.
+            let quiet = phone
+                .connect("server:0", ACCEPTOR_ID)
+                .await
+                .expect("connect of the second stream");
+            let (mut quiet_reader, mut quiet_writer) = quiet.into_split();
+            let mut quiet_request = Bytes::from_static(b"quiet");
+            quiet_writer
+                .write_all_from_fin(&mut quiet_request)
+                .await
+                .expect("phone write of the second request");
+            let mut quiet_buf = BytesMut::with_capacity(64);
+            read_update(&mut quiet_reader, &mut quiet_buf, FIRST_UPDATE, idle).await;
+
+            // Every packet goes through for a tenth of an idle timeout, so that the phone
+            // acknowledges each of the host's packets of the second stream.
+            (idle / 10).sleep().await;
+
+            // The phone's packets stop reaching the host, while the host's still reach the phone.
+            delivery.store(DROP_THE_PHONES, Ordering::Relaxed);
+            let _ = second.send(());
+            let bound = idle / 10;
+            read_update(&mut reader, &mut updates, SECOND_UPDATE, bound).await;
+
+            // The phone reads the third update before the host's idle timeout passes after the
+            // phone's last packet.
+            (idle * 4 / 5).sleep().await;
+            let _ = third.send(());
+            read_update(&mut reader, &mut updates, THIRD_UPDATE, bound).await;
+
+            // No packet goes either way while the host sends its last update and marks the
+            // phone dead.
+            delivery.store(DROP_ALL, Ordering::Relaxed);
+            let _ = last.send(());
+            (idle * 2 / 5).sleep().await;
+
+            // Delivery resumes before the phone's idle timeout passes after the third update.
+            delivery.store(DELIVER_ALL, Ordering::Relaxed);
+            info!("delivery resumed");
+
+            let reset_bound = idle * 2 / 5;
+            let read = timeout(reset_bound, read_to_end(&mut quiet_reader, &mut quiet_buf)).await;
+            let err = match read {
+                Err(_elapsed) => panic!(
+                    "the phone's read of the second stream was still pending at its bound: the \
+                     host didn't reset the stream it held none of the frames of"
+                ),
+                Ok(Ok(())) => panic!("the phone read the second stream to its end"),
+                Ok(Err(err)) => err,
+            };
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::TimedOut,
+                "the phone's read of the second stream ended in {err:?}"
+            );
+            assert_eq!(
+                err.get_ref()
+                    .and_then(|inner| inner.downcast_ref::<crate::endpoint::error::Error>()),
+                Some(&crate::endpoint::error::Error::IdleTimeout),
+                "the phone's read of the second stream ended in {err:?}, not in a reset for the \
+                 host's idle timeout"
+            );
+
+            // The read ended in the host's reset: the phone hasn't marked the host dead.
+            let entry = lookup_sim_map(phone.data_addr())
+                .expect("the phone's path-secret map is registered")
+                .get_raw(host)
+                .expect("the phone holds a path-secret entry for the host");
+            let now = crate::time::precision::Clock::now(&crate::time::bach::Clock::default());
+            assert!(
+                !entry.is_dead_during_cooldown(now, DEFAULT_DEAD_PEER_COOLDOWN),
+                "the phone marked the host dead, so its read didn't end in the host's reset"
+            );
+            drop((reader, writer, quiet_writer));
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
+/// A stream whose slot the host freed after its dead mark reset it, while the phone still
+/// writes on it.
+///
+/// The first stream runs as in
+/// `reading_phone_is_reset_once_delivery_resumes_after_the_host_marked_it_dead`. Beside it, the
+/// phone opens a second stream once the first is set up and writes the first part of an upload
+/// on it, three quarters of the initial flow-control window, which the host reads, so that the
+/// host's reader grants the phone's writer more room. Every packet goes through for a tenth of
+/// an idle timeout after that, so the host holds none of the second stream's frames when it
+/// marks the phone dead. The dead mark resets the second stream on the host: the host's read of
+/// the upload ends, and the host drops the stream, which frees its slot. Once delivery resumes,
+/// the phone writes the rest of the upload, whose frames reach the slot the host freed and are
+/// dropped there, and the phone's next packet clears the host's dead mark, so the host resets
+/// the second stream: the phone's write ends in the host's reset, `ConnectionReset` for the
+/// host's idle timeout, within two fifths of an idle timeout.
+#[test]
+fn writing_phone_is_reset_once_delivery_resumes_after_the_host_freed_the_stream() {
+    // Snapshot disabled: the test waits through idle timeouts, and its trace would be large.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        // What the network delivers: every packet, every packet but the phone's, or none.
+        const DELIVER_ALL: u8 = 0;
+        const DROP_THE_PHONES: u8 = 1;
+        const DROP_ALL: u8 = 2;
+        // Three quarters of the initial flow-control window of 1 MiB, past the half that the
+        // host's reader grants more room at.
+        const FIRST_PART: u64 = 768 * 1024;
+        let delivery = Arc::new(AtomicU8::new(DELIVER_ALL));
+        {
+            let delivery = delivery.clone();
+            let mut phone_addr = MonitorHostAddr::new("client");
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let state = delivery.load(Ordering::Relaxed);
+                if state == DROP_ALL
+                    || (state == DROP_THE_PHONES && phone_addr.is_packet_source(packet))
+                {
+                    return bach::net::monitor::Command::Drop;
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        let (second, second_rx) = oneshot::channel::<()>();
+        let (third, third_rx) = oneshot::channel::<()>();
+        let (last, last_rx) = oneshot::channel::<()>();
+        // Set once the host dropped the second stream, which frees its slot.
+        let freed = Arc::new(AtomicBool::new(false));
+        let host_freed = freed.clone();
+
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(ACCEPTOR_ID, 8)
+                .expect("acceptor registration failed");
+            let mut signals = Some((second_rx, third_rx, last_rx));
+
+            while let Some(stream) = acceptor.recv().await {
+                let signals = signals.take();
+                let freed = host_freed.clone();
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+
+                    // The second stream: the host reads the upload until its read ends, then
+                    // drops the stream, which frees its slot.
+                    let Some((second_rx, third_rx, last_rx)) = signals else {
+                        let mut upload = Data::new(UPLOAD_LEN);
+                        let read = loop {
+                            match reader.read_into(&mut upload).await {
+                                Ok(0) => break Ok(()),
+                                Ok(_) => {}
+                                Err(err) => break Err(err),
+                            }
+                        };
+                        info!(?read, "host read of the upload ended");
+                        drop((reader, writer));
+                        freed.store(true, Ordering::Relaxed);
+                        return;
+                    };
+
+                    let mut request = BytesMut::with_capacity(64);
+                    read_to_end(&mut reader, &mut request)
+                        .await
+                        .expect("host read of the request");
+
+                    let mut first = Bytes::from_static(FIRST_UPDATE);
+                    writer
+                        .write_all_from(&mut first)
+                        .await
+                        .expect("host write of the first update");
+
+                    if second_rx.await.is_ok() {
+                        let mut second = Bytes::from_static(SECOND_UPDATE);
+                        let _ = writer.write_all_from(&mut second).await;
+                    }
+                    if third_rx.await.is_ok() {
+                        let mut third = Bytes::from_static(THIRD_UPDATE);
+                        let _ = writer.write_all_from(&mut third).await;
+                    }
+                    if last_rx.await.is_ok() {
+                        let mut last = Bytes::from_static(LAST_UPDATE);
+                        let _ = writer.write_all_from_fin(&mut last).await;
+                    }
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let mut phone = Client::new();
+            let stream = phone
+                .connect("server:0", ACCEPTOR_ID)
+                .await
+                .expect("connect");
+            let host = stream.peer_addr();
+            let idle = host_idle_timeout(&phone, host);
+            let (mut reader, mut writer) = stream.into_split();
+
+            let mut request = Bytes::from_static(b"subscribe");
+            writer
+                .write_all_from_fin(&mut request)
+                .await
+                .expect("phone write of the request");
+
+            let mut updates = BytesMut::with_capacity(64);
+            read_update(&mut reader, &mut updates, FIRST_UPDATE, idle).await;
+
+            // The second stream, which the host accepts after the first.
+            let upload = phone
+                .connect("server:0", ACCEPTOR_ID)
+                .await
+                .expect("connect of the second stream");
+            let (upload_reader, mut upload_writer) = upload.into_split();
+            let mut first_part = Data::new(FIRST_PART);
+            upload_writer
+                .write_all_from(&mut first_part)
+                .await
+                .expect("phone write of the first part of the upload");
+
+            // Every packet goes through for a tenth of an idle timeout, so that the host reads
+            // the first part and the phone acknowledges each of the host's packets.
+            (idle / 10).sleep().await;
+
+            // The phone's packets stop reaching the host, while the host's still reach the phone.
+            delivery.store(DROP_THE_PHONES, Ordering::Relaxed);
+            let _ = second.send(());
+            let bound = idle / 10;
+            read_update(&mut reader, &mut updates, SECOND_UPDATE, bound).await;
+
+            // The phone reads the third update before the host's idle timeout passes after the
+            // phone's last packet.
+            (idle * 4 / 5).sleep().await;
+            let _ = third.send(());
+            read_update(&mut reader, &mut updates, THIRD_UPDATE, bound).await;
+
+            // No packet goes either way while the host sends its last update and marks the
+            // phone dead.
+            delivery.store(DROP_ALL, Ordering::Relaxed);
+            let _ = last.send(());
+            (idle * 2 / 5).sleep().await;
+
+            // Delivery resumes before the phone's idle timeout passes after the third update.
+            delivery.store(DELIVER_ALL, Ordering::Relaxed);
+            info!("delivery resumed");
+            assert!(
+                freed.load(Ordering::Relaxed),
+                "the host's dead mark ended its read of the upload, and the host dropped the \
+                 stream, before delivery resumed"
+            );
+
+            let reset_bound = idle * 2 / 5;
+            let mut rest = Data::new(UPLOAD_LEN);
+            let write = timeout(reset_bound, upload_writer.write_all_from(&mut rest)).await;
+            let err = match write {
+                Err(_elapsed) => panic!(
+                    "the phone's write of the rest of the upload was still pending at its bound: \
+                     the host didn't reset the stream whose slot it freed"
+                ),
+                Ok(Ok(written)) => panic!(
+                    "the phone wrote the rest of the upload, {written} bytes, though the host \
+                     freed the stream"
+                ),
+                Ok(Err(err)) => err,
+            };
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::ConnectionReset,
+                "the phone's write of the rest of the upload ended in {err:?}"
+            );
+            assert_eq!(
+                err.get_ref()
+                    .and_then(|inner| inner.downcast_ref::<crate::endpoint::error::Error>()),
+                Some(&crate::endpoint::error::Error::IdleTimeout),
+                "the phone's write ended in {err:?}, not in a reset for the host's idle timeout"
+            );
+
+            // The write ended in the host's reset: the phone hasn't marked the host dead.
+            let entry = lookup_sim_map(phone.data_addr())
+                .expect("the phone's path-secret map is registered")
+                .get_raw(host)
+                .expect("the phone holds a path-secret entry for the host");
+            let now = crate::time::precision::Clock::now(&crate::time::bach::Clock::default());
+            assert!(
+                !entry.is_dead_during_cooldown(now, DEFAULT_DEAD_PEER_COOLDOWN),
+                "the phone marked the host dead, so its write didn't end in the host's reset"
+            );
+            drop((reader, writer, upload_reader));
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}

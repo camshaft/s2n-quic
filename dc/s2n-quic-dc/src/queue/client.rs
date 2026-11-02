@@ -115,8 +115,8 @@ pub struct ClientState {
     /// While it isn't zero, a stream on this path may wait on the peer, so the send idle
     /// wheel probes the path while it is quiet (`send_idle_wheel_drain`).
     open_slots: AtomicUsize,
-    /// The resets this side owes the peer for the streams whose frames it failed when it marked
-    /// the peer dead (`path::secret::map::Entry::owe_resets`).
+    /// The resets this side owes the peer for the streams it reset when it marked the peer dead
+    /// (`path::secret::map::Entry::mark_dead_owing_resets`).
     pub(crate) owed_resets: super::OwedResets,
 }
 
@@ -180,6 +180,15 @@ impl ClientState {
         });
         self.peer_free
             .wake_all(&mut |w| waker_sink(AutoWake::new(Some(w))));
+    }
+
+    /// The stream of each allocated slot whose writer recorded the peer's queue, as a reset of it
+    /// that this side owes the peer routes: the streams that `broadcast_reset` resets.
+    pub fn open_streams(&self) -> Vec<super::OwedReset> {
+        let mut streams = Vec::new();
+        let mut view = SenderView::new();
+        view.for_each_slot(&self.pages, |slot| streams.extend(slot.owed_reset()));
+        streams
     }
 
     pub(crate) fn alloc_local(self: &Arc<Self>, dest_queue_id: VarInt) -> Option<AllocResult> {
