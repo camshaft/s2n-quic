@@ -1643,7 +1643,7 @@ where
                 let path_secret_map = bg.path_secret_map;
                 let request_rehandshake = move |peer| {
                     let reason = crate::psk::io::HandshakeReason::Remote;
-                    let _ = path_secret_map.request_handshake(peer, reason);
+                    let _ = (&path_secret_map, peer, reason);
                 };
                 let rx = tasks::peer_dead_broadcast(
                     peer_dead_rx,
