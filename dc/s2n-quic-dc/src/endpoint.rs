@@ -698,9 +698,13 @@ where
             .unzip();
 
     // UPS channel: recv_dispatch workers → background (UnknownPathSecret responses)
+    // It carries the ReplayDetected and StaleKey responses too, and `ups::Pending` keeps at most
+    // one response in it for each credential and peer sender id.
     let (ups_tx, ups_rx) = intrusive::sync::new::<ups::Response>();
     let ups_queue_gauge = counter_registry.register_queue_gauge("q.ups");
-    let ups_tx = GaugedSender::new(ups_tx, ups_queue_gauge.clone());
+    let ups_pending = ups::Pending::new(counter_registry.register("ups.pending_suppressed"));
+    let ups_tx = ups_pending.sender(GaugedSender::new(ups_tx, ups_queue_gauge.clone()));
+    let ups_rx = ups_pending.receiver(ups_rx);
 
     // Invalidation channels: recv IO → background (raw segments) and background → workers
     let (invalidation_raw_tx, invalidation_raw_rx) = intrusive::sync::new::<descriptor::Filled>();
@@ -1178,7 +1182,7 @@ struct BackgroundParts<UpsSocket> {
     send_txs: IdMap<id::SendWorkerId, InvalidationSender>,
     recv_txs: IdMap<id::RecvDispatchWorkerId, InvalidationSender>,
     sender_id_to_worker: IdMap<LocalSenderId, id::SendWorkerId>,
-    ups_rx: sync_queue::Receiver<ups::Response>,
+    ups_rx: ups::PendingReceiver<sync_queue::Receiver<ups::Response>>,
     ups_queue_gauge: crate::counter::QueueGauge,
     ups_socket: UpsSocket,
     ups_rate: crate::socket::rate::Rate,
@@ -1192,7 +1196,8 @@ type InvalidationSender =
     GaugedSender<sync_queue::Sender<tasks::Invalidation>, Entry<tasks::Invalidation>>;
 type PeerDeadSender = GaugedSender<sync_queue::Sender<tasks::PeerDead>, Entry<tasks::PeerDead>>;
 
-type UpsSender = GaugedSender<sync_queue::Sender<ups::Response>, Entry<ups::Response>>;
+type UpsSender =
+    ups::PendingSender<GaugedSender<sync_queue::Sender<ups::Response>, Entry<ups::Response>>>;
 
 // ── Worker ────────────────────────────────────────────────────────────────
 
