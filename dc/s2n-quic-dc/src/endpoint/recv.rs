@@ -692,4 +692,181 @@ impl Cache {
 crate::context_wheel_adapter!(IdleWheelAdapter, Context, idle_wheel);
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::{
+        endpoint::routing::{PowerOfTwoRoute, SenderRoute as _},
+        packet::secret_control as control,
+        path::secret::map::{testing as map_testing, Map, PeerKey},
+        time::testing::Clock,
+    };
+    use core::{cell::Cell, time::Duration};
+    use s2n_codec::DecoderBufferMut;
+    use std::net::SocketAddr;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn key(name: &str) -> PeerKey {
+        PeerKey::from_spki_der(name.as_bytes())
+    }
+
+    /// What the cache did with one packet that [`receive`] passed to it.
+    struct Received {
+        /// Whether the cache held the packet's context, or the error the cache answered with.
+        result: Result<bool, CacheError>,
+        /// The control packet the cache wrote for the packet's sender.
+        control_out: Vec<u8>,
+        /// Whether the cache called the decrypt callback, with its cached opener or a new one.
+        decrypted: bool,
+    }
+
+    /// Passes a packet on `credentials` from `remote_sender_id` at `peer` to `cache`, as the
+    /// receive path does, with a decrypt callback that opens each packet it's called with.
+    fn receive(
+        cache: &mut Cache,
+        map: &Map,
+        credentials: &Credentials,
+        remote_sender_id: RemoteSenderId,
+        peer: SocketAddr,
+    ) -> Received {
+        let clock = Clock::new(Duration::ZERO);
+        let route = PowerOfTwoRoute::new(1);
+        let mut control_out = Vec::new();
+        let decrypted = Cell::new(false);
+        let result = cache
+            .get_or_insert(
+                credentials,
+                remote_sender_id,
+                map,
+                &clock,
+                SocketAddress::from(peer),
+                &mut control_out,
+                &route,
+                |_opener, _queue_view, _path_entry| {
+                    decrypted.set(true);
+                    Some(())
+                },
+            )
+            .map(|((), _ctx, hit)| hit);
+        Received {
+            result,
+            control_out,
+            decrypted: decrypted.get(),
+        }
+    }
+
+    /// Once the map revokes a path secret because its peer's key is removed, the cache doesn't
+    /// open a packet on it with the opener of its cached context: it drops the context and
+    /// answers the packet as the map answers one on an unknown path secret. The cached context of
+    /// a path secret the map didn't revoke still opens its packets.
+    #[test]
+    fn a_revoked_path_secret_drops_its_cached_receive_context() {
+        let server_addr = addr(4501);
+        let (client_addr, other_addr) = (addr(4502), addr(4503));
+        let (client_key, other_key) = (key("client key"), key("other key"));
+
+        // The server lists the keys of both clients, and its path secret with each client records
+        // that client's key, as a handshake would.
+        let server_map = map_testing::new(16);
+        server_map.set_peer_keys([client_key.clone(), other_key.clone()]);
+        let client_map = map_testing::new(16);
+        let client_id = client_map
+            .test_insert_pair(
+                PathSecretEntry::builder(server_addr).local(client_addr),
+                &server_map,
+                PathSecretEntry::builder(client_addr)
+                    .local(server_addr)
+                    .peer_key(Some(client_key.clone())),
+            )
+            .peer;
+        let other_map = map_testing::new(16);
+        let other_id = other_map
+            .test_insert_pair(
+                PathSecretEntry::builder(server_addr).local(other_addr),
+                &server_map,
+                PathSecretEntry::builder(other_addr)
+                    .local(server_addr)
+                    .peer_key(Some(other_key)),
+            )
+            .peer;
+        assert!(server_map.get_by_id(&client_id).is_some());
+        assert!(server_map.get_by_id(&other_id).is_some());
+
+        let sender = RemoteSenderId::new(VarInt::from_u8(3));
+        let client = Credentials {
+            id: client_id,
+            key_id: VarInt::ZERO,
+        };
+        let other = Credentials {
+            id: other_id,
+            key_id: VarInt::ZERO,
+        };
+        let client_cache_key = Key {
+            id: client_id,
+            remote_sender_id: sender,
+        };
+        let other_cache_key = Key {
+            id: other_id,
+            remote_sender_id: sender,
+        };
+        let mut cache = Cache::new(RecvDispatchWorkerId::new(0));
+
+        // The first packet on each path secret derives its context from the map, and the next one
+        // opens with the cached context.
+        for (credentials, peer) in [(&client, client_addr), (&other, other_addr)] {
+            let miss = receive(&mut cache, &server_map, credentials, sender, peer);
+            assert!(matches!(miss.result, Ok(false)));
+            assert!(miss.decrypted);
+            assert!(miss.control_out.is_empty());
+
+            let hit = receive(&mut cache, &server_map, credentials, sender, peer);
+            assert!(matches!(hit.result, Ok(true)));
+            assert!(hit.decrypted);
+            assert!(hit.control_out.is_empty());
+        }
+        let client_ctx = cache
+            .senders
+            .get(&client_cache_key)
+            .expect("the client's cached context")
+            .clone();
+
+        // Removing the client's key evicts its path secret from the map and revokes it, while the
+        // cache still holds its context.
+        assert!(server_map.remove_peer_key(&client_key));
+        assert!(server_map.get_by_id(&client_id).is_none());
+        assert!(client_ctx.borrow().path_entry.is_revoked());
+        assert!(cache.senders.contains_key(&client_cache_key));
+
+        // The client's next packet isn't opened with the cached opener: the cache drops the
+        // context and refuses the packet as one on an unknown path secret.
+        let refused = receive(&mut cache, &server_map, &client, sender, client_addr);
+        assert!(
+            matches!(refused.result, Err(CacheError::PathSecretNotFound)),
+            "the cache didn't refuse a packet on a revoked path secret"
+        );
+        assert!(!refused.decrypted, "the cache opened a packet on a revoked path secret");
+        assert!(!cache.senders.contains_key(&client_cache_key));
+
+        // The cache answers the packet with an unknown path secret packet for its sender.
+        let mut control_out = refused.control_out;
+        let (packet, remaining) = control::Packet::decode(DecoderBufferMut::new(&mut control_out))
+            .expect("a control packet");
+        assert!(remaining.is_empty());
+        let packet = match packet {
+            control::Packet::UnknownPathSecret(packet) => packet,
+            packet => panic!("the cache answered with another control packet: {packet:?}"),
+        };
+        assert_eq!(*packet.credential_id(), client_id);
+        assert_eq!(packet.queue_id(), Some(sender.as_varint()));
+
+        // The other client's path secret isn't revoked, so its cached context still opens its
+        // packets.
+        assert!(cache.senders.contains_key(&other_cache_key));
+        let open = receive(&mut cache, &server_map, &other, sender, other_addr);
+        assert!(matches!(open.result, Ok(true)));
+        assert!(open.decrypted);
+        assert!(open.control_out.is_empty());
+    }
+}
