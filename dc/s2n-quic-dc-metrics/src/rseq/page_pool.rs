@@ -225,6 +225,21 @@ impl<H: Head> Stack<H> {
     }
 }
 
+/// Frees every page still on the stack. With `&mut self`, a recorder or a stealer can't reach the
+/// stack any more, so the chain is the stack's alone to walk. `Channels::drop` folds every page
+/// into `empty_pages` and then drops it, so without this each dropped registry leaked its pages.
+impl<H: Head> Drop for Stack<H> {
+    fn drop(&mut self) {
+        let mut cursor = H::ptr(self.head.load(Ordering::Acquire));
+        while !cursor.is_null() {
+            // SAFETY: each page on the chain was pushed with `Box::into_raw`, and the stack owns
+            // it until it is popped or drained.
+            let page = unsafe { Box::from_raw(cursor) };
+            cursor = page.next.load(Ordering::Relaxed);
+        }
+    }
+}
+
 /// `pop` is available only on the ABA-safe tagged head (the SPMC `empty_pages` pool).
 impl Stack<TaggedHead> {
     #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
@@ -352,6 +367,23 @@ impl ShardedPagePool<PtrHead> {
 mod tests {
     use super::*;
 
+    /// A pool frees the pages it still holds when it drops. `Channels::drop` folds every page into
+    /// `empty_pages` and then drops it, so a pool that kept its pages leaked each page of every
+    /// dropped registry.
+    #[test]
+    fn dropped_pools_free_their_pages() {
+        let freed_before = super::super::pages_freed_here();
+        {
+            let empty_pages = ShardedPagePool::<TaggedHead>::new();
+            let full_pages = ShardedPagePool::<PtrHead>::new();
+            for cpu_hint in 0..3 {
+                empty_pages.push(Page::new(), cpu_hint);
+                full_pages.push(Page::new(), cpu_hint);
+            }
+        }
+        assert_eq!(super::super::pages_freed_here() - freed_before, 6);
+    }
+
     /// Reproduces the ABA hazard in a Treiber-stack `pop` deterministically and asserts page
     /// conservation. Every page created must end up in exactly one of two disjoint sets: *owned* by
     /// a caller, or *reachable* from the stack head. A page in neither is leaked; a page in both is
@@ -369,9 +401,10 @@ mod tests {
     ///      double-owned. Under the tagged head, the generation moved, P1's CAS fails and it retries
     ///      onto C -> conserved.
     ///
-    /// Pages are tracked by raw pointer and intentionally never freed here (the buggy path would
-    /// otherwise double-free the double-owned page and abort instead of failing the assertion). A
-    /// few leaked pages in a unit test is fine; the point is the conservation check.
+    /// Pages popped out of the stack are tracked by raw pointer and intentionally never freed here
+    /// (the buggy path would otherwise double-free the double-owned page and abort instead of
+    /// failing the assertion); the stack frees the pages still on it when it drops. A few leaked
+    /// pages in a unit test is fine; the point is the conservation check.
     #[test]
     fn pop_aba_conserves_pages() {
         // Distinct id per page, written into slot 0; survives push/pop (which only touch `.next`).
