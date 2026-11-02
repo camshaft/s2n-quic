@@ -53,6 +53,237 @@ fn cleans_after_delay() {
     assert!(map.ids.contains_key(third.id()));
 }
 
+fn entry_for_peer(port: u16, generation: u64) -> Arc<Entry> {
+    Entry::builder((Ipv4Addr::LOCALHOST, port).into())
+        .generation(generation)
+        .build(None)
+}
+
+/// Builds a map that evicts once it holds more than `capacity` entries, with its background
+/// cleaner stopped, so that a test runs each cleaner cycle itself.
+fn map_with_capacity(capacity: usize) -> Arc<State<Clock, tracing::Subscriber>> {
+    let signer = stateless_reset::Signer::new(b"secret");
+    let mut map = State::builder()
+        .with_signer(signer)
+        .with_capacity(50)
+        .with_clock(Clock)
+        .with_subscriber(tracing::Subscriber::default())
+        .build_state()
+        .unwrap();
+
+    // Stopping the background worker also drops its reference to the map, which `get_mut`
+    // needs.
+    map.cleaner.stop();
+
+    // Lower the limit after the build, as `check_invariants_inner` does.
+    Arc::<State<Clock, tracing::Subscriber>>::get_mut(&mut map)
+        .unwrap()
+        .set_max_capacity(capacity);
+
+    map
+}
+
+/// Receives a packet on `entry` as the receive path does: the lookup by credential id before the
+/// packet is opened, then, where `opened` is true, the replay check that follows a successful
+/// open and the mark of use that `Dedup::check` and the receive cache make where it passes.
+fn receive(map: &State<Clock, tracing::Subscriber>, entry: &Arc<Entry>, opened: bool) {
+    let creds = Credentials {
+        id: *entry.id(),
+        key_id: VarInt::ZERO,
+    };
+    let mut out = Vec::new();
+    let found = map.pre_authentication(
+        &creds,
+        None,
+        crate::path::secret::map::store::ControlResponse::ReturnBuffer { out: &mut out },
+    );
+    assert!(found.is_some());
+    if opened {
+        assert!(map.check_dedup(entry, creds.key_id, None, &mut out).is_ok());
+        entry.set_accessed_authenticated();
+    }
+}
+
+/// Inserts two entries into a map with room for two, marks the older one as used with
+/// `mark_used`, runs a cleaner cycle, and inserts a third entry. The insert evicts the newer of
+/// the first two, which wasn't used, keeps the older one, and leaves the map at its capacity.
+fn assert_idle_evicted_before_older_in_use(
+    mark_used: impl Fn(&Arc<State<Clock, tracing::Subscriber>>, &Arc<Entry>),
+) {
+    let map = map_with_capacity(2);
+
+    let in_use = entry_for_peer(1, 1);
+    let idle = entry_for_peer(2, 2);
+    let newest = entry_for_peer(3, 3);
+    map.test_insert(in_use.clone());
+    map.test_insert(idle.clone());
+
+    mark_used(&map, &in_use);
+    map.cleaner.clean(&map, 1);
+
+    map.test_insert(newest.clone());
+
+    assert!(map.ids.contains_key(in_use.id()));
+    assert!(map.contains(in_use.peer()));
+    assert!(!map.ids.contains_key(idle.id()));
+    assert!(!map.contains(idle.peer()));
+    assert!(map.ids.contains_key(newest.id()));
+    assert_eq!(map.ids.len(), 2);
+}
+
+#[test]
+fn over_capacity_evicts_idle_entry_before_older_entry_used_by_authenticated_packet() {
+    assert_idle_evicted_before_older_in_use(|map, entry| receive(map, entry, true));
+}
+
+#[test]
+fn over_capacity_evicts_idle_entry_before_older_entry_used_by_address() {
+    // A connect to the peer looks its entry up by the peer's address.
+    assert_idle_evicted_before_older_in_use(|map, entry| {
+        assert!(map.get_by_addr_tracked(entry.peer()).is_some());
+    });
+}
+
+/// A packet that doesn't open still looks its entry up by credential id first, and any sender
+/// that knows the id can send one. That lookup alone doesn't count as use: the entry stays at
+/// the front of the queue, and an insert over capacity evicts it before a newer entry.
+#[test]
+fn over_capacity_evicts_entry_whose_packets_did_not_authenticate() {
+    let map = map_with_capacity(2);
+
+    let looked_up = entry_for_peer(1, 1);
+    let newer = entry_for_peer(2, 2);
+    let newest = entry_for_peer(3, 3);
+    map.test_insert(looked_up.clone());
+    map.test_insert(newer.clone());
+
+    receive(&map, &looked_up, false);
+    map.cleaner.clean(&map, 1);
+
+    map.test_insert(newest.clone());
+
+    assert!(!map.ids.contains_key(looked_up.id()));
+    assert!(map.ids.contains_key(newer.id()));
+    assert!(map.ids.contains_key(newest.id()));
+}
+
+/// The replay check alone doesn't mark an entry as used: the receive cache also runs it, for a
+/// key id older than the one it has cached, without opening the packet. An entry whose packets
+/// only reached the replay check stays at the front of the queue, and an insert over capacity
+/// evicts it before a newer entry.
+#[test]
+fn over_capacity_evicts_entry_whose_packets_only_reached_the_replay_check() {
+    let map = map_with_capacity(2);
+
+    let checked = entry_for_peer(1, 1);
+    let newer = entry_for_peer(2, 2);
+    let newest = entry_for_peer(3, 3);
+    map.test_insert(checked.clone());
+    map.test_insert(newer.clone());
+
+    // A key id, then an older one that the entry hasn't seen: both pass the replay check.
+    let mut out = Vec::new();
+    let first = map.check_dedup(&checked, VarInt::from_u8(5), None, &mut out);
+    let older = map.check_dedup(&checked, VarInt::from_u8(3), None, &mut out);
+    assert!(first.is_ok());
+    assert!(older.is_ok());
+    map.cleaner.clean(&map, 1);
+
+    map.test_insert(newest.clone());
+
+    assert!(!map.ids.contains_key(checked.id()));
+    assert!(map.ids.contains_key(newer.id()));
+    assert!(map.ids.contains_key(newest.id()));
+}
+
+/// `Dedup::check` runs once a stream's first packet has opened. Where its replay check passes,
+/// it marks the entry as used for the cleaner's eviction order; a replay of the same key id
+/// fails the check and doesn't mark it.
+#[test]
+fn dedup_check_marks_use_only_where_the_replay_check_passes() {
+    let map = super::super::Map::builder()
+        .with_signer(stateless_reset::Signer::new(b"secret"))
+        .with_capacity(50)
+        .with_clock(Clock)
+        .with_subscriber(tracing::Subscriber::default())
+        .build()
+        .unwrap();
+    map.test_stop_cleaner();
+
+    let entry = entry_for_peer(1, 1);
+    map.store.test_insert(entry.clone());
+
+    let first = super::super::Dedup::new(entry.clone(), VarInt::ZERO, None, map.clone());
+    assert!(first.check().is_ok());
+    assert!(entry.take_accessed_authenticated());
+
+    let replay = super::super::Dedup::new(entry.clone(), VarInt::ZERO, None, map.clone());
+    assert!(replay.check().is_err());
+    assert!(!entry.take_accessed_authenticated());
+}
+
+/// Where every entry was used, an insert over capacity evicts the front entry in the order the
+/// cleaner left them, which isn't always the oldest: an entry the cleaner moved back in an
+/// earlier cycle stays behind one it didn't move then.
+#[test]
+fn over_capacity_with_every_entry_in_use_evicts_in_the_cleaner_order() {
+    let map = map_with_capacity(2);
+
+    let older = entry_for_peer(1, 1);
+    let newer = entry_for_peer(2, 2);
+    let newest = entry_for_peer(3, 3);
+    map.test_insert(older.clone());
+    map.test_insert(newer.clone());
+
+    // The first cycle moves `older` behind `newer`, which wasn't used.
+    assert!(map.get_by_addr_tracked(older.peer()).is_some());
+    map.cleaner.clean(&map, 1);
+
+    // The second cycle moves both, and each keeps its place relative to the other.
+    assert!(map.get_by_addr_tracked(older.peer()).is_some());
+    assert!(map.get_by_addr_tracked(newer.peer()).is_some());
+    map.cleaner.clean(&map, 1);
+
+    map.test_insert(newest.clone());
+
+    assert!(map.ids.contains_key(older.id()));
+    assert!(!map.ids.contains_key(newer.id()));
+    assert!(map.ids.contains_key(newest.id()));
+}
+
+/// A retired entry, one that a newer entry for its peer replaced, stays with the unused entries
+/// though packets on it still arrive, so an insert over capacity evicts it before an older live
+/// entry in use, and keeps the newer entry.
+#[test]
+fn over_capacity_evicts_retired_entry_before_older_live_entry() {
+    let map = map_with_capacity(3);
+
+    let live = entry_for_peer(1, 1);
+    let retired = entry_for_peer(2, 2);
+    let replacement = entry_for_peer(2, 3);
+    let newest = entry_for_peer(3, 4);
+    map.test_insert(live.clone());
+    map.test_insert(retired.clone());
+    // A second handshake with the same peer replaces its entry and retires the older one.
+    map.test_insert(replacement.clone());
+    assert!(retired.retired_at().is_some());
+
+    receive(&map, &live, true);
+    receive(&map, &retired, true);
+    map.cleaner.clean(&map, 1);
+    // One cycle doesn't evict a retired entry yet.
+    assert!(map.ids.contains_key(retired.id()));
+
+    map.test_insert(newest.clone());
+
+    assert!(!map.ids.contains_key(retired.id()));
+    assert!(map.ids.contains_key(live.id()));
+    assert!(map.ids.contains_key(replacement.id()));
+    assert!(map.contains(replacement.peer()));
+    assert!(map.ids.contains_key(newest.id()));
+    assert_eq!(map.ids.len(), 3);
+}
+
 #[test]
 fn thread_shutdown() {
     let signer = stateless_reset::Signer::new(b"secret");
