@@ -30,7 +30,9 @@
 //!   starts just before the drop ends can stay open until the idle timeout declares the peer dead,
 //!   the client's streams then fail until the cooldown ends, and the client needs a completed
 //!   stream that starts after the drop ends and one more after it. The client checks only that the
-//!   run ends after the drop does.
+//!   run ends after the drop does. Past the run's end, the client starts streams until it has the
+//!   ones its assertion decides on: one stream, and where the schedule has a drop, two that start
+//!   at or after the drop's end, so that a setup that takes up the run doesn't end it before them.
 //!
 //! The schedule's times count from the start of the client end. The client runs one stream at a
 //! time and asserts that each stream that ended before the drop started completed, that a stream
@@ -78,14 +80,10 @@ const END_ACCEPTOR: VarInt = VarInt::from_u8(2);
 /// The server name of the handshake's test certificate.
 const SERVER_NAME: &str = "localhost";
 
-/// The schedule `loopback` runs both ends under: a link drop of 1 ms at the client end's start.
-/// The window passes without a fault, since the loopback interface doesn't lose packets or take
-/// its link down, so no stream waits out the idle timeout or the dead-peer cooldown and the run
-/// doesn't need to outlast the drop by them. The client's times count from before it builds its
-/// endpoint and makes its first handshake, so with the drop at the start, `check` needs only two
-/// streams anywhere in the run: the reconnection, the first stream that starts at or after 1 ms
-/// and completes, and one more. A drop later in the run would need streams after it, which a slow
-/// setup, as on a sanitizer or coverage build, can push past the run's end.
+/// The schedule `loopback` runs both ends under: a link drop of 1 ms at the client end's start,
+/// which ends before the client's run does. The window passes without a fault, since the loopback
+/// interface doesn't lose packets or take its link down, so no stream waits out the idle timeout
+/// or the dead-peer cooldown and the run doesn't need to outlast the drop by them.
 const LOOPBACK_SCHEDULE: [(&str, &str); 3] = [
     ("DC_CROSS_HOST_LOSS_PERCENT", "0"),
     ("DC_CROSS_HOST_DROP_START_MS", "0"),
@@ -93,9 +91,14 @@ const LOOPBACK_SCHEDULE: [(&str, &str); 3] = [
 ];
 /// The length of each request of the client end in `loopback`.
 const LOOPBACK_STREAM_BYTES: &str = "16384";
-/// The client end's run in `loopback`: a stream each 100 ms for 2.5 s from the client end's start.
+/// The client end's run in `loopback`: 2 ms, the shortest run that ends after the schedule's drop,
+/// and a stream each 100 ms. The client's times count from before it builds its endpoint and makes
+/// its first handshake, and its second stream starts 100 ms after its first, so the run holds at
+/// most its first stream, whatever its setup takes. The client starts each later stream because
+/// `holds_checked_streams` asks for two that start at or after the drop's end, the reconnection
+/// and one more, so `loopback` passes or fails on the streams' outcomes alone.
 const LOOPBACK_CLIENT: [(&str, &str); 3] = [
-    ("DC_CROSS_HOST_RUN_MS", "2500"),
+    ("DC_CROSS_HOST_RUN_MS", "2"),
     ("DC_CROSS_HOST_STREAM_INTERVAL_MS", "100"),
     ("DC_CROSS_HOST_STREAM_BYTES", LOOPBACK_STREAM_BYTES),
 ];
@@ -400,8 +403,9 @@ async fn echo_stream(stream: Stream) -> io::Result<usize> {
 }
 
 /// The client end: starts a stream each `DC_CROSS_HOST_STREAM_INTERVAL_MS` until
-/// `DC_CROSS_HOST_RUN_MS` from `started`, ends the server's run, and asserts the outcome of its
-/// streams under the schedule.
+/// `DC_CROSS_HOST_RUN_MS` from `started` and until it holds the streams that `check` decides on
+/// (`holds_checked_streams`), ends the server's run, and asserts the outcome of its streams under
+/// the schedule.
 async fn run_client(schedule: Schedule, started: Instant) {
     let peer: SocketAddr = parse("DC_CROSS_HOST_PEER");
     let run = millis("DC_CROSS_HOST_RUN_MS");
@@ -440,8 +444,8 @@ async fn run_client(schedule: Schedule, started: Instant) {
         .expect("the handshake client");
     let mut client = stream::Client::new(stream_endpoint, handshake, Name::from(SERVER_NAME));
 
-    let mut records = Vec::new();
-    while started.elapsed() < run {
+    let mut records: Vec<Record> = Vec::new();
+    while started.elapsed() < run || !holds_checked_streams(&records, &schedule) {
         let index = records.len() as u64;
         let start = started.elapsed();
         let result = exchange(&mut client, peer, ECHO_ACCEPTOR, payload(index, size)).await;
@@ -566,6 +570,24 @@ fn reconnection(records: &[Record], schedule: &Schedule) -> Value {
         "reconnected_ms": reconnect.map(|record| ms(record.end)),
         "after_drop_end_ms": reconnect.map(|record| ms(record.end - drop_end)),
     })
+}
+
+/// Whether `records` holds the streams that `check` decides on: one stream, and where the
+/// schedule has a drop, two that started at or after the drop's end, which are the reconnection
+/// and one more where both completed. The client starts streams past its run until they're
+/// there, so that a setup that takes up the run, as on a sanitizer or coverage build, doesn't end
+/// the run before them. A stream that starts past the run starts after the drop's end, since the
+/// run ends after the drop does, so the client starts at most two streams past its run.
+fn holds_checked_streams(records: &[Record], schedule: &Schedule) -> bool {
+    if !schedule.has_drop() {
+        return !records.is_empty();
+    }
+    let drop_end = schedule.drop_end();
+    let after_drop = records
+        .iter()
+        .filter(|record| record.start >= drop_end)
+        .count();
+    after_drop >= 2
 }
 
 /// Runs the client's assertion, `check`, and its reconnection line on chosen streams, under a
@@ -703,6 +725,39 @@ fn client_assertion() {
         &without_drop,
         "stream 2 failed under the scheduled loss",
     );
+}
+
+/// Runs `holds_checked_streams`, which decides where the client's run goes on past
+/// `DC_CROSS_HOST_RUN_MS`, on chosen streams under the schedule of `client_assertion` and under the
+/// same schedule without a drop.
+#[test]
+fn checked_streams() {
+    let schedule = Schedule {
+        loss_percent: 0.0,
+        drop_start: Duration::from_millis(1000),
+        drop_len: Duration::from_millis(500),
+    };
+    let without_drop = Schedule {
+        drop_len: Duration::ZERO,
+        ..schedule
+    };
+    let (ok, failed) = (true, false);
+
+    // Without a drop, one stream is enough, whatever its outcome.
+    assert!(!holds_checked_streams(&[], &without_drop));
+    let one_failed = client_records(&[(0, 100, failed)]);
+    assert!(holds_checked_streams(&one_failed, &without_drop));
+
+    // With a drop, a stream that started before the drop's end doesn't count, though it ended at
+    // the drop's end or after it, and two streams that started at or after the drop's end are
+    // enough, whatever their outcomes.
+    assert!(!holds_checked_streams(&[], &schedule));
+    let before_end = client_records(&[(0, 100, ok), (1100, 1600, failed)]);
+    assert!(!holds_checked_streams(&before_end, &schedule));
+    let one_after = client_records(&[(1400, 1500, ok), (1500, 1600, failed)]);
+    assert!(!holds_checked_streams(&one_after, &schedule));
+    let two_after = client_records(&[(1500, 1600, failed), (1600, 1700, ok)]);
+    assert!(holds_checked_streams(&two_after, &schedule));
 }
 
 /// The client's records of streams that ran one after the other, each with its start and end in
