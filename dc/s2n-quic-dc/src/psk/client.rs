@@ -263,15 +263,27 @@ impl Provider {
         Ok(HandshakeKind::Fresh)
     }
 
-    /// Lets the next handshake with `peer` start at once where its last one succeeded.
+    /// Replaces `stale`, the cached entry for `peer` that a caller found dead and silent, with
+    /// the entry of a new handshake, and returns the peer's entry.
     ///
     /// After a successful handshake, the client holds that success for a random period, and a
-    /// handshake requested within it returns that success without handshaking. A caller that
-    /// evicted the peer's entry from the map calls this before it handshakes again, so that
-    /// handshake builds a new entry. A handshake still running, or a failure, stays held.
-    #[inline]
-    pub(crate) fn forget_completed_handshake(&self, peer: SocketAddr) {
-        self.state.client.forget_completed_handshake(peer);
+    /// handshake requested within it returns that success without handshaking. This evicts
+    /// `stale` and drops that hold, then handshakes, so the handshake builds a new entry.
+    ///
+    /// Concurrent calls for the same peer share one handshake: the handshake queue runs one
+    /// handshake for a peer at a time, which the other calls join. Evicting `stale` leaves a
+    /// newer entry for the peer in place, and a call that finds one, as one that comes after the
+    /// shared handshake does, keeps that handshake's hold and gets the newer entry back as
+    /// cached. A failed handshake stays held, so the calls after it get its error until its
+    /// backoff ends, without handshaking.
+    pub(crate) async fn handshake_replacing(
+        &self,
+        peer: SocketAddr,
+        stale: &Arc<secret::map::Entry>,
+        server_name: Name,
+    ) -> std::io::Result<(secret::map::Peer, HandshakeKind)> {
+        self.state.client.evict_and_forget_completed(peer, stale);
+        self.handshake_with_entry(peer, server_name).await
     }
 
     /// This forces a handshake with the given peer, ignoring whether there's already an entry or
@@ -342,13 +354,13 @@ mod tests {
             .unwrap()
     }
 
-    /// The order `stream::Client::connect` follows after it evicts a dead and silent entry, with
-    /// a real handshake. While the handshake queue still holds the success of the handshake that
-    /// built the evicted entry, the next handshake returns that success without handshaking, and
-    /// fails since the map has no entry. Once `forget_completed_handshake` drops the hold, the
-    /// next handshake builds a new entry.
+    /// The case `handshake_replacing` covers, with a real handshake. While the handshake queue
+    /// still holds the success of the handshake that built an evicted entry, the next handshake
+    /// returns that success without handshaking, and fails since the map has no entry.
+    /// `handshake_replacing` drops the hold, so its handshake builds a new entry, here for an
+    /// entry that another caller evicted first.
     #[tokio::test]
-    async fn forget_completed_handshake_lets_a_handshake_replace_an_evicted_entry() {
+    async fn handshake_replacing_replaces_an_evicted_entry() {
         init_tracing();
 
         let tls = TestTlsProvider {};
@@ -387,8 +399,8 @@ mod tests {
         client.map().evict_entry(&first);
         assert!(!client.map().contains(&server_addr));
 
-        // Without `forget_completed_handshake`, the held success comes back without a
-        // handshake, and the map has no entry for the peer.
+        // While the hold stands, the held success comes back without a handshake, and the map
+        // has no entry for the peer.
         let error = client
             .handshake_with_entry(server_addr, server_name())
             .await
@@ -396,14 +408,94 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
 
-        client.forget_completed_handshake(server_addr);
-
         let (second, kind) = client
-            .handshake_with_entry(server_addr, server_name())
+            .handshake_replacing(server_addr, &first, server_name())
             .await
             .unwrap();
         assert!(matches!(kind, HandshakeKind::Fresh));
         assert_ne!(*second.into_raw().id(), first_id);
+    }
+
+    /// A thousand concurrent `handshake_replacing` calls for one dead entry share one handshake.
+    /// The first evicts the entry and drops the held success; the others join its handshake or
+    /// find the entry it inserted, and none drops that handshake's hold, so none handshakes
+    /// again. Each call gets the same new entry, and the map holds that entry alone.
+    #[tokio::test]
+    async fn concurrent_replacements_share_one_handshake() {
+        init_tracing();
+
+        let tls = TestTlsProvider {};
+        let server = crate::psk::server::Provider::builder()
+            .start(
+                "[::1]:0".parse().unwrap(),
+                tls.clone(),
+                NoopSubscriber {},
+                test_map(),
+            )
+            .await
+            .unwrap();
+        let server_addr = server.local_addr();
+
+        // With the cleaner stopped, an entry a second handshake replaced would stay in the map's
+        // list of secrets, and `secrets_len` would count it.
+        let map = test_map();
+        map.test_stop_cleaner();
+        // A success hold far longer than the test, so a call that dropped the new handshake's
+        // hold would let the next call handshake again.
+        let client = Provider::builder()
+            .with_success_jitter(Duration::from_secs(1_000_000))
+            .start(
+                "[::]:0".parse().unwrap(),
+                map.clone(),
+                tls,
+                NoopSubscriber {},
+                server_name(),
+            )
+            .unwrap();
+
+        let (first, _kind) = client
+            .handshake_with_entry(server_addr, server_name())
+            .await
+            .unwrap();
+        let first = first.into_raw();
+        let first_id = *first.id();
+        assert_eq!(map.secrets_len(), 1);
+
+        let calls = tokio::task::LocalSet::new();
+        let ids = calls
+            .run_until(async {
+                let handles: Vec<_> = (0..1_000)
+                    .map(|_| {
+                        let client = client.clone();
+                        let first = first.clone();
+                        tokio::task::spawn_local(async move {
+                            let (entry, _kind) = client
+                                .handshake_replacing(server_addr, &first, server_name())
+                                .await
+                                .expect("each call gets the peer's new entry");
+                            *entry.into_raw().id()
+                        })
+                    })
+                    .collect();
+                let mut ids = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    ids.push(handle.await.unwrap());
+                }
+                ids
+            })
+            .await;
+
+        let second_id = ids[0];
+        assert_ne!(second_id, first_id, "the calls replaced the dead entry");
+        assert!(
+            ids.iter().all(|id| *id == second_id),
+            "every call gets the one new entry"
+        );
+        assert_eq!(
+            map.secrets_len(),
+            1,
+            "one handshake replaced the dead entry, and none ran after it"
+        );
     }
 
     /// The provider registers a handshake request on its map, so a background request for a
