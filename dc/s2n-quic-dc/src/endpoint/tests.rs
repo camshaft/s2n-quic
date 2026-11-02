@@ -3327,6 +3327,224 @@ fn stale_key_detected_after_recv_cache_eviction() {
     });
 }
 
+/// Reproduces a client that loses its receive context for a server's key while the server keeps
+/// sending on that key, with every notice that would recover it lost on the way.
+///
+/// The client's entry has a 1 s idle timeout and the server's an hour, so once the first stream
+/// is done, the client's receive idle wheel drops its receive context for the server's key, while
+/// the server keeps its send context and the key id it seals with. Each later packet from the
+/// server misses the client's receive cache, its key id is already in the client's replay window,
+/// and the client rejects it and answers with a replay or stale-key notice. The network monitor
+/// drops each such notice, in either direction, and passes every other packet. The server never
+/// moves to a new key, so the client rejects everything it sends: the client's flows go
+/// unanswered, its send idle wheel marks the server dead, and connects are refused in the
+/// dead-peer cooldown window. Only an entry for a new path secret gets the client out.
+#[test]
+fn recv_eviction_with_lost_replay_notices_recovers() {
+    use crate::{
+        endpoint::testing::sim::{lookup_sim_map, packet_tag},
+        packet::Tag,
+        path::secret::map::Entry,
+    };
+    use s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS;
+    use std::{num::NonZeroU32, sync::Mutex};
+
+    let _no_snap = crate::testing::without_snapshots();
+    let dropped_notices = Arc::new(AtomicUsize::new(0));
+    let dropped_notices_inner = dropped_notices.clone();
+    let cooldown_refusals = Arc::new(AtomicUsize::new(0));
+    let cooldown_refusals_inner = cooldown_refusals.clone();
+    let recovered_after: Arc<Mutex<Option<Duration>>> = Default::default();
+    let recovered_after_inner = recovered_after.clone();
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+
+        // Drop every replay and stale-key notice, decided by the packet's tag, and pass every
+        // other packet.
+        bach::net::monitor::on_packet_sent(move |packet| {
+            if matches!(
+                packet_tag(packet),
+                Some(Tag::ReplayDetected(_) | Tag::StaleKey(_))
+            ) {
+                dropped_notices_inner.fetch_add(1, Ordering::Relaxed);
+                return bach::net::monitor::Command::Drop;
+            }
+            bach::net::monitor::Command::Pass
+        });
+
+        // Server: echo each stream back.
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 64)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut echo = buf.freeze();
+                    let _ = writer.write_all_from_fin(&mut echo).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary).
+        async move {
+            let mut client = Client::new();
+            // Yield so the server group has a chance to bind its socket.
+            bach::task::yield_now().await;
+
+            let server_addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("server addr");
+            let client_addr = client.data_addr();
+            let client_map = lookup_sim_map(client_addr).expect("client map");
+            let server_map = lookup_sim_map(server_addr).expect("server map");
+
+            // The client's entry expires its contexts after 1 s of silence. The server's entry
+            // keeps its send context, and the key id that context seals with, for the whole test.
+            let mut client_params = TEST_APPLICATION_PARAMS;
+            client_params.max_idle_timeout = NonZeroU32::new(1_000);
+            client_params.remote_max_data = client_params.local_recv_max_data;
+            let mut server_params = TEST_APPLICATION_PARAMS;
+            server_params.max_idle_timeout = NonZeroU32::new(3_600_000);
+            server_params.remote_max_data = server_params.local_recv_max_data;
+            client_map.test_insert_pair(
+                Entry::builder(server_addr)
+                    .local(client_addr)
+                    .params(client_params),
+                &server_map,
+                Entry::builder(client_addr)
+                    .local(server_addr)
+                    .params(server_params),
+            );
+
+            // A first stream works on the inserted entry.
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 1");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            writer.write_all_from_fin(&mut ping).await.expect("write 1");
+            let mut buf = BytesMut::with_capacity(16);
+            loop {
+                if reader.read_into(&mut buf).await.expect("read 1") == 0 {
+                    break;
+                }
+            }
+            assert_eq!(&buf[..], b"ping");
+            drop(reader);
+            drop(writer);
+
+            let old_entry = client_map
+                .get_raw(server_addr)
+                .expect("entry after the first stream");
+            let old_id = *old_entry.id();
+
+            // After 3 s the client's receive idle wheel has dropped its receive context for the
+            // server's key, while the server's send context still seals with that key.
+            3.s().sleep().await;
+            let broke_at = client_map.entry_age(&old_entry);
+
+            // Keep opening streams, as a busy caller would, for at least five minutes.
+            for _ in 0..300 {
+                let peer = format!("server:{SERVER_PORT}");
+                let connect = client.connect(peer, acceptor_id);
+                let stream = match timeout(5.s(), connect).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        // Refused in the dead-peer cooldown window.
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            cooldown_refusals_inner.fetch_add(1, Ordering::Relaxed);
+                        }
+                        1.s().sleep().await;
+                        continue;
+                    }
+                    Err(_) => {
+                        // Still waiting for a queue slot.
+                        1.s().sleep().await;
+                        continue;
+                    }
+                };
+                let (mut reader, mut writer) = stream.into_split();
+                let mut ping = Bytes::from_static(b"ping");
+                if !matches!(
+                    timeout(5.s(), writer.write_all_from_fin(&mut ping)).await,
+                    Ok(Ok(_))
+                ) {
+                    continue;
+                }
+                let mut buf = BytesMut::with_capacity(16);
+                let done = loop {
+                    match timeout(5.s(), reader.read_into(&mut buf)).await {
+                        Ok(Ok(0)) => break true,
+                        Ok(Ok(_)) => {}
+                        _ => break false,
+                    }
+                };
+                if done && &buf[..] == b"ping" {
+                    let new_id = *client_map
+                        .get_raw(server_addr)
+                        .expect("entry after recovery")
+                        .id();
+                    assert_ne!(new_id, old_id, "recovery must come from a fresh entry");
+                    let elapsed = client_map.entry_age(&old_entry) - broke_at;
+                    *recovered_after_inner.lock().unwrap() = Some(elapsed);
+                    break;
+                }
+            }
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    // The server's packets reached the client on the old key and the client answered them with
+    // notices, which the monitor dropped.
+    assert!(
+        dropped_notices.load(Ordering::Relaxed) > 0,
+        "the client never answered the server's packets with a replay or stale-key notice, so the \
+         test didn't reproduce the loss of the client's receive context"
+    );
+    // The client's flows went unanswered, so its send idle wheel marked the server dead.
+    assert!(
+        cooldown_refusals.load(Ordering::Relaxed) > 0,
+        "no connect was refused in the dead-peer cooldown window, so the client never marked the \
+         server dead"
+    );
+    let recovered_after = *recovered_after.lock().unwrap();
+    assert!(
+        recovered_after.is_some(),
+        "the client never completed a stream to a healthy server after it lost its receive \
+         context for the server's key and every replay and stale-key notice was dropped: only an \
+         authenticated packet clears the dead-peer mark, and the server keeps sealing with the \
+         key the client rejects, so the client stays in the dead-cooldown loop for as long as it \
+         keeps the entry"
+    );
+    let recovered_after = recovered_after.unwrap();
+    let bound = crate::stream::endpoint::DEFAULT_IDLE_TIMEOUT * 3;
+    assert!(
+        recovered_after <= bound,
+        "the client completed a stream {recovered_after:?} after it lost its receive context, \
+         later than three idle timeouts ({bound:?})"
+    );
+}
+
 // ── QueueMsg Integration Tests ─────────────────────────────────────────────
 
 /// Single message, two chunks — verifies the basic QueueMsg path works end-to-end.
