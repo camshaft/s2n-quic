@@ -1763,6 +1763,7 @@ mod tests {
             // every byte is accounted as pool-backed.
             initial_window_remaining: 0,
             recv_finished: false,
+            peer_queue_id: None,
         };
 
         // The reader advertised (and therefore acquired) only 10 bytes of pool credit. A peer that
@@ -1797,6 +1798,7 @@ mod tests {
             max_received_offset: 0,
             initial_window_remaining: 4,
             recv_finished: false,
+            peer_queue_id: None,
         };
 
         // Advertised window comfortably above what arrives. First 4 bytes are unbacked (release 0),
