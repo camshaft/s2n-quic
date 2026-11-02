@@ -34,7 +34,7 @@ use crate::{
     testing::{ext::*, sim},
     tracing::*,
 };
-use bach::time::timeout;
+use bach::time::{timeout, Instant};
 use bytes::{Bytes, BytesMut};
 use s2n_quic_core::{stream::testing::Data, varint::VarInt};
 use std::{
@@ -634,6 +634,137 @@ fn reading_only_phone_across_a_suspension_ends_or_completes() {
                 io::ErrorKind::TimedOut,
             );
             resumed.await.expect("the suspension ends");
+            drop(writer);
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}
+
+/// A peer that doesn't answer the idle probe of a quiet stream is marked dead at the idle
+/// timeout.
+///
+/// The phone sends a request and reads the host's first update, so the host has acknowledged
+/// every packet the phone sent; then no packet goes either way again. The phone's stream is open
+/// and it has no packet the host hasn't acknowledged, so its idle wheel probes the quiet path
+/// with a Ping half an idle timeout after it last heard from the host, and the Ping goes out
+/// through the packet assembler. The host doesn't answer, so the phone marks the host dead once
+/// its idle timeout has passed since it last heard from the host, and the read of the second
+/// update ends in `TimedOut` then: sending the Ping doesn't move that deadline.
+///
+/// The idle wheel runs a check at the start of the wheel tick its target falls in, so the dead
+/// mark comes up to a tick before the deadline. The test starts the quiet period as the read of
+/// the first update returns, and allows a second tick below the deadline and one above it for
+/// the time between a packet's arrival and that return, and for a packet of the host's that was
+/// on its way as delivery stopped.
+#[test]
+fn an_unanswered_idle_probe_marks_the_peer_dead_at_the_idle_timeout() {
+    // Snapshot disabled: the test waits through an idle timeout, and its trace would be large.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let stopped = Arc::new(AtomicBool::new(false));
+        {
+            let stopped = stopped.clone();
+            bach::net::monitor::on_packet_sent(move |_packet| {
+                if stopped.load(Ordering::Relaxed) {
+                    return bach::net::monitor::Command::Drop;
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        // The host keeps its stream open, without a second update, until the phone is done.
+        let (done, done_rx) = oneshot::channel::<()>();
+
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(ACCEPTOR_ID, 8)
+                .expect("acceptor registration failed");
+            let mut done_rx = Some(done_rx);
+
+            while let Some(stream) = acceptor.recv().await {
+                let done_rx = done_rx.take();
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut request = BytesMut::with_capacity(64);
+                    read_to_end(&mut reader, &mut request)
+                        .await
+                        .expect("host read of the request");
+
+                    let mut first = Bytes::from_static(FIRST_UPDATE);
+                    writer
+                        .write_all_from(&mut first)
+                        .await
+                        .expect("host write of the first update");
+
+                    if let Some(done_rx) = done_rx {
+                        let _ = done_rx.await;
+                    }
+                    drop(writer);
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let mut phone = Client::new();
+            let stream = phone
+                .connect("server:0", ACCEPTOR_ID)
+                .await
+                .expect("connect");
+            let idle = host_idle_timeout(&phone, stream.peer_addr());
+            let tick = Duration::from_nanos(crate::time::wheel::SECOND_GRANULARITY_NANOS);
+            // A Ping whose send moved the deadline would put the dead mark about half an idle
+            // timeout later, up to two wheel ticks early. Half an idle timeout of more than four
+            // ticks keeps that time past the upper bound below.
+            assert!(
+                idle / 2 > tick * 4,
+                "the idle timeout ({idle:?}) is more than eight wheel ticks ({tick:?})"
+            );
+            let (mut reader, mut writer) = stream.into_split();
+
+            let mut request = Bytes::from_static(b"subscribe");
+            writer
+                .write_all_from_fin(&mut request)
+                .await
+                .expect("phone write of the request");
+
+            // Once the first update arrives, the host has acknowledged the request.
+            let mut updates = BytesMut::with_capacity(64);
+            while updates.len() < FIRST_UPDATE.len() {
+                let n = timeout(idle, reader.read_into(&mut updates))
+                    .await
+                    .expect("the read of the first update was still pending at its bound")
+                    .expect("phone read of the first update");
+                assert_ne!(n, 0, "the host ended the stream before its first update");
+            }
+            assert_eq!(&updates[..], FIRST_UPDATE);
+
+            stopped.store(true, Ordering::Relaxed);
+            let quiet_since = Instant::now().elapsed_since_start();
+
+            let read = read_to_end(&mut reader, &mut updates);
+            assert_error_kind(
+                "the phone's read of the second update",
+                timeout(idle * 2, read).await,
+                io::ErrorKind::TimedOut,
+            );
+            let dead_after = Instant::now().elapsed_since_start() - quiet_since;
+            assert!(
+                dead_after >= idle - tick * 2,
+                "the phone marked the host dead {dead_after:?} into the quiet period, more than \
+                 two wheel ticks before its idle timeout of {idle:?}"
+            );
+            assert!(
+                dead_after <= idle + tick,
+                "the phone marked the host dead {dead_after:?} into the quiet period, more than \
+                 a wheel tick after its idle timeout of {idle:?}"
+            );
+            let _ = done.send(());
             drop(writer);
         }
         .group("client")
