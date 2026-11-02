@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::{
+    endpoint::{id::RecvDispatchWorkerId, routing::{PowerOfTwoRoute, SenderRoute as _}},
     packet::datagram::{self, QueuePair},
-    path::secret::map::Entry as PathSecretEntry,
+    path::secret::{map::Entry as PathSecretEntry, stateless_reset},
     socket::pool::{self, descriptor::SyncRecycler},
 };
 use s2n_codec::{DecoderBufferMut, Encoder as _};
@@ -64,6 +65,37 @@ fn sealed_queue_msg_packet_geometry(
         key_id,
     };
 
+    let packet = seal_queue_msg_packet(
+        peer,
+        &sealer,
+        &credentials,
+        VarInt::ZERO,
+        dest_queue_id,
+        binding_id,
+        message_size,
+        chunk_size,
+        chunk_index,
+    );
+    let decrypt_len = packet.decrypt_into_len();
+
+    (packet, opener, decrypt_len)
+}
+
+/// Seals a single non-init QueueMsg frame routed at `(dest_queue_id, binding_id)`, with the
+/// message geometry given, as packet number `packet_number` under `sealer` and `credentials`,
+/// into a pool-backed `Filled` packet from `peer`, as the router hands one to `process`.
+#[allow(clippy::too_many_arguments)]
+fn seal_queue_msg_packet(
+    peer: SocketAddr,
+    sealer: &crate::crypto::awslc::seal::Application,
+    credentials: &crate::credentials::Credentials,
+    packet_number: VarInt,
+    dest_queue_id: VarInt,
+    binding_id: VarInt,
+    message_size: u64,
+    chunk_size: u64,
+    chunk_index: u64,
+) -> datagram::decoder::Packet<crate::socket::pool::descriptor::Filled> {
     let payload = b"queue-msg-payload".to_vec();
 
     let header = Header::QueueMsg {
@@ -105,13 +137,13 @@ fn sealed_queue_msg_packet_geometry(
         s2n_codec::EncoderBuffer::new(&mut buf),
         443,
         routing_info,
-        Some(VarInt::ZERO),
+        Some(packet_number),
         VarInt::try_from(header_buf.len() as u64).unwrap(),
         &mut header_reader,
         VarInt::try_from(payload.len() as u64).unwrap(),
         &mut payload_reader,
-        &sealer,
-        &credentials,
+        sealer,
+        credentials,
     );
     assert!(encoded_len > 0);
 
@@ -132,10 +164,7 @@ fn sealed_queue_msg_packet_geometry(
         let decode_buf = DecoderBufferMut::new(&mut filled[..]);
         datagram::decoder::Meta::decode(&decode_buf, (), TAG_LEN).expect("meta decode")
     };
-    let packet = meta.with_storage(filled).expect("with_storage");
-    let decrypt_len = packet.decrypt_into_len();
-
-    (packet, opener, decrypt_len)
+    meta.with_storage(filled).expect("with_storage")
 }
 
 /// Build a fresh (no slots bound) Server `QueueView`. Any QueueMsg routed at it rejects with
@@ -452,4 +481,148 @@ fn slot_diag_reports_bound_vs_unallocated_state() {
             .is_none_or(|d| d.unallocated && !d.stream_has_receiver),
         "an unbound slot must read back as unallocated with no receiver"
     );
+}
+
+/// Keeps each value `process` sends on one of its channels, in place of the queue that a
+/// worker task reads it from.
+struct Sent<T>(Vec<T>);
+
+impl<T> channel::UnboundedSender<T> for Sent<T> {
+    fn send(&mut self, value: T) -> Result<(), T> {
+        self.0.push(value);
+        Ok(())
+    }
+}
+
+/// A receive dispatch worker's state for `process`: its receive cache, the path-secret map, the
+/// clock and the route, a `Sent` for each channel, and the arguments `decrypt_fast_path` takes.
+struct ProcessHarness {
+    fast_path: FastPathHarness,
+    recv_cache: recv::Cache,
+    ack_burst: Sent<Rc<RefCell<recv::Context>>>,
+    idle_wheel: Sent<Rc<RefCell<recv::Context>>>,
+    senders: Sent<Entry<msg::Sender>>,
+    wakers: Sent<AutoWake>,
+    path_secret_map: PathSecretMap,
+    clock: crate::time::testing::Clock,
+    route: PowerOfTwoRoute,
+}
+
+impl ProcessHarness {
+    fn new(path_secret_map: PathSecretMap) -> Self {
+        Self {
+            fast_path: FastPathHarness::new(),
+            recv_cache: recv::Cache::new(RecvDispatchWorkerId::new(0)),
+            ack_burst: Sent(Vec::new()),
+            idle_wheel: Sent(Vec::new()),
+            senders: Sent(Vec::new()),
+            wakers: Sent(Vec::new()),
+            path_secret_map,
+            clock: crate::time::testing::Clock::new(Duration::from_secs(1)),
+            route: PowerOfTwoRoute::new(1),
+        }
+    }
+
+    fn receive(
+        &mut self,
+        packet: datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    ) -> Result<(), Error> {
+        process(
+            Entry::new(packet),
+            &mut self.recv_cache,
+            &mut self.ack_burst,
+            &mut self.idle_wheel,
+            &self.path_secret_map,
+            &mut self.fast_path.acceptor_registry,
+            &mut self.fast_path.frame_tx,
+            &mut self.senders,
+            &mut self.fast_path.freed_batch_tx,
+            &self.clock,
+            &self.fast_path.counters,
+            &self.route,
+            &mut self.wakers,
+            &self.fast_path.stream_clock,
+            &self.fast_path.reader_metrics,
+            &self.fast_path.writer_metrics,
+            &self.fast_path.send_credit_pool,
+            &self.fast_path.recv_credit_pool,
+        )
+    }
+}
+
+/// A path-secret map whose cleaner is stopped, so that no cleaner cycle takes an entry's
+/// authenticated bit between a packet and the test's read of it.
+fn map_without_cleaner(signer: &[u8]) -> PathSecretMap {
+    let map = PathSecretMap::builder()
+        .with_signer(stateless_reset::Signer::new(signer))
+        .with_capacity(10)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber(crate::event::tracing::Subscriber::default())
+        .build()
+        .unwrap();
+    map.test_stop_cleaner();
+    map
+}
+
+/// `process` counts each packet that opens on a cached receive context and passes the
+/// context's packet-number check as use of the path secret for the map's eviction order, so an
+/// entry whose only traffic is one long-lived stream counts as used in each cleaner cycle. A
+/// replay of that packet opens with the cached opener, and `process` drops it as a duplicate
+/// without marking the entry.
+#[test]
+fn process_marks_use_for_each_opened_packet_on_a_cached_context() {
+    let client_addr: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+    let server_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let client = map_without_cleaner(b"client");
+    let server = map_without_cleaner(b"server");
+    let ids = client.test_insert_pair(
+        PathSecretEntry::builder(server_addr).local(client_addr),
+        &server,
+        PathSecretEntry::builder(client_addr).local(server_addr),
+    );
+
+    // The client seals each packet with its entry of the pair, which the server's entry opens.
+    let (sealer, credentials) = client
+        .get_by_id(&ids.local)
+        .expect("the client's entry of the pair")
+        .reusable_sealer();
+    assert_eq!(credentials.id, ids.peer);
+    // A single QueueMsg to a queue the server hasn't bound: `process` authenticates it in place
+    // before the packet-number check, as it does for each packet that opens.
+    let sealed = |packet_number: u8| {
+        seal_queue_msg_packet(
+            client_addr,
+            &sealer,
+            &credentials,
+            VarInt::from_u8(packet_number),
+            VarInt::from_u8(0),
+            VarInt::from_u8(1),
+            17,
+            17,
+            0,
+        )
+    };
+    let mut harness = ProcessHarness::new(server);
+
+    // The first packet opens on a cache miss, which creates the receive context and hands it to
+    // the idle wheel. A cleaner cycle then takes the bit.
+    assert!(harness.receive(sealed(0)).is_ok());
+    assert_eq!(harness.idle_wheel.0.len(), 1);
+    let entry = harness.idle_wheel.0[0].borrow().path_entry.clone();
+    assert_eq!(*entry.id(), ids.peer);
+    assert!(entry.take_accessed_authenticated());
+
+    // A later packet opens on the cached context, so no other context goes to the idle wheel,
+    // and passes the packet-number check, which marks the entry.
+    assert!(harness.receive(sealed(1)).is_ok());
+    assert_eq!(harness.idle_wheel.0.len(), 1);
+    assert!(entry.take_accessed_authenticated());
+
+    // A replay of that packet opens on the cached context and fails the packet-number check:
+    // `process` drops it as a duplicate and doesn't mark the entry.
+    assert!(matches!(
+        harness.receive(sealed(1)),
+        Err(Error::Duplicate { packet_number, .. }) if packet_number == VarInt::from_u8(1)
+    ));
+    assert!(!entry.take_accessed_authenticated());
 }
