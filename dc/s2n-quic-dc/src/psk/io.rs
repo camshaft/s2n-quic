@@ -612,7 +612,8 @@ pub enum HandshakeReason {
     User,
     /// Periodic re-handshaking
     Periodic,
-    /// Rehandshaking driven by remote packets (e.g., unknown path secret).
+    /// Rehandshaking driven by the remote peer: a packet it sends (e.g., unknown path secret), or
+    /// its silence on a path the send idle wheel marks dead.
     Remote,
 }
 
