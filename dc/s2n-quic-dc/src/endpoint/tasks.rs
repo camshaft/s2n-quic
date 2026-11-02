@@ -1236,10 +1236,14 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // once for each quiet period, so that the idle timeout decides on it as it
                 // decides on an unacknowledged packet. `probed` holds once the probe of the
                 // current quiet period went out; a later peer activity starts a new period.
+                // An invalidated context is probed as well. It stays on the idle wheel, and
+                // where no live context of its path is there, as after a stale key's
+                // invalidation with nothing to retransmit, its check is the only one left on the
+                // path. Its Ping goes to the path's current context, which the frame pipeline
+                // makes where there is none, and the answer moves the path's last activity.
                 let probed = ctx.idle_probe_for == Some(last_activity.nanos);
                 let open_stream = ctx.path_secret_entry.queue_state().has_open_stream();
-                let wants_probe =
-                    !probed && !ctx.invalidated && !ctx.inflight.has_inflight() && open_stream;
+                let wants_probe = !probed && !ctx.inflight.has_inflight() && open_stream;
 
                 // Compute the reschedule target. If it's in a future wheel tick,
                 // reschedule and return early.
