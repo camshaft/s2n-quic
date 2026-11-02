@@ -796,7 +796,8 @@ fn send_idle_wheel_probes_an_invalidated_context_half_an_idle_timeout_in() {
 /// last activity, which the idle wheel reads for the invalidated context beside the context's
 /// own `last_peer_activity`, so the answer starts a new quiet period. The check half an idle
 /// timeout after the probe, which marks the peer dead where the probe goes unanswered, finds
-/// that period unprobed and doesn't mark the peer dead.
+/// that period unprobed and doesn't mark the peer dead, and the check half an idle timeout
+/// after the answer probes that period.
 #[test]
 fn send_idle_wheel_starts_a_new_quiet_period_once_an_invalidated_contexts_probe_is_answered() {
     let _guard = crate::testing::without_snapshots();
@@ -872,7 +873,22 @@ fn send_idle_wheel_starts_a_new_quiet_period_once_an_invalidated_contexts_probe_
             assert_ne!(
                 ctx.borrow().idle_probe_for,
                 Some(answered.nanos),
-                "the earlier probe shouldn't count for the quiet period the answer started"
+                "the new quiet period's probe shouldn't go out before half an idle timeout"
+            );
+
+            // Past the new quiet period's probe, half an idle timeout after the answer, the
+            // idle wheel has probed that period for the answer's last activity, and the peer
+            // still isn't marked dead.
+            3.s().sleep().await;
+            let now = precision::Clock::now(&Clock::default());
+            assert_eq!(
+                ctx.borrow().idle_probe_for,
+                Some(answered.nanos),
+                "the idle wheel should probe the quiet period the answer started"
+            );
+            assert!(
+                !pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "the new quiet period's probe should go out before the peer is marked dead"
             );
             drop(stream);
         }
