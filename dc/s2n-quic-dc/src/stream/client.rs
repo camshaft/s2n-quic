@@ -125,10 +125,34 @@ impl Client {
         priority: crate::credit::Priority,
     ) -> io::Result<Stream> {
         let handshake_start = Instant::now();
-        let (peer, handshake_kind) = self
+        let peer_addr = peer;
+        let (peer, mut handshake_kind) = self
             .psk
-            .handshake_with_entry(peer, self.server_name.clone())
+            .handshake_with_entry(peer_addr, self.server_name.clone())
             .await?;
+        let mut path_secret_entry = peer.into_raw();
+
+        // A cached entry whose peer was marked dead, past the dead-peer cooldown, and hasn't
+        // answered for a whole idle timeout can't recover by itself: only a packet from the peer
+        // clears the mark, and each flow we open on it goes unanswered and marks it again. Evict
+        // it and handshake again, so the peer gets fresh keys and queue state, in place of
+        // refusing flows until the process restarts.
+        if matches!(handshake_kind, crate::path::secret::HandshakeKind::Cached)
+            && path_secret_entry.is_dead_and_silent(
+                self.endpoint.clock.now(),
+                self.endpoint.path_secret_map.entry_age(&path_secret_entry),
+                self.endpoint.dead_peer_cooldown,
+            )
+        {
+            // Connects that find the same entry at once share one handshake, and a later one
+            // gets that handshake's entry, as `handshake_replacing` says.
+            let (peer, kind) = self
+                .psk
+                .handshake_replacing(peer_addr, &path_secret_entry, self.server_name.clone())
+                .await?;
+            path_secret_entry = peer.into_raw();
+            handshake_kind = kind;
+        }
         let handshake_elapsed = handshake_start.elapsed();
         let handshake_timer = match handshake_kind {
             crate::path::secret::HandshakeKind::Cached => {
@@ -140,7 +164,6 @@ impl Client {
         };
         handshake_timer.record(handshake_elapsed);
 
-        let path_secret_entry = peer.into_raw();
         let now = self.endpoint.clock.now();
         if path_secret_entry.is_dead_during_cooldown(now, self.endpoint.dead_peer_cooldown) {
             return Err(io::Error::new(
@@ -244,5 +267,253 @@ impl Client {
     {
         let stream = self.connect(peer, acceptor_id, priority).await?;
         rpc::from_stream(stream, request, response).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        credit::Priority,
+        path::secret::{stateless_reset::Signer, Map},
+        testing::{init_tracing, server_name, NoopSubscriber, TestTlsProvider},
+    };
+    use s2n_quic_core::time::StdClock;
+    use std::time::Duration;
+
+    /// `connect` replaces a cached entry that is dead and silent while the handshake queue still
+    /// holds the success of the handshake that built it: it evicts the entry, drops that hold,
+    /// handshakes again for a new entry, and records the second handshake on the fresh handshake
+    /// timer, not the cached one.
+    #[tokio::test]
+    async fn connect_replaces_a_dead_and_silent_entry_inside_the_success_hold() {
+        init_tracing();
+
+        let tls = TestTlsProvider {};
+        let server_map = Map::builder()
+            .with_signer(Signer::new(b"default"))
+            .with_capacity(50_000)
+            .with_clock(StdClock::default())
+            .with_subscriber(NoopSubscriber {})
+            .build()
+            .unwrap();
+        let server = psk::server::Provider::builder()
+            .start(
+                "[::1]:0".parse().unwrap(),
+                tls.clone(),
+                NoopSubscriber {},
+                server_map,
+            )
+            .await
+            .unwrap();
+        let server_addr = server.local_addr();
+
+        // The client's map runs on a test clock, so the test moves an entry's age past an idle
+        // timeout without waiting.
+        let map_clock = crate::time::testing::Clock::new(Duration::from_secs(1_000));
+        let map = Map::builder()
+            .with_signer(Signer::new(b"default"))
+            .with_capacity(50_000)
+            .with_clock(map_clock.clone())
+            .with_subscriber(NoopSubscriber {})
+            .build()
+            .unwrap();
+        map.test_stop_cleaner();
+
+        // A success hold far longer than the test, so the first handshake's success is still
+        // held when `connect` evicts its entry.
+        let handshakes = psk::client::Provider::builder()
+            .with_success_jitter(Duration::from_secs(1_000_000))
+            .start(
+                "[::]:0".parse().unwrap(),
+                map.clone(),
+                tls,
+                NoopSubscriber {},
+                server_name(),
+            )
+            .unwrap();
+
+        // The endpoint's clock counts from two minutes back. No packet updates the entry's last
+        // activity here, so the time since that activity already passes an idle timeout.
+        let start = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("the monotonic clock reads at least two minutes");
+        let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+        let (endpoint, _frames) = crate::endpoint::Endpoint::without_workers(
+            map.clone(),
+            crate::time::DefaultClock::busy_poll_from(start),
+            cooldown,
+        );
+        let endpoint = Arc::new(endpoint);
+        let mut client = Client::new(endpoint.clone(), handshakes, server_name());
+        let acceptor_id = VarInt::from_u8(0);
+
+        let stream = client
+            .connect(server_addr, acceptor_id, Priority::default())
+            .await
+            .expect("the first connect handshakes");
+        let first_binding = stream.binding_id();
+        drop(stream);
+        let first = map
+            .get_untracked(server_addr)
+            .expect("the first connect's entry")
+            .into_raw();
+        let first_id = *first.id();
+        let metrics = endpoint
+            .counters
+            .take_current_metrics_line()
+            .expect("the first connect records its handshake");
+        assert!(metrics.contains("Variant|fresh"), "{metrics}");
+        assert!(!metrics.contains("Variant|cached"), "{metrics}");
+
+        // The send idle wheel marks a peer dead when a flow goes unanswered. Mark it as of a
+        // time just past the dead-peer cooldown.
+        let now = endpoint.clock.now();
+        let dead_at = now - (cooldown + Duration::from_secs(1));
+        assert!(first.mark_dead_if_cooldown_elapsed(dead_at, cooldown));
+        assert!(!first.is_dead_during_cooldown(now, cooldown));
+        // The entry is new on the map's clock, so it hasn't been silent for an idle timeout yet.
+        let age = map.entry_age(&first);
+        assert!(!first.is_dead_and_silent(now, age, cooldown));
+
+        map_clock.advance(first.idle_timeout());
+        let now = endpoint.clock.now();
+        assert!(
+            first.is_dead_and_silent(now, map.entry_age(&first), cooldown),
+            "the entry is dead, past the cooldown and silent for an idle timeout"
+        );
+
+        // `connect` gets the cached entry back, evicts it, drops the handshake queue's hold on
+        // the first handshake's success and handshakes again. Without that drop, the second
+        // handshake would return the held success while the map has no entry for the peer, and
+        // this connect would fail with "handshake failed to exchange credentials".
+        let stream = client
+            .connect(server_addr, acceptor_id, Priority::default())
+            .await
+            .expect("connect replaces the dead and silent entry");
+        // A stream takes its binding id from its entry's queue state, which starts each entry's
+        // ids at the same value, so a stream on the new entry has the first stream's id, and one
+        // on the evicted entry would have that entry's next id.
+        assert_eq!(
+            stream.binding_id(),
+            first_binding,
+            "the stream uses the new entry's queue state"
+        );
+        drop(stream);
+        let second = map
+            .get_untracked(server_addr)
+            .expect("the second connect's entry")
+            .into_raw();
+        assert_ne!(
+            *second.id(),
+            first_id,
+            "connect handshook again for a new entry"
+        );
+        let metrics = endpoint
+            .counters
+            .take_current_metrics_line()
+            .expect("the second connect records its handshake");
+        assert!(metrics.contains("Variant|fresh"), "{metrics}");
+        assert!(!metrics.contains("Variant|cached"), "{metrics}");
+    }
+
+    /// `connect` to a peer that is down, with its entry dead past the cooldown and silent for an
+    /// idle timeout, evicts the entry and handshakes, and returns that handshake's error in place
+    /// of the cooldown refusal. The handshake queue keeps the failure, so a connect right after
+    /// it gets the same failure back without handshaking again.
+    #[tokio::test]
+    async fn connect_to_a_down_peer_returns_the_handshake_error() {
+        init_tracing();
+
+        // A loopback address that nothing listens on: bind a socket for a free port, then
+        // close it.
+        let peer_addr = std::net::UdpSocket::bind("[::1]:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let map_clock = crate::time::testing::Clock::new(Duration::from_secs(1_000));
+        let map = Map::builder()
+            .with_signer(Signer::new(b"default"))
+            .with_capacity(50_000)
+            .with_clock(map_clock.clone())
+            .with_subscriber(NoopSubscriber {})
+            .build()
+            .unwrap();
+        map.test_stop_cleaner();
+
+        let handshakes = psk::client::Provider::builder()
+            .start(
+                "[::]:0".parse().unwrap(),
+                map.clone(),
+                TestTlsProvider {},
+                NoopSubscriber {},
+                server_name(),
+            )
+            .unwrap();
+
+        // The endpoint's clock counts from two minutes back. No packet updates the entry's last
+        // activity here, so the time since that activity already passes an idle timeout.
+        let start = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("the monotonic clock reads at least two minutes");
+        let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+        let (endpoint, _frames) = crate::endpoint::Endpoint::without_workers(
+            map.clone(),
+            crate::time::DefaultClock::busy_poll_from(start),
+            cooldown,
+        );
+        let endpoint = Arc::new(endpoint);
+        let mut client = Client::new(endpoint.clone(), handshakes, server_name());
+        let acceptor_id = VarInt::from_u8(0);
+
+        // An entry for the peer, as an earlier handshake would leave it, marked dead as of a time
+        // just past the cooldown and silent for an idle timeout.
+        map.test_insert(peer_addr, s2n_quic_core::endpoint::Type::Client);
+        let entry = map
+            .get_untracked(peer_addr)
+            .expect("the inserted entry")
+            .into_raw();
+        let now = endpoint.clock.now();
+        let dead_at = now - (cooldown + Duration::from_secs(1));
+        assert!(entry.mark_dead_if_cooldown_elapsed(dead_at, cooldown));
+        // The test entry builder takes the entry's creation time from the process clock, which a
+        // long test process reads past the map's test clock, so move the map's clock to one idle
+        // timeout past the entry's creation, whatever the process clock reads.
+        let map_now = s2n_quic_core::time::Clock::get_time(&map_clock);
+        let behind = entry.creation_time().saturating_duration_since(map_now);
+        map_clock.advance(behind + entry.idle_timeout());
+        let now = endpoint.clock.now();
+        assert!(
+            entry.is_dead_and_silent(now, map.entry_age(&entry), cooldown),
+            "the entry is dead, past the cooldown and silent for an idle timeout"
+        );
+
+        let first_start = std::time::Instant::now();
+        let error = client
+            .connect(peer_addr, acceptor_id, Priority::default())
+            .await
+            .map(|_| ())
+            .expect_err("nothing answers the handshake");
+        let first_elapsed = first_start.elapsed();
+        assert!(
+            !error.to_string().contains("dead cooldown"),
+            "connect returns the handshake's error, not the cooldown refusal: {error}"
+        );
+        assert!(
+            !map.contains(&peer_addr),
+            "connect evicted the dead entry, and the failed handshake didn't insert one"
+        );
+
+        let second_start = std::time::Instant::now();
+        client
+            .connect(peer_addr, acceptor_id, Priority::default())
+            .await
+            .map(|_| ())
+            .expect_err("the held failure comes back");
+        assert!(
+            second_start.elapsed() < first_elapsed,
+            "the second connect gets the held failure without handshaking again"
+        );
     }
 }

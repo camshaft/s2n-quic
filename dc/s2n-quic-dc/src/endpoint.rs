@@ -72,6 +72,51 @@ type BatchSender =
 type BatchReceiver = sync_queue::Receiver<combinator::FrameBatch>;
 type AckMsgReceiver = sync_queue::Receiver<msg::Sender>;
 
+#[cfg(test)]
+impl Endpoint {
+    /// An endpoint that doesn't run any worker or hold any socket, for tests of
+    /// `stream::Client::connect`: `connect` reads only the endpoint's path-secret map, clock,
+    /// dead-peer cooldown, metrics, credit pools and frame sender, and a stream it returns sends
+    /// nothing until its first write. The returned receiver keeps the frame channel open while
+    /// the test holds it.
+    pub(crate) fn without_workers(
+        path_secret_map: crate::path::secret::Map,
+        clock: crate::time::DefaultClock,
+        dead_peer_cooldown: Duration,
+    ) -> (Self, frame::SubmissionReceiver) {
+        let counters = crate::counter::Registry::default();
+        let (frame_tx, frame_rx) = frame::submission_channel(1);
+        let reader_metrics = Arc::new(crate::stream::metrics::ReaderMetrics::new(
+            &counters,
+            "stream.reader",
+        ));
+        let writer_metrics = Arc::new(crate::stream::metrics::WriterMetrics::new(
+            &counters,
+            "stream.writer",
+        ));
+        let client_metrics = Arc::new(crate::stream::metrics::ClientMetrics::new(&counters));
+        let send_credit_pool = crate::sync::Arc::new(crate::credit::Pool::new(Default::default()));
+        let recv_credit_pool = crate::sync::Arc::new(crate::credit::Pool::new(Default::default()));
+        let endpoint = Self {
+            frame_tx,
+            path_secret_map,
+            acceptor_registry: acceptor::Registry::new(),
+            counters,
+            next_binding_id: AtomicU64::new(0),
+            data_addrs: Vec::new(),
+            dead_peer_cooldown,
+            clock,
+            reader_metrics,
+            writer_metrics,
+            client_metrics,
+            send_credit_pool,
+            recv_credit_pool,
+            recv_rings: Vec::new(),
+        };
+        (endpoint, frame_rx)
+    }
+}
+
 pub struct Endpoint {
     /// Frame submission channel (writers submit frame inputs here)
     pub frame_tx: SubmissionSender,
@@ -1564,7 +1609,7 @@ where
                 };
                 let rx = tasks::invalidation_validator(
                     bg.raw_rx,
-                    bg.path_secret_map,
+                    bg.path_secret_map.clone(),
                     bg.send_txs,
                     bg.recv_txs,
                     bg.sender_id_to_worker,
@@ -1593,8 +1638,19 @@ where
                         .receiver("task.peer_dead_broadcast")
                         .with_function("endpoint::Worker::spawn"),
                 );
-                let rx =
-                    tasks::peer_dead_broadcast(peer_dead_rx, bg.waker_sink, peer_dead_counters);
+                // A client path the idle wheel marks dead asks the handshake client registered
+                // on the map, where one is, for a new handshake with the peer in the background.
+                let path_secret_map = bg.path_secret_map;
+                let request_rehandshake = move |peer| {
+                    let reason = crate::psk::io::HandshakeReason::Remote;
+                    let _ = path_secret_map.request_handshake(peer, reason);
+                };
+                let rx = tasks::peer_dead_broadcast(
+                    peer_dead_rx,
+                    bg.waker_sink,
+                    peer_dead_counters,
+                    request_rehandshake,
+                );
                 let task_counter = counter_registry
                     .register_nominal_task("task.peer_dead_broadcast", "background")
                     .with_registration_metadata(
