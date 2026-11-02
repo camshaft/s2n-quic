@@ -13,12 +13,15 @@
 //! `O_DIRECT` is rejected) and on macOS the open path falls back appropriately.
 
 use s2n_quic_core::buffer::writer::Storage as _;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::{
     fs::OpenOptions,
     io,
-    os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
+#[cfg(windows)]
+use windows_file_ext::FileExt;
 
 /// Device block alignment for direct IO. 4 KiB covers every common page/sector size.
 pub const ALIGNMENT: usize = 4096;
@@ -236,12 +239,23 @@ pub struct File {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl std::os::fd::AsRawFd for File {
     /// Lets `Arc<File>` coerce to `Arc<dyn AsRawFd + Send + Sync>` so it can back an
     /// [`Fd`](crate::fs::op::Fd) — the file then stays open for an op's whole lifetime.
     #[inline]
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.inner.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawHandle for File {
+    /// Lets `Arc<File>` coerce to `Arc<dyn AsRawHandle + Send + Sync>` so it can back an
+    /// [`Fd`](crate::fs::op::Fd), which keeps the file open for an op's whole lifetime.
+    #[inline]
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        std::os::windows::io::AsRawHandle::as_raw_handle(&self.inner)
     }
 }
 
@@ -257,6 +271,7 @@ impl File {
     }
 
     /// The raw fd, for handing to a backend (e.g. an `IoOp`'s `fd` field).
+    #[cfg(unix)]
     #[inline]
     pub fn raw_fd(&self) -> i32 {
         use std::os::fd::AsRawFd;
@@ -290,7 +305,8 @@ impl File {
 }
 
 /// Open a file, optionally in direct (unbuffered) mode. On Linux uses `O_DIRECT` (skipped on tmpfs,
-/// which rejects it); on macOS sets `F_NOCACHE` after open.
+/// which rejects it); on macOS sets `F_NOCACHE` after open; on Windows opens with
+/// `FILE_FLAG_NO_BUFFERING`, which asks the same sector alignment as `O_DIRECT`.
 fn open_file(path: &Path, truncate: bool, direct: bool) -> io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options
@@ -322,7 +338,16 @@ fn open_file(path: &Path, truncate: bool, direct: bool) -> io::Result<std::fs::F
         Ok(file)
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        if direct {
+            options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING);
+        }
+        options.open(path)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = direct;
         options.open(path)
@@ -346,6 +371,60 @@ fn is_tmpfs(path: &Path) -> io::Result<bool> {
     // SAFETY: `statfs` was initialized by a successful `statfs` call.
     let statfs = unsafe { statfs.assume_init() };
     Ok(statfs.f_type == libc::TMPFS_MAGIC)
+}
+
+/// The positional reads and writes of Unix's `FileExt`, on Windows' `seek_read` and `seek_write`.
+#[cfg(windows)]
+mod windows_file_ext {
+    use std::{io, os::windows::fs::FileExt as _};
+
+    pub trait FileExt {
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+    }
+
+    impl FileExt for std::fs::File {
+        fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+            while !buf.is_empty() {
+                match self.seek_read(buf, offset) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "failed to fill whole buffer",
+                        ))
+                    }
+                    Ok(n) => {
+                        let tmp = buf;
+                        buf = &mut tmp[n..];
+                        offset += n as u64;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(())
+        }
+
+        fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+            while !buf.is_empty() {
+                match self.seek_write(buf, offset) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        ))
+                    }
+                    Ok(n) => {
+                        buf = &buf[n..];
+                        offset += n as u64;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
