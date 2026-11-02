@@ -64,13 +64,20 @@ const ANSWER: &[u8] = b"done";
 struct FirstStream {
     /// Sent once the host has read `CHANGE_AT` bytes of the upload.
     mid_stream: oneshot::Sender<()>,
+    /// Where set, the host waits on it after `mid_stream` and then writes one byte on the
+    /// stream. The phone sends on it right after the change, which drops the byte, so the host
+    /// holds a packet the phone hasn't acknowledged and marks the phone dead once its idle
+    /// timeout passes after the phone's last packet (`send_idle_wheel_drain` marks a peer dead
+    /// only with unacknowledged packets).
+    write_after_change: Option<oneshot::Receiver<()>>,
     /// How the host's read of the upload ended: the bytes read before its end, or the error.
     read: Option<oneshot::Sender<io::Result<u64>>>,
 }
 
 /// Runs the host in the "server" group. It accepts each stream, reads the phone's upload to
 /// its end, and writes `ANSWER` with FIN once the whole upload arrived. The handler of the
-/// first stream reports on `first`.
+/// first stream reports on `first`, and writes one byte on its stream once it receives on
+/// `first.write_after_change`.
 fn spawn_host(first: FirstStream) {
     async move {
         let server = Server::new();
@@ -83,9 +90,13 @@ fn spawn_host(first: FirstStream) {
             let report = first.take();
             async move {
                 let (mut reader, mut writer) = stream.into_split();
-                let (mut mid_stream, read_report) = match report {
-                    Some(report) => (Some(report.mid_stream), report.read),
-                    None => (None, None),
+                let (mut mid_stream, mut write_after_change, read_report) = match report {
+                    Some(report) => (
+                        Some(report.mid_stream),
+                        report.write_after_change,
+                        report.read,
+                    ),
+                    None => (None, None, None),
                 };
 
                 let mut upload = Data::new(UPLOAD_LEN);
@@ -98,6 +109,12 @@ fn spawn_host(first: FirstStream) {
                             if received >= CHANGE_AT {
                                 if let Some(mid_stream) = mid_stream.take() {
                                     let _ = mid_stream.send(());
+                                }
+                                if let Some(write_after_change) = write_after_change.take() {
+                                    if write_after_change.await.is_ok() {
+                                        let mut byte = Bytes::from_static(b"!");
+                                        let _ = writer.write_all_from(&mut byte).await;
+                                    }
                                 }
                             }
                         }
@@ -235,7 +252,10 @@ async fn complete_work(stream: Stream, bound: Duration, what: &str) {
 /// marks the host dead, and its reader and writer end in `TimedOut`. The app then opens its
 /// endpoint again on the new network, a group of its own with an address of its own, and the
 /// work completes on a new connection there; from then on the old address doesn't send
-/// anything. The host's read of the first upload ends in `TimedOut` too.
+/// anything. Right after the move the host writes one byte on the old stream, which the move
+/// drops, so the host holds a packet the phone hasn't acknowledged: once the phone stops
+/// sending and the host's idle timeout passes, the host marks the phone dead, and its read of
+/// the first upload ends in `TimedOut` too.
 #[test]
 fn wifi_move_mid_stream_times_out_then_completes_on_the_new_network() {
     // Snapshot disabled: the test waits through idle timeouts, and its trace would be large.
@@ -263,9 +283,11 @@ fn wifi_move_mid_stream_times_out_then_completes_on_the_new_network() {
         }
 
         let (mid_stream, mid_stream_rx) = oneshot::channel();
+        let (write_after_change, write_after_change_rx) = oneshot::channel();
         let (host_read, host_read_rx) = oneshot::channel();
         spawn_host(FirstStream {
             mid_stream,
+            write_after_change: Some(write_after_change_rx),
             read: Some(host_read),
         });
 
@@ -280,7 +302,10 @@ fn wifi_move_mid_stream_times_out_then_completes_on_the_new_network() {
             change_mid_stream(
                 stream,
                 mid_stream_rx,
-                || moved.store(true, Ordering::Relaxed),
+                || {
+                    moved.store(true, Ordering::Relaxed);
+                    let _ = write_after_change.send(());
+                },
                 idle * 2,
                 io::ErrorKind::TimedOut,
             )
@@ -325,8 +350,10 @@ fn wifi_move_mid_stream_times_out_then_completes_on_the_new_network() {
 /// any more, so the phone doesn't hear from the host. The phone has packets the host hasn't
 /// acknowledged, so once its idle timeout passes it marks the host dead, and its reader and
 /// writer end in `TimedOut`. A connect right after is refused at once with `TimedOut`, since
-/// the dead-peer cooldown holds. Once the phone stops sending, the host's read of the upload
-/// ends in `TimedOut` too.
+/// the dead-peer cooldown holds. Right after the change the host writes one byte on the
+/// stream, which the change drops, so the host holds a packet the phone hasn't acknowledged:
+/// once the phone stops sending and the host's idle timeout passes, the host marks the phone
+/// dead, and its read of the upload ends in `TimedOut` too.
 #[test]
 fn address_change_mid_stream_times_out() {
     // Snapshot disabled: the test waits through idle timeouts, and its trace would be large.
@@ -346,9 +373,11 @@ fn address_change_mid_stream_times_out() {
         }
 
         let (mid_stream, mid_stream_rx) = oneshot::channel();
+        let (write_after_change, write_after_change_rx) = oneshot::channel();
         let (host_read, host_read_rx) = oneshot::channel();
         spawn_host(FirstStream {
             mid_stream,
+            write_after_change: Some(write_after_change_rx),
             read: Some(host_read),
         });
 
@@ -362,7 +391,10 @@ fn address_change_mid_stream_times_out() {
             change_mid_stream(
                 stream,
                 mid_stream_rx,
-                || rebound.store(true, Ordering::Relaxed),
+                || {
+                    rebound.store(true, Ordering::Relaxed);
+                    let _ = write_after_change.send(());
+                },
                 idle * 2,
                 io::ErrorKind::TimedOut,
             )
@@ -421,6 +453,7 @@ fn suspension_mid_stream_times_out_then_completes_on_a_new_connection() {
         let (mid_stream, mid_stream_rx) = oneshot::channel();
         spawn_host(FirstStream {
             mid_stream,
+            write_after_change: None,
             read: None,
         });
 
