@@ -275,6 +275,10 @@ impl Cleaner {
 
         drop(rehandshake);
 
+        // Drop the entries the map revoked that no stream or frame holds any longer, so that
+        // their allocations don't wait for the next key removal.
+        state.drop_released_revoked();
+
         let id_entries = state.ids.len();
         let address_entries = state.peers_len();
 
