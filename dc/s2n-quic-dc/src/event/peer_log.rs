@@ -46,36 +46,19 @@ enum Level {
     Error,
 }
 
-/// What a throttled event is about.
+/// What a throttled event is about: the peer's address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Subject {
-    /// The peer's address
-    Peer(SocketAddr),
-    /// The credential id of an event that doesn't carry the peer's address
-    Credential([u8; 16]),
-}
+struct Subject(SocketAddr);
 
 impl Subject {
     fn peer(address: &api::SocketAddress) -> Self {
-        Self::Peer(address.into())
-    }
-
-    fn credential(id: &[u8]) -> Self {
-        let mut bytes = [0; 16];
-        let len = id.len().min(bytes.len());
-        bytes[..len].copy_from_slice(&id[..len]);
-        Self::Credential(bytes)
+        Self(address.into())
     }
 }
 
 impl fmt::Display for Subject {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Peer(address) => fmt::Display::fmt(address, f),
-            // The line's credential id tells which peer it is: the map's `entry_ready` line for the
-            // same credential id, and its control packet lines, give the peer's address.
-            Self::Credential(_) => f.write_str("unknown"),
-        }
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
@@ -239,11 +222,7 @@ fn emit(
     held_back: u64,
     detail: fmt::Arguments,
 ) {
-    let credential_id = match (credential_id, &subject) {
-        (Some(id), _) => CredentialId(Some(id)),
-        (None, Subject::Credential(id)) => CredentialId(Some(&id[..])),
-        (None, Subject::Peer(_)) => CredentialId(None),
-    };
+    let credential_id = CredentialId(credential_id);
 
     match level {
         Level::Info => ::tracing::info!(
@@ -279,9 +258,7 @@ fn emit(
 /// - each entry evicted from the map, by credential id or by address, at `WARN`;
 /// - each `UnknownPathSecret` packet sent, received, accepted (at `WARN`), rejected or dropped;
 /// - each replay the map detects, and each packet whose key id is too old for the replay window
-///   to tell (a stale key), at `WARN`. These events carry the credential id and not the peer's
-///   address, so they are throttled for each credential id, and the `ReplayDetected` and
-///   `StaleKey` packet lines for the same credential id give the peer;
+///   to tell (a stale key), at `WARN`;
 /// - each `ReplayDetected` and `StaleKey` packet sent, received, accepted, rejected or dropped;
 /// - each background handshake the map asks for, each entry replaced by a new one for the same
 ///   peer, and each entry ready for use;
@@ -317,20 +294,6 @@ impl Subscriber {
     ) {
         let now = meta.timestamp.duration_since_start();
         let subject = Subject::peer(peer);
-        self.throttle.log(now, level, E::NAME, subject, id, detail);
-    }
-
-    fn credential<E: Event>(
-        &self,
-        meta: &api::EndpointMeta,
-        level: Level,
-        _event: &E,
-        credential_id: &[u8],
-        detail: fmt::Arguments,
-    ) {
-        let now = meta.timestamp.duration_since_start();
-        let subject = Subject::credential(credential_id);
-        let id = Some(credential_id);
         self.throttle.log(now, level, E::NAME, subject, id, detail);
     }
 }
@@ -476,11 +439,14 @@ impl event::Subscriber for Subscriber {
         meta: &api::EndpointMeta,
         event: &api::ReplayDefinitelyDetected,
     ) {
-        self.credential(
+        let peer = &event.peer_address;
+        let id = Some(event.credential_id);
+        self.peer(
             meta,
             Level::Warn,
             event,
-            event.credential_id,
+            peer,
+            id,
             format_args!("key_id={}", event.key_id),
         );
     }
@@ -490,11 +456,14 @@ impl event::Subscriber for Subscriber {
         meta: &api::EndpointMeta,
         event: &api::ReplayPotentiallyDetected,
     ) {
-        self.credential(
+        let peer = &event.peer_address;
+        let id = Some(event.credential_id);
+        self.peer(
             meta,
             Level::Warn,
             event,
-            event.credential_id,
+            peer,
+            id,
             format_args!("key_id={} gap={}", event.key_id, event.gap),
         );
     }
@@ -638,7 +607,7 @@ impl HandshakeSubscriber {
         detail: fmt::Arguments,
     ) {
         let now = meta.timestamp.duration_since_start();
-        let subject = Subject::Peer(peer);
+        let subject = Subject(peer);
         self.throttle.log(now, level, kind, subject, None, detail);
     }
 }
