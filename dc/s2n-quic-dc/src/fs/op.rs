@@ -21,7 +21,26 @@ use crate::{
     fs::device::{Device, LocalRingId},
     sync::Arc,
 };
-use std::os::fd::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+/// The OS handle of a file: a file descriptor on Unix, a `HANDLE` on Windows.
+#[cfg(unix)]
+pub type RawFile = std::os::fd::RawFd;
+
+/// The OS handle of a file: a file descriptor on Unix, a `HANDLE` on Windows.
+#[cfg(windows)]
+pub type RawFile = std::os::windows::io::RawHandle;
+
+/// A shared file that exposes its OS handle: its descriptor on Unix, its `HANDLE` on Windows.
+#[cfg(unix)]
+pub type SharedFile = dyn AsRawFd + Send + Sync;
+
+/// A shared file that exposes its OS handle: its descriptor on Unix, its `HANDLE` on Windows.
+#[cfg(windows)]
+pub type SharedFile = dyn AsRawHandle + Send + Sync;
 
 /// A file descriptor handle that **keeps the file open for the op's whole lifetime**.
 ///
@@ -31,25 +50,34 @@ use std::os::fd::{AsRawFd, RawFd};
 /// recycled, and the backend would `pread`/`pwrite` (or hand io_uring) a **stale or reused**
 /// descriptor. Worse for io_uring, the kernel holds the fd across the async op.
 ///
-/// `Fd` carries an `Arc<dyn AsRawFd + Send + Sync>` — typically an `Arc<File>` — so the op pins the
+/// `Fd` carries an `Arc<`[`SharedFile`]`>` — typically an `Arc<File>` — so the op pins the
 /// file open until it completes and is dropped, exactly as it pins its [`Device`] and its buffer.
 /// Cloning is a cheap `Arc` bump; `as_raw()` yields the descriptor for the backend syscall/SQE, valid
 /// because the `Fd` (held by the op) outlives that call.
 #[derive(Clone)]
-pub struct Fd(Arc<dyn AsRawFd + Send + Sync>);
+pub struct Fd(Arc<SharedFile>);
 
 impl Fd {
     /// Wrap a shared, raw-fd-bearing handle (e.g. `Arc<File>`); the op holds it open until done.
     #[inline]
-    pub fn new(file: Arc<dyn AsRawFd + Send + Sync>) -> Self {
+    pub fn new(file: Arc<SharedFile>) -> Self {
         Self(file)
     }
 
     /// The raw descriptor, for a backend syscall / SQE. Valid for the duration of the call because
     /// the owning op (and thus this `Fd`) outlives it.
+    #[cfg(unix)]
     #[inline]
-    pub fn as_raw(&self) -> RawFd {
+    pub fn as_raw(&self) -> RawFile {
         self.0.as_raw_fd()
+    }
+
+    /// The raw `HANDLE`, for a backend file call. Valid for the duration of the call because the
+    /// owning op (and thus this `Fd`) outlives it.
+    #[cfg(windows)]
+    #[inline]
+    pub fn as_raw(&self) -> RawFile {
+        self.0.as_raw_handle()
     }
 }
 
@@ -207,7 +235,7 @@ pub struct IoOp {
     /// release its own credit (`device.pool_for(kind).release(..)`) on whatever thread completes it,
     /// with no `DeviceTable` lookup. Assigned at submit time.
     pub device: Arc<Device>,
-    /// Target file, carried as an [`Fd`] (`Arc<dyn AsRawFd>`) so the op keeps it open for its whole
+    /// Target file, carried as an [`Fd`] (`Arc<SharedFile>`) so the op keeps it open for its whole
     /// lifetime — no use-after-free if the caller drops its `File` before the op completes.
     pub fd: Fd,
     /// Byte offset within the file.
