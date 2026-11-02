@@ -455,6 +455,9 @@ struct Inner {
     status: Status,
     /// Reset error code if the stream was reset by the peer
     reset_error_code: Option<VarInt>,
+    /// Whether this reader sent the peer's writer the reset of a revoked path secret (see
+    /// [`Inner::reset_peer_on_revoke`]).
+    revoke_reset_sent: bool,
     /// Counts total EOF returns in debug builds so a second `Ok(0)` can trip a
     /// debug assertion and catch post-EOF spin loops.
     #[cfg(debug_assertions)]
@@ -552,6 +555,7 @@ impl Reader {
             // acceptor id and no MAX_DATA is advertised until a packet arrives.
             status: Status::Init,
             reset_error_code: None,
+            revoke_reset_sent: false,
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
@@ -607,6 +611,7 @@ impl Reader {
             // Already bound: the server reader is open for reads immediately.
             status: Status::Open,
             reset_error_code: None,
+            revoke_reset_sent: false,
             #[cfg(debug_assertions)]
             eof_counter: 0,
             coop: Coop::default(),
@@ -1388,6 +1393,9 @@ impl Inner {
                 );
                 self.reset_error_code = Some(error_code);
                 self.status.on_reset().ok();
+                // On a revoked path secret this is the map's reset (`Entry::revoke`): reset the
+                // peer's writer now, as the reset wakes this reader, rather than on drop.
+                self.reset_peer_on_revoke();
                 // Only clear the reassembler immediately when it is
                 // already empty.  If data was buffered before the
                 // reset arrived, leave it intact so poll_read_into_inner
@@ -2012,6 +2020,19 @@ impl Inner {
         }
     }
 
+    /// Sends the peer's writer a reset with `PEER_KEY_REMOVED`, once, where the map revoked the
+    /// stream's path secret (see `Entry::revoke`): the peer still holds the path secret, and the
+    /// unknown path secret packet the map sent it may not have reached it. The reader sends it as
+    /// the revoke's reset wakes it and it hands the error to its application, or else as it is
+    /// dropped, so a peer that sends nothing on the path secret doesn't wait for the drop.
+    fn reset_peer_on_revoke(&mut self) {
+        if self.revoke_reset_sent || !self.path_secret_entry.is_revoked() {
+            return;
+        }
+        self.revoke_reset_sent = true;
+        let _ = self.send_reset_frame(error::PEER_KEY_REMOVED, ResetTarget::Control);
+    }
+
     fn send_reset_frame(
         &mut self,
         error_code: VarInt,
@@ -2123,11 +2144,12 @@ impl Drop for Reader {
             );
         } else if self.0.path_secret_entry.is_revoked() {
             // The map revoked the stream's path secret because the peer's key was removed, which
-            // reset this reader. The peer still holds the path secret, so reset its writer too.
-            let _ = self.0.send_reset_frame(error::PEER_KEY_REMOVED, ResetTarget::Control);
+            // reset this reader. The peer still holds the path secret, so reset its writer too,
+            // where this reader didn't already as it handed the error to its application.
+            self.0.reset_peer_on_revoke();
             debug!(
                 binding_id = self.0.stream_rx.binding_id().as_u64(),
-                "Reader dropped on a revoked path secret - sent QueueReset"
+                "Reader dropped on a revoked path secret"
             );
         } else if !self.0.reassembler.is_writing_complete() && !self.0.status.is_reset() {
             let error_code = error::STOP_SENDING;
