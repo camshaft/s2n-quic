@@ -2676,6 +2676,8 @@ fn dead_and_silent_peer_entry_is_replaced() {
     let _no_snap = crate::testing::without_snapshots();
     let recovered = Arc::new(AtomicBool::new(false));
     let recovered_inner = recovered.clone();
+    let cooldown_refusals = Arc::new(AtomicUsize::new(0));
+    let cooldown_refusals_inner = cooldown_refusals.clone();
 
     sim(|| {
         let acceptor_id = VarInt::from_u8(1);
@@ -2766,10 +2768,21 @@ fn dead_and_silent_peer_entry_is_replaced() {
             for _ in 0..300 {
                 let peer = format!("server:{SERVER_PORT}");
                 let connect = client.connect(peer, acceptor_id);
-                let Ok(Ok(stream)) = timeout(5.s(), connect).await else {
-                    // Refused in the dead-peer cooldown window, or still waiting for a queue slot.
-                    1.s().sleep().await;
-                    continue;
+                let stream = match timeout(5.s(), connect).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        // Refused in the dead-peer cooldown window.
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            cooldown_refusals_inner.fetch_add(1, Ordering::Relaxed);
+                        }
+                        1.s().sleep().await;
+                        continue;
+                    }
+                    Err(_) => {
+                        // Still waiting for a queue slot.
+                        1.s().sleep().await;
+                        continue;
+                    }
                 };
                 let (mut reader, mut writer) = stream.into_split();
                 let mut ping = Bytes::from_static(b"ping");
@@ -2803,6 +2816,14 @@ fn dead_and_silent_peer_entry_is_replaced() {
         .spawn();
     });
 
+    // The monitor's drops leave the client's flows unanswered, so the send idle wheel marks the
+    // server dead, and connects are refused in the dead-peer cooldown window before the entry is
+    // evicted.
+    assert!(
+        cooldown_refusals.load(Ordering::Relaxed) > 0,
+        "no connect was refused in the dead-peer cooldown window, so the monitor's drops never \
+         made the client mark the server dead"
+    );
     assert!(
         recovered.load(Ordering::Relaxed),
         "the client never completed a stream to a healthy server after its cached entry stopped \
