@@ -195,7 +195,9 @@ impl Model {
                 state
                     .handle_unknown_path_secret_packet(&packet, &"127.0.0.1:1234".parse().unwrap());
 
-                if state.should_evict_on_unknown_path_secret()
+                // A client entry is evicted whatever the map's setting.
+                if (state.should_evict_on_unknown_path_secret()
+                    || local_id.endpoint_type() == s2n_quic_core::endpoint::Type::Client)
                     && self.invariants.contains(&Invariant::ContainsId(local_id))
                 {
                     self.invariants.retain(|invariant| {
@@ -376,6 +378,55 @@ fn no_memory_growth() {
     for idx in 0..500_000 {
         // FIXME: this ends up 2**16 peers in the `peers` map
         map.test_insert(fake_entry(idx as u64));
+    }
+}
+
+/// An accepted UnknownPathSecret evicts a client entry whatever the map's
+/// `with_evict_on_unknown_path_secret` setting, so the client's next connect handshakes again.
+/// For a server entry the setting still decides.
+#[test]
+fn unknown_path_secret_evicts_client_entry_by_default() {
+    use s2n_quic_core::endpoint::Type;
+
+    for (endpoint_type, evict_setting, evicted) in [
+        (Type::Client, false, true),
+        (Type::Server, false, false),
+        (Type::Server, true, true),
+    ] {
+        let map = State::builder()
+            .with_signer(stateless_reset::Signer::new(b"secret"))
+            .with_capacity(5)
+            .with_evict_on_unknown_path_secret(evict_setting)
+            .with_clock(Clock)
+            .with_subscriber(tracing::Subscriber::default())
+            .build_state()
+            .unwrap();
+        map.cleaner.stop();
+
+        let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into())
+            .endpoint_type(endpoint_type)
+            .build(None);
+        map.test_insert(entry.clone());
+        let peers = match endpoint_type {
+            Type::Client => &map.client_peers,
+            Type::Server => &map.server_peers,
+        };
+        assert!(peers.contains_key(entry.peer()), "{endpoint_type:?}");
+
+        // The peer's UnknownPathSecret: our peer_id on the wire, tagged with the entry's
+        // stateless-reset token.
+        let packet = crate::packet::secret_control::unknown_path_secret::Packet::new_for_test(
+            entry.id().for_peer(),
+            &entry.sender().stateless_reset,
+        );
+        let accepted = map
+            .handle_unknown_path_secret_packet(&packet, &"127.0.0.1:1234".parse().unwrap())
+            .is_some();
+        assert!(accepted, "{endpoint_type:?}");
+
+        let case = format!("{endpoint_type:?}, setting {evict_setting}");
+        assert_eq!(!map.ids.contains_key(entry.id()), evicted, "{case}");
+        assert_eq!(!peers.contains_key(entry.peer()), evicted, "{case}");
     }
 }
 
