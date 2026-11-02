@@ -378,7 +378,8 @@ mod tests {
         assert!(first.mark_dead_if_cooldown_elapsed(dead_at, cooldown));
         assert!(!first.is_dead_during_cooldown(now, cooldown));
         // The entry is new on the map's clock, so it hasn't been silent for an idle timeout yet.
-        assert!(!first.is_dead_and_silent(now, map.entry_age(&first), cooldown));
+        let age = map.entry_age(&first);
+        assert!(!first.is_dead_and_silent(now, age, cooldown));
 
         map_clock.advance(first.idle_timeout());
         let now = endpoint.clock.now();
