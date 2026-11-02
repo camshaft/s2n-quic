@@ -117,12 +117,22 @@ impl QueueState {
         }
     }
 
-    /// The resets this side owes the peer for the streams whose frames it failed when it found
-    /// the peer unresponsive ([`Entry::owe_resets`]).
+    /// The resets this side owes the peer for the streams it reset when it found the peer
+    /// unresponsive and marked it dead ([`Entry::mark_dead_owing_resets`]).
     pub fn owed_resets(&self) -> &OwedResets {
         match self {
             Self::Client(state) => &state.owed_resets,
             Self::Server(state) => &state.owed_resets,
+        }
+    }
+
+    /// The stream of each slot this side holds whose writer recorded the peer's queue, as a reset
+    /// of it that this side owes the peer routes: each stream on the path that the dead mark
+    /// resets on this side (`peer_dead_broadcast`).
+    pub fn open_streams(&self) -> Vec<OwedReset> {
+        match self {
+            Self::Client(state) => state.open_streams(),
+            Self::Server(state) => state.open_streams(),
         }
     }
 }
@@ -439,12 +449,12 @@ impl Entry {
         false
     }
 
-    /// Records `resets`, the streams whose frames this side failed as it found the peer
-    /// unresponsive, until a packet from the peer clears the dead mark
+    /// Records `resets`, streams that this side reset as it found the peer unresponsive and
+    /// marked it dead, until a packet from the peer clears the dead mark
     /// ([`Self::touch_activity`]): the peer isn't told that this side reset those streams, so its
-    /// end of each may still wait on this side. The send idle wheel records them before it marks
-    /// the peer dead, so that the packet that clears the mark finds them. Returns how many of
-    /// them weren't owed already.
+    /// end of each may still wait on this side. [`Self::mark_dead_owing_resets`] records them
+    /// before it marks the peer dead, so that the packet that clears the mark finds them. Returns
+    /// how many of them weren't owed already.
     pub fn owe_resets(&self, resets: impl IntoIterator<Item = OwedReset>) -> usize {
         self.queue_state.owed_resets().record(resets)
     }
@@ -452,6 +462,27 @@ impl Entry {
     /// Takes the resets this side owes the peer, once a packet from it cleared the dead mark.
     pub fn take_owed_resets(&self) -> Vec<OwedReset> {
         self.queue_state.owed_resets().take()
+    }
+
+    /// Marks the entry dead at `now` unless it was marked within `cooldown`, as
+    /// [`Self::mark_dead_if_cooldown_elapsed`] does, once it records a reset this side owes the
+    /// peer for each stream of `failed` and for each stream open on the path
+    /// ([`QueueState::open_streams`]). These are the streams the dead mark resets on this side:
+    /// `failed` holds the streams whose frames the send idle wheel failed, and an open stream may
+    /// have none of its frames held at all, as an idle writer's or that of a reader that sent
+    /// every MaxData update. The records come before the mark, so that a packet from the peer
+    /// that arrives between the two doesn't find a mark to clear, and the packet that clears the
+    /// mark finds every record. Returns how many of the streams weren't owed already, as
+    /// [`Self::owe_resets`] does, and whether it marked the entry dead.
+    pub fn mark_dead_owing_resets(
+        &self,
+        now: crate::time::precision::Timestamp,
+        cooldown: Duration,
+        failed: impl IntoIterator<Item = OwedReset>,
+    ) -> (usize, bool) {
+        let open = self.queue_state.open_streams();
+        let recorded = self.owe_resets(failed.into_iter().chain(open));
+        (recorded, self.mark_dead_if_cooldown_elapsed(now, cooldown))
     }
 
     pub fn last_activity(&self) -> crate::time::precision::Timestamp {
