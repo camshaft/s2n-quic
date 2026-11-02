@@ -599,9 +599,14 @@ where
         });
     }
 
-    // Update activity tracking on the shared PathSecretEntry
-    peer.path_entry
-        .touch_activity(crate::time::precision::Clock::now(clock));
+    // Update activity tracking on the shared PathSecretEntry. A packet that clears a dead mark
+    // shows that the peer is reachable again: reset each stream whose frames this side failed
+    // when it marked the peer dead, since the peer's end of it may still wait on this side.
+    let received_at = crate::time::precision::Clock::now(clock);
+    if peer.path_entry.touch_activity(received_at) {
+        let owed = peer.path_entry.take_owed_resets();
+        send_owed_resets(&peer.path_entry, owed, frame_tx);
+    }
     peer.ecn_counts.increment(ecn);
     counters.on_ecn(ecn);
     let now = clock.get_time();
@@ -1919,6 +1924,37 @@ fn send_reset(
         flow_credits: 0,
     };
     let _ = frame_tx.send_batch(Entry::new(frame));
+}
+
+/// Sends the peer of `path_secret_entry` a reset of each stream of `owed`: the streams whose
+/// frames this side failed when it marked the peer dead, which the peer may still wait on. Each
+/// reset is routed by the stream's queue pair and binding, without init fields, so where the
+/// peer has freed or rebound the slot since, it drops the reset as unallocated or stale, and a
+/// late reset doesn't end a newer stream.
+fn send_owed_resets(
+    path_secret_entry: &Arc<PathSecretEntry>,
+    owed: Vec<crate::queue::OwedReset>,
+    frame_tx: &mut SubmissionSender,
+) {
+    for reset in owed {
+        let frame = Frame {
+            header: Header::QueueReset {
+                queue_pair: reset.queue_pair,
+                binding_id: reset.binding_id,
+                reset_target: ResetTarget::Both,
+                error_code: error::IDLE_TIMEOUT,
+                init: None,
+            },
+            payload: ByteVec::new(),
+            path_secret_entry: path_secret_entry.clone(),
+            completion: None,
+            status: crate::endpoint::frame::TransmissionStatus::default(),
+            ttl: DEFAULT_TTL,
+            enqueued_at: None,
+            flow_credits: 0,
+        };
+        let _ = frame_tx.send_batch(Entry::new(frame));
+    }
 }
 
 // ── QueueControl ───────────────────────────────────────────────────────────
