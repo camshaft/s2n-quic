@@ -992,8 +992,14 @@ pub(crate) fn packet(
 }
 
 /// Requests an asynchronous dump of the recorder's rings to disk. A no-op when disabled.
+///
+/// It is also a no-op in this crate's unit-test build. `cargo test` runs every unit test of the
+/// crate in one process, so a dump that one test's `QueueDbg` starts would be written by the
+/// background dumper while the later tests run. The tests read the recorder in memory, with
+/// `backbeat::global::recorder().dump`, and never read a dump file.
 #[inline]
 pub(crate) fn trigger() {
+    #[cfg(not(test))]
     super::dbg::on_enabled(backbeat::global::trigger);
 }
 
