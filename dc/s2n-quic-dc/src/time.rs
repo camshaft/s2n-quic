@@ -60,6 +60,15 @@ impl DefaultClock {
             DefaultClockKind::BusyPoll(c) => precision::Clock::now(c),
         }
     }
+
+    /// A busy-poll clock that counts from `start` in place of the process's shared epoch, so a
+    /// test outside a bach simulation reads timestamps as far from zero as it needs.
+    #[cfg(test)]
+    pub(crate) fn busy_poll_from(start: std::time::Instant) -> Self {
+        Self(DefaultClockKind::BusyPoll(
+            crate::busy_poll::clock::Clock::from_epoch(start),
+        ))
+    }
 }
 
 impl time::Clock for DefaultClock {
