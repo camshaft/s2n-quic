@@ -7,37 +7,22 @@
 //! secret map, the pre-authentication step encodes an UnknownPathSecret control packet.
 //! That packet is pushed into a shared sync queue and drained by a single background task
 //! that applies per-credential dedup and token-bucket rate limiting before sending.
-//!
-//! The same queue carries the ReplayDetected and StaleKey packets a recv_dispatch worker
-//! encodes for a packet whose key id it has already seen, or that falls outside its replay
-//! window. A peer that keeps sending on such a key gets each of its packets rejected, far
-//! faster than the background task's pacer sends, so [`Pending`] keeps at most one response
-//! in the queue for each credential and peer sender id.
 
 use crate::{
     counter::{Counter, Registry},
     credentials,
-    endpoint::routing,
-    intrusive::Entry,
     msg::addr::Addr,
-    socket::channel::{self, Budget, ByteCost, Sendable, UnboundedSender},
+    socket::channel::{ByteCost, Sendable},
     time::precision::Timestamp,
 };
-use core::task::{self, Poll};
-use crossbeam_utils::CachePadded;
-use hashbrown::{HashMap, HashSet};
-use s2n_quic_core::{inet::ExplicitCongestionNotification, ready, varint::VarInt};
-use std::{
-    io::IoSlice,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use hashbrown::HashMap;
+use s2n_quic_core::inet::ExplicitCongestionNotification;
+use std::io::IoSlice;
 
-/// A pre-encoded UnknownPathSecret, ReplayDetected or StaleKey response ready to be sent.
+/// A pre-encoded UnknownPathSecret response ready to be sent.
 pub struct Response {
     pub dest_addr: Addr,
     pub packet: Vec<u8>,
-    /// The credential and peer sender id of the packet the response answers.
-    pub key: Key,
 }
 
 impl ByteCost for Response {
@@ -55,147 +40,6 @@ impl Sendable for Response {
             ExplicitCongestionNotification::NotEct,
         )?;
         Ok(())
-    }
-}
-
-/// The credential and the peer's sender id of a packet a recv_dispatch worker rejected.
-///
-/// The peer recovers the send contexts of one sender id from each ReplayDetected or StaleKey
-/// response, which names that sender id as its queue id. [`Pending`] keeps a response for each
-/// sender id of a credential, so a burst on one of them doesn't hold back the response for
-/// another.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Key {
-    pub credential_id: credentials::Id,
-    pub sender_id: VarInt,
-}
-
-/// The keys of the responses waiting in the UPS queue.
-///
-/// [`PendingSender`] queues a response only where no response with its key waits in the
-/// queue, and [`PendingReceiver`] takes the key out as the background task takes the response
-/// off the queue. The queue then holds at most one response for each key: the credentials and
-/// sender ids with a rejected packet bound its length, and the rejections don't. The first
-/// rejection after a response leaves the queue queues a new one, so the peer still receives a
-/// response for each key it keeps sending on.
-///
-/// The keys are split into one shard for each recv_dispatch worker, each shard behind its own
-/// lock in its own cache line. A key's shard is the worker the recv router hands the key's
-/// packets to, since both pick it from `routing::hash_id_and_sender` of the credential id and
-/// the sender id. The lock of a shard is then taken by one recv_dispatch worker, for each
-/// packet it rejects, and by the background task, for each response it takes off the queue,
-/// so a burst of rejections on one worker doesn't wait on the rejections of another.
-#[derive(Clone)]
-pub struct Pending {
-    shards: Arc<[CachePadded<Mutex<HashSet<Key>>>]>,
-    suppressed: Counter,
-}
-
-impl Pending {
-    /// `workers` is the number of recv_dispatch workers the recv router spreads the keys over,
-    /// and `suppressed` counts the responses the sender drops because one with their key waits
-    /// in the queue.
-    pub fn new(workers: usize, suppressed: Counter) -> Self {
-        Self {
-            shards: (0..workers.max(1))
-                .map(|_| CachePadded::new(Mutex::new(HashSet::new())))
-                .collect(),
-            suppressed,
-        }
-    }
-
-    /// Wraps the sending end of the queue.
-    pub fn sender<S>(&self, inner: S) -> PendingSender<S> {
-        PendingSender {
-            inner,
-            pending: self.clone(),
-        }
-    }
-
-    /// Wraps the receiving end of the queue.
-    pub fn receiver<R>(&self, inner: R) -> PendingReceiver<R> {
-        PendingReceiver {
-            inner,
-            pending: self.clone(),
-        }
-    }
-
-    /// The number of keys with a response waiting in the queue.
-    #[cfg(test)]
-    pub fn queued(&self) -> usize {
-        self.shards.iter().map(|shard| lock(shard).len()).sum()
-    }
-
-    /// The shard that holds `key`: the recv_dispatch worker the recv router hands the key's
-    /// packets to, as `routing::SenderRoute::worker_id_for_recv` picks it from the same hash
-    /// for a power-of-two or any other number of workers.
-    pub(crate) fn shard(&self, key: &Key) -> usize {
-        let hash = routing::hash_id_and_sender(&key.credential_id, key.sender_id);
-        (hash % self.shards.len() as u64) as usize
-    }
-
-    fn keys(&self, key: &Key) -> MutexGuard<'_, HashSet<Key>> {
-        lock(&self.shards[self.shard(key)])
-    }
-}
-
-fn lock(keys: &Mutex<HashSet<Key>>) -> MutexGuard<'_, HashSet<Key>> {
-    // Each holder makes one insert or one remove, so the set is whole after a panic.
-    keys.lock().unwrap_or_else(|err| err.into_inner())
-}
-
-/// The sending end of the UPS queue, which drops a response whose key waits in the queue.
-#[derive(Clone)]
-pub struct PendingSender<S> {
-    inner: S,
-    pending: Pending,
-}
-
-impl<S> UnboundedSender<Entry<Response>> for PendingSender<S>
-where
-    S: UnboundedSender<Entry<Response>>,
-{
-    fn send(&mut self, value: Entry<Response>) -> Result<(), Entry<Response>> {
-        let key = value.key;
-        if !self.pending.keys(&key).insert(key) {
-            // The response waiting in the queue tells the peer the same thing.
-            self.pending.suppressed.add(1);
-            return Ok(());
-        }
-        let result = self.inner.send(value);
-        if result.is_err() {
-            // The queue didn't take the response, so its key doesn't wait there.
-            self.pending.keys(&key).remove(&key);
-        }
-        result
-    }
-}
-
-/// The receiving end of the UPS queue, which takes the key of each response it yields out of
-/// [`Pending`], so the next rejection with that key queues a new response.
-pub struct PendingReceiver<R> {
-    inner: R,
-    pending: Pending,
-}
-
-impl<R> channel::Receiver<Entry<Response>> for PendingReceiver<R>
-where
-    R: channel::Receiver<Entry<Response>>,
-{
-    fn poll_recv(
-        &mut self,
-        cx: &mut task::Context<'_>,
-        budget: &mut Budget,
-    ) -> Poll<Option<Entry<Response>>> {
-        let response = ready!(self.inner.poll_recv(cx, budget));
-        if let Some(response) = &response {
-            self.pending.keys(&response.key).remove(&response.key);
-        }
-        Poll::Ready(response)
-    }
-
-    fn on_consumed(&mut self, bytes: u64) {
-        self.inner.on_consumed(bytes);
     }
 }
 

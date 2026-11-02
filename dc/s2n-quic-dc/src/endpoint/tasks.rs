@@ -1654,7 +1654,6 @@ fn on_packet_dispatch_error(
         dispatch::Error::PeerStateLookup {
             dest_addr,
             credentials,
-            sender_id,
             control_out,
         } => {
             counters.rx_process_err_peer_lookup.add(1);
@@ -1662,10 +1661,6 @@ fn on_packet_dispatch_error(
                 let response = endpoint::ups::Response {
                     dest_addr,
                     packet: control_out,
-                    key: endpoint::ups::Key {
-                        credential_id: credentials.id,
-                        sender_id,
-                    },
                 };
                 let _ = ups_tx.send(Entry::new(response));
             }
@@ -1699,22 +1694,14 @@ fn on_packet_dispatch_error(
         dispatch::Error::StaleKey {
             dest_addr,
             credentials,
-            sender_id,
             packet_number,
             control_out,
         } => {
             counters.rx_process_err_stale_key.add(1);
             if !control_out.is_empty() {
-                // In the endpoint `ups_tx` is a `ups::PendingSender`, which keeps one response
-                // in the queue for each credential and sender id, however many of the peer's
-                // packets on the key arrive before the pacer sends.
                 let response = endpoint::ups::Response {
                     dest_addr,
                     packet: control_out,
-                    key: endpoint::ups::Key {
-                        credential_id: credentials.id,
-                        sender_id,
-                    },
                 };
                 let _ = ups_tx.send(Entry::new(response));
             }
