@@ -170,6 +170,18 @@ impl MonitorHostAddr {
     }
 }
 
+/// Returns the tag of the dc packet that a simulated datagram carries, decoded from the start of
+/// its payload, or `None` where the payload doesn't start with a packet tag.
+///
+/// Monitor filters use it to tell secret control packets, such as replay and stale-key notices,
+/// from stream packets by the packet's own tag, rather than by its size or its port.
+pub fn packet_tag(packet: &bach::net::monitor::Packet) -> Option<crate::packet::Tag> {
+    s2n_codec::DecoderBuffer::new(packet.transport.payload())
+        .decode::<crate::packet::Tag>()
+        .ok()
+        .map(|(tag, _remaining)| tag)
+}
+
 /// Returns the shared [`Endpoint`] for the current Bach group, creating it lazily.
 ///
 /// The config is used only on the first call for a given group (or after a
@@ -682,7 +694,20 @@ where
     }
 
     // Auto-insert path secrets (idempotent: re-uses existing entry if present).
-    let path_secret_entry = connect(endpoint, peer_addr);
+    let mut path_secret_entry = connect(endpoint, peer_addr);
+
+    // Mirrors `stream::Client::connect`: an entry marked dead, past the dead-peer cooldown, whose
+    // peer hasn't answered for a whole idle timeout is evicted for a fresh path pair, in place of
+    // refusing flows on it forever. The simulation has no handshake queue, so it doesn't model
+    // the hold on a recent successful handshake that `stream::Client::connect` drops.
+    if path_secret_entry.is_dead_and_silent(
+        endpoint.clock.now(),
+        endpoint.path_secret_map.entry_age(&path_secret_entry),
+        endpoint.dead_peer_cooldown,
+    ) {
+        endpoint.path_secret_map.evict_entry(&path_secret_entry);
+        path_secret_entry = connect(endpoint, peer_addr);
+    }
 
     let now = endpoint.clock.now();
     if path_secret_entry.is_dead_during_cooldown(now, endpoint.dead_peer_cooldown) {

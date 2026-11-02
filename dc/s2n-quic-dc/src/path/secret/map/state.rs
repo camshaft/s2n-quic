@@ -823,6 +823,10 @@ where
         self.server_peers.clear();
     }
 
+    fn evict_entry(&self, entry: &Arc<Entry>) {
+        let _ = self.evict(entry);
+    }
+
     fn contains(&self, peer: &SocketAddr) -> bool {
         self.client_peers.contains_key(peer) || self.server_peers.contains_key(peer)
     }
@@ -910,6 +914,14 @@ where
         cb: Box<dyn Fn(SocketAddr, HandshakeReason) -> Option<JoinHandle<()>> + Send + Sync>,
     ) {
         self.register_request_handshake(cb);
+    }
+
+    fn request_handshake(
+        &self,
+        peer: SocketAddr,
+        reason: HandshakeReason,
+    ) -> Option<JoinHandle<()>> {
+        self.request_handshake(peer, reason)
     }
 
     fn advertised_peer_info(&self) -> Option<bytes::Bytes> {

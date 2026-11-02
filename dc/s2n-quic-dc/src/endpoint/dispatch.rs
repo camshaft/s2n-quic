@@ -39,6 +39,8 @@ pub(crate) enum Error {
     PeerStateLookup {
         dest_addr: crate::msg::addr::Addr,
         credentials: Credentials,
+        /// The peer's sender id of the rejected packet.
+        sender_id: VarInt,
         control_out: Vec<u8>,
     },
     Decryption {
@@ -55,6 +57,8 @@ pub(crate) enum Error {
     StaleKey {
         dest_addr: crate::msg::addr::Addr,
         credentials: Credentials,
+        /// The peer's sender id of the rejected packet.
+        sender_id: VarInt,
         packet_number: VarInt,
         control_out: Vec<u8>,
     },
@@ -539,6 +543,7 @@ where
                 return Err(Error::PeerStateLookup {
                     dest_addr,
                     credentials,
+                    sender_id: source_sender_id,
                     control_out,
                 });
             }
@@ -571,6 +576,7 @@ where
                 return Err(Error::StaleKey {
                     dest_addr,
                     credentials,
+                    sender_id: source_sender_id,
                     packet_number,
                     control_out,
                 });
