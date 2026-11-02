@@ -17,12 +17,14 @@
 use crate::{
     counter::{Counter, Registry},
     credentials,
+    endpoint::routing,
     intrusive::Entry,
     msg::addr::Addr,
     socket::channel::{self, Budget, ByteCost, Sendable, UnboundedSender},
     time::precision::Timestamp,
 };
 use core::task::{self, Poll};
+use crossbeam_utils::CachePadded;
 use hashbrown::{HashMap, HashSet};
 use s2n_quic_core::{inet::ExplicitCongestionNotification, ready, varint::VarInt};
 use std::{
@@ -76,18 +78,28 @@ pub struct Key {
 /// sender ids with a rejected packet bound its length, and the rejections don't. The first
 /// rejection after a response leaves the queue queues a new one, so the peer still receives a
 /// response for each key it keeps sending on.
+///
+/// The keys are split into one shard for each recv_dispatch worker, each shard behind its own
+/// lock in its own cache line. A key's shard is the worker the recv router hands the key's
+/// packets to, since both pick it from `routing::hash_id_and_sender` of the credential id and
+/// the sender id. The lock of a shard is then taken by one recv_dispatch worker, for each
+/// packet it rejects, and by the background task, for each response it takes off the queue,
+/// so a burst of rejections on one worker doesn't wait on the rejections of another.
 #[derive(Clone)]
 pub struct Pending {
-    keys: Arc<Mutex<HashSet<Key>>>,
+    shards: Arc<[CachePadded<Mutex<HashSet<Key>>>]>,
     suppressed: Counter,
 }
 
 impl Pending {
-    /// `suppressed` counts the responses the sender drops because one with their key waits in
-    /// the queue.
-    pub fn new(suppressed: Counter) -> Self {
+    /// `workers` is the number of recv_dispatch workers the recv router spreads the keys over,
+    /// and `suppressed` counts the responses the sender drops because one with their key waits
+    /// in the queue.
+    pub fn new(workers: usize, suppressed: Counter) -> Self {
         Self {
-            keys: Default::default(),
+            shards: (0..workers.max(1))
+                .map(|_| CachePadded::new(Mutex::new(HashSet::new())))
+                .collect(),
             suppressed,
         }
     }
@@ -111,13 +123,25 @@ impl Pending {
     /// The number of keys with a response waiting in the queue.
     #[cfg(test)]
     pub fn queued(&self) -> usize {
-        self.keys().len()
+        self.shards.iter().map(|shard| lock(shard).len()).sum()
     }
 
-    fn keys(&self) -> MutexGuard<'_, HashSet<Key>> {
-        // Each holder makes one insert or one remove, so the set is whole after a panic.
-        self.keys.lock().unwrap_or_else(|err| err.into_inner())
+    /// The shard that holds `key`: the recv_dispatch worker the recv router hands the key's
+    /// packets to, as `routing::SenderRoute::worker_id_for_recv` picks it from the same hash
+    /// for a power-of-two or any other number of workers.
+    pub(crate) fn shard(&self, key: &Key) -> usize {
+        let hash = routing::hash_id_and_sender(&key.credential_id, key.sender_id);
+        (hash % self.shards.len() as u64) as usize
     }
+
+    fn keys(&self, key: &Key) -> MutexGuard<'_, HashSet<Key>> {
+        lock(&self.shards[self.shard(key)])
+    }
+}
+
+fn lock(keys: &Mutex<HashSet<Key>>) -> MutexGuard<'_, HashSet<Key>> {
+    // Each holder makes one insert or one remove, so the set is whole after a panic.
+    keys.lock().unwrap_or_else(|err| err.into_inner())
 }
 
 /// The sending end of the UPS queue, which drops a response whose key waits in the queue.
@@ -133,7 +157,7 @@ where
 {
     fn send(&mut self, value: Entry<Response>) -> Result<(), Entry<Response>> {
         let key = value.key;
-        if !self.pending.keys().insert(key) {
+        if !self.pending.keys(&key).insert(key) {
             // The response waiting in the queue tells the peer the same thing.
             self.pending.suppressed.add(1);
             return Ok(());
@@ -141,7 +165,7 @@ where
         let result = self.inner.send(value);
         if result.is_err() {
             // The queue didn't take the response, so its key doesn't wait there.
-            self.pending.keys().remove(&key);
+            self.pending.keys(&key).remove(&key);
         }
         result
     }
@@ -165,7 +189,7 @@ where
     ) -> Poll<Option<Entry<Response>>> {
         let response = ready!(self.inner.poll_recv(cx, budget));
         if let Some(response) = &response {
-            self.pending.keys().remove(&response.key);
+            self.pending.keys(&response.key).remove(&response.key);
         }
         Poll::Ready(response)
     }

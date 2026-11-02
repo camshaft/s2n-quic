@@ -14,12 +14,14 @@
 //! 5. A response the queue refuses doesn't keep a later response with its key out.
 //! 6. Rejections of packets whose credential the path secret map doesn't hold leave one
 //!    UnknownPathSecret response in the queue for each credential and sender id.
+//! 7. Each key's shard of `ups::Pending` is the recv_dispatch worker the recv router hands the
+//!    key's packets to, and `ups_send` takes each response's key out of the shard that holds it.
 
 use super::helpers::test_entry;
 use crate::{
     counter::Registry,
     credentials::{Credentials, Id},
-    endpoint::{counters, dispatch, tasks, ups},
+    endpoint::{counters, dispatch, id::RemoteSenderId, routing, tasks, ups},
     intrusive::Entry,
     msg::addr::Addr,
     packet::{secret_control, WireVersion},
@@ -31,12 +33,15 @@ use bach::net::UdpSocket;
 use core::time::Duration;
 use s2n_codec::{DecoderBufferMut, EncoderBuffer};
 use s2n_quic_core::varint::VarInt;
-use std::{cell::RefCell, net::SocketAddr, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, net::SocketAddr, rc::Rc};
 
 const STATELESS_RESET_TAG: &[u8; 16] = b"ups-test-signer!";
 const CREDENTIAL_BYTES: [u8; 16] = [0xAB; 16];
 /// How many of the peer's packets one burst rejects, each with a response of its own.
 const BURST: usize = 100;
+/// The recv_dispatch workers each test's `ups::Pending` holds a shard of keys for: more than
+/// one, so that the tests' keys spread over several shards.
+const RECV_DISPATCH_WORKERS: usize = 4;
 
 fn encode_ups_packet(id: Id) -> Vec<u8> {
     let mut buf = [0u8; secret_control::MAX_PACKET_SIZE];
@@ -238,7 +243,22 @@ fn reject_unknown(
 }
 
 fn new_pending(registry: &Registry) -> ups::Pending {
-    ups::Pending::new(registry.register("test.ups.pending_suppressed"))
+    ups::Pending::new(
+        RECV_DISPATCH_WORKERS,
+        registry.register("test.ups.pending_suppressed"),
+    )
+}
+
+/// The recv_dispatch worker that route `R` picks, over `workers` workers, for the packets of
+/// `key`, as the recv router picks it.
+fn routed_worker<R: routing::SenderRoute>(workers: usize, key: ups::Key) -> usize {
+    let credentials = Credentials {
+        id: key.credential_id,
+        key_id: VarInt::ZERO,
+    };
+    R::new(workers)
+        .worker_id_for_recv(&credentials, RemoteSenderId::new(key.sender_id))
+        .as_usize()
 }
 
 async fn server_addr() -> SocketAddr {
@@ -373,6 +393,15 @@ fn rejections_for_many_credentials_queue_one_response_each() {
             let dest = server_addr().await;
             let dispatch_counters = counters::Dispatch::new(&registry);
             let mut ups_tx = pending.sender(tx);
+            let key = |i: u8| ups::Key {
+                credential_id: Id::from([i; 16]),
+                sender_id,
+            };
+            let shards: HashSet<_> = (0..CREDENTIALS).map(|i| pending.shard(&key(i))).collect();
+            assert!(
+                shards.len() > 1,
+                "the credentials' keys spread over more than one shard"
+            );
 
             for _ in 0..BURST {
                 for i in 0..CREDENTIALS {
@@ -383,6 +412,11 @@ fn rejections_for_many_credentials_queue_one_response_each() {
             assert_eq!(pending.queued(), usize::from(CREDENTIALS));
 
             1.s().sleep().await;
+            assert_eq!(
+                pending.queued(),
+                0,
+                "ups_send took each response's key out of its shard"
+            );
             let received = received.borrow();
             assert_eq!(received.len(), usize::from(CREDENTIALS));
             for i in 0..CREDENTIALS {
@@ -481,4 +515,31 @@ fn unknown_credentials_queue_one_response_for_each_credential_and_sender_id() {
         }
     }
     assert_eq!(pending.queued(), ids.len() * sender_ids.len());
+}
+
+/// Each key's shard of `ups::Pending` is the recv_dispatch worker the recv router hands the
+/// key's packets to, for a power-of-two or any other number of workers, so the lock of each
+/// shard is taken by one recv_dispatch worker and by `ups_send` alone.
+#[test]
+fn each_key_shards_by_the_recv_dispatch_worker_its_packets_route_to() {
+    for workers in 1..=8 {
+        let registry = Registry::default();
+        let pending = ups::Pending::new(workers, registry.register("test.ups.pending_suppressed"));
+        for i in 0..=u8::MAX {
+            for sender_id in 0..4 {
+                let key = ups::Key {
+                    credential_id: Id::from([i; 16]),
+                    sender_id: VarInt::from_u8(sender_id),
+                };
+                let shard = pending.shard(&key);
+                assert_eq!(shard, routed_worker::<routing::ModuloRoute>(workers, key));
+                if workers.is_power_of_two() {
+                    assert_eq!(
+                        shard,
+                        routed_worker::<routing::PowerOfTwoRoute>(workers, key)
+                    );
+                }
+            }
+        }
+    }
 }
