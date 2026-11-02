@@ -106,6 +106,8 @@ s2n-quic-core = { path = "../../quic/s2n-quic-core", features = ["state-tracing"
 s2n-quic-platform = { path = "../../quic/s2n-quic-platform", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+# CI diagnostic, not for merge: stack sampling for the unit-test heap profiler in src/testing.rs.
+backtrace = "0.3"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
