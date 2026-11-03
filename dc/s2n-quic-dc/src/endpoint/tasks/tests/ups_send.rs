@@ -19,10 +19,13 @@
 //! 8. Rejections of packets with many distinct credential ids that the map doesn't hold leave
 //!    UnknownPathSecret responses in each shard up to its share of the bytes the pacer sends in
 //!    one burst, and a ReplayDetected response still queues past them.
+//! 9. Each response the sender drops counts in one of `ups::Pending`'s two counters: a response
+//!    whose key waits in the queue in the first, and an UnknownPathSecret response past its
+//!    shard's share of the burst in the second.
 
 use super::helpers::test_entry;
 use crate::{
-    counter::Registry,
+    counter::{Counter, Registry},
     credentials::{Credentials, Id},
     endpoint::{counters, dispatch, id::RemoteSenderId, routing, tasks, ups},
     intrusive::Entry,
@@ -246,13 +249,58 @@ fn reject_unknown(
     tasks::on_packet_dispatch_error(dispatch_counters, ups_tx, err);
 }
 
-fn new_pending(registry: &Registry) -> ups::Pending {
-    ups::Pending::new(
-        RECV_DISPATCH_WORKERS,
-        registry.register("test.ups.pending_suppressed"),
-        registry.register("test.ups.unknown_dropped"),
-        unknown_capacity(),
-    )
+/// The two counters a test's `ups::Pending` counts the responses its sender drops in, which the
+/// test keeps to read their counts.
+struct DropCounters {
+    /// The responses dropped because a response with their key waits in the queue.
+    suppressed: Counter,
+    /// The UnknownPathSecret responses dropped past their shard's share of the pacer's burst.
+    unknown_dropped: Counter,
+}
+
+impl DropCounters {
+    fn new(registry: &Registry) -> Self {
+        Self {
+            suppressed: registry.register("test.ups.pending_suppressed"),
+            unknown_dropped: registry.register("test.ups.unknown_dropped"),
+        }
+    }
+
+    /// An `ups::Pending` over `workers` shards, holding UnknownPathSecret responses up to
+    /// `unknown_capacity` bytes, that counts its drops in these counters.
+    fn pending(&self, workers: usize, unknown_capacity: u64) -> ups::Pending {
+        ups::Pending::new(
+            workers,
+            self.suppressed.clone(),
+            self.unknown_dropped.clone(),
+            unknown_capacity,
+        )
+    }
+
+    /// Asserts how many responses the sender dropped because a response with their key waits
+    /// in the queue, and how many UnknownPathSecret responses it dropped past their shard's
+    /// share of the pacer's burst.
+    #[track_caller]
+    fn assert_dropped(&self, suppressed: u64, unknown_dropped: u64) {
+        assert_eq!(
+            self.suppressed.count(),
+            suppressed,
+            "responses dropped because a response with their key waits in the queue"
+        );
+        assert_eq!(
+            self.unknown_dropped.count(),
+            unknown_dropped,
+            "UnknownPathSecret responses dropped past their shard's share of the burst"
+        );
+    }
+}
+
+/// An `ups::Pending` over `RECV_DISPATCH_WORKERS` shards, holding UnknownPathSecret responses
+/// up to `unknown_capacity()` bytes, and the counters it counts its drops in.
+fn new_pending(registry: &Registry) -> (ups::Pending, DropCounters) {
+    let drops = DropCounters::new(registry);
+    let pending = drops.pending(RECV_DISPATCH_WORKERS, unknown_capacity());
+    (pending, drops)
 }
 
 /// The bytes of UnknownPathSecret responses [`new_pending`] lets the queue hold: the burst of the
@@ -413,7 +461,7 @@ fn a_burst_for_one_credential_queues_and_sends_one_response() {
         let id = Id::from(CREDENTIAL_BYTES);
         let sender_id = VarInt::from_u8(3);
         let registry = Registry::default();
-        let pending = new_pending(&registry);
+        let (pending, drops) = new_pending(&registry);
         let (tx, rx) = unsync::new::<ups::Response>();
         spawn_pipeline(pending.receiver(rx));
         let received = spawn_server();
@@ -431,6 +479,7 @@ fn a_burst_for_one_credential_queues_and_sends_one_response() {
                 1,
                 "the burst leaves one response in the queue"
             );
+            drops.assert_dropped(BURST as u64 - 1, 0);
 
             1.s().sleep().await;
             assert_eq!(
@@ -448,6 +497,7 @@ fn a_burst_for_one_credential_queues_and_sends_one_response() {
                 1,
                 "a rejection after the response left the queue queues a new one"
             );
+            drops.assert_dropped(2 * (BURST as u64 - 1), 0);
 
             1.s().sleep().await;
             assert_eq!(*received.borrow(), [(id, Some(sender_id)); 2]);
@@ -467,7 +517,7 @@ fn rejections_for_many_credentials_queue_one_response_each() {
     sim(|| {
         let sender_id = VarInt::from_u8(3);
         let registry = Registry::default();
-        let pending = new_pending(&registry);
+        let (pending, drops) = new_pending(&registry);
         let (tx, rx) = unsync::new::<ups::Response>();
         spawn_pipeline(pending.receiver(rx));
         let received = spawn_server();
@@ -493,6 +543,7 @@ fn rejections_for_many_credentials_queue_one_response_each() {
                 }
             }
             assert_eq!(pending.queued(), usize::from(CREDENTIALS));
+            drops.assert_dropped(u64::from(CREDENTIALS) * (BURST as u64 - 1), 0);
 
             1.s().sleep().await;
             assert_eq!(
@@ -525,7 +576,7 @@ fn rejections_for_two_sender_ids_of_one_credential_queue_one_response_each() {
         let id = Id::from(CREDENTIAL_BYTES);
         let sender_ids = [VarInt::from_u8(0), VarInt::from_u8(1)];
         let registry = Registry::default();
-        let pending = new_pending(&registry);
+        let (pending, drops) = new_pending(&registry);
         let (tx, rx) = unsync::new::<ups::Response>();
         spawn_pipeline(pending.receiver(rx));
         let received = spawn_server();
@@ -541,6 +592,7 @@ fn rejections_for_two_sender_ids_of_one_credential_queue_one_response_each() {
                 }
             }
             assert_eq!(pending.queued(), sender_ids.len());
+            drops.assert_dropped(sender_ids.len() as u64 * (BURST as u64 - 1), 0);
 
             1.s().sleep().await;
             let received = received.borrow();
@@ -562,7 +614,7 @@ fn rejections_for_two_sender_ids_of_one_credential_queue_one_response_each() {
 #[test]
 fn a_refused_response_does_not_hold_its_key() {
     let registry = Registry::default();
-    let pending = new_pending(&registry);
+    let (pending, drops) = new_pending(&registry);
     let (tx, rx) = unsync::new::<ups::Response>();
     let mut ups_tx = pending.sender(tx);
     drop(rx);
@@ -580,6 +632,7 @@ fn a_refused_response_does_not_hold_its_key() {
         0,
         "the refused response doesn't hold its bytes"
     );
+    drops.assert_dropped(0, 0);
 }
 
 /// Rejections of packets whose credential the path secret map doesn't hold leave one
@@ -587,7 +640,7 @@ fn a_refused_response_does_not_hold_its_key() {
 #[test]
 fn unknown_credentials_queue_one_response_for_each_credential_and_sender_id() {
     let registry = Registry::default();
-    let pending = new_pending(&registry);
+    let (pending, drops) = new_pending(&registry);
     let dispatch_counters = counters::Dispatch::new(&registry);
     let (tx, _rx) = unsync::new::<ups::Response>();
     let mut ups_tx = pending.sender(tx);
@@ -603,6 +656,10 @@ fn unknown_credentials_queue_one_response_for_each_credential_and_sender_id() {
         }
     }
     assert_eq!(pending.queued(), ids.len() * sender_ids.len());
+    drops.assert_dropped(
+        (ids.len() * sender_ids.len()) as u64 * (BURST as u64 - 1),
+        0,
+    );
 }
 
 /// Each key's shard of `ups::Pending` is the recv_dispatch worker the recv router hands the
@@ -646,7 +703,7 @@ fn a_burst_of_unknown_credentials_queues_up_to_the_pacers_burst() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
         let registry = Registry::default();
-        let pending = new_pending(&registry);
+        let (pending, drops) = new_pending(&registry);
         let (tx, rx) = unsync::new::<ups::Response>();
         let drained = spawn_drain(pending.receiver(rx));
 
@@ -673,6 +730,7 @@ fn a_burst_of_unknown_credentials_queues_up_to_the_pacers_burst() {
             assert!(queued < burst, "the queue drops the rest");
             assert_eq!(pending.queued_unknown_bytes(), queued * len);
             assert!(pending.queued_unknown_bytes() <= unknown_capacity());
+            drops.assert_dropped(0, burst - queued);
 
             1.s().sleep().await;
             assert_eq!(
@@ -687,11 +745,13 @@ fn a_burst_of_unknown_credentials_queues_up_to_the_pacers_burst() {
                 let id = unknown_id(i);
                 reject_unknown(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
             }
+            let queued_again = queued_of(&pending, burst..2 * burst, fit);
             assert_eq!(
                 pending.queued() as u64,
-                queued_of(&pending, burst..2 * burst, fit),
+                queued_again,
                 "once the queue is drained, each shard takes its share again"
             );
+            drops.assert_dropped(0, (burst - queued) + (burst - queued_again));
         }
         .primary()
         .spawn();
@@ -706,7 +766,7 @@ fn unknown_credentials_past_the_burst_leave_room_for_rejections() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
         let registry = Registry::default();
-        let pending = new_pending(&registry);
+        let (pending, drops) = new_pending(&registry);
         let (tx, rx) = unsync::new::<ups::Response>();
 
         async move {
@@ -731,6 +791,7 @@ fn unknown_credentials_past_the_burst_leave_room_for_rejections() {
                 fit,
                 "the shard holds its share of the burst"
             );
+            drops.assert_dropped(0, fit);
 
             reject(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
             assert_eq!(
@@ -743,6 +804,7 @@ fn unknown_credentials_past_the_burst_leave_room_for_rejections() {
                 fit * len,
                 "a ReplayDetected response doesn't count toward the burst"
             );
+            drops.assert_dropped(0, fit);
         }
         .primary()
         .spawn();
@@ -757,12 +819,8 @@ fn a_burst_smaller_than_one_response_still_queues_one() {
     let _guard = crate::testing::without_snapshots();
     sim(|| {
         let registry = Registry::default();
-        let pending = ups::Pending::new(
-            RECV_DISPATCH_WORKERS,
-            registry.register("test.ups.pending_suppressed"),
-            registry.register("test.ups.unknown_dropped"),
-            0,
-        );
+        let drops = DropCounters::new(&registry);
+        let pending = drops.pending(RECV_DISPATCH_WORKERS, 0);
         let (tx, rx) = unsync::new::<ups::Response>();
 
         async move {
@@ -782,6 +840,7 @@ fn a_burst_smaller_than_one_response_still_queues_one() {
             }
             assert_eq!(pending.queued(), 1, "the shard takes one response");
             assert_eq!(pending.queued_unknown_bytes(), unknown_response_len());
+            drops.assert_dropped(0, BURST as u64 - 1);
 
             reject(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
             assert_eq!(
@@ -789,6 +848,7 @@ fn a_burst_smaller_than_one_response_still_queues_one() {
                 2,
                 "the response past the burst doesn't keep a ReplayDetected response out"
             );
+            drops.assert_dropped(0, BURST as u64 - 1);
         }
         .primary()
         .spawn();
