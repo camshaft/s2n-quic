@@ -270,6 +270,184 @@ fn reader_fits_a_derived_clone() {
     assert_eq!(decoder.reader.len(), 5);
 }
 
+/// A buffer of the three chunks "hel", "lo w" and "orld", so that a read crosses the boundaries of
+/// its chunks.
+fn three_chunks() -> ByteVec {
+    let mut buf = ByteVec::from(&b"hel"[..]);
+    buf.push_back(Bytes::from_static(b"lo w"));
+    buf.push_back(Bytes::from_static(b"orld"));
+    // each test below reads across these boundaries
+    assert_eq!(
+        buf.chunks().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+        [3, 4, 4]
+    );
+    buf
+}
+
+#[test]
+fn reader_advance_moves_on_and_refuses_past_the_end() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+
+    reader.advance(0).unwrap();
+    assert_eq!(reader.len(), 11);
+
+    // into the second chunk
+    reader.advance(5).unwrap();
+    assert_eq!(reader.len(), 6);
+    // the iterator yields the rest of the chunk the reader is in
+    assert_eq!(reader.next().as_deref(), Some(&b" w"[..]));
+
+    // a length past the end is refused, and the reader stays where it was
+    let error = reader.advance(5).unwrap_err();
+    assert!(matches!(error, ByteVecError::OutOfBounds(5)));
+    assert_eq!(reader.len(), 4);
+
+    // to the end of the last chunk
+    reader.advance(4).unwrap();
+    assert!(reader.is_empty());
+    assert!(reader.next().is_none());
+}
+
+#[test]
+fn reader_buf_reads_across_chunks() {
+    use bytes::Buf as _;
+
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+    assert_eq!(reader.remaining(), 11);
+    assert_eq!(reader.chunk(), b"hel");
+
+    // `advance` inside a chunk leaves the rest of that chunk as `chunk`
+    bytes::Buf::advance(&mut reader, 1);
+    assert_eq!(reader.remaining(), 10);
+    assert_eq!(reader.chunk(), b"el");
+
+    // a u32 across the boundary of the first two chunks
+    let value = reader.try_get_u32().unwrap();
+    assert_eq!(value, u32::from_be_bytes(*b"ello"));
+    assert_eq!(reader.remaining(), 6);
+    assert_eq!(reader.chunk(), b" w");
+
+    // `advance` to the end of a chunk moves on to the next chunk
+    bytes::Buf::advance(&mut reader, 2);
+    assert_eq!(reader.chunk(), b"orld");
+
+    // `copy_to_bytes` of a prefix of one chunk shares that chunk's memory
+    let last = buf.chunks().last().unwrap();
+    let prefix = bytes::Buf::copy_to_bytes(&mut reader, 2);
+    assert_eq!(prefix, &b"or"[..]);
+    assert_eq!(prefix.as_ptr(), last.as_ptr());
+
+    // too few bytes are left for a u32, and the reader stays where it was
+    assert!(reader.try_get_u32().is_err());
+    assert_eq!(reader.chunk(), b"ld");
+
+    bytes::Buf::advance(&mut reader, 2);
+    assert_eq!(reader.remaining(), 0);
+    assert!(reader.chunk().is_empty());
+}
+
+#[test]
+#[should_panic]
+fn reader_buf_advance_past_the_end_panics() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+    bytes::Buf::advance(&mut reader, 12);
+}
+
+#[test]
+#[should_panic]
+fn reader_buf_copy_to_bytes_past_the_end_panics() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+    let _ = bytes::Buf::copy_to_bytes(&mut reader, 12);
+}
+
+#[test]
+fn reader_storage_reads_across_chunks() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+    assert_eq!(reader.buffered_len(), 11);
+
+    // `read_chunk` returns at most the rest of the chunk the reader is in
+    assert_eq!(&reader.read_chunk(2).unwrap()[..], b"he");
+    assert_eq!(&reader.read_chunk(usize::MAX).unwrap()[..], b"l");
+    assert_eq!(reader.buffered_len(), 8);
+
+    // `infallible_copy_into` copies the rest across the boundary of the last two chunks
+    let mut out: Vec<u8> = Vec::new();
+    reader.infallible_copy_into(&mut out);
+    assert_eq!(out, b"lo world");
+    assert_eq!(reader.buffered_len(), 0);
+    assert!(reader.read_chunk(usize::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn reader_partial_copy_into_returns_the_chunk_that_fills_dest() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+    let mut out: Vec<u8> = Vec::new();
+    {
+        // a dest with a 5-byte write limit takes the first chunk and the front of the second
+        let mut limited = out.with_write_limit(5);
+        let mut chunk = reader.partial_copy_into(&mut limited).unwrap();
+        assert_eq!(&chunk[..], b"lo");
+        chunk.infallible_copy_into(&mut limited);
+    }
+    assert_eq!(out, b"hello");
+    // the rest stays readable
+    assert_eq!(reader.len(), 6);
+    assert_eq!(reader.next().as_deref(), Some(&b" w"[..]));
+}
+
+#[test]
+fn reader_io_read_reads_across_chunks() {
+    use std::io::Read as _;
+
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+
+    // one read fills `out` across the boundary of the first two chunks
+    let mut out = [0u8; 5];
+    assert_eq!(reader.read(&mut out).unwrap(), 5);
+    assert_eq!(&out, b"hello");
+    assert_eq!(reader.len(), 6);
+
+    // a read into a larger buffer reads the rest, and a read after it reads nothing
+    let mut rest = [0u8; 16];
+    assert_eq!(reader.read(&mut rest).unwrap(), 6);
+    assert_eq!(&rest[..6], b" world");
+    assert_eq!(reader.read(&mut out).unwrap(), 0);
+}
+
+#[test]
+fn reader_reads_leave_the_buffer_unchanged() {
+    use std::io::Read as _;
+
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+
+    bytes::Buf::advance(&mut reader, 1);
+    assert_eq!(bytes::Buf::copy_to_bytes(&mut reader, 5), &b"ello "[..]);
+    let mut out: Vec<u8> = Vec::new();
+    reader.clone().infallible_copy_into(&mut out);
+    assert_eq!(out, b"world");
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"world");
+
+    // the buffer keeps its bytes and its chunks, and a new reader reads all of them
+    assert_eq!(buf, b"hello world");
+    assert_eq!(
+        buf.chunks().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+        [3, 4, 4]
+    );
+    let mut all = Vec::new();
+    buf.reader().read_to_end(&mut all).unwrap();
+    assert_eq!(all, b"hello world");
+}
+
 /// A [`Behavior`] that stores each chunk in upper case and counts its freezes, so that a test can
 /// tell which chunks went through it.
 #[derive(Clone, Debug, Default)]
