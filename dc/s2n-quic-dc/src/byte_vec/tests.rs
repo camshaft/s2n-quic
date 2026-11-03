@@ -571,3 +571,54 @@ fn behavior_freezes_each_buffer_the_builder_completes() {
     assert_eq!(flatten(b.finish()), expected);
     assert_eq!(upper.freezes.get(), 5);
 }
+
+#[test]
+fn debug_prints_the_chunk_list() {
+    assert_eq!(format!("{:?}", ByteVec::new()), "[]");
+    assert_eq!(format!("{:#?}", ByteVec::new()), "[]");
+
+    let one = ByteVec::from(&b"\x01\x02\x03"[..]);
+    assert_eq!(format!("{one:?}"), "[b\"\\x01\\x02\\x03\"]");
+    assert_eq!(format!("{one:#?}"), "[\n    b\"\\x01\\x02\\x03\",\n]");
+
+    let mut two = ByteVec::new();
+    two.push_back(Bytes::copy_from_slice(&3u64.to_be_bytes()));
+    two.push_back(Bytes::from_static(b"\x01\x02\x03"));
+    assert_eq!(
+        format!("{two:?}"),
+        "[b\"\\0\\0\\0\\0\\0\\0\\0\\x03\", b\"\\x01\\x02\\x03\"]"
+    );
+    assert_eq!(
+        format!("{two:#?}"),
+        "[\n    b\"\\0\\0\\0\\0\\0\\0\\0\\x03\",\n    b\"\\x01\\x02\\x03\",\n]"
+    );
+}
+
+#[derive(Debug)]
+struct DebugOwner;
+
+#[derive(Clone, Debug)]
+struct DebugHandle;
+
+impl tagged::Owner for DebugOwner {
+    type Handle = DebugHandle;
+
+    fn tag(&self, _len: usize) -> Self::Handle {
+        DebugHandle
+    }
+}
+
+impl tagged::Handle for DebugHandle {
+    fn increment(&mut self, _len: usize) {}
+
+    fn decrement(&mut self, _len: usize) {}
+}
+
+#[test]
+fn tagged_debug_prints_the_chunk_list() {
+    let tagged = Tagged::new(ByteVec::from(&b"abc"[..]), &DebugOwner);
+    assert_eq!(
+        format!("{tagged:?}"),
+        "Tagged { bytes: [b\"abc\"], tag: DebugHandle }"
+    );
+}

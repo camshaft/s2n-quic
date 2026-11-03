@@ -17,7 +17,7 @@
 //! [`Behavior`]) and [`tagged`] (owner/handle tagging) modules keep their fork-local logic, now
 //! layered on this newtype.
 
-use core::ops;
+use core::{fmt, ops};
 use s2n_quic_core::buffer::{
     reader::{
         self,
@@ -57,8 +57,17 @@ pub use tagged::Tagged;
 /// }
 /// assert!(buf.pop_front().is_none());
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ByteVec(etude_bytevec::ByteVec);
+
+// Prints the chunks as a list, such as `[b"hello", b" world"]`, as the buffer printed them before
+// it moved to etude-bytevec, instead of the derived `ByteVec([...])`.
+impl fmt::Debug for ByteVec {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.0.chunks()).finish()
+    }
+}
 
 impl ByteVec {
     /// Creates an empty [`ByteVec`].
