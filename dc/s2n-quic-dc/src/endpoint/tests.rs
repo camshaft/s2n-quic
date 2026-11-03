@@ -3820,6 +3820,214 @@ fn burst_on_a_dropped_recv_key_queues_one_notice_per_sender_id() {
     );
 }
 
+/// Reproduces a burst of packets whose credential ids the client's path secret map doesn't
+/// hold, arriving far faster than the client's UPS pacer sends, and checks that the
+/// UnknownPathSecret responses waiting in the client's UPS queue stay within the bytes the
+/// pacer sends in one burst.
+///
+/// The monitor keeps a packet the server sealed for a first stream. A third host then sends
+/// the client that packet each millisecond, each time with a credential id of its own, and the
+/// client answers each one with an UnknownPathSecret response keyed by that credential id. The
+/// client's pacer sends 200 bytes a second, with a burst of four of the largest such responses,
+/// and the client's one recv_dispatch worker holds the queue's one shard, whose share is the
+/// whole burst. A task reads the depth of the client's UPS queue each millisecond. Where each
+/// rejection queues a response of its own, the depth grows with each packet the pacer hasn't
+/// answered.
+#[test]
+fn a_burst_of_unknown_credentials_keeps_the_ups_queue_within_the_pacers_burst() {
+    use crate::{
+        endpoint::testing::sim::{packet_tag, SimEndpointConfig},
+        packet::{secret_control::UnknownPathSecret, Tag},
+        socket::rate::Rate,
+    };
+    use std::sync::{atomic::AtomicU64, Mutex};
+
+    // The packets with unknown credential ids that the third host sends, one each millisecond.
+    const UNKNOWN_PACKETS: u64 = 2_000;
+    // A packet's credential id follows its one-byte tag (`packet::datagram::encoder::encode`).
+    const ID_OFFSET: usize = 1;
+
+    let _no_snap = crate::testing::without_snapshots();
+    // The client's UPS pacer sends 200 bytes a second, with a burst of four of the largest
+    // UnknownPathSecret responses.
+    let burst_allowance = 4 * UnknownPathSecret::MAX_PACKET_SIZE as u64;
+    let ups_rate = Rate::new(200.0 * 8.0 / 1e9).with_burst_bytes(burst_allowance);
+    // A packet the server sealed, which the monitor keeps, and the client's data address.
+    let template: Arc<Mutex<Option<Vec<u8>>>> = Default::default();
+    let client_addr: Arc<Mutex<Option<std::net::SocketAddr>>> = Default::default();
+    // The client's UnknownPathSecret responses, and the largest of their lengths.
+    let responses = Arc::new(AtomicU64::new(0));
+    let response_len = Arc::new(AtomicU64::new(0));
+    // The most responses the client's UPS queue held at one time, read each millisecond.
+    let max_depth = Arc::new(AtomicU64::new(0));
+
+    // One send socket and one worker of each kind, so the client's UPS queue has one shard.
+    fn one_worker() -> SimEndpointConfig {
+        SimEndpointConfig {
+            num_send_sockets: 1,
+            num_recv_sockets: 1,
+            num_recv_io_workers: 1,
+            num_send_workers: 1,
+            num_recv_dispatch_workers: 1,
+            ..Default::default()
+        }
+    }
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+
+        // Keep the first packet the server seals, and count the client's UnknownPathSecret
+        // responses with the largest of their lengths. Every packet passes.
+        {
+            let template = template.clone();
+            let responses = responses.clone();
+            let response_len = response_len.clone();
+            let mut client_host = MonitorHostAddr::new("client");
+            let mut server_host = MonitorHostAddr::new("server");
+            bach::net::monitor::on_packet_sent(move |packet| {
+                let tag = packet_tag(packet);
+                if matches!(tag, Some(Tag::Datagram(_))) && server_host.is_packet_source(packet) {
+                    let mut kept = template.lock().unwrap();
+                    if kept.is_none() {
+                        *kept = Some(packet.transport.payload().to_vec());
+                    }
+                } else if matches!(tag, Some(Tag::UnknownPathSecret(_)))
+                    && client_host.is_packet_source(packet)
+                {
+                    responses.fetch_add(1, Ordering::Relaxed);
+                    let len = packet.transport.payload().len() as u64;
+                    response_len.fetch_max(len, Ordering::Relaxed);
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        // Server: answer each stream with a short response once its request is in.
+        async move {
+            let server = Server::with_config(one_worker());
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut request = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut request).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut response = Bytes::from_static(b"pong");
+                    let _ = writer.write_all_from_fin(&mut response).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary): a first stream, then the depth of its UPS queue each millisecond
+        // while the third host sends, and for a second after.
+        {
+            let client_addr = client_addr.clone();
+            let max_depth = max_depth.clone();
+            async move {
+                let mut client = Client::with_config(SimEndpointConfig {
+                    ups_rate,
+                    ..one_worker()
+                });
+                // Yield so the server group has a chance to bind its socket.
+                bach::task::yield_now().await;
+                *client_addr.lock().unwrap() = Some(client.data_addr());
+
+                // A first stream, whose packets give the monitor one the server sealed.
+                let stream = client
+                    .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                    .await
+                    .expect("connect");
+                let (mut reader, mut writer) = stream.into_split();
+                let mut ping = Bytes::from_static(b"ping");
+                writer.write_all_from_fin(&mut ping).await.expect("write");
+                let mut response = BytesMut::with_capacity(16);
+                while reader.read_into(&mut response).await.expect("read") > 0 {}
+                drop(reader);
+                drop(writer);
+
+                let ups_queue = client.counters().register_queue_gauge("q.ups");
+                for _ in 0..UNKNOWN_PACKETS + 2_000 {
+                    let depth = ups_queue.depth.get().max(0) as u64;
+                    max_depth.fetch_max(depth, Ordering::Relaxed);
+                    1.ms().sleep().await;
+                }
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        }
+
+        // A third host: once the first stream is done, it sends the client the server's packet
+        // each millisecond, each time with a credential id of its own.
+        {
+            let template = template.clone();
+            let client_addr = client_addr.clone();
+            async move {
+                1.s().sleep().await;
+                let kept = template.lock().unwrap().clone();
+                let template = kept.expect("the monitor kept a packet the server sealed");
+                let addr = *client_addr.lock().unwrap();
+                let client_addr = addr.expect("the client's data address");
+                let socket = bach::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+                for i in 0..UNKNOWN_PACKETS {
+                    // A credential id of its own, which the client's path secret map doesn't
+                    // hold.
+                    let mut id = [0xFF; 16];
+                    id[..8].copy_from_slice(&i.to_be_bytes());
+                    let mut packet = template.clone();
+                    packet[ID_OFFSET..ID_OFFSET + id.len()].copy_from_slice(&id);
+                    socket.send_to(&packet, client_addr).await.unwrap();
+                    1.ms().sleep().await;
+                }
+            }
+            .group("sender")
+            .spawn();
+        }
+    });
+
+    // The third host's packets reached the client, which answered them with UnknownPathSecret
+    // responses.
+    let responses = responses.load(Ordering::Relaxed);
+    assert!(
+        responses > 0,
+        "the client never answered the packets with unknown credential ids, so the test didn't \
+         reproduce the burst"
+    );
+    let response_len = response_len.load(Ordering::Relaxed);
+    let burst = ups_rate.burst_bytes();
+    // The responses the queue's one shard holds within the pacer's burst, and at least one.
+    let fit = (burst / response_len).max(1);
+    // The pacer holds at most one response beside the ones it sent, so where each rejection
+    // queued a response of its own, the queue would hold more than `fit` of them.
+    assert!(
+        UNKNOWN_PACKETS > responses + fit + 1,
+        "the client answered {responses} of the {UNKNOWN_PACKETS} packets, too many for the \
+         queue to hold more than {fit} responses behind the one its pacer holds"
+    );
+    let max_depth = max_depth.load(Ordering::Relaxed);
+    assert!(
+        max_depth * response_len <= burst,
+        "the client's UPS queue held {max_depth} UnknownPathSecret responses of {response_len} \
+         bytes at one time, more than the {burst} bytes its pacer sends in one burst"
+    );
+    assert!(
+        max_depth >= fit,
+        "the client's UPS queue held at most {max_depth} responses, fewer than the {fit} that \
+         fit in its pacer's burst, so the packets didn't arrive faster than the pacer sends"
+    );
+}
+
 // ── QueueMsg Integration Tests ─────────────────────────────────────────────
 
 /// Single message, two chunks — verifies the basic QueueMsg path works end-to-end.
