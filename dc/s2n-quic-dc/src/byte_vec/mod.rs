@@ -17,7 +17,7 @@ pub mod tagged;
 #[cfg(test)]
 mod tests;
 
-pub use builder::Builder;
+pub use builder::{Behavior, Builder, DefaultBehavior};
 pub use bytes::{Bytes, BytesMut};
 pub use tagged::Tagged;
 

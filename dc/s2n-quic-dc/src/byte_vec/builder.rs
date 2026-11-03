@@ -6,11 +6,47 @@ use s2n_quic_core::buffer::writer::Storage;
 
 const DEFAULT_CAPACITY: usize = 1 << 17;
 
+/// The policy a [`Builder`] runs on: how it sizes its head buffer, and how a completed chunk buffer
+/// becomes immutable [`Bytes`].
+///
+/// A [`Builder`] is *parameterized* over this behavior trait, so a caller can control every builder
+/// knob by supplying one `Behavior` impl — without reimplementing the builder. Every method has a
+/// default matching the plain builder, so an impl overrides only the knobs it cares about, and the
+/// zero-sized [`DefaultBehavior`] (all defaults) leaves existing callers unchanged.
+///
+/// The motivating override is [`Behavior::freeze`] for secret hygiene: wrap the completed buffer in
+/// a zeroize-on-drop owner and produce the chunk via [`Bytes::from_owner`] instead of
+/// [`BytesMut::freeze`], so the backing allocation is wiped when the last chunk drops.
+pub trait Behavior {
+    /// The head-buffer capacity a builder uses when one is not given explicitly (e.g. via
+    /// [`Builder::default`] or [`Builder::from_behavior`]). Defaults to 128 KiB.
+    fn default_capacity(&self) -> usize {
+        DEFAULT_CAPACITY
+    }
+
+    /// Converts a completed chunk buffer into the immutable [`Bytes`] stored in the rope. Defaults
+    /// to [`BytesMut::freeze`] — reuse the buffer in place, no copy.
+    fn freeze(&self, buf: BytesMut) -> Bytes {
+        buf.freeze()
+    }
+}
+
+/// The default [`Behavior`]: 128 KiB capacity and [`BytesMut::freeze`] — a zero-sized type, so
+/// `Builder<DefaultBehavior>` costs and behaves exactly as the plain builder.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultBehavior;
+
+impl Behavior for DefaultBehavior {}
+
 /// A builder for efficiently constructing a [`ByteVec`] by buffering writes.
 ///
 /// The builder maintains a head buffer for direct writes and a collection of
 /// completed chunks. This allows for efficient buffering of writes while
 /// maintaining the chunked nature of [`ByteVec`].
+///
+/// The type parameter `B` is the [`Behavior`] — the builder's capacity/freeze policy. It defaults
+/// to [`DefaultBehavior`], so `Builder` (unparameterized) behaves exactly as before; use
+/// [`Builder::with_behavior`] or [`Builder::from_behavior`] to select another.
 ///
 /// # Examples
 ///
@@ -27,25 +63,31 @@ const DEFAULT_CAPACITY: usize = 1 << 17;
 /// assert_eq!(byte_vec, b"hello world");
 /// ```
 #[derive(Debug)]
-pub struct Builder {
+pub struct Builder<B = DefaultBehavior> {
     chunks: ByteVec,
     head: BytesMut,
     capacity: usize,
+    /// The [`Behavior`] policy — the default capacity and how a completed [`BytesMut`] chunk becomes
+    /// immutable [`Bytes`]. Defaults to [`DefaultBehavior`]; selected via
+    /// [`Builder::with_behavior`]/[`Builder::from_behavior`].
+    behavior: B,
 }
 
-impl Default for Builder {
+impl Default for Builder<DefaultBehavior> {
     fn default() -> Self {
-        Self::new(DEFAULT_CAPACITY)
+        Self::from_behavior(DefaultBehavior)
     }
 }
 
-impl Builder {
+impl Builder<DefaultBehavior> {
     pub const DEFAULT_CAPACITY: usize = DEFAULT_CAPACITY;
 
     /// Creates a new [`Builder`] with the specified capacity for the head buffer.
     ///
     /// The capacity determines the size of the internal buffer used for direct writes.
     /// When this buffer is full, it will be flushed to the chunks collection.
+    ///
+    /// The builder uses the [`DefaultBehavior`]; call [`Builder::with_behavior`] to select another.
     ///
     /// # Examples
     ///
@@ -59,7 +101,57 @@ impl Builder {
             chunks: ByteVec::new(),
             head: BytesMut::new(),
             capacity,
+            behavior: DefaultBehavior,
         }
+    }
+}
+
+impl<B: Behavior> Builder<B> {
+    /// Creates a [`Builder`] driven by the given [`Behavior`], taking its head-buffer capacity from
+    /// the behavior's [`default_capacity`](Behavior::default_capacity).
+    ///
+    /// This is the "control the builder with one impl" entry point. Use [`ByteVec::builder`] instead
+    /// to pin an explicit capacity with the default behavior.
+    pub fn from_behavior(behavior: B) -> Self {
+        Builder {
+            chunks: ByteVec::new(),
+            head: BytesMut::new(),
+            capacity: behavior.default_capacity(),
+            behavior,
+        }
+    }
+
+    /// Selects the [`Behavior`]: the builder's capacity/freeze policy, returning a builder
+    /// parameterized over the new behavior (the buffered contents and current capacity are carried
+    /// over — only the freeze behavior and future policy queries change).
+    ///
+    /// The behavior's [`freeze`](Behavior::freeze) is applied at every point the builder turns a
+    /// [`BytesMut`] into a chunk: flushing the head buffer (on capacity overflow,
+    /// [`split`](Builder::split), [`split_to`](Builder::split_to),
+    /// [`append`](Builder::append)/[`extend`](Builder::extend),
+    /// [`write_with_len_prefix`](Builder::write_with_len_prefix), and [`finish`](Builder::finish))
+    /// and freezing a [`BytesMut`] handed to [`put_bytes_mut`](writer::Storage::put_bytes_mut). It
+    /// is *not* applied to chunks supplied already-frozen as [`Bytes`]. To also adopt the behavior's
+    /// default capacity, construct with [`Builder::from_behavior`] instead.
+    ///
+    /// The default is [`DefaultBehavior`] ([`BytesMut::freeze`], in place, no copy). Parameterizing
+    /// over a trait keeps the builder generic while letting the caller add new behaviors — for
+    /// example, wrapping secret-carrying buffers in a zeroize-on-drop owner and producing the chunk
+    /// via [`Bytes::from_owner`].
+    pub fn with_behavior<B2: Behavior>(self, behavior: B2) -> Builder<B2> {
+        Builder {
+            chunks: self.chunks,
+            head: self.head,
+            capacity: self.capacity,
+            behavior,
+        }
+    }
+
+    /// Converts a completed [`BytesMut`] chunk into immutable [`Bytes`] via the configured
+    /// [`Behavior`] (see [`Builder::with_behavior`]).
+    #[inline]
+    fn freeze_chunk(&self, buf: BytesMut) -> Bytes {
+        self.behavior.freeze(buf)
     }
 
     /// Returns the total number of bytes in the builder.
@@ -217,8 +309,9 @@ impl Builder {
 
         // check if we need to move some of the head into the chunks
         if let Some(remaining) = at.checked_sub(self.chunks.len()).filter(|v| *v > 0) {
-            self.chunks
-                .push_back(self.head.split_to(remaining).freeze());
+            let buf = self.head.split_to(remaining);
+            let chunk = self.freeze_chunk(buf);
+            self.chunks.push_back(chunk);
         }
 
         self.chunks.split_to(at)
@@ -243,15 +336,20 @@ impl Builder {
     /// assert_eq!(result, b"hello world");
     /// ```
     pub fn finish(self) -> ByteVec {
-        let mut chunks = self.chunks;
-        if !self.head.is_empty() {
-            chunks.push_back(self.head.freeze());
+        let Builder {
+            mut chunks,
+            head,
+            behavior,
+            ..
+        } = self;
+        if !head.is_empty() {
+            chunks.push_back(behavior.freeze(head));
         }
         chunks
     }
 
     /// Calls the provided function and prefixes the written data with a `u64` length
-    pub fn write_with_len_prefix<F: FnOnce(&mut Self)>(&mut self, f: F) {
+    pub fn write_with_len_prefix<Body: FnOnce(&mut Self)>(&mut self, f: Body) {
         // flush any data we have buffered
         self.flush();
 
@@ -278,17 +376,18 @@ impl Builder {
         self.head.put_slice(&written_len_bytes);
 
         // insert the length chunk where we recorded initially
-        let len_chunk = self.head.split().freeze();
+        let buf = self.head.split();
+        let len_chunk = self.freeze_chunk(buf);
         // make sure the length chunk is not torn
         debug_assert_eq!(len_chunk.len(), 8);
         self.chunks.insert(chunk_index, len_chunk);
     }
 
     /// Reserves buffer space for reading from a socket
-    pub fn for_socket_read<F: FnOnce(&mut bytes::buf::UninitSlice) -> usize>(
+    pub fn for_socket_read<Cb: FnOnce(&mut bytes::buf::UninitSlice) -> usize>(
         &mut self,
         preferred_read_size: usize,
-        f: F,
+        f: Cb,
     ) {
         if preferred_read_size > self.head.spare_capacity_mut().len() {
             self.flush_and_reserve(preferred_read_size);
@@ -313,35 +412,39 @@ impl Builder {
         let capacity = self.capacity.max(min_len);
         let head = core::mem::replace(&mut self.head, BytesMut::with_capacity(capacity));
         if !head.is_empty() {
-            self.chunks.push_back(head.freeze());
+            let chunk = self.freeze_chunk(head);
+            self.chunks.push_back(chunk);
         }
     }
 
     // flushes the current buffer, if non-empty
     fn flush(&mut self) {
         if !self.head.is_empty() {
-            self.chunks.push_back(self.head.split().freeze());
+            let buf = self.head.split();
+            let chunk = self.freeze_chunk(buf);
+            self.chunks.push_back(chunk);
         }
     }
 }
 
-impl From<ByteVec> for Builder {
+impl From<ByteVec> for Builder<DefaultBehavior> {
     fn from(chunks: ByteVec) -> Self {
         Builder {
             chunks,
             head: BytesMut::new(),
             capacity: DEFAULT_CAPACITY,
+            behavior: DefaultBehavior,
         }
     }
 }
 
-impl From<Builder> for ByteVec {
-    fn from(writer: Builder) -> Self {
+impl<B: Behavior> From<Builder<B>> for ByteVec {
+    fn from(writer: Builder<B>) -> Self {
         writer.finish()
     }
 }
 
-impl writer::Storage for Builder {
+impl<B: Behavior> writer::Storage for Builder<B> {
     // we prefer direct writes into the head chunk rather than appending byte chunks
     const SPECIALIZES_BYTES: bool = false;
     const SPECIALIZES_BYTES_MUT: bool = false;
@@ -367,9 +470,9 @@ impl writer::Storage for Builder {
         usize::MAX
     }
 
-    fn put_uninit_slice<F, Error>(&mut self, payload_len: usize, f: F) -> Result<bool, Error>
+    fn put_uninit_slice<Fill, Error>(&mut self, payload_len: usize, f: Fill) -> Result<bool, Error>
     where
-        F: FnOnce(&mut bytes::buf::UninitSlice) -> Result<(), Error>,
+        Fill: FnOnce(&mut bytes::buf::UninitSlice) -> Result<(), Error>,
     {
         if payload_len > self.head.spare_capacity_mut().len() {
             self.flush_and_reserve(payload_len);
@@ -395,11 +498,12 @@ impl writer::Storage for Builder {
             return;
         }
         self.flush();
-        self.chunks.push_back(bytes.freeze());
+        let chunk = self.freeze_chunk(bytes);
+        self.chunks.push_back(chunk);
     }
 }
 
-impl reader::Storage for Builder {
+impl<B: Behavior> reader::Storage for Builder<B> {
     type Error = core::convert::Infallible;
 
     fn buffered_len(&self) -> usize {
