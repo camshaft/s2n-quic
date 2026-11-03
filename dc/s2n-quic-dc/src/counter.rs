@@ -154,6 +154,10 @@ pub struct Counter {
     inner: s2n_quic_dc_metrics::Counter,
     metric_id: MetricId,
     metadata: Arc<Mutex<HashMap<MetricId, MetricMetadata>>>,
+    /// The sum of the counts added through this handle and its clones, which a test reads with
+    /// `Counter::count`.
+    #[cfg(test)]
+    count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Counter {
@@ -164,7 +168,17 @@ impl Counter {
             let (label, variant) = metric_trace_fields(self.metric_id, &self.metadata);
             metric_emit!("c", label, variant, v);
         }
+        #[cfg(test)]
+        self.count.fetch_add(v, Ordering::Relaxed);
         self.inner.increment(v);
+    }
+
+    /// The sum of the counts added through this handle and its clones, which a test asserts as
+    /// a number instead of reading it from a metrics line's text. A second handle that
+    /// `Registry::register` returns for the same label counts apart from this one.
+    #[cfg(test)]
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -2180,6 +2194,8 @@ impl Registry {
             inner,
             metric_id,
             metadata: self.metric_metadata.clone(),
+            #[cfg(test)]
+            count: Default::default(),
         }
     }
 
