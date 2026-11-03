@@ -448,6 +448,26 @@ fn reader_reads_leave_the_buffer_unchanged() {
     assert_eq!(all, b"01234567890");
 }
 
+#[test]
+fn reader_skips_empty_chunks() {
+    use bytes::Buf as _;
+
+    // where the buffer keeps empty chunks, the reader moves past them
+    let buf = ByteVec::from(vec![
+        Bytes::new(),
+        Bytes::from_static(b"012"),
+        Bytes::new(),
+        Bytes::from_static(b"3456"),
+    ]);
+    let mut reader = buf.reader();
+    assert_eq!(reader.remaining(), 7);
+    assert_eq!(reader.chunk(), b"012");
+    assert_eq!(reader.next().as_deref(), Some(&b"012"[..]));
+    assert_eq!(reader.chunk(), b"3456");
+    assert_eq!(reader.next().as_deref(), Some(&b"3456"[..]));
+    assert!(reader.next().is_none());
+}
+
 /// A [`Behavior`] that stores each chunk in upper case and counts its freezes, so that a test can
 /// tell which chunks went through it.
 #[derive(Clone, Debug, Default)]
