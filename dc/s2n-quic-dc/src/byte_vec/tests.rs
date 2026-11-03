@@ -584,7 +584,10 @@ fn debug_prints_the_chunk_list() {
     let mut two = ByteVec::new();
     two.push_back(Bytes::copy_from_slice(&3u64.to_be_bytes()));
     two.push_back(Bytes::from_static(b"\x01\x02\x03"));
-    assert_eq!(format!("{two:?}"), "[b\"\\0\\0\\0\\0\\0\\0\\0\\x03\", b\"\\x01\\x02\\x03\"]");
+    assert_eq!(
+        format!("{two:?}"),
+        "[b\"\\0\\0\\0\\0\\0\\0\\0\\x03\", b\"\\x01\\x02\\x03\"]"
+    );
     assert_eq!(
         format!("{two:#?}"),
         "[\n    b\"\\0\\0\\0\\0\\0\\0\\0\\x03\",\n    b\"\\x01\\x02\\x03\",\n]"
@@ -614,5 +617,8 @@ impl tagged::Handle for DebugHandle {
 #[test]
 fn tagged_debug_prints_the_chunk_list() {
     let tagged = Tagged::new(ByteVec::from(&b"abc"[..]), &DebugOwner);
-    assert_eq!(format!("{tagged:?}"), "Tagged { bytes: [b\"abc\"], tag: DebugHandle }");
+    assert_eq!(
+        format!("{tagged:?}"),
+        "Tagged { bytes: [b\"abc\"], tag: DebugHandle }"
+    );
 }
