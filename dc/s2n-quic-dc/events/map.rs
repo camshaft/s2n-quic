@@ -180,6 +180,8 @@ struct KeyAccepted<'a> {
 #[subject(endpoint)]
 /// Emitted when credential replay was definitely detected
 struct ReplayDefinitelyDetected<'a> {
+    peer_address: SocketAddress<'a>,
+
     #[snapshot("[HIDDEN]")]
     credential_id: &'a [u8],
 
@@ -191,6 +193,8 @@ struct ReplayDefinitelyDetected<'a> {
 /// Emitted when credential replay was potentially detected, but could not be verified
 /// due to a limiting tracking window
 struct ReplayPotentiallyDetected<'a> {
+    peer_address: SocketAddress<'a>,
+
     #[snapshot("[HIDDEN]")]
     credential_id: &'a [u8],
 
