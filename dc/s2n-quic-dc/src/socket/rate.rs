@@ -46,6 +46,14 @@ impl Rate {
     pub fn burst_nanos(&self) -> u64 {
         self.burst_nanos
     }
+
+    /// Returns this rate with a burst allowance of `bytes` in place of the 64 KiB default. A
+    /// test passes 0 so that its pacer waits after each send, the first one included.
+    #[cfg(test)]
+    pub fn with_burst_bytes(mut self, bytes: u64) -> Self {
+        self.burst_nanos = self.nanos_for_bytes(bytes);
+        self
+    }
 }
 
 impl core::fmt::Debug for Rate {

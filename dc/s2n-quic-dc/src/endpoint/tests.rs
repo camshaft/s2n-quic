@@ -3567,6 +3567,259 @@ fn recv_eviction_with_lost_replay_notices_recovers() {
     );
 }
 
+/// Reproduces a burst of the server's packets on a key that the client's receive cache dropped,
+/// with the client's UPS pacer far slower than the rejections arrive, and checks that the
+/// client's UPS queue holds at most one notice for each of the server's sender ids.
+///
+/// As in `recv_eviction_with_lost_replay_notices_recovers`, the client's entry has a 1 s idle
+/// timeout and the server's an hour, so once the first stream is done, the client's receive
+/// idle wheel drops its receive context for the server's key, while the server keeps its send
+/// context and the key id it seals with. The server answers the next stream with 64 KiB on that
+/// key, and the client rejects each of its packets and answers with a replay or stale-key
+/// notice. The client's pacer sends 200 bytes a second, about one notice each quarter second,
+/// with no burst allowance, so the rejections arrive far faster than it sends. The monitor
+/// passes every packet: the first notice moves the server to a new key, and the stream
+/// completes.
+///
+/// Each endpoint has one send socket, so each rejected packet carries the server's one
+/// credential and its one sender id. A task reads the depth of the client's `q.ups` queue each
+/// millisecond. Where each rejection queues a notice of its own, the depth grows with each
+/// rejection the pacer hasn't sent.
+#[test]
+fn burst_on_a_dropped_recv_key_queues_one_notice_per_sender_id() {
+    use crate::{
+        endpoint::testing::sim::{lookup_sim_map, packet_tag, SimEndpointConfig},
+        packet::Tag,
+        path::secret::map::Entry,
+        socket::rate::Rate,
+    };
+    use s2n_quic_core::dc::testing::TEST_APPLICATION_PARAMS;
+    use std::{num::NonZeroU32, sync::Mutex};
+
+    const RESPONSE_LEN: u64 = 64 * 1024;
+
+    let _no_snap = crate::testing::without_snapshots();
+    // The client's replay and stale-key notices sent since the client lost its receive context.
+    let notices = Arc::new(AtomicUsize::new(0));
+    let notices_inner = notices.clone();
+    // The server's packets sent since then and before the client's first notice: the server
+    // can't have moved to a new key by then, so the client rejects each of them.
+    let stale_packets = Arc::new(AtomicUsize::new(0));
+    let stale_packets_inner = stale_packets.clone();
+    // The most notices the client's UPS queue held at one time, read each millisecond.
+    let max_depth = Arc::new(AtomicUsize::new(0));
+    let max_depth_inner = max_depth.clone();
+    // Whether the stream after the break received its whole response.
+    let completed: Arc<Mutex<Option<bool>>> = Default::default();
+    let completed_inner = completed.clone();
+
+    // One send socket and one worker of each kind, so the server seals the next stream with the
+    // key the client dropped, from its one sender id.
+    fn one_socket() -> SimEndpointConfig {
+        SimEndpointConfig {
+            num_send_sockets: 1,
+            num_recv_sockets: 1,
+            num_recv_io_workers: 1,
+            num_send_workers: 1,
+            num_recv_dispatch_workers: 1,
+            ..Default::default()
+        }
+    }
+    // The server's sender ids that send on the dropped key: the client's queue may hold one
+    // notice for each of them.
+    let server_sender_ids = one_socket().num_send_sockets;
+
+    sim(|| {
+        let acceptor_id = VarInt::from_u8(1);
+        // Set once the client's receive context for the server's key is gone.
+        let broken = Arc::new(AtomicBool::new(false));
+
+        // Count the client's notices and the server's packets on the dropped key, and pass every
+        // packet.
+        {
+            let broken = broken.clone();
+            let mut client_host = MonitorHostAddr::new("client");
+            let mut server_host = MonitorHostAddr::new("server");
+            bach::net::monitor::on_packet_sent(move |packet| {
+                if !broken.load(Ordering::Relaxed) {
+                    return bach::net::monitor::Command::Pass;
+                }
+                let tag = packet_tag(packet);
+                if matches!(tag, Some(Tag::ReplayDetected(_) | Tag::StaleKey(_))) {
+                    if client_host.is_packet_source(packet) {
+                        notices_inner.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if matches!(tag, Some(Tag::Datagram(_)))
+                    && notices_inner.load(Ordering::Relaxed) == 0
+                    && server_host.is_packet_source(packet)
+                {
+                    stale_packets_inner.fetch_add(1, Ordering::Relaxed);
+                }
+                bach::net::monitor::Command::Pass
+            });
+        }
+
+        // Server: answer each stream with RESPONSE_LEN bytes once its request is in.
+        async move {
+            let server = Server::with_config(one_socket());
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 8)
+                .expect("acceptor registration");
+
+            while let Some(stream) = acceptor.recv().await {
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut request = BytesMut::with_capacity(16);
+                    loop {
+                        match reader.read_into(&mut request).await {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => return,
+                        }
+                    }
+                    let mut response = Data::new(RESPONSE_LEN);
+                    let _ = writer.write_all_from_fin(&mut response).await;
+                }
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client (primary).
+        async move {
+            // The client's UPS pacer sends 200 bytes a second, about one notice each quarter
+            // second, with no burst allowance.
+            let mut client = Client::with_config(SimEndpointConfig {
+                ups_rate: Rate::new(200.0 * 8.0 / 1e9).with_burst_bytes(0),
+                ..one_socket()
+            });
+            // Yield so the server group has a chance to bind its socket.
+            bach::task::yield_now().await;
+
+            let server_addr = bach::net::lookup_host(format!("server:{SERVER_PORT}"))
+                .await
+                .expect("lookup")
+                .next()
+                .expect("server addr");
+            let client_addr = client.data_addr();
+            let client_map = lookup_sim_map(client_addr).expect("client map");
+            let server_map = lookup_sim_map(server_addr).expect("server map");
+
+            // The client's entry expires its contexts after 1 s of silence. The server's entry
+            // keeps its send context, and the key id that context seals with, for the whole test.
+            let mut client_params = TEST_APPLICATION_PARAMS;
+            client_params.max_idle_timeout = NonZeroU32::new(1_000);
+            client_params.remote_max_data = client_params.local_recv_max_data;
+            let mut server_params = TEST_APPLICATION_PARAMS;
+            server_params.max_idle_timeout = NonZeroU32::new(3_600_000);
+            server_params.remote_max_data = server_params.local_recv_max_data;
+            client_map.test_insert_pair(
+                Entry::builder(server_addr)
+                    .local(client_addr)
+                    .params(client_params),
+                &server_map,
+                Entry::builder(client_addr)
+                    .local(server_addr)
+                    .params(server_params),
+            );
+
+            // A first stream works on the inserted entry.
+            let stream = client
+                .connect(format!("server:{SERVER_PORT}"), acceptor_id)
+                .await
+                .expect("connect 1");
+            let (mut reader, mut writer) = stream.into_split();
+            let mut ping = Bytes::from_static(b"ping");
+            writer.write_all_from_fin(&mut ping).await.expect("write 1");
+            let mut response = Data::new(RESPONSE_LEN);
+            loop {
+                if reader.read_into(&mut response).await.expect("read 1") == 0 {
+                    break;
+                }
+            }
+            assert!(response.is_finished(), "response 1 was cut");
+            drop(reader);
+            drop(writer);
+
+            // After 3 s the client's receive idle wheel has dropped its receive context for the
+            // server's key, while the server's send context still seals with that key.
+            3.s().sleep().await;
+            broken.store(true, Ordering::Relaxed);
+
+            // Read the depth of the client's UPS queue each millisecond until the next stream is
+            // done.
+            let ups_queue = client.counters().register_queue_gauge("q.ups");
+            let sampling = Arc::new(AtomicBool::new(true));
+            {
+                let sampling = sampling.clone();
+                async move {
+                    while sampling.load(Ordering::Relaxed) {
+                        let depth = ups_queue.depth.get().max(0) as usize;
+                        max_depth_inner.fetch_max(depth, Ordering::Relaxed);
+                        1.ms().sleep().await;
+                    }
+                }
+                .spawn();
+            }
+
+            // The server answers the next stream on the dropped key, and the client rejects each
+            // of its packets until the first notice moves the server to a new key.
+            let next = async {
+                let peer = format!("server:{SERVER_PORT}");
+                let stream = client.connect(peer, acceptor_id).await.ok()?;
+                let (mut reader, mut writer) = stream.into_split();
+                let mut ping = Bytes::from_static(b"ping");
+                writer.write_all_from_fin(&mut ping).await.ok()?;
+                let mut response = Data::new(RESPONSE_LEN);
+                loop {
+                    if reader.read_into(&mut response).await.ok()? == 0 {
+                        break;
+                    }
+                }
+                Some(response.is_finished())
+            };
+            let finished = timeout(10.s(), next).await.ok().flatten();
+            sampling.store(false, Ordering::Relaxed);
+            *completed_inner.lock().unwrap() = finished;
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    // The server's packets reached the client on the dropped key, and the client answered them
+    // with notices.
+    let notices = notices.load(Ordering::Relaxed);
+    assert!(
+        notices > 0,
+        "the client never answered the server's packets with a replay or stale-key notice, so \
+         the test didn't reproduce the loss of the client's receive context"
+    );
+    // Before its first wait ends, the pacer removes at most two notices from the queue: the one
+    // it sends and the one it holds. Each later rejection waits in the queue.
+    let stale_packets = stale_packets.load(Ordering::Relaxed);
+    assert!(
+        stale_packets > server_sender_ids + 2,
+        "the server sent {stale_packets} packets on the dropped key before the client's first \
+         notice, too few for the queue to hold more than {server_sender_ids} notices behind the \
+         two its pacer removes first"
+    );
+    let max_depth = max_depth.load(Ordering::Relaxed);
+    assert!(
+        max_depth <= server_sender_ids,
+        "the client's UPS queue held {max_depth} notices at one time for the server's one \
+         credential and {server_sender_ids} sender id: each rejected packet queued a notice of \
+         its own"
+    );
+    let completed = *completed.lock().unwrap();
+    assert_eq!(
+        completed,
+        Some(true),
+        "the stream after the break didn't receive its whole response within 10 s"
+    );
+}
+
 // ── QueueMsg Integration Tests ─────────────────────────────────────────────
 
 /// Single message, two chunks — verifies the basic QueueMsg path works end-to-end.
