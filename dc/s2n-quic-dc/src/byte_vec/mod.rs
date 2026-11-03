@@ -319,10 +319,10 @@ impl<'a> Reader<'a> {
     /// buf.push_back(Bytes::from_static(b" world"));
     ///
     /// let mut reader = buf.reader();
-    /// reader.advance(7).unwrap();
-    /// assert_eq!(reader.len(), 4);
-    /// assert!(reader.advance(5).is_err());
-    /// assert_eq!(reader.next().as_deref(), Some(&b"orld"[..]));
+    /// reader.advance(6).unwrap();
+    /// assert_eq!(reader.len(), 5);
+    /// assert!(reader.advance(6).is_err());
+    /// assert_eq!(reader.next().as_deref(), Some(&b"world"[..]));
     /// ```
     #[inline]
     pub fn advance(&mut self, len: usize) -> Result<(), ByteVecError> {
@@ -433,8 +433,8 @@ impl bytes::Buf for Reader<'_> {
     }
 
     #[inline]
-    fn advance(&mut self, cnt: usize) {
-        Self::advance(self, cnt).unwrap();
+    fn advance(&mut self, len: usize) {
+        Self::advance(self, len).unwrap();
     }
 }
 
