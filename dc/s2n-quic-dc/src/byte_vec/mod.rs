@@ -9,9 +9,13 @@
 //! `etude_buffer` Storage traits, so the fork-local newtype supplies the s2n-quic-core ones — a
 //! newtype is required because both the trait and etude's type are foreign to this crate). Every
 //! other method is either forwarded verbatim to etude via [`Deref`]/[`DerefMut`] or a thin wrapper
-//! where a `Self` value crosses the boundary. The [`Builder`] (length-prefix framing, socket reads)
-//! and [`tagged`] (owner/handle tagging) modules keep their fork-local logic, now layered on this
-//! newtype.
+//! where a `Self` value crosses the boundary. A few methods are inherent on the newtype itself:
+//! `len` and `is_empty`, so that `ByteVec::len` names a function; `truncate`, so that a
+//! call such as `buf.truncate(buf.len() - 1)` compiles; and `copy_to_bytes`, so that a call
+//! without a length isn't taken for `bytes::Buf::copy_to_bytes`. [`Reader`] is the newtype's own,
+//! so that a reader can be cloned. The [`Builder`] (length-prefix framing, socket reads, and its
+//! [`Behavior`]) and [`tagged`] (owner/handle tagging) modules keep their fork-local logic, now
+//! layered on this newtype.
 
 use core::ops;
 use s2n_quic_core::buffer::{
@@ -28,8 +32,10 @@ pub mod tagged;
 #[cfg(test)]
 mod tests;
 
-pub use builder::Builder;
-pub use etude_bytevec::{ByteVecError, Bytes, BytesMut};
+pub use builder::{Behavior, Builder, DefaultBehavior};
+// etude-bytevec's chunk and drain iterators are re-exported so that callers can name them without
+// a dependency on etude-bytevec.
+pub use etude_bytevec::{ByteVecError, Bytes, BytesMut, ChunkIter, DrainIter};
 pub use tagged::Tagged;
 
 /// A vector of [`Bytes`] chunks, backed by [`etude_bytevec::ByteVec`].
@@ -57,7 +63,7 @@ pub struct ByteVec(etude_bytevec::ByteVec);
 impl ByteVec {
     /// Creates an empty [`ByteVec`].
     #[inline]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self(etude_bytevec::ByteVec::new())
     }
 
@@ -71,6 +77,116 @@ impl ByteVec {
     #[inline]
     pub fn builder(chunk_capacity: usize) -> Builder {
         Builder::new(chunk_capacity)
+    }
+
+    /// Returns the total number of bytes in the buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use s2n_quic_dc::byte_vec::ByteVec;
+    ///
+    /// let buffers = [ByteVec::from(&b"hello"[..]), ByteVec::new()];
+    /// let lens: Vec<usize> = buffers.iter().map(ByteVec::len).collect();
+    /// assert_eq!(lens, [5, 0]);
+    /// ```
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns `true` if the buffer is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use s2n_quic_dc::byte_vec::ByteVec;
+    ///
+    /// assert!(ByteVec::new().is_empty());
+    /// assert!(!ByteVec::from(&b"hello"[..]).is_empty());
+    /// ```
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Shortens the buffer to its first `len` bytes. It does nothing where `len` is the buffer's
+    /// length or more.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use s2n_quic_dc::byte_vec::ByteVec;
+    ///
+    /// let mut buf = ByteVec::from(&b"hello world"[..]);
+    /// buf.truncate(buf.len() - 6);
+    /// assert_eq!(buf, b"hello");
+    ///
+    /// buf.truncate(10);
+    /// assert_eq!(buf, b"hello");
+    /// ```
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
+
+    /// Flattens the buffer into one [`Bytes`], and leaves the buffer as it is.
+    ///
+    /// A buffer of one chunk returns that chunk without a copy, and a buffer of more chunks copies
+    /// them into one new buffer, so read the chunks one by one where one buffer isn't needed. To
+    /// take bytes off the front of the buffer, call `bytes::Buf::copy_to_bytes(&mut buf, len)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use s2n_quic_dc::byte_vec::ByteVec;
+    /// use bytes::Bytes;
+    ///
+    /// let mut buf = ByteVec::new();
+    /// buf.push_back(Bytes::from("hello"));
+    /// buf.push_back(Bytes::from(" world"));
+    ///
+    /// assert_eq!(buf.copy_to_bytes(), &b"hello world"[..]);
+    /// assert_eq!(buf, b"hello world");
+    /// ```
+    #[inline]
+    pub fn copy_to_bytes(&self) -> Bytes {
+        let mut chunks = self.0.chunks();
+        let Some(first) = chunks.next() else {
+            return Bytes::new();
+        };
+        let Some(second) = chunks.next() else {
+            // one chunk: hand it back without a copy
+            return first.clone();
+        };
+        let mut out = BytesMut::with_capacity(self.0.len());
+        out.extend_from_slice(first);
+        out.extend_from_slice(second);
+        for chunk in chunks {
+            out.extend_from_slice(chunk);
+        }
+        out.freeze()
+    }
+
+    /// Returns a [`Reader`] over the buffer's chunks. The reader borrows the buffer, and a clone of
+    /// it reads on from the same place.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use s2n_quic_dc::byte_vec::ByteVec;
+    ///
+    /// let buf = ByteVec::from(&b"hello"[..]);
+    /// let mut reader = buf.reader();
+    /// let copy = reader.clone();
+    ///
+    /// assert_eq!(reader.next().as_deref(), Some(&b"hello"[..]));
+    /// assert!(reader.next().is_none());
+    /// assert_eq!(copy.len(), 5);
+    /// ```
+    #[inline]
+    pub fn reader(&self) -> Reader<'_> {
+        Reader::new(&self.0)
     }
 
     /// Splits the bytes into two at the given index.
@@ -137,6 +253,62 @@ impl ops::DerefMut for ByteVec {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/// A reader over the chunks of a [`ByteVec`], which [`ByteVec::reader`] returns.
+///
+/// It yields each chunk as a [`Bytes`], a reference-counted handle to the chunk's memory, and
+/// borrows the [`ByteVec`] instead of cloning its list of chunks. A clone of a reader reads on from
+/// the place the reader had reached, and the two then read independently.
+#[derive(Clone, Debug)]
+pub struct Reader<'a> {
+    buffer: &'a etude_bytevec::ByteVec,
+    /// The index in `buffer` of the next chunk to read.
+    next_chunk: usize,
+    /// The bytes left to read.
+    remaining: usize,
+}
+
+impl<'a> Reader<'a> {
+    #[inline]
+    fn new(buffer: &'a etude_bytevec::ByteVec) -> Self {
+        Self {
+            buffer,
+            next_chunk: 0,
+            remaining: buffer.len(),
+        }
+    }
+
+    /// Returns the number of bytes left to read.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.remaining
+    }
+
+    /// Returns `true` if no bytes are left to read.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
+impl Iterator for Reader<'_> {
+    type Item = Bytes;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        // `remaining` counts the bytes of the chunks from `next_chunk` on, so a chunk is left to
+        // read while it is above 0
+        while self.remaining > 0 {
+            let chunk = &self.buffer[self.next_chunk];
+            self.next_chunk += 1;
+            if !chunk.is_empty() {
+                self.remaining -= chunk.len();
+                return Some(chunk.clone());
+            }
+        }
+        None
     }
 }
 
