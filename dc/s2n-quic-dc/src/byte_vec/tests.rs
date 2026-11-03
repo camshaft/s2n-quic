@@ -314,7 +314,8 @@ fn reader_buf_reads_across_chunks() {
     use bytes::Buf as _;
 
     let buf = three_chunks();
-    let mut reader = buf.reader();
+    // `Buf::reader` takes `buf` by value, so with `Buf` in scope `buf.reader()` would call it
+    let mut reader = ByteVec::reader(&buf);
     assert_eq!(reader.remaining(), 11);
     assert_eq!(reader.chunk(), b"012");
 
@@ -459,7 +460,8 @@ fn reader_skips_empty_chunks() {
         Bytes::new(),
         Bytes::from_static(b"3456"),
     ]);
-    let mut reader = buf.reader();
+    // `Buf::reader` takes `buf` by value, so with `Buf` in scope `buf.reader()` would call it
+    let mut reader = ByteVec::reader(&buf);
     assert_eq!(reader.remaining(), 7);
     assert_eq!(reader.chunk(), b"012");
     assert_eq!(reader.next().as_deref(), Some(&b"012"[..]));
