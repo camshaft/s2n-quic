@@ -6,11 +6,66 @@ use s2n_quic_core::buffer::writer::Storage;
 
 const DEFAULT_CAPACITY: usize = 1 << 17;
 
+/// The policy a [`Builder`] follows: the capacity of its head buffer, and how it turns a completed
+/// chunk buffer into the [`Bytes`] it stores.
+///
+/// Each method has a default that matches the plain builder, so an implementation overrides only
+/// the methods it needs. [`DefaultBehavior`] keeps every default.
+///
+/// For example, an implementation of [`Behavior::freeze`] can wrap each completed buffer in an
+/// owner that zeroes the memory on drop, and build the chunk with `Bytes::from_owner`, so that the
+/// memory is wiped once the last chunk that points into it is dropped.
+///
+/// # Examples
+///
+/// ```
+/// use s2n_quic_dc::byte_vec::{Behavior, Builder};
+/// use s2n_quic_core::buffer::writer::Storage;
+///
+/// struct Small;
+///
+/// impl Behavior for Small {
+///     fn default_capacity(&self) -> usize {
+///         16
+///     }
+/// }
+///
+/// let mut builder = Builder::from_behavior(Small);
+/// builder.put_slice(b"hello");
+/// assert_eq!(builder.finish(), b"hello");
+/// ```
+pub trait Behavior {
+    /// The head-buffer capacity of a builder made with [`Builder::from_behavior`]: 128 KiB unless
+    /// the implementation overrides it.
+    #[inline]
+    fn default_capacity(&self) -> usize {
+        DEFAULT_CAPACITY
+    }
+
+    /// Turns a completed chunk buffer into the [`Bytes`] the builder stores: [`BytesMut::freeze`]
+    /// unless the implementation overrides it, which keeps the buffer in place without a copy.
+    #[inline]
+    fn freeze(&self, buf: BytesMut) -> Bytes {
+        buf.freeze()
+    }
+}
+
+/// The default [`Behavior`]: a 128 KiB head buffer, and [`BytesMut::freeze`] for each completed
+/// chunk. It is a zero-sized type, so a `Builder<DefaultBehavior>` is the plain builder.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DefaultBehavior;
+
+impl Behavior for DefaultBehavior {}
+
 /// A builder for efficiently constructing a [`ByteVec`] by buffering writes.
 ///
 /// The builder maintains a head buffer for direct writes and a collection of
 /// completed chunks. This allows for efficient buffering of writes while
 /// maintaining the chunked nature of [`ByteVec`].
+///
+/// The type parameter `B` is the builder's [`Behavior`]. It defaults to [`DefaultBehavior`], so a
+/// `Builder` without a parameter works as it did before the parameter was added;
+/// [`Builder::from_behavior`] and [`Builder::with_behavior`] make a builder with another one.
 ///
 /// # Examples
 ///
@@ -27,19 +82,20 @@ const DEFAULT_CAPACITY: usize = 1 << 17;
 /// assert_eq!(byte_vec, b"hello world");
 /// ```
 #[derive(Debug)]
-pub struct Builder {
+pub struct Builder<B = DefaultBehavior> {
     chunks: ByteVec,
     head: BytesMut,
     capacity: usize,
+    behavior: B,
 }
 
-impl Default for Builder {
+impl Default for Builder<DefaultBehavior> {
     fn default() -> Self {
         Self::new(DEFAULT_CAPACITY)
     }
 }
 
-impl Builder {
+impl Builder<DefaultBehavior> {
     pub const DEFAULT_CAPACITY: usize = DEFAULT_CAPACITY;
 
     /// Creates a new [`Builder`] with the specified capacity for the head buffer.
@@ -59,6 +115,58 @@ impl Builder {
             chunks: ByteVec::new(),
             head: BytesMut::new(),
             capacity,
+            behavior: DefaultBehavior,
+        }
+    }
+}
+
+impl<B: Behavior> Builder<B> {
+    /// Creates a [`Builder`] that follows `behavior`, with the head-buffer capacity that
+    /// [`Behavior::default_capacity`] returns.
+    pub fn from_behavior(behavior: B) -> Self {
+        Builder {
+            chunks: ByteVec::new(),
+            head: BytesMut::new(),
+            capacity: behavior.default_capacity(),
+            behavior,
+        }
+    }
+
+    /// Returns a builder that follows `behavior` in place of this builder's [`Behavior`].
+    ///
+    /// The new builder holds the bytes this one buffered and keeps its head-buffer capacity; use
+    /// [`Builder::from_behavior`] for the capacity the behavior sets. The chunks this builder
+    /// completed keep the [`Bytes`] its behavior made, and the bytes still in its head buffer are
+    /// frozen by the new behavior.
+    ///
+    /// The builder calls [`Behavior::freeze`] each time it turns a [`BytesMut`] into a chunk: when
+    /// it flushes its head buffer, and for each buffer handed to `put_bytes_mut`. It doesn't call
+    /// it for [`Bytes`] it is handed, such as through `put_bytes` or [`Builder::append`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use s2n_quic_dc::byte_vec::{Behavior, ByteVec, Bytes, BytesMut};
+    /// use s2n_quic_core::buffer::writer::Storage;
+    ///
+    /// struct Upper;
+    ///
+    /// impl Behavior for Upper {
+    ///     fn freeze(&self, buf: BytesMut) -> Bytes {
+    ///         Bytes::from(buf.to_ascii_uppercase())
+    ///     }
+    /// }
+    ///
+    /// let mut builder = ByteVec::builder(1024).with_behavior(Upper);
+    /// builder.put_slice(b"hello");
+    /// assert_eq!(builder.finish(), b"HELLO");
+    /// ```
+    pub fn with_behavior<B2: Behavior>(self, behavior: B2) -> Builder<B2> {
+        Builder {
+            chunks: self.chunks,
+            head: self.head,
+            capacity: self.capacity,
+            behavior,
         }
     }
 
@@ -218,7 +326,7 @@ impl Builder {
         // check if we need to move some of the head into the chunks
         if let Some(remaining) = at.checked_sub(self.chunks.len()).filter(|v| *v > 0) {
             self.chunks
-                .push_back(self.head.split_to(remaining).freeze());
+                .push_back(self.behavior.freeze(self.head.split_to(remaining)));
         }
 
         self.chunks.split_to(at)
@@ -245,7 +353,7 @@ impl Builder {
     pub fn finish(self) -> ByteVec {
         let mut chunks = self.chunks;
         if !self.head.is_empty() {
-            chunks.push_back(self.head.freeze());
+            chunks.push_back(self.behavior.freeze(self.head));
         }
         chunks
     }
@@ -317,35 +425,37 @@ impl Builder {
         let capacity = self.capacity.max(min_len);
         let head = core::mem::replace(&mut self.head, BytesMut::with_capacity(capacity));
         if !head.is_empty() {
-            self.chunks.push_back(head.freeze());
+            self.chunks.push_back(self.behavior.freeze(head));
         }
     }
 
     // flushes the current buffer, if non-empty
     fn flush(&mut self) {
         if !self.head.is_empty() {
-            self.chunks.push_back(self.head.split().freeze());
+            self.chunks
+                .push_back(self.behavior.freeze(self.head.split()));
         }
     }
 }
 
-impl From<ByteVec> for Builder {
+impl From<ByteVec> for Builder<DefaultBehavior> {
     fn from(chunks: ByteVec) -> Self {
         Builder {
             chunks,
             head: BytesMut::new(),
             capacity: DEFAULT_CAPACITY,
+            behavior: DefaultBehavior,
         }
     }
 }
 
-impl From<Builder> for ByteVec {
-    fn from(writer: Builder) -> Self {
+impl<B: Behavior> From<Builder<B>> for ByteVec {
+    fn from(writer: Builder<B>) -> Self {
         writer.finish()
     }
 }
 
-impl writer::Storage for Builder {
+impl<B: Behavior> writer::Storage for Builder<B> {
     // we prefer direct writes into the head chunk rather than appending byte chunks
     const SPECIALIZES_BYTES: bool = false;
     const SPECIALIZES_BYTES_MUT: bool = false;
@@ -399,11 +509,11 @@ impl writer::Storage for Builder {
             return;
         }
         self.flush();
-        self.chunks.push_back(bytes.freeze());
+        self.chunks.push_back(self.behavior.freeze(bytes));
     }
 }
 
-impl reader::Storage for Builder {
+impl<B: Behavior> reader::Storage for Builder<B> {
     type Error = core::convert::Infallible;
 
     fn buffered_len(&self) -> usize {
