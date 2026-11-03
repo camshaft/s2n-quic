@@ -261,11 +261,18 @@ impl ops::DerefMut for ByteVec {
 /// It yields each chunk as a [`Bytes`], a reference-counted handle to the chunk's memory, and
 /// borrows the [`ByteVec`] instead of cloning its list of chunks. A clone of a reader reads on from
 /// the place the reader had reached, and the two then read independently.
+///
+/// As the reader before the move to etude-bytevec did, it also implements [`bytes::Buf`],
+/// s2n-quic-core's [`reader::Storage`] and [`io::Read`], and [`Reader::advance`] moves it on
+/// without reading. A read through any of them can stop inside a chunk, and the next read starts
+/// from that place. None of them changes the [`ByteVec`] the reader borrows.
 #[derive(Clone, Debug)]
 pub struct Reader<'a> {
     buffer: &'a etude_bytevec::ByteVec,
-    /// The index in `buffer` of the next chunk to read.
-    next_chunk: usize,
+    /// The index in `buffer` of the chunk that holds the next byte to read.
+    index: usize,
+    /// The bytes of that chunk the reader has read already.
+    offset: usize,
     /// The bytes left to read.
     remaining: usize,
 }
@@ -273,11 +280,14 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     #[inline]
     fn new(buffer: &'a etude_bytevec::ByteVec) -> Self {
-        Self {
+        let mut reader = Self {
             buffer,
-            next_chunk: 0,
+            index: 0,
+            offset: 0,
             remaining: buffer.len(),
-        }
+        };
+        reader.skip_read_chunks();
+        reader
     }
 
     /// Returns the number of bytes left to read.
@@ -291,6 +301,87 @@ impl<'a> Reader<'a> {
     pub fn is_empty(&self) -> bool {
         self.remaining == 0
     }
+
+    /// Moves the reader `len` bytes on without reading them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ByteVecError::OutOfBounds`], and leaves the reader where it was, if `len` is
+    /// greater than the number of bytes left to read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use s2n_quic_dc::byte_vec::ByteVec;
+    /// use bytes::Bytes;
+    ///
+    /// let mut buf = ByteVec::from(&b"hello"[..]);
+    /// buf.push_back(Bytes::from_static(b" world"));
+    ///
+    /// let mut reader = buf.reader();
+    /// reader.advance(6).unwrap();
+    /// assert_eq!(reader.len(), 5);
+    /// assert!(reader.advance(6).is_err());
+    /// assert_eq!(reader.next().as_deref(), Some(&b"world"[..]));
+    /// ```
+    #[inline]
+    pub fn advance(&mut self, len: usize) -> Result<(), ByteVecError> {
+        if len > self.remaining {
+            return Err(ByteVecError::OutOfBounds(len));
+        }
+
+        let mut left = len;
+        while left > 0 {
+            let read = left.min(self.head().len());
+            self.consume(read);
+            left -= read;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the bytes left to read in the chunk that holds the next byte to read. They are
+    /// empty only once the reader has read every byte.
+    #[inline]
+    fn head(&self) -> &'a [u8] {
+        if self.remaining == 0 {
+            return &[];
+        }
+        let buffer: &'a etude_bytevec::ByteVec = self.buffer;
+        &buffer[self.index][self.offset..]
+    }
+
+    /// Takes up to `watermark` bytes off the front of `head` as a [`Bytes`] that shares the
+    /// chunk's memory, and moves the reader past them.
+    #[inline]
+    fn read_head(&mut self, watermark: usize) -> Bytes {
+        let len = watermark.min(self.head().len());
+        if len == 0 {
+            return Bytes::new();
+        }
+        let chunk = &self.buffer[self.index];
+        let bytes = chunk.slice(self.offset..self.offset + len);
+        self.consume(len);
+        bytes
+    }
+
+    /// Moves the reader `len` bytes on in `head`, where `len` is at most the length of `head`.
+    #[inline]
+    fn consume(&mut self, len: usize) {
+        self.offset += len;
+        self.remaining -= len;
+        self.skip_read_chunks();
+    }
+
+    /// Moves the reader past each chunk it has read to its end and past each empty chunk, so that
+    /// `head` isn't empty while bytes are left to read.
+    #[inline]
+    fn skip_read_chunks(&mut self) {
+        while self.remaining > 0 && self.offset == self.buffer[self.index].len() {
+            self.index += 1;
+            self.offset = 0;
+        }
+    }
 }
 
 impl Iterator for Reader<'_> {
@@ -298,17 +389,98 @@ impl Iterator for Reader<'_> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        // `remaining` counts the bytes of the chunks from `next_chunk` on, so a chunk is left to
-        // read while it is above 0
-        while self.remaining > 0 {
-            let chunk = &self.buffer[self.next_chunk];
-            self.next_chunk += 1;
-            if !chunk.is_empty() {
-                self.remaining -= chunk.len();
-                return Some(chunk.clone());
-            }
+        // the rest of the chunk the reader is in, which is empty only once every byte is read
+        let chunk = self.read_head(usize::MAX);
+        if chunk.is_empty() {
+            None
+        } else {
+            Some(chunk)
         }
-        None
+    }
+}
+
+impl bytes::Buf for Reader<'_> {
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    #[inline]
+    fn chunk(&self) -> &[u8] {
+        self.head()
+    }
+
+    #[inline]
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        assert!(
+            len <= self.remaining,
+            "`len` is greater than the number of bytes left to read"
+        );
+
+        // a prefix of the chunk the reader is in shares the chunk's memory, without a copy
+        let head = self.read_head(len);
+        if head.len() == len {
+            return head;
+        }
+
+        let mut out = BytesMut::with_capacity(len);
+        out.extend_from_slice(&head);
+        while out.len() < len {
+            let chunk = self.read_head(len - out.len());
+            out.extend_from_slice(&chunk);
+        }
+        out.freeze()
+    }
+
+    #[inline]
+    fn advance(&mut self, len: usize) {
+        Self::advance(self, len).unwrap();
+    }
+}
+
+impl reader::Storage for Reader<'_> {
+    type Error = core::convert::Infallible;
+
+    #[inline]
+    fn buffered_len(&self) -> usize {
+        self.remaining
+    }
+
+    #[inline]
+    fn read_chunk(&mut self, watermark: usize) -> Result<Chunk<'_>, Self::Error> {
+        Ok(self.read_head(watermark).into())
+    }
+
+    #[inline]
+    fn partial_copy_into<Dest>(&mut self, dest: &mut Dest) -> Result<Chunk<'_>, Self::Error>
+    where
+        Dest: writer::Storage + ?Sized,
+    {
+        loop {
+            let head_len = self.head().len();
+            if head_len == 0 {
+                return Ok(Chunk::empty());
+            }
+
+            let remaining_capacity = dest.remaining_capacity();
+            // the chunk that fills `dest` goes back to the caller, which copies it later
+            if head_len >= remaining_capacity {
+                return Ok(self.read_head(remaining_capacity).into());
+            }
+
+            // the chunk fits, so copy it into `dest` and go on with the next one
+            let mut chunk = Chunk::from(self.read_head(head_len));
+            chunk.infallible_copy_into(dest);
+        }
+    }
+}
+
+impl io::Read for Reader<'_> {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = buf.len().min(self.remaining);
+        bytes::Buf::copy_to_slice(self, &mut buf[..len]);
+        Ok(len)
     }
 }
 

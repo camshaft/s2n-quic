@@ -270,6 +270,206 @@ fn reader_fits_a_derived_clone() {
     assert_eq!(decoder.reader.len(), 5);
 }
 
+/// A buffer of the three chunks "012", "3456" and "7890", so that a read crosses the boundaries of
+/// its chunks.
+fn three_chunks() -> ByteVec {
+    let mut buf = ByteVec::from(&b"012"[..]);
+    buf.push_back(Bytes::from_static(b"3456"));
+    buf.push_back(Bytes::from_static(b"7890"));
+    // each test below reads across these boundaries
+    assert_eq!(
+        buf.chunks().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+        [3, 4, 4]
+    );
+    buf
+}
+
+#[test]
+fn reader_advance_moves_on_and_refuses_past_the_end() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+
+    reader.advance(0).unwrap();
+    assert_eq!(reader.len(), 11);
+
+    // into the second chunk
+    reader.advance(5).unwrap();
+    assert_eq!(reader.len(), 6);
+    // the iterator yields the rest of the chunk the reader is in
+    assert_eq!(reader.next().as_deref(), Some(&b"56"[..]));
+
+    // a length past the end is refused, and the reader stays where it was
+    let error = reader.advance(5).unwrap_err();
+    assert!(matches!(error, ByteVecError::OutOfBounds(5)));
+    assert_eq!(reader.len(), 4);
+
+    // to the end of the last chunk
+    reader.advance(4).unwrap();
+    assert!(reader.is_empty());
+    assert!(reader.next().is_none());
+}
+
+#[test]
+fn reader_buf_reads_across_chunks() {
+    use bytes::Buf as _;
+
+    let buf = three_chunks();
+    // `Buf::reader` takes `buf` by value, so with `Buf` in scope `buf.reader()` would call it
+    let mut reader = ByteVec::reader(&buf);
+    assert_eq!(reader.remaining(), 11);
+    assert_eq!(reader.chunk(), b"012");
+
+    // `advance` inside a chunk leaves the rest of that chunk as `chunk`
+    bytes::Buf::advance(&mut reader, 1);
+    assert_eq!(reader.remaining(), 10);
+    assert_eq!(reader.chunk(), b"12");
+
+    // a u32 across the boundary of the first two chunks
+    let value = reader.try_get_u32().unwrap();
+    assert_eq!(value, u32::from_be_bytes(*b"1234"));
+    assert_eq!(reader.remaining(), 6);
+    assert_eq!(reader.chunk(), b"56");
+
+    // `advance` to the end of a chunk moves on to the next chunk
+    bytes::Buf::advance(&mut reader, 2);
+    assert_eq!(reader.chunk(), b"7890");
+
+    // `copy_to_bytes` of a prefix of one chunk shares that chunk's memory
+    let last = buf.chunks().last().unwrap();
+    let prefix = bytes::Buf::copy_to_bytes(&mut reader, 2);
+    assert_eq!(prefix, &b"78"[..]);
+    assert_eq!(prefix.as_ptr(), last.as_ptr());
+
+    // too few bytes are left for a u32, and the reader stays where it was
+    assert!(reader.try_get_u32().is_err());
+    assert_eq!(reader.chunk(), b"90");
+
+    bytes::Buf::advance(&mut reader, 2);
+    assert_eq!(reader.remaining(), 0);
+    assert!(reader.chunk().is_empty());
+}
+
+#[test]
+#[should_panic]
+fn reader_buf_advance_past_the_end_panics() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+    bytes::Buf::advance(&mut reader, 12);
+}
+
+#[test]
+#[should_panic]
+fn reader_buf_copy_to_bytes_past_the_end_panics() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+    let _ = bytes::Buf::copy_to_bytes(&mut reader, 12);
+}
+
+#[test]
+fn reader_storage_reads_across_chunks() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+    assert_eq!(reader.buffered_len(), 11);
+
+    // `read_chunk` returns at most the rest of the chunk the reader is in
+    assert_eq!(&reader.read_chunk(2).unwrap()[..], b"01");
+    assert_eq!(&reader.read_chunk(usize::MAX).unwrap()[..], b"2");
+    assert_eq!(reader.buffered_len(), 8);
+
+    // `infallible_copy_into` copies the rest across the boundary of the last two chunks
+    let mut out: Vec<u8> = Vec::new();
+    reader.infallible_copy_into(&mut out);
+    assert_eq!(out, b"34567890");
+    assert_eq!(reader.buffered_len(), 0);
+    assert!(reader.read_chunk(usize::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn reader_partial_copy_into_returns_the_chunk_that_fills_dest() {
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+    let mut out: Vec<u8> = Vec::new();
+    {
+        // a dest with a 5-byte write limit takes the first chunk and the front of the second
+        let mut limited = out.with_write_limit(5);
+        let mut chunk = reader.partial_copy_into(&mut limited).unwrap();
+        assert_eq!(&chunk[..], b"34");
+        chunk.infallible_copy_into(&mut limited);
+    }
+    assert_eq!(out, b"01234");
+    // the rest stays readable
+    assert_eq!(reader.len(), 6);
+    assert_eq!(reader.next().as_deref(), Some(&b"56"[..]));
+}
+
+#[test]
+fn reader_io_read_reads_across_chunks() {
+    use std::io::Read as _;
+
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+
+    // one read fills `out` across the boundary of the first two chunks
+    let mut out = [0u8; 5];
+    assert_eq!(reader.read(&mut out).unwrap(), 5);
+    assert_eq!(&out, b"01234");
+    assert_eq!(reader.len(), 6);
+
+    // a read into a larger buffer reads the rest, and a read after it reads nothing
+    let mut rest = [0u8; 16];
+    assert_eq!(reader.read(&mut rest).unwrap(), 6);
+    assert_eq!(&rest[..6], b"567890");
+    assert_eq!(reader.read(&mut out).unwrap(), 0);
+}
+
+#[test]
+fn reader_reads_leave_the_buffer_unchanged() {
+    use std::io::Read as _;
+
+    let buf = three_chunks();
+    let mut reader = buf.reader();
+
+    bytes::Buf::advance(&mut reader, 1);
+    assert_eq!(bytes::Buf::copy_to_bytes(&mut reader, 5), &b"12345"[..]);
+    let mut out: Vec<u8> = Vec::new();
+    reader.clone().infallible_copy_into(&mut out);
+    assert_eq!(out, b"67890");
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"67890");
+
+    // the buffer keeps its bytes and its chunks, and a new reader reads all of them
+    assert_eq!(buf, b"01234567890");
+    assert_eq!(
+        buf.chunks().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+        [3, 4, 4]
+    );
+    let mut all = Vec::new();
+    buf.reader().read_to_end(&mut all).unwrap();
+    assert_eq!(all, b"01234567890");
+}
+
+#[test]
+fn reader_skips_empty_chunks() {
+    use bytes::Buf as _;
+
+    // where the buffer keeps empty chunks, the reader moves past them
+    let buf = ByteVec::from(vec![
+        Bytes::new(),
+        Bytes::from_static(b"012"),
+        Bytes::new(),
+        Bytes::from_static(b"3456"),
+    ]);
+    // `Buf::reader` takes `buf` by value, so with `Buf` in scope `buf.reader()` would call it
+    let mut reader = ByteVec::reader(&buf);
+    assert_eq!(reader.remaining(), 7);
+    assert_eq!(reader.chunk(), b"012");
+    assert_eq!(reader.next().as_deref(), Some(&b"012"[..]));
+    assert_eq!(reader.chunk(), b"3456");
+    assert_eq!(reader.next().as_deref(), Some(&b"3456"[..]));
+    assert!(reader.next().is_none());
+}
+
 /// A [`Behavior`] that stores each chunk in upper case and counts its freezes, so that a test can
 /// tell which chunks went through it.
 #[derive(Clone, Debug, Default)]
