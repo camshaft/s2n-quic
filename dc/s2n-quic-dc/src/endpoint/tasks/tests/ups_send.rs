@@ -656,7 +656,10 @@ fn unknown_credentials_queue_one_response_for_each_credential_and_sender_id() {
         }
     }
     assert_eq!(pending.queued(), ids.len() * sender_ids.len());
-    drops.assert_dropped((ids.len() * sender_ids.len()) as u64 * (BURST as u64 - 1), 0);
+    drops.assert_dropped(
+        (ids.len() * sender_ids.len()) as u64 * (BURST as u64 - 1),
+        0,
+    );
 }
 
 /// Each key's shard of `ups::Pending` is the recv_dispatch worker the recv router hands the
