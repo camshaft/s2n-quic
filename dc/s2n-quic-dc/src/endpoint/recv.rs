@@ -563,6 +563,9 @@ impl Cache {
                         control_out,
                     )
                     .map_err(|_| CacheError::ReplayDetected)?;
+                // The packet opened and passed the replay check, so it counts as use of the path
+                // secret for the map's eviction order.
+                path_entry.set_accessed_authenticated();
 
                 // Packet is authentic — replace the entry with a fresh context.
                 // Key advancement means the peer abandoned its old sender context
@@ -644,6 +647,9 @@ impl Cache {
                         control_out,
                     )
                     .map_err(|_| CacheError::ReplayDetected)?;
+                // The packet opened and passed the replay check, so it counts as use of the path
+                // secret for the map's eviction order.
+                path_entry.set_accessed_authenticated();
 
                 let dest_sender_id = route.sender_id_for_ack(remote_sender_id);
 
@@ -678,4 +684,94 @@ impl Cache {
 crate::context_wheel_adapter!(IdleWheelAdapter, Context, idle_wheel);
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::{
+        endpoint::routing::{PowerOfTwoRoute, SenderRoute as _},
+        path::secret::{map::Entry, stateless_reset, Map},
+    };
+    use std::time::Duration;
+
+    fn test_map(secret: &[u8]) -> Map {
+        let map = Map::builder()
+            .with_signer(stateless_reset::Signer::new(secret))
+            .with_capacity(10)
+            .with_clock(s2n_quic_core::time::NoopClock)
+            .with_subscriber(crate::event::tracing::Subscriber::default())
+            .build()
+            .unwrap();
+        map.test_stop_cleaner();
+        map
+    }
+
+    /// The receive cache marks a path secret as used for the map's eviction order only once a
+    /// packet has opened and passed the replay check: on a cache miss and on a newer key id. It
+    /// doesn't mark it for an older key id, which it checks for replay without opening the packet,
+    /// or for a packet that opens and fails the replay check.
+    #[test]
+    fn marks_use_only_after_a_packet_opens() {
+        let client_addr: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let server_addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let client = test_map(b"client");
+        let server = test_map(b"server");
+        let ids = client.test_insert_pair(
+            Entry::builder(server_addr).local(client_addr),
+            &server,
+            Entry::builder(client_addr).local(server_addr),
+        );
+
+        let mut cache = Cache::new(RecvDispatchWorkerId::new(0));
+        let clock = crate::time::testing::Clock::new(Duration::from_secs(1));
+        let route = PowerOfTwoRoute::new(1);
+        let sender = RemoteSenderId::new(VarInt::ZERO);
+        let mut control_out = Vec::new();
+        // The decrypt callback opens every packet, as an authentic packet opens.
+        let mut receive = |cache: &mut Cache, key_id: u8| {
+            let credentials = Credentials {
+                id: ids.peer,
+                key_id: VarInt::from_u8(key_id),
+            };
+            cache.get_or_insert(
+                &credentials,
+                sender,
+                &server,
+                &clock,
+                SocketAddress::from(client_addr),
+                &mut control_out,
+                &route,
+                |_, _, _| Some(()),
+            )
+        };
+
+        // A cache miss opens the packet, then checks it for replay.
+        let Ok((_, ctx, _)) = receive(&mut cache, 5) else {
+            panic!("the first packet opens");
+        };
+        let entry = ctx.borrow().path_entry.clone();
+        assert!(entry.take_accessed_authenticated());
+
+        // An older key id that the entry hasn't seen passes the replay check, and the cache
+        // rejects the packet without opening it.
+        assert!(matches!(receive(&mut cache, 3), Err(CacheError::ReplayDetected)));
+        assert!(!entry.take_accessed_authenticated());
+
+        // A newer key id opens the packet with a fresh opener, then checks it for replay.
+        assert!(receive(&mut cache, 7).is_ok());
+        assert!(entry.take_accessed_authenticated());
+
+        // A second cache misses on key id 5, which the entry has seen: the packet opens and
+        // fails the replay check, and the cache doesn't mark the entry.
+        let mut other = Cache::new(RecvDispatchWorkerId::new(0));
+        assert!(matches!(receive(&mut other, 5), Err(CacheError::ReplayDetected)));
+        assert!(!entry.take_accessed_authenticated());
+
+        // Key id 6, below the newest key id seen and not seen itself, opens on a miss.
+        assert!(receive(&mut other, 6).is_ok());
+        assert!(entry.take_accessed_authenticated());
+
+        // Key id 7, newer than the cached 6 and seen already, opens with a fresh opener and
+        // fails the replay check, and the cache doesn't mark the entry.
+        assert!(matches!(receive(&mut other, 7), Err(CacheError::ReplayDetected)));
+        assert!(!entry.take_accessed_authenticated());
+    }
+}
