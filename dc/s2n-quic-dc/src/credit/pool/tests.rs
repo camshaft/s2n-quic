@@ -1703,7 +1703,7 @@ fn pacer_never_drives_available_past_capacity_in_a_wedge() {
     // care that the free level the fast path can see is bounded by the cap.
     //
     // The suspected ratchet: the pacer computes headroom from the raw `available` atomic, which is
-    // (a) held negative by parked demand and (b) blind to credit it has ALREADY put into the system
+    // (a) held negative by parked demand and (b) omits credit it has ALREADY put into the system
     // but not yet reflected in `available` — `refill_pending` (injection queued for the next pass)
     // and `carry` (pull the previous pass withheld to preserve no-snipe while parkers were live).
     // If a wedge keeps the writeback capped by live parked demand, `available` stays low every tick,
