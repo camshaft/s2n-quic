@@ -432,7 +432,7 @@ impl Tasks {
             if let Some(task) = slot {
                 heartbeat.current_task.store(idx as i64, Ordering::Relaxed);
                 if task.task.as_mut().poll(cx).is_ready() {
-                    eprintln!("task {idx} done ({})", task.location);
+                    trace!(idx, location = %task.location, "busy-poll task done");
                     *slot = None;
                     self.free.push(idx);
                     self.active -= 1;
