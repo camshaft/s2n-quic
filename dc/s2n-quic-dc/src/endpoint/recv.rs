@@ -253,6 +253,12 @@ pub(crate) struct Context {
     /// Timestamp when ack_state entered Flushed (submission sent to send pipeline).
     /// Used to measure how long the recv context is blocked waiting for ACK completion.
     pub flushed_at: Option<crate::time::precision::Timestamp>,
+    /// ack-every-N / delayed-ACK (p7-071971): count of ack-eliciting packets received since the last
+    /// ACK was flushed, and the arrival time of the first of them. `ack_scheduling` uses these to
+    /// suppress scheduling an ACK until `DCQUIC_ACK_EVERY_N` packets have arrived (or the oldest has
+    /// waited `DCQUIC_ACK_MAX_DELAY_US`); reset in `encode_and_flush`. Inert when the knob is <= 1.
+    pub ack_eliciting_since_ack: u32,
+    pub first_unacked_at: Option<crate::time::precision::Timestamp>,
     /// Map from binding_id to allocated queue_id for this sender.
     /// Shared with queue handles so they can remove entries when closed.
     /// Cached queue dispatch view (client or server depending on role).
@@ -341,9 +347,36 @@ impl Context {
             created_at: now,
             ack_state: AckState::Idle,
             flushed_at: None,
+            ack_eliciting_since_ack: 0,
+            first_unacked_at: None,
             queue_view,
             ack_burst: intrusive::Links::new(),
         }
+    }
+
+    /// ack-every-N / delayed-ACK decision for an incoming ack-eliciting packet (p7-071971).
+    ///
+    /// Increments the per-peer ack-eliciting counter (and records the first unacked arrival time),
+    /// then returns `true` = SCHEDULE (the caller drives `on_ack_eliciting` + enqueues the ACK) when
+    /// the count has reached `every_n` OR the oldest unacked packet has waited `max_delay`; else
+    /// `false` = SUPPRESS. Suppressing is safe: the packet's range still accumulates in `ack_ranges`,
+    /// so the eventual ACK is cumulative, and the max_delay floor bounds the sender's RTT/BBR sampling
+    /// gap. `every_n <= 1` always schedules — byte-identical to the previous ACK-every-packet behavior.
+    /// Reset by `encode_and_flush` when the ACK is actually sent.
+    pub(crate) fn ack_scheduling(
+        &mut self,
+        every_n: u32,
+        max_delay: core::time::Duration,
+        now: crate::time::precision::Timestamp,
+    ) -> bool {
+        self.ack_eliciting_since_ack = self.ack_eliciting_since_ack.saturating_add(1);
+        let first = *self.first_unacked_at.get_or_insert(now);
+        ack_schedule_decision(
+            self.ack_eliciting_since_ack,
+            every_n,
+            now.duration_since(first),
+            max_delay,
+        )
     }
 
     /// Encode the current ACK state and produce a direct submission for the send worker.
@@ -389,6 +422,9 @@ impl Context {
             "on_flush transition failed from Scheduled"
         );
         self.flushed_at = Some(largest_recv_time.into());
+        // ack-every-N: this ACK covers all accumulated ranges, so reset the delayed-ACK counters.
+        self.ack_eliciting_since_ack = 0;
+        self.first_unacked_at = None;
         self.invariants();
 
         Some(ack_state::Submission {
@@ -677,5 +713,38 @@ impl Cache {
 
 crate::context_wheel_adapter!(IdleWheelAdapter, Context, idle_wheel);
 
+/// Pure ack-every-N / delayed-ACK decision (extracted from [`Context::ack_scheduling`] so it is
+/// testable without a `Context` or clock): schedule when `every_n <= 1`, or the ack-eliciting
+/// `count` since the last ACK has reached `every_n`, or the oldest unacked packet has `waited` at
+/// least `max_delay`.
+fn ack_schedule_decision(
+    count: u32,
+    every_n: u32,
+    waited: core::time::Duration,
+    max_delay: core::time::Duration,
+) -> bool {
+    every_n <= 1 || count >= every_n || waited >= max_delay
+}
+
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::ack_schedule_decision;
+    use core::time::Duration;
+
+    #[test]
+    fn ack_every_n_decision() {
+        let d = Duration::from_micros;
+        // every_n <= 1 => always schedule (byte-identical ACK-every-packet baseline).
+        assert!(ack_schedule_decision(1, 1, d(0), d(200)));
+        assert!(ack_schedule_decision(1, 0, d(0), d(200)));
+        // N > 1: suppress until the count reaches N (and while under the max-delay floor)...
+        assert!(!ack_schedule_decision(1, 4, d(0), d(200)));
+        assert!(!ack_schedule_decision(3, 4, d(10), d(200)));
+        // ...schedule at/above N...
+        assert!(ack_schedule_decision(4, 4, d(0), d(200)));
+        assert!(ack_schedule_decision(5, 4, d(0), d(200)));
+        // ...or when the oldest unacked packet has waited >= max_delay, even below N.
+        assert!(ack_schedule_decision(2, 4, d(200), d(200)));
+        assert!(ack_schedule_decision(1, 4, d(250), d(200)));
+    }
+}
