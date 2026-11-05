@@ -1,5 +1,6 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
+assertion_line: 332
 expression: logs
 ---
 0:00:00.000000000 [server] DEBUG s2n_quic_dc: capacity=50000
@@ -936,54 +937,27 @@ expression: logs
 0:00:00.001041000 [client] TRACE c#socket.rx.bytes[recv.7]=7266
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=1
-0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=1
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=2
-0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=2
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=3
-0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=3
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=4
-0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=4
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=5
-0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=5
 0:00:00.001041000 [client] TRACE c#socket.rx.ops[recv.7]=1
 0:00:00.001041000 [client] TRACE c#socket.rx.bytes[recv.7]=7266
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=6
-0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=6
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=7
-0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=7
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=8
-0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=8
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=9
-0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=9
 0:00:00.001041000 [client] TRACE c#router.routed=1
 0:00:00.001041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
+0:00:00.001041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=10
 0:00:00.001041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=10
 0:00:00.001041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=10
 0:00:00.001041000 [client] TRACE m#task.socket_recv.drained[recv.7]=8
@@ -1428,17 +1402,11 @@ expression: logs
 0:00:00.002041000 [client] TRACE c#socket.rx.bytes[recv.7]=3546
 0:00:00.002041000 [client] TRACE c#router.routed=1
 0:00:00.002041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.002041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.002041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=1
-0:00:00.002041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=1
 0:00:00.002041000 [client] TRACE c#router.routed=1
 0:00:00.002041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.002041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
-0:00:00.002041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=2
-0:00:00.002041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=2
 0:00:00.002041000 [client] TRACE c#router.routed=1
 0:00:00.002041000 [client] TRACE c#router.routed[recv.1]=1
-0:00:00.002041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=1
+0:00:00.002041000 [client] TRACE c#q.dispatch_rx.enq[recv.1]=3
 0:00:00.002041000 [client] TRACE g#q.dispatch_rx.depth[recv.1]=3
 0:00:00.002041000 [client] TRACE m#q.dispatch_rx.depth_dist[recv.1]=3
 0:00:00.002041000 [client] TRACE m#task.socket_recv.drained[recv.7]=2
