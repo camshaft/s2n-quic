@@ -1,5 +1,6 @@
 ---
 source: dc/s2n-quic-dc/src/testing.rs
+assertion_line: 332
 expression: logs
 ---
 0:00:00.000000000 [peer] DEBUG s2n_quic_dc: capacity=50000
@@ -261,6 +262,7 @@ expression: logs
 0:00:00.000521000 [peer] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.000521000 [peer] TRACE g#q.dispatch_rx.depth[recv.0]=0
 0:00:00.000521000 [peer] TRACE c#rx.data_pkt=1
+0:00:00.000521000 [peer] TRACE c#rx.peer_cache.front_miss[recv.0]=1
 0:00:00.000521000 [peer] DEBUG deriving opener for credentials credentials=0xf0fd2a0a4d67aaf871aba8165276bbd1:0 peer_addr=10.0.0.1:49158 sender_id=7 recv_worker_id=0
 0:00:00.000521000 [peer] DEBUG s2n_quic_dc: credential_id=[240, 253, 42, 10, 77, 103, 170, 248, 113, 171, 168, 22, 82, 118, 187, 209] hit=true
 0:00:00.000521000 [peer] DEBUG s2n_quic_dc: credential_id=[240, 253, 42, 10, 77, 103, 170, 248, 113, 171, 168, 22, 82, 118, 187, 209] age=520µs
@@ -457,6 +459,7 @@ expression: logs
 0:00:00.001021000 [peer] TRACE c#q.dispatch_rx.drain[recv.0]=1
 0:00:00.001021000 [peer] TRACE g#q.dispatch_rx.depth[recv.0]=0
 0:00:00.001021000 [peer] TRACE c#rx.data_pkt=1
+0:00:00.001021000 [peer] TRACE c#rx.peer_cache.front_miss[recv.0]=1
 0:00:00.001021000 [peer] DEBUG deriving opener for credentials credentials=0x70fd2a0a4d67aaf871aba8165276bbd1:0 peer_addr=10.0.0.1:49158 sender_id=7 recv_worker_id=0
 0:00:00.001021000 [peer] DEBUG s2n_quic_dc: credential_id=[112, 253, 42, 10, 77, 103, 170, 248, 113, 171, 168, 22, 82, 118, 187, 209] hit=true
 0:00:00.001021000 [peer] DEBUG s2n_quic_dc: credential_id=[112, 253, 42, 10, 77, 103, 170, 248, 113, 171, 168, 22, 82, 118, 187, 209] age=1.02ms
@@ -474,6 +477,7 @@ expression: logs
 0:00:00.001021000 [peer] TRACE c#q.dispatch_rx.drain[recv.1]=1
 0:00:00.001021000 [peer] TRACE g#q.dispatch_rx.depth[recv.1]=0
 0:00:00.001021000 [peer] TRACE c#rx.data_pkt=1
+0:00:00.001021000 [peer] TRACE c#rx.peer_cache.front_miss[recv.1]=1
 0:00:00.001021000 [peer] DEBUG deriving opener for credentials credentials=0x70fd2a0a4d67aaf871aba8165276bbd1:1 peer_addr=10.0.0.1:49152 sender_id=1 recv_worker_id=1
 0:00:00.001021000 [peer] DEBUG s2n_quic_dc: credential_id=[112, 253, 42, 10, 77, 103, 170, 248, 113, 171, 168, 22, 82, 118, 187, 209] hit=true
 0:00:00.001021000 [peer] DEBUG s2n_quic_dc: credential_id=[112, 253, 42, 10, 77, 103, 170, 248, 113, 171, 168, 22, 82, 118, 187, 209] age=1.02ms
@@ -569,6 +573,7 @@ expression: logs
 0:00:00.001041000 [peer] TRACE c#q.dispatch_rx.drain[recv.1]=1
 0:00:00.001041000 [peer] TRACE g#q.dispatch_rx.depth[recv.1]=0
 0:00:00.001041000 [peer] TRACE c#rx.data_pkt=1
+0:00:00.001041000 [peer] TRACE c#rx.peer_cache.front_miss[recv.1]=1
 0:00:00.001041000 [peer] DEBUG deriving opener for credentials credentials=0x70fd2a0a4d67aaf871aba8165276bbd1:2 peer_addr=10.0.0.1:4433 sender_id=0 recv_worker_id=1
 0:00:00.001041000 [peer] DEBUG s2n_quic_dc: credential_id=[112, 253, 42, 10, 77, 103, 170, 248, 113, 171, 168, 22, 82, 118, 187, 209] hit=true
 0:00:00.001041000 [peer] DEBUG s2n_quic_dc: credential_id=[112, 253, 42, 10, 77, 103, 170, 248, 113, 171, 168, 22, 82, 118, 187, 209] age=1.04ms

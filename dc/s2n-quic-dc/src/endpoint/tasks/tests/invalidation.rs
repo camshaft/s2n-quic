@@ -86,6 +86,7 @@ fn test_frame(pse: &Arc<crate::path::secret::map::Entry>) -> Entry<Frame> {
 
 fn setup_recv() -> (Rc<RefCell<recv::Cache>>, credentials::Id) {
     let recv_cache = Rc::new(RefCell::new(recv::Cache::new(
+        &crate::counter::Registry::default(),
         crate::endpoint::id::RecvDispatchWorkerId::new(0),
     )));
 
