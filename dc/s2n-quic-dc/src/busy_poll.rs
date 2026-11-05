@@ -351,8 +351,14 @@ impl Runner {
                 core::mem::swap(&mut spawns, &mut guard.spawns);
             } else {
                 for _ in 0..ITERATIONS {
+                    // One real clock read per sweep; the many timer polls below reuse it via the
+                    // thread-local cache instead of each issuing its own `clock_gettime`.
+                    clock::refresh_cached_now();
                     tasks.poll(&mut cx, &heartbeat);
                 }
+                // Drop the cached timestamp so any clock read outside a sweep (spawn handling below,
+                // or after parking on the condvar) falls back to a fresh read rather than a stale one.
+                clock::clear_cached_now();
 
                 // Yield to allow other threads (especially SCHED_OTHER threads like Tokio runtime)
                 // to make progress when running with RT scheduling
