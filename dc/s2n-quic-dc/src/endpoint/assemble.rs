@@ -46,6 +46,22 @@ use std::sync::Arc;
 #[cfg(test)]
 mod tests;
 
+/// Whether the per-packet TX-assemble histogram/aggregate metric recordings run. On by default
+/// (baseline = full fidelity); set `DCQUIC_TX_ASSEMBLE_METRICS=0` (also `off`/`false`/`no`) to compile
+/// them out at runtime for an A/B measuring their per-packet cost at high TX PPS. Gates only the three
+/// `record_value` histogram pushes + `send_counters.on_tx_packet()` (the `send_event` per-packet cost);
+/// the cheap `counters.tx_data.add(1)` packet counter is kept so cycles-per-packet still has a
+/// denominator. Read once and cached.
+#[inline]
+fn tx_assemble_metrics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DCQUIC_TX_ASSEMBLE_METRICS")
+            .map(|v| !matches!(v.as_str(), "0" | "off" | "false" | "no"))
+            .unwrap_or(true)
+    })
+}
+
 /// Attempt to assemble pending frames into a full GSO datagram of encrypted packets.
 ///
 /// Returns None if the CCA window is full or no transmittable frames exist. The caller
@@ -505,15 +521,20 @@ where
 
             debug_assert!(encoded_len <= max_segment_len);
 
-            counters.packet_size.record_value(encoded_len as u64);
-            counters
-                .tx_frames_per_packet
-                .record_value(packet_frames.len() as u64);
-            counters
-                .tx_payload_size
-                .record_value(metadata.payload_len as u64);
+            // Per-packet histogram/aggregate recordings — the suspected high-PPS cost under A/B.
+            // Gated by DCQUIC_TX_ASSEMBLE_METRICS (default on = baseline). `tx_data` (the packet
+            // counter) stays ungated so cycles-per-packet has a denominator in the off variant.
+            if tx_assemble_metrics_enabled() {
+                counters.packet_size.record_value(encoded_len as u64);
+                counters
+                    .tx_frames_per_packet
+                    .record_value(packet_frames.len() as u64);
+                counters
+                    .tx_payload_size
+                    .record_value(metadata.payload_len as u64);
+                send_counters.on_tx_packet();
+            }
             counters.tx_data.add(1);
-            send_counters.on_tx_packet();
 
             if probe_from_pn.is_some() {
                 counters.tx_probe.add(1);
