@@ -39,6 +39,21 @@ pub struct AssembleBenchmark {
 
 impl AssembleBenchmark {
     pub fn new(packets: usize, frames_per_packet: usize, payload_len: usize) -> Self {
+        // Preserve the historical single-segment (non-GSO-batched) behavior for
+        // existing callers.
+        Self::new_with_segments(packets, frames_per_packet, payload_len, 1)
+    }
+
+    /// Like [`Self::new`], but drives the assembler with a GSO datagram of up to
+    /// `max_segments` encrypted packets so the GSO-packing path (the segment loop,
+    /// zero-pad mode, and per-segment seal) is exercised. `max_segments` is clamped
+    /// to the platform GSO ceiling so the caller never has to know it.
+    pub fn new_with_segments(
+        packets: usize,
+        frames_per_packet: usize,
+        payload_len: usize,
+        max_segments: usize,
+    ) -> Self {
         let registry = crate::counter::Registry::default();
         let clock = Clock::default();
         let entry = test_path_secret_entry();
@@ -52,7 +67,8 @@ impl AssembleBenchmark {
         let ack_completions = Queue::new();
         let (freed_batch_tx, freed_batch_rx) = crate::queue::freed_batch_channel();
         let recycle_pool = pool::UnsyncReusePool::new();
-        let gso: Gso = MaxSegments::try_from(1usize).unwrap().into();
+        let max_segments = max_segments.max(1).min(usize::from(MaxSegments::MAX));
+        let gso: Gso = MaxSegments::try_from(max_segments).unwrap().into();
 
         for packet_idx in 0..packets {
             for frame_idx in 0..frames_per_packet {
@@ -286,4 +302,31 @@ fn seed_inflight_packets(
     }
 
     context.next_packet_number = VarInt::new(packets as u64).unwrap_or(VarInt::MAX);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guards the GSO-parametrized `AssembleBenchmark` harness: every segment count
+    // (including the kernel ceiling) must still drive the assembler to produce
+    // output, so a bench row can never silently measure a no-op.
+    #[test]
+    fn assemble_benchmark_produces_segments_across_gso_regime() {
+        for max_segments in [1usize, 8, 32, 64] {
+            let produced = AssembleBenchmark::new_with_segments(64, 8, 32, max_segments).run();
+            assert!(
+                produced > 0,
+                "assemble produced no segments at max_segments={max_segments}"
+            );
+        }
+    }
+
+    // The requested segment count is clamped to the platform ceiling, so an
+    // out-of-range request never panics in `MaxSegments::try_from`.
+    #[test]
+    fn assemble_benchmark_clamps_segments_to_platform_max() {
+        let produced = AssembleBenchmark::new_with_segments(16, 8, 32, usize::MAX).run();
+        assert!(produced > 0);
+    }
 }
