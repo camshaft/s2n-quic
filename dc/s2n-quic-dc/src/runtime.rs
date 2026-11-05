@@ -89,6 +89,42 @@ pub trait Spawner {
             task_counter.with_registration_metadata_ref(|name, _, _, _| name.to_string());
         self.spawn_named(&task_name, future);
     }
+
+    /// Spawn a named !Send future at an explicit scheduling priority.
+    ///
+    /// `priority` is the busy-poll scheduler priority (lower = higher priority; `None` = the
+    /// runtime default). The default implementation IGNORES the priority and spawns normally —
+    /// only runtimes with a priority-ordered scheduler (the busy-poll executor) honor it, so this
+    /// is inert on the tokio/bach runtimes.
+    #[inline]
+    fn spawn_named_with_priority<F>(&mut self, name: &str, _priority: Option<u8>, future: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        self.spawn_named(name, future);
+    }
+
+    /// Like [`spawn_receiver_task`](Self::spawn_receiver_task), but spawns at an explicit
+    /// scheduling priority (lower = higher priority; `None` = runtime default). Used to give a
+    /// latency-critical task (e.g. `ack_completion`) scheduling priority over a heavy co-located
+    /// task (e.g. `packet_dispatch`) on the same worker. Inert where the runtime ignores priority.
+    #[inline]
+    fn spawn_receiver_task_with_priority<F>(
+        &mut self,
+        future: F,
+        budget: Option<usize>,
+        task_counter: counter::Task,
+        priority: Option<u8>,
+    ) where
+        F: Future<Output = ()> + 'static,
+        Self: Sized,
+    {
+        let worker_id = self.worker_id();
+        task_counter.on_spawn(budget, worker_id);
+        let task_name =
+            task_counter.with_registration_metadata_ref(|name, _, _, _| name.to_string());
+        self.spawn_named_with_priority(&task_name, priority, future);
+    }
 }
 
 // ── BusyPoll Implementation ────────────────────────────────────────────────
@@ -149,6 +185,13 @@ pub mod busy_poll {
             F: Future<Output = ()> + 'static,
         {
             self.spawn_with_priority_and_name(future, None, Some(name.to_string()));
+        }
+
+        fn spawn_named_with_priority<F>(&mut self, name: &str, priority: Option<u8>, future: F)
+        where
+            F: Future<Output = ()> + 'static,
+        {
+            self.spawn_with_priority_and_name(future, priority, Some(name.to_string()));
         }
 
         fn worker_id(&self) -> usize {
