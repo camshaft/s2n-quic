@@ -488,6 +488,16 @@ mod tests {
         let mut held = vec![];
         take_last(&limit, &mut held).release(Answer::Failed(peer(1)));
         assert_eq!(limit.current(), 4);
+
+        // Work of a third peer takes its permit while another permit is free, so it doesn't
+        // contend for the limit: its failure leaves the limit and keeps the first peer's failure.
+        held.pop().unwrap().release(Answer::Neutral);
+        let permit = limit.try_acquire().unwrap();
+        assert!(!permit.saturated_at_start, "another permit is free");
+        permit.release(Answer::Failed(peer(3)));
+        assert_eq!(limit.current(), 4);
+
+        // A contended failure of a second peer still halves the limit.
         take_last(&limit, &mut held).release(Answer::Failed(peer(2)));
         assert_eq!(limit.current(), 2);
     }
