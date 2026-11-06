@@ -113,6 +113,17 @@ impl CoreSub for PathRtt {
     }
 }
 
+/// Reads the start limit's answer for a handshake that reached dc.complete in `elapsed` from its
+/// connect: `elapsed` past the round trips its path accounts for, from the lowest round-trip time
+/// the connection measured.
+fn start_answer(connection: &s2n_quic::Connection, elapsed: Duration) -> limit::Answer {
+    let min_rtt = connection
+        .query_event_context(|context: &PathRttContext| context.min_rtt)
+        .ok()
+        .flatten();
+    limit::Answer::for_handshake(elapsed, min_rtt)
+}
+
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub type Result<T = (), E = Error> = core::result::Result<T, E>;
@@ -555,12 +566,7 @@ impl HandshakeQueue {
             // Don't wait for the connection to fully close, just wait until dc.complete to
             // release the permit, with the handshake's time past what its path accounts for, from
             // the lowest round-trip time the connection measured, as its answer.
-            let elapsed = handshake_start.elapsed();
-            let min_rtt = connection
-                .query_event_context(|context: &PathRttContext| context.min_rtt)
-                .ok()
-                .flatten();
-            permit_start.release(limit::Answer::for_handshake(elapsed, min_rtt));
+            permit_start.release(start_answer(&connection, handshake_start.elapsed()));
 
             // Spawn a task to leave the connection open for MTU probing to complete.
             // The 1-second wait for peers that don't support MtuProbingComplete
@@ -928,6 +934,47 @@ mod tests {
             .unwrap_err();
         assert_eq!(queue.limiter_start.current(), 1);
         assert_eq!(queue.limiter_inflight.current(), 1);
+    }
+
+    /// Verifies that a client's connection has measured its path's lowest round-trip time by
+    /// dc.complete, and that the start limit's answer for its handshake takes two of those round
+    /// trips out of the handshake's time.
+    #[tokio::test]
+    async fn the_start_answer_takes_two_measured_round_trips_out_of_the_time() {
+        let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
+        let server_name: s2n_quic::server::Name = "localhost".into();
+        let connect =
+            s2n_quic::client::Connect::new(setup.server_addr).with_server_name(server_name);
+        let mut connection = setup.client.client.connect(connect).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            ConfirmComplete::wait_ready(&mut connection),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let min_rtt = || {
+            connection
+                .query_event_context(|context: &PathRttContext| context.min_rtt)
+                .unwrap()
+                .expect("the connection measured a round-trip time by dc.complete")
+        };
+        // Once measured, the lowest round-trip time only goes down unless the connection meets
+        // persistent congestion, so the round trip the answer used lies between the ones read
+        // before and after it.
+        let before = min_rtt();
+        let elapsed = Duration::from_secs(1);
+        let answer = start_answer(&connection, elapsed);
+        let after = min_rtt();
+        assert!(after > Duration::ZERO);
+        match answer {
+            limit::Answer::Latency(time) => {
+                assert!(time >= elapsed - before * 2, "{time:?}, {before:?}");
+                assert!(time <= elapsed - after * 2, "{time:?}, {after:?}");
+            }
+            other => panic!("expected a latency answer, got {other:?}"),
+        }
     }
 
     #[test]
