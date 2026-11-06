@@ -29,7 +29,9 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::Semaphore, time::Instant as TokioInstant};
+use tokio::time::Instant as TokioInstant;
+
+mod limit;
 
 pub use crate::endpoint::DEFAULT_IDLE_TIMEOUT;
 /// Connection-level flow-control window and the local send window. Bounds the peer's
@@ -334,8 +336,8 @@ struct HandshakeQueueInner {
 }
 struct HandshakeQueue {
     inner: Mutex<HandshakeQueueInner>,
-    limiter_start: Semaphore,
-    limiter_inflight: Arc<Semaphore>,
+    limiter_start: limit::Limit,
+    limiter_inflight: limit::Limit,
     success_jitter: Duration,
     hasher: std::collections::hash_map::RandomState,
 }
@@ -343,21 +345,20 @@ struct HandshakeQueue {
 impl HandshakeQueue {
     fn new(success_jitter: Duration) -> Self {
         HandshakeQueue {
-            // The "start" limiter bounds TLS handshake concurrency.
+            // The "start" limit bounds TLS handshake concurrency.
             //
-            // TLS handshakes have high CPU cost (~1ms) which stalls out the endpoint, we don't
-            // want too many of those to build up at the same time since that stalls out the
-            // endpoint, increasing our baseline latency ~linearly with increases here. For
-            // example, 5 here translates to 5ms avg handshake latency in our benchmarks. Lowering
-            // it to 2-3 reduces our latencies to the expected 2-3ms (now hitting lowest possible
-            // cost for the CPU work needed for a handshake).
-            limiter_start: Semaphore::new(5),
-            // The inflight limiter bounds the total number of connections we have open. Keeping
+            // TLS handshakes have high CPU cost (~1ms) which stalls out the endpoint, so too many
+            // of them at once raise our baseline latency ~linearly. The limit reads each
+            // handshake's time from its connect to dc.complete, and halves where that time is
+            // more than twice the base, or where handshakes with two peers timed out or were
+            // refused since the last clean answer.
+            limiter_start: limit::Limit::new(),
+            // The inflight limit bounds the total number of connections we have open. Keeping
             // that bounded helps avoid unbounded work ongoing in s2n-quic (which implies unbounded
-            // packet transmit/receive work), and helps our benchmarks exercise the maximum
-            // concurrency within s2n-quic. We haven't found a particular stress test for which is
-            // meaningful yet though.
-            limiter_inflight: Arc::new(Semaphore::new(750)),
+            // packet transmit/receive work). The limit reads whether each connection finished its
+            // MTU probing before its deadline, and halves where connections to two peers missed
+            // it, or their handshakes timed out or were refused, since the last clean answer.
+            limiter_inflight: limit::Limit::new(),
             success_jitter,
             inner: Default::default(),
             hasher: Default::default(),
@@ -446,9 +447,11 @@ impl HandshakeQueue {
 
     /// Handshake with a peer while rate limiting and de-duplicating handshakes.
     ///
-    /// This ensures that in-flight handshakes are bounded to a fixed amount (adjusted to maximize
-    /// throughput while avoiding unbounded latencies *within* the handshake itself, which causes
-    /// timeouts and can cause congestive collapse under enough load).
+    /// This ensures that the handshakes running at once are bounded by limits that the
+    /// handshakes' answers set: they grow while handshakes finish in time, and halve where
+    /// handshakes slow down or handshakes with two peers time out or are refused (avoiding
+    /// unbounded latencies *within* the handshake itself, which causes timeouts and can cause
+    /// congestive collapse under enough load).
     async fn handshake(
         self: Arc<Self>,
         client: &s2n_quic::Client,
@@ -465,7 +468,7 @@ impl HandshakeQueue {
             // We've de-duplicated above already so the handshaker is unique per SocketAddr, so
             // this permit will only be used for the current handshake.
             let start = std::time::Instant::now();
-            let permit_inflight = self.limiter_inflight.clone().acquire_owned().await;
+            let permit_inflight = self.limiter_inflight.acquire().await;
             let permit_start = self.limiter_start.acquire().await;
             let limiter_duration = start.elapsed();
 
@@ -489,21 +492,39 @@ impl HandshakeQueue {
                 reason_counts,
             }));
 
-            let mut connection = attempt.await?;
+            let handshake_start = std::time::Instant::now();
+            let handshake_result = async {
+                let mut connection = attempt.await?;
 
-            // A 10 second deadline is used to bound ConfirmComplete and
-            // MtuConfirmComplete, avoiding unbounded waits if the peer is slow.
-            // Data addresses are exchanged via transport parameters during the
-            // TLS handshake.
-            let deadline = TokioInstant::now() + Duration::from_secs(10);
+                // A 10 second deadline is used to bound ConfirmComplete and
+                // MtuConfirmComplete, avoiding unbounded waits if the peer is slow.
+                // Data addresses are exchanged via transport parameters during the
+                // TLS handshake.
+                let deadline = TokioInstant::now() + Duration::from_secs(10);
 
-            tokio::time::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+                tokio::time::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+
+                Ok::<_, io::Error>((connection, deadline))
+            }
+            .await;
+            let (mut connection, deadline) = match handshake_result {
+                Ok(connected) => connected,
+                Err(error) => {
+                    // A handshake that timed out or that the server refused is a failure of this
+                    // peer, which halves both limits where another peer's handshake failed too
+                    // since the last clean answer. Any other failure doesn't change them.
+                    let answer = limit::Answer::for_error(&error, peer);
+                    permit_start.release(answer);
+                    permit_inflight.release(answer);
+                    return Err(error);
+                }
+            };
 
             // Don't wait for the connection to fully close, just wait until dc.complete to
-            // drop the permit.
-            drop(permit_start);
+            // release the permit, with the handshake's time as its answer.
+            permit_start.release(limit::Answer::Latency(handshake_start.elapsed()));
 
             // Spawn a task to leave the connection open for MTU probing to complete.
             // The 1-second wait for peers that don't support MtuProbingComplete
@@ -514,18 +535,22 @@ impl HandshakeQueue {
             let map_clone = map.clone();
             tokio::spawn(async move {
                 // Use the same deadline for MTU probing - any remaining time from the 10s budget
-                if tokio::time::timeout_at(
+                let probed = tokio::time::timeout_at(
                     deadline,
                     MtuConfirmComplete::wait_ready(&mut connection),
                 )
-                .await
-                .is_err()
-                {
+                .await;
+                let answer = if probed.is_err() {
                     map_clone.on_dc_connection_timeout(&peer);
-                }
+                    // A connection that didn't finish its MTU probing before the deadline is a
+                    // failure of this peer for the inflight limit.
+                    limit::Answer::Failed(peer)
+                } else {
+                    limit::Answer::Finished
+                };
 
                 drop(connection);
-                drop(permit_inflight);
+                permit_inflight.release(answer);
 
                 // Delay deleting the entry by a random time, up to 1 minute.
                 //
@@ -816,6 +841,57 @@ mod tests {
             "Connection took {:?}, expected < 500ms",
             duration
         );
+    }
+
+    /// Verifies that the handshake queue's limits start at one and that the handshakes' answers
+    /// size them: a clean handshake that filled a limit grows it, one peer's refusal leaves the
+    /// limits as they are, and a second peer's refusal since the last clean answer halves them.
+    #[tokio::test]
+    async fn handshake_answers_size_the_limits() {
+        let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
+        let refusing_a = TestSetup::new(Some(CloseAllConnectionsLimiter)).await;
+        let refusing_b = TestSetup::new(Some(CloseAllConnectionsLimiter)).await;
+        let queue = &setup.client.queue;
+        let server_name: s2n_quic::server::Name = "localhost".into();
+        assert_eq!(queue.limiter_start.current(), 1);
+        assert_eq!(queue.limiter_inflight.current(), 1);
+
+        // The handshake filled the start limit of one and finished cleanly, so the limit grows.
+        setup
+            .client
+            .connect(
+                setup.server_addr,
+                HandshakeReason::User,
+                server_name.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.limiter_start.current(), 2);
+
+        // The first handshake's inflight permit comes back once its connection finished MTU
+        // probing, which grows the inflight limit and lets this handshake start. The server
+        // refuses it, and one peer's refusal doesn't change either limit.
+        let error = setup
+            .client
+            .connect(
+                refusing_a.server_addr,
+                HandshakeReason::User,
+                server_name.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(queue.limiter_start.current(), 2);
+        assert_eq!(queue.limiter_inflight.current(), 2);
+
+        // A second peer's refusal since the last clean answer halves both limits.
+        setup
+            .client
+            .connect(refusing_b.server_addr, HandshakeReason::User, server_name)
+            .await
+            .unwrap_err();
+        assert_eq!(queue.limiter_start.current(), 1);
+        assert_eq!(queue.limiter_inflight.current(), 1);
     }
 
     #[test]
