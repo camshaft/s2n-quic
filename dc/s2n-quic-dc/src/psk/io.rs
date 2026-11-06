@@ -1360,4 +1360,58 @@ mod tests {
         let waits = waits_after(|publisher| publisher.on_packet_lost(lost(false)));
         assert_eq!((waits.round_trips, waits.lost), (0, true));
     }
+
+    /// A test limiter that asks each client for a Retry before its connection: the server takes
+    /// the client's next Initial, which carries the Retry's token, without asking the limiter.
+    #[derive(Default)]
+    struct RetryLimiter;
+
+    impl Limiter for RetryLimiter {
+        fn on_connection_attempt(&mut self, _info: &ConnectionAttempt) -> Outcome {
+            Outcome::retry()
+        }
+    }
+
+    /// Verifies that a client's connection counts the Retry the server sent it, and that the
+    /// start limit's answer for its handshake takes three measured round trips out of the
+    /// handshake's time.
+    #[tokio::test]
+    async fn the_start_answer_takes_a_retrys_round_trip_out_of_the_time() {
+        let setup = TestSetup::new(Some(RetryLimiter)).await;
+        let server_name: s2n_quic::server::Name = "localhost".into();
+        let connect =
+            s2n_quic::client::Connect::new(setup.server_addr).with_server_name(server_name);
+        let mut connection = setup.client.client.connect(connect).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            ConfirmComplete::wait_ready(&mut connection),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let waits = connection
+            .query_event_context(|context: &HandshakeWaitsContext| context.waits)
+            .expect("the client counts what each handshake waited");
+        assert_eq!((waits.round_trips, waits.lost), (1, false));
+
+        let min_rtt = || {
+            connection
+                .query_event_context(|context: &PathRttContext| context.min_rtt)
+                .unwrap()
+                .expect("the connection measured a round-trip time by dc.complete")
+        };
+        // The round trip the answer used lies between the ones read before and after it.
+        let before = min_rtt();
+        let elapsed = Duration::from_secs(1);
+        let answer = start_answer(&connection, None, elapsed);
+        let after = min_rtt();
+        match answer {
+            limit::Answer::Latency(time) => {
+                assert!(time >= elapsed - before * 3, "{time:?}, {before:?}");
+                assert!(time <= elapsed - after * 3, "{time:?}, {after:?}");
+            }
+            other => panic!("expected a latency answer, got {other:?}"),
+        }
+    }
 }
