@@ -83,6 +83,36 @@ impl CoreSub for DcPathCapture {
     }
 }
 
+/// Records the lowest round-trip time each connection's recovery measured, which the handshake
+/// queue's start limit takes out of a handshake's time.
+struct PathRtt;
+
+struct PathRttContext {
+    /// The `min_rtt` of the connection's newest recovery metrics, or `None` before the first.
+    min_rtt: Option<Duration>,
+}
+
+impl CoreSub for PathRtt {
+    type ConnectionContext = PathRttContext;
+
+    fn create_connection_context(
+        &mut self,
+        _meta: &events::ConnectionMeta,
+        _info: &events::ConnectionInfo,
+    ) -> Self::ConnectionContext {
+        PathRttContext { min_rtt: None }
+    }
+
+    fn on_recovery_metrics(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &events::ConnectionMeta,
+        event: &events::RecoveryMetrics,
+    ) {
+        context.min_rtt = Some(event.min_rtt);
+    }
+}
+
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub type Result<T = (), E = Error> = core::result::Result<T, E>;
@@ -267,7 +297,7 @@ impl Client {
             .with_initial_round_trip_time(DEFAULT_INITIAL_RTT)?;
 
         let event = (
-            (ConfirmComplete, (MtuConfirmComplete, DcPathCapture)),
+            (ConfirmComplete, (MtuConfirmComplete, (DcPathCapture, PathRtt))),
             subscriber,
         );
 
@@ -349,9 +379,9 @@ impl HandshakeQueue {
             //
             // TLS handshakes have high CPU cost (~1ms) which stalls out the endpoint, so too many
             // of them at once raise our baseline latency ~linearly. The limit reads each
-            // handshake's time from its connect to dc.complete, and halves where that time is
-            // more than twice the base, or where handshakes with two peers timed out or were
-            // refused since the last clean answer.
+            // handshake's time from its connect to dc.complete past the two round trips its path
+            // accounts for, and halves where that time is more than twice the base, or where
+            // handshakes with two peers timed out or were refused since the last clean answer.
             limiter_start: limit::Limit::new(),
             // The inflight limit bounds the total number of connections we have open. Keeping
             // that bounded helps avoid unbounded work ongoing in s2n-quic (which implies unbounded
@@ -523,8 +553,14 @@ impl HandshakeQueue {
             };
 
             // Don't wait for the connection to fully close, just wait until dc.complete to
-            // release the permit, with the handshake's time as its answer.
-            permit_start.release(limit::Answer::Latency(handshake_start.elapsed()));
+            // release the permit, with the handshake's time past what its path accounts for, from
+            // the lowest round-trip time the connection measured, as its answer.
+            let elapsed = handshake_start.elapsed();
+            let min_rtt = connection
+                .query_event_context(|context: &PathRttContext| context.min_rtt)
+                .ok()
+                .flatten();
+            permit_start.release(limit::Answer::for_handshake(elapsed, min_rtt));
 
             // Spawn a task to leave the connection open for MTU probing to complete.
             // The 1-second wait for peers that don't support MtuProbingComplete
