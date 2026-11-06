@@ -70,7 +70,9 @@ impl RoundTrips {
 
     /// The time that a handshake's path accounts for: `HANDSHAKE_ROUND_TRIPS` round trips of the
     /// lower of `earlier_rtt` and the lowest of `rtt`, and the spread of `rtt` once, up to the
-    /// time of its two round trips together, and never below the round trips alone.
+    /// time of its two round trips together, which the handshake's time holds. A lowest that a
+    /// peer's held acknowledgements raised above the round trips the client timed doesn't take
+    /// more out of the handshake's time than those round trips.
     pub(super) fn path(earlier_rtt: Option<Duration>, rtt: Option<Self>) -> Duration {
         let connection_lowest = rtt.map(|rtt| rtt.lowest);
         let round_trips = match earlier_rtt.into_iter().chain(connection_lowest).min() {
@@ -80,8 +82,7 @@ impl RoundTrips {
         match rtt {
             Some(rtt) => round_trips
                 .saturating_add(rtt.spread())
-                .min(rtt.flights_time())
-                .max(round_trips),
+                .min(rtt.flights_time()),
             None => round_trips,
         }
     }
@@ -107,7 +108,7 @@ impl Answer {
     /// the base. A handshake with a farther peer waits longer on its path, and a far path's round
     /// trips can vary by more than twice the base, and neither is congestion. The client times
     /// each of the two round trips itself, from a flight it sent to the server's reply, and the
-    /// spread counts only up to the time of the two together, which the handshake's time holds:
+    /// path counts only up to the time of the two together, which the handshake's time holds:
     /// a peer that delays its reply, or holds the acknowledgement that a recovery sample reads,
     /// doesn't take more out of the handshake's time than it added to it. A connection's own
     /// round trips also hold the time its packets waited in the endpoint's receive queue, so
@@ -577,13 +578,15 @@ mod tests {
             // counts once, beside two of the lower round trip.
             (ms(120), None, rtt(50, 69), Answer::Latency(ms(1))),
             (ms(120), Some(ms(40)), rtt(50, 69), Answer::Latency(ms(21))),
-            // The spread counts only up to the handshake's two round trips together: where the
+            // The path counts only up to the handshake's two round trips together: where the
             // peer held its acknowledgements, so that the lowest round trip its connection's
             // recovery measured took 80 ms though the client timed 50 ms and 120 ms, 30 ms is
             // left past the 170 ms of the two.
             (ms(200), None, flights(80, 50, 120), Answer::Latency(ms(30))),
-            // Round trips the client timed below the lowest don't take the path below two of it.
-            (ms(161), None, flights(80, 50, 60), Answer::Latency(ms(1))),
+            // Where that lowest is above both round trips the client timed, 50 ms and 60 ms, the
+            // path counts only the 110 ms of the two, and 51 ms is left: the acknowledgements the
+            // peer held don't take more out of the handshake's time than the round trips.
+            (ms(161), None, flights(80, 50, 60), Answer::Latency(ms(51))),
             // Without a round-trip time, the rest is the whole time.
             (ms(103), None, None, Answer::Latency(ms(103))),
             // Where the round trips take the whole time, the handshake doesn't show a time to
@@ -638,6 +641,26 @@ mod tests {
         let far = Answer::for_handshake(ms(103), None, rtt(50, 50));
         let mut permits = take_all(&limit).into_iter();
         permits.next().unwrap().release(far);
+        assert_eq!(limit.current(), 1);
+    }
+
+    #[test]
+    fn a_first_handshake_whose_peer_holds_its_acknowledgements_shows_the_endpoints_time() {
+        let limit = Limit::new();
+        // A near peer's handshake runs alone, and its 1 ms past its round trips is the base.
+        round(&limit, Answer::for_handshake(ms(3), None, rtt(1, 1)));
+        assert_eq!(limit.current(), 2);
+
+        // A far peer's first handshake, without an earlier round trip: the peer holds the
+        // acknowledgement of the client's Initial until just before its last flight, and of its
+        // Handshake packets past it, so the lowest round trip that the connection's recovery
+        // measured took 100 ms, about the whole handshake, though the client timed its two round
+        // trips at 50 ms each. The path counts only the 100 ms of the two, and the 30 ms the
+        // endpoint added to the handshake's 130 ms is past twice the base, which halves the limit.
+        let held = Answer::for_handshake(ms(130), None, flights(100, 50, 50));
+        assert_eq!(held, Answer::Latency(ms(30)));
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(held);
         assert_eq!(limit.current(), 1);
     }
 
