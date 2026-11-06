@@ -77,6 +77,10 @@ pub struct Entry {
     application_data: Option<ApplicationData>,
     last_activity: AtomicU64,
     dead_at: AtomicI64,
+    /// The lowest round-trip time, in nanoseconds, that the client's handshakes with this peer
+    /// measured, or `u64::MAX` where none did. The handshake queue reads it before a handshake
+    /// with the peer, and keeps the lower of it and the new connection's with the new entry.
+    path_rtt_nanos: AtomicU64,
     /// The peer's data recv addresses, learned via the post-handshake exchange.
     peer_data_addrs: PeerDataAddrs,
     /// Per-socket-sender load scores encoded as u64 nanoseconds.
@@ -120,6 +124,7 @@ impl SizeOf for Entry {
             application_data,
             last_activity,
             dead_at,
+            path_rtt_nanos,
             peer_data_addrs,
             sender_load_scores,
             queue_state: _,
@@ -135,6 +140,7 @@ impl SizeOf for Entry {
             + application_data.size()
             + last_activity.size()
             + dead_at.size()
+            + path_rtt_nanos.size()
             + std::mem::size_of::<PeerDataAddrs>()
             + peer_data_addrs.len() * std::mem::size_of::<SocketAddr>()
             + std::mem::size_of::<Box<[AtomicU64]>>()
@@ -238,6 +244,7 @@ impl Entry {
             application_data,
             last_activity: AtomicU64::new(0),
             dead_at: AtomicI64::new(-1),
+            path_rtt_nanos: AtomicU64::new(u64::MAX),
             peer_data_addrs,
             sender_load_scores: Self::init_load_scores(socket_sender_count),
             queue_state,
@@ -583,6 +590,23 @@ impl Entry {
         self.parameters
             .max_datagram_size
             .store(mtu, Ordering::Relaxed);
+    }
+
+    /// The lowest round-trip time that the client's handshakes with this peer measured, as
+    /// [`lower_path_rtt`](Self::lower_path_rtt) kept it, or `None` where none did.
+    pub fn path_rtt(&self) -> Option<Duration> {
+        match self.path_rtt_nanos.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            nanos => Some(Duration::from_nanos(nanos)),
+        }
+    }
+
+    /// Lowers the round-trip time this entry keeps to `rtt`, where `rtt` is the lower.
+    pub fn lower_path_rtt(&self, rtt: Duration) {
+        // `u64::MAX` stands for no time, so a longer time is kept just below it.
+        let nanos = u64::try_from(rtt.as_nanos()).unwrap_or(u64::MAX);
+        let nanos = nanos.min(u64::MAX - 1);
+        self.path_rtt_nanos.fetch_min(nanos, Ordering::Relaxed);
     }
 
     pub fn creation_time(&self) -> Timestamp {
