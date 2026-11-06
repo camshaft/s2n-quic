@@ -663,8 +663,8 @@ impl HandshakeQueue {
 
             // Don't wait for the connection to fully close, just wait until dc.complete to
             // release the permit, with the handshake's time past what its path accounts for, from
-            // the round-trip times of this connection and the time the peer's last handshake read
-            // for its path, as its answer.
+            // the round-trip times of this connection and the time that the peer's map entry kept,
+            // as its answer.
             let answer = start_answer(&connection, earlier_rtt, handshake_start.elapsed());
             permit_start.release(answer);
 
