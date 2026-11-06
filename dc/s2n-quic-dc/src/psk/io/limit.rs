@@ -313,6 +313,31 @@ mod tests {
     }
 
     #[test]
+    fn a_decrease_starts_the_count_of_clean_answers_again() {
+        let limit = Limit::new();
+        for _ in 0..3 {
+            round(&limit, Answer::Finished);
+        }
+        round(&limit, Answer::Congested);
+        assert_eq!(limit.current(), 4);
+
+        // Three of the four clean answers that a round at 4 needs, then congestion.
+        let mut permits = take_all(&limit).into_iter();
+        for permit in permits.by_ref().take(3) {
+            permit.release(Answer::Finished);
+        }
+        permits.next().unwrap().release(Answer::Congested);
+        assert_eq!(limit.current(), 2);
+
+        // The count starts again, so the limit grows only once a whole round at 2 is clean.
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(Answer::Finished);
+        assert_eq!(limit.current(), 2);
+        permits.next().unwrap().release(Answer::Finished);
+        assert_eq!(limit.current(), 3);
+    }
+
+    #[test]
     fn a_time_past_twice_the_base_is_congestion() {
         let limit = Limit::new();
         round(&limit, Answer::Latency(ms(10)));
@@ -323,6 +348,8 @@ mod tests {
         assert_eq!(limit.current(), 3, "twice the base is clean");
         permits.next().unwrap().release(Answer::Latency(ms(21)));
         assert_eq!(limit.current(), 1, "past twice the base is congestion");
+        // The decrease retired the free permits past the new limit at once.
+        take_all(&limit);
     }
 
     #[test]
