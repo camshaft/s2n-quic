@@ -947,10 +947,7 @@ mod tests {
         let deadline = TokioInstant::now() + Duration::from_secs(10);
 
         let answer = mtu_probing_answer(std::future::pending(), deadline, &map, peer_a).await;
-        assert!(
-            TokioInstant::now() >= deadline,
-            "the wait lasts until the deadline"
-        );
+        assert!(TokioInstant::now() >= deadline, "the wait lasts until the deadline");
         assert_eq!(answer, limit::Answer::Failed(peer_a));
         assert_eq!(timeouts(), 1);
         // One peer's missed deadline leaves the limit as it is.
