@@ -350,14 +350,16 @@ impl HandshakeQueue {
             // TLS handshakes have high CPU cost (~1ms) which stalls out the endpoint, so too many
             // of them at once raise our baseline latency ~linearly. The limit reads each
             // handshake's time from its connect to dc.complete, and halves where that time is
-            // more than twice the base, or where handshakes with two peers timed out or were
-            // refused since the last clean answer.
+            // more than twice the base, or where handshakes with two peers that each took the
+            // last free permit timed out or were refused since the last clean answer or the
+            // last decrease.
             limiter_start: limit::Limit::new(),
             // The inflight limit bounds the total number of connections we have open. Keeping
             // that bounded helps avoid unbounded work ongoing in s2n-quic (which implies unbounded
             // packet transmit/receive work). The limit reads whether each connection finished its
-            // MTU probing before its deadline, and halves where connections to two peers missed
-            // it, or their handshakes timed out or were refused, since the last clean answer.
+            // MTU probing before its deadline, and halves where connections to two peers that each
+            // took the last free permit missed it, or their handshakes timed out or were refused,
+            // since the last clean answer or the last decrease.
             limiter_inflight: limit::Limit::new(),
             success_jitter,
             inner: Default::default(),
@@ -449,9 +451,9 @@ impl HandshakeQueue {
     ///
     /// This ensures that the handshakes running at once are bounded by limits that the
     /// handshakes' answers set: they grow while handshakes finish in time, and halve where
-    /// handshakes slow down or handshakes with two peers time out or are refused (avoiding
-    /// unbounded latencies *within* the handshake itself, which causes timeouts and can cause
-    /// congestive collapse under enough load).
+    /// handshakes slow down or handshakes with two peers that each took the last free permit
+    /// time out or are refused (avoiding unbounded latencies *within* the handshake itself,
+    /// which causes timeouts and can cause congestive collapse under enough load).
     async fn handshake(
         self: Arc<Self>,
         client: &s2n_quic::Client,
@@ -513,8 +515,9 @@ impl HandshakeQueue {
                 Ok(connected) => connected,
                 Err(error) => {
                     // A handshake that timed out or that the server refused is a failure of this
-                    // peer, which halves both limits where another peer's handshake failed too
-                    // since the last clean answer. Any other failure doesn't change them.
+                    // peer, which halves a limit where the handshake took that limit's last free
+                    // permit and such a handshake with another peer failed too since the last
+                    // clean answer or the last decrease. Any other failure doesn't change them.
                     let answer = limit::Answer::for_error(&error, peer);
                     permit_start.release(answer);
                     permit_inflight.release(answer);
@@ -844,13 +847,16 @@ mod tests {
     }
 
     /// Verifies that the handshake queue's limits start at one and that the handshakes' answers
-    /// size them: a clean handshake that filled a limit grows it, one peer's refusal leaves the
-    /// limits as they are, and a second peer's refusal since the last clean answer halves them.
+    /// size them: a clean handshake that filled a limit grows it, refusals of two peers whose
+    /// handshakes each took a permit while another was free leave the limits as they are, and
+    /// refusals of two peers whose handshakes each took the last free permit halve them.
     #[tokio::test]
     async fn handshake_answers_size_the_limits() {
         let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
         let refusing_a = TestSetup::new(Some(CloseAllConnectionsLimiter)).await;
         let refusing_b = TestSetup::new(Some(CloseAllConnectionsLimiter)).await;
+        let refusing_c = TestSetup::new(Some(CloseAllConnectionsLimiter)).await;
+        let refusing_d = TestSetup::new(Some(CloseAllConnectionsLimiter)).await;
         let queue = &setup.client.queue;
         let server_name: s2n_quic::server::Name = "localhost".into();
         assert_eq!(queue.limiter_start.current(), 1);
@@ -884,14 +890,46 @@ mod tests {
         assert_eq!(queue.limiter_start.current(), 2);
         assert_eq!(queue.limiter_inflight.current(), 2);
 
-        // A second peer's refusal since the last clean answer halves both limits.
+        // A second peer refuses its handshake too. Each of the two handshakes took a permit of
+        // each limit while another was free, so neither contended for a limit, and the refusals
+        // leave both limits as they are.
         setup
             .client
-            .connect(refusing_b.server_addr, HandshakeReason::User, server_name)
+            .connect(
+                refusing_b.server_addr,
+                HandshakeReason::User,
+                server_name.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(queue.limiter_start.current(), 2);
+        assert_eq!(queue.limiter_inflight.current(), 2);
+
+        // With one permit of each limit held here, each of the next two handshakes takes the
+        // last free permit of each limit. One peer's refusal leaves both limits, and a second
+        // peer's refusal since the last clean answer halves them.
+        let held_start = queue.limiter_start.try_acquire().unwrap();
+        let held_inflight = queue.limiter_inflight.try_acquire().unwrap();
+        setup
+            .client
+            .connect(
+                refusing_c.server_addr,
+                HandshakeReason::User,
+                server_name.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(queue.limiter_start.current(), 2);
+        assert_eq!(queue.limiter_inflight.current(), 2);
+        setup
+            .client
+            .connect(refusing_d.server_addr, HandshakeReason::User, server_name)
             .await
             .unwrap_err();
         assert_eq!(queue.limiter_start.current(), 1);
         assert_eq!(queue.limiter_inflight.current(), 1);
+        drop(held_start);
+        drop(held_inflight);
     }
 
     #[test]
