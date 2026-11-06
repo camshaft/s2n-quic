@@ -130,6 +130,18 @@ struct HandshakeWaitsContext {
     initial: ServerSpace,
     /// What the client received of the server's Handshake packets.
     handshake: ServerSpace,
+    /// What the client received of the server's 1-RTT packets before its stateless reset tokens.
+    tokens: ServerTokens,
+}
+
+/// Whether the server's packet `number`, which the client received, follows a gap in the numbers
+/// the client received in its space: `largest` is the highest number it received there before,
+/// and the number is past the next one, or past 0 where it didn't receive one. Sets `largest` to
+/// the highest number received.
+fn past_next(largest: &mut Option<u64>, number: u64) -> bool {
+    let next = largest.map_or(0, |largest| largest.saturating_add(1));
+    *largest = Some(largest.map_or(number, |largest| largest.max(number)));
+    number > next
 }
 
 /// What a client received of the server's packets in one of the handshake's packet number
@@ -137,13 +149,19 @@ struct HandshakeWaitsContext {
 /// that loss, and the client waits for the server's probe timeout and its retransmission.
 ///
 /// The server numbers its packets in each space from 0. It skips a number for a probe it sends
-/// after its packet 0, so a gap between two later numbers isn't a loss, and a probe sends again
-/// CRYPTO data that the client may have received. A packet that arrives out of order reads as a
-/// loss, which leaves the start limit as it is.
+/// after its packet 0, so a gap between two later numbers isn't a loss by itself, and a probe
+/// sends again CRYPTO data that the client may have received. A probe that brings CRYPTO data
+/// past the data the client received sends again the data of a lost packet, such as the
+/// server's last packet in the space. A packet that arrives out of order reads as a loss, and so
+/// does a probe that sends data the server hadn't sent before, which leaves the start limit as
+/// it is.
 #[derive(Default)]
 struct ServerSpace {
-    /// Whether the client received a packet of the server's in this space.
-    received: bool,
+    /// The highest number of the server's packets that the client received in this space.
+    largest: Option<u64>,
+    /// The number of the server's packet that the client received last in this space, where it
+    /// followed a gap in the numbers, as a probe's number does.
+    after_gap: Option<u64>,
     /// The end of the CRYPTO data the client received from the server in this space, the
     /// highest end of a CRYPTO frame's data.
     crypto_end: u64,
@@ -154,17 +172,59 @@ impl ServerSpace {
     /// the first packet the client receives in the space has a number past 0 where the server's
     /// packet 0 didn't arrive.
     fn on_packet(&mut self, number: u64) -> bool {
-        let first = !std::mem::replace(&mut self.received, true);
+        let first = self.largest.is_none();
+        self.after_gap = past_next(&mut self.largest, number).then_some(number);
         first && number > 0
     }
 
-    /// Whether a CRYPTO frame of the server's, of `len` bytes at `offset`, shows a lost packet:
-    /// the server sends its CRYPTO data in order, so a frame that starts past the data the
-    /// client received follows data that didn't arrive.
-    fn on_crypto(&mut self, offset: u64, len: u16) -> bool {
-        let past = offset > self.crypto_end;
-        self.crypto_end = self.crypto_end.max(offset.saturating_add(len.into()));
+    /// Whether a CRYPTO frame of the server's, of `len` bytes at `offset` in its packet `number`,
+    /// shows a lost packet: the server sends its CRYPTO data in order, so a frame that starts
+    /// past the data the client received follows data that didn't arrive, and a frame in a
+    /// packet after a gap that ends past that data sends again data that didn't arrive.
+    fn on_crypto(&mut self, number: u64, offset: u64, len: u16) -> bool {
+        let end = offset.saturating_add(len.into());
+        let past =
+            offset > self.crypto_end || (self.after_gap == Some(number) && end > self.crypto_end);
+        self.crypto_end = self.crypto_end.max(end);
         past
+    }
+}
+
+/// What a client received of the server's 1-RTT packets before the server's stateless reset
+/// tokens, whose receipt completes the client's handshake: the server sends its tokens once it
+/// receives the client's, and a lost 1-RTT packet of the server's before them, or the one that
+/// held them, makes the client wait for the server's retransmission.
+///
+/// The server numbers its 1-RTT packets from 0, and before its tokens it sends fewer of them
+/// than it sends before it first skips a number to check its peer's acknowledgements, so a gap
+/// in the numbers before the first tokens reads as a loss. A lost packet that held nothing the
+/// client waited for, a probe the server sent though its packet arrived, and a packet that
+/// arrives out of order read as a loss too, which leaves the start limit as it is.
+#[derive(Default)]
+struct ServerTokens {
+    /// The highest number of the server's 1-RTT packets that the client received before the
+    /// tokens.
+    largest: Option<u64>,
+    /// Whether the numbers the client received before the tokens had a gap.
+    gap: bool,
+    /// Whether the client received the server's tokens.
+    received: bool,
+}
+
+impl ServerTokens {
+    /// Reads the server's 1-RTT packet `number`, which the client received, for a gap before the
+    /// server's tokens.
+    fn on_packet(&mut self, number: u64) {
+        if !self.received {
+            self.gap |= past_next(&mut self.largest, number);
+        }
+    }
+
+    /// Whether the server's stateless reset tokens show a lost packet: a gap in the numbers of
+    /// the server's 1-RTT packets came before the tokens.
+    fn on_tokens(&mut self) -> bool {
+        self.received = true;
+        self.gap
     }
 }
 
@@ -181,9 +241,8 @@ impl CoreSub for HandshakeWaits {
 
     /// A Retry that the client takes makes it send its first flight again. The server's first
     /// Initial or Handshake packet that the client receives shows whether a packet the server
-    /// sent before it was lost. The client doesn't read the server's 1-RTT packets for a loss:
-    /// the server skips packet numbers there to check its peer's acknowledgements, and its MTU
-    /// probes, whose loss doesn't hold up the handshake, go ahead of its other data.
+    /// sent before it was lost, and its 1-RTT packets before its stateless reset tokens show a
+    /// gap in their numbers.
     fn on_packet_received(
         &mut self,
         context: &mut Self::ConnectionContext,
@@ -200,27 +259,37 @@ impl CoreSub for HandshakeWaits {
             events::PacketHeader::Handshake { number, .. } => {
                 context.waits.lost |= context.handshake.on_packet(number);
             }
+            events::PacketHeader::OneRtt { number, .. } => context.tokens.on_packet(number),
             _ => {}
         }
     }
 
     /// A CRYPTO frame of the server's Initial or Handshake data that starts past the data the
-    /// client received in its space shows that a packet the server sent before it was lost.
+    /// client received in its space, or that ends past it after a gap in the server's packet
+    /// numbers, shows that a packet the server sent before it was lost, and so do the server's
+    /// first stateless reset tokens after a gap in the numbers of its 1-RTT packets.
     fn on_frame_received(
         &mut self,
         context: &mut Self::ConnectionContext,
         _meta: &events::ConnectionMeta,
         event: &events::FrameReceived,
     ) {
-        let events::Frame::Crypto { offset, len, .. } = event.frame else {
-            return;
-        };
-        let space = match event.packet_header {
-            events::PacketHeader::Initial { .. } => &mut context.initial,
-            events::PacketHeader::Handshake { .. } => &mut context.handshake,
-            _ => return,
-        };
-        context.waits.lost |= space.on_crypto(offset, len);
+        match event.frame {
+            events::Frame::Crypto { offset, len, .. } => {
+                let (space, number) = match event.packet_header {
+                    events::PacketHeader::Initial { number, .. } => (&mut context.initial, number),
+                    events::PacketHeader::Handshake { number, .. } => {
+                        (&mut context.handshake, number)
+                    }
+                    _ => return,
+                };
+                context.waits.lost |= space.on_crypto(number, offset, len);
+            }
+            events::Frame::DcStatelessResetTokens { .. } => {
+                context.waits.lost |= context.tokens.on_tokens();
+            }
+            _ => {}
+        }
     }
 
     /// The client publishes a Retry it receives before it checks it, and a Retry that it
@@ -1536,6 +1605,110 @@ mod tests {
             let waits = waits_after(|publisher| {
                 for (packet_header, offset, len) in frames {
                     publisher.on_frame_received(crypto_received(packet_header, offset, len));
+                }
+            });
+            assert_eq!((waits.round_trips, waits.lost), (0, true));
+        }
+    }
+
+    /// A frame of the server's stateless reset tokens, in its 1-RTT packet `packet_number`.
+    fn tokens_received(packet_number: u64) -> builder::FrameReceived<'static> {
+        builder::FrameReceived {
+            packet_header: builder::PacketHeader::OneRtt {
+                number: packet_number,
+            },
+            path: path(),
+            frame: builder::Frame::DcStatelessResetTokens {},
+        }
+    }
+
+    /// Verifies that the server's stateless reset tokens mark the handshake where a gap in the
+    /// numbers of the server's 1-RTT packets came before them, and that tokens without a gap
+    /// before them, or a gap after them, don't.
+    #[test]
+    fn the_servers_tokens_after_a_gap_in_its_1_rtt_packets_mark_the_handshake() {
+        let one_rtt = |number| builder::PacketHeader::OneRtt { number };
+        let waits = waits_after(|publisher| {
+            publisher.on_packet_received(received(one_rtt(0)));
+            publisher.on_packet_received(received(one_rtt(1)));
+            publisher.on_frame_received(tokens_received(1));
+            // A probe after the tokens skips a number and sends the tokens again.
+            publisher.on_packet_received(received(one_rtt(3)));
+            publisher.on_frame_received(tokens_received(3));
+            publisher.on_packet_received(received(one_rtt(5)));
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, false));
+
+        // The server's 1-RTT packet 1 didn't arrive, and its packet 2 holds the tokens.
+        let waits = waits_after(|publisher| {
+            publisher.on_packet_received(received(one_rtt(0)));
+            publisher.on_packet_received(received(one_rtt(2)));
+            publisher.on_frame_received(tokens_received(2));
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, true));
+
+        // The server's 1-RTT packet 0, which held the tokens, didn't arrive, and its probe 2
+        // sends them again.
+        let waits = waits_after(|publisher| {
+            publisher.on_packet_received(received(one_rtt(2)));
+            publisher.on_frame_received(tokens_received(2));
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, true));
+    }
+
+    /// Publishes the server's packet `number` in the space of `header`, with a CRYPTO frame of
+    /// `len` bytes at `offset`, as the client receives it.
+    fn crypto_packet_received(
+        publisher: &mut ConnectionPublisherSubscriber<'_, HandshakeWaits>,
+        header: fn(u64) -> builder::PacketHeader,
+        number: u64,
+        offset: u64,
+        len: u16,
+    ) {
+        publisher.on_packet_received(received(header(number)));
+        publisher.on_frame_received(crypto_received(header(number), offset, len));
+    }
+
+    /// Verifies that a CRYPTO frame in the server's packet after a gap in its numbers marks the
+    /// handshake where its data ends past the data the client received, as a probe's frame does
+    /// when it sends again the data of the server's lost last packet in its space, and that a
+    /// probe's frame of data the client received, or a frame in a packet without a gap before
+    /// it, doesn't.
+    #[test]
+    fn a_probe_that_sends_the_servers_lost_last_data_again_marks_the_handshake() {
+        let waits = waits_after(|publisher| {
+            crypto_packet_received(publisher, initial_header, 0, 0, 90);
+            // A probe sends again data that the client received.
+            crypto_packet_received(publisher, initial_header, 2, 0, 90);
+            crypto_packet_received(publisher, handshake_header, 0, 0, 1000);
+            crypto_packet_received(publisher, handshake_header, 1, 1000, 1000);
+            // A probe sends again the data of packet 1, which the client received.
+            crypto_packet_received(publisher, handshake_header, 3, 1000, 1000);
+            // The packet after the probe brings data the server hadn't sent before.
+            crypto_packet_received(publisher, handshake_header, 4, 2000, 500);
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, false));
+
+        // The server's packet 1 arrives after its probe 3, and its packet 4, which follows the
+        // probe without a gap, brings data the server hadn't sent before.
+        let waits = waits_after(|publisher| {
+            crypto_packet_received(publisher, handshake_header, 0, 0, 1000);
+            crypto_packet_received(publisher, handshake_header, 3, 0, 1000);
+            crypto_packet_received(publisher, handshake_header, 1, 1000, 1000);
+            crypto_packet_received(publisher, handshake_header, 4, 2000, 500);
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, false));
+
+        for frames in [
+            // The server's last Handshake packet 1, with the data from 1000 to 2000, didn't
+            // arrive, and its probe 3 sends that data again.
+            [(0, 0, 1000), (3, 1000, 1000)],
+            // A packet after a gap sends the lost data again after data the client received.
+            [(0, 0, 1000), (2, 500, 1500)],
+        ] {
+            let waits = waits_after(|publisher| {
+                for (number, offset, len) in frames {
+                    crypto_packet_received(publisher, handshake_header, number, offset, len);
                 }
             });
             assert_eq!((waits.round_trips, waits.lost), (0, true));
