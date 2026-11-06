@@ -1367,6 +1367,155 @@ mod tests {
         );
     }
 
+    /// The time the network adds to each packet from or to the far peer as the packet arrives,
+    /// beside the 500 microseconds of each simulated path, so that the far peer's round trip takes
+    /// 51 ms and the near peer's 1 ms.
+    const FAR_PATH_DELAY: Duration = Duration::from_millis(25);
+
+    /// A client subscriber that sends a message as each connection opens, and keeps the time from
+    /// each connection's opening to its dc.complete, in the order the connections reach it.
+    struct HandshakeTimes {
+        opened: tokio::sync::mpsc::UnboundedSender<()>,
+        times: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl CoreSub for HandshakeTimes {
+        /// The time of the connection's opening, from the endpoint's start.
+        type ConnectionContext = Duration;
+
+        fn create_connection_context(
+            &mut self,
+            meta: &events::ConnectionMeta,
+            _info: &events::ConnectionInfo,
+        ) -> Self::ConnectionContext {
+            let _ = self.opened.send(());
+            meta.timestamp.duration_since_start()
+        }
+
+        fn on_dc_state_changed(
+            &mut self,
+            context: &mut Self::ConnectionContext,
+            meta: &events::ConnectionMeta,
+            event: &events::DcStateChanged,
+        ) {
+            if let events::DcState::Complete { .. } = event.state {
+                let now = meta.timestamp.duration_since_start();
+                let elapsed = now.saturating_sub(*context);
+                self.times.lock().unwrap().push(elapsed);
+            }
+        }
+    }
+
+    /// Verifies that handshakes with a near and a far peer at once through
+    /// `HandshakeQueue::handshake` don't lower the start limit, with the PSK client and its
+    /// servers in a bach simulation on the bach-backed IO provider. The network delays each packet
+    /// from or to the far peer, so the far peer's handshake takes about 50 times as long as the
+    /// near peer's, though the endpoint doesn't add that time. The first handshake with each peer
+    /// reads its own connection's round trips, which in the simulation are its path's. A limit
+    /// that the test answers with each handshake's whole time halves on the far peer's handshake,
+    /// as the start limit does where `handshake` releases its start permit with the whole time.
+    #[test]
+    fn near_and_far_handshakes_at_once_through_the_queue_dont_lower_the_start_limit() {
+        // The handshakes run real TLS, whose record sizes, and so the times of its events, differ
+        // across platforms, so the test doesn't compare its logs with a snapshot.
+        let _no_snapshots = without_snapshots();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_check = done.clone();
+
+        sim(|| {
+            for peer in ["first", "near", "far"] {
+                sim_server().group(peer).spawn();
+            }
+
+            async move {
+                let peer = |group: &str| bach::net::try_lookup((group, SIM_SERVER_PORT)).unwrap();
+                let (first, near, far) = (peer("first"), peer("near"), peer("far"));
+                // The network delays each packet from or to the far peer as the packet arrives.
+                let far_ip = far.ip();
+                bach::net::monitor::on_packet_received(move |packet| {
+                    if packet.source().ip() == far_ip || packet.destination().ip() == far_ip {
+                        bach::net::monitor::delay(FAR_PATH_DELAY).into()
+                    } else {
+                        bach::net::monitor::Command::Pass
+                    }
+                });
+
+                let (opened_sender, mut opened) = tokio::sync::mpsc::unbounded_channel();
+                let times = Arc::new(Mutex::new(Vec::new()));
+                let client = Client::bind_with_io(
+                    sim_io(0),
+                    sim_map(NoopSubscriber {}),
+                    TestTlsProvider {}.start_client().unwrap(),
+                    HandshakeTimes {
+                        opened: opened_sender,
+                        times: times.clone(),
+                    },
+                    crate::psk::client::Builder::default().with_success_jitter(Duration::ZERO),
+                )
+                .unwrap();
+                let start_limit = &client.queue.limiter_start;
+                let server_name: s2n_quic::server::Name = "localhost".into();
+                assert_eq!(start_limit.current(), 1);
+
+                // The first handshake runs alone and fills the limit of one, which grows to 2.
+                client
+                    .connect(first, HandshakeReason::User, server_name.clone())
+                    .await
+                    .unwrap();
+                opened.recv().await.unwrap();
+                assert_eq!(start_limit.current(), 2);
+
+                // The far peer's handshake starts once the near peer's connection opened, which
+                // holds a start permit from then on, so the two handshakes run at once and fill
+                // the limit of 2.
+                let near_handshake =
+                    client.connect(near, HandshakeReason::User, server_name.clone());
+                let far_handshake = async {
+                    opened.recv().await.unwrap();
+                    client
+                        .connect(far, HandshakeReason::User, server_name.clone())
+                        .await
+                };
+                let (near_result, far_result) = tokio::join!(near_handshake, far_handshake);
+                near_result.unwrap();
+                far_result.unwrap();
+                // Neither handshake's time past its path's two round trips reads as congestion,
+                // so the limit grows with each answer.
+                assert_eq!(start_limit.current(), 4);
+
+                let times = times.lock().unwrap().clone();
+                assert_eq!(times.len(), 3, "each connection reaches dc.complete once");
+                // The connections reach dc.complete in the order first, near and far.
+                let (first_time, near_time, far_time) = (times[0], times[1], times[2]);
+                // The far peer's handshake takes more than twice as long as the first one, which
+                // ran alone, so its whole time reads as congestion.
+                assert!(far_time > first_time.saturating_mul(2), "{times:?}");
+
+                // A limit answered with each handshake's whole time halves on the far peer's.
+                let whole = limit::Limit::new();
+                let first_permit = whole.acquire().await;
+                first_permit.release(limit::Answer::Latency(first_time));
+                assert_eq!(whole.current(), 2);
+                let near_permit = whole.acquire().await;
+                let far_permit = whole.acquire().await;
+                near_permit.release(limit::Answer::Latency(near_time));
+                assert_eq!(whole.current(), 3);
+                far_permit.release(limit::Answer::Latency(far_time));
+                assert_eq!(whole.current(), 1);
+
+                done.store(true, Ordering::SeqCst);
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        });
+
+        assert!(
+            done_check.load(Ordering::SeqCst),
+            "the client task didn't finish"
+        );
+    }
+
     #[test]
     fn alloc_entry_increments() {
         let queue = HandshakeQueue::new(Duration::ZERO);
