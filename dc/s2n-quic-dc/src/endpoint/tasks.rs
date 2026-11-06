@@ -622,9 +622,11 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             ack_completions_tx.clone(),
             peer_dead_tx.clone(),
             dead_peer_cooldown,
+            frame_tx.clone(),
             counter_registry.register("idle.send.expired"),
             counter_registry.register("idle.send.rescheduled"),
             counter_registry.register_nominal_timer("idle.send.lifetime", &variant),
+            IdleProbeCounters::new(&counter_registry),
             budgets.idle_wheel,
             task_counter.clone(),
         );
@@ -1175,7 +1177,29 @@ where
 /// the idle wheel. Expired contexts (including deadlines that fall within the current wheel
 /// tick) are invalidated from the send cache; any failed frames are completed with
 /// [`frame::FailureReason::PeerDead`], and `peer_dead_tx` is notified only when the idle expiry
-/// also indicates an unresponsive peer with inflight data.
+/// also indicates an unresponsive peer: one that left packets unacknowledged, one that didn't
+/// answer a probe while a stream on its path is open, or one whose path has an open stream and
+/// an idle check that ran more than a wheel tick late. The peer is marked dead too where its
+/// path has an open stream and `frame_tx` refused the probe at the idle deadline, as once the
+/// endpoint shuts down. Each stream that such an expiry resets on
+/// this side, each stream whose frames it fails and each stream open on the path, is owed a
+/// reset, which the receive path sends once a packet from the peer clears the dead mark
+/// (`Entry::mark_dead_owing_resets`).
+///
+/// A context with no unacknowledged packet whose path has an open stream is probed with a Ping
+/// once in each quiet period, half an idle timeout into it, or at the idle deadline where its
+/// check was armed for the deadline, so that a peer that is reachable answers before the idle
+/// timeout decides. A path with an open stream whose idle check runs late, as where this side
+/// was suspended, marks the peer dead without a probe: the peer marks this side dead under the
+/// same rule by then. Probes go out on `frame_tx`, which refuses one only once its receiver has
+/// closed it, and a closed channel doesn't open again: a refused probe isn't recorded, and the
+/// context waits for its idle deadline, where the check tries the probe once more. `probes`
+/// counts the probes, and the peers these rules mark dead.
+///
+/// A probe sent within a wheel tick of the idle deadline, as where the check was armed for the
+/// deadline or the idle timeout is under two wheel ticks, is checked again half an idle timeout
+/// later, or a wheel tick later where that is longer, so that the peer has until the next tick
+/// at least to answer it.
 pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
     rx: intrusive::unsync::Receiver<send::IdleWheelAdapter>,
     idle_wheel_tx: intrusive::unsync::Sender<send::IdleWheelAdapter>,
@@ -1188,9 +1212,11 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
     mut ack_completions_tx: AckComp,
     mut peer_dead_tx: WakerSink,
     dead_peer_cooldown: core::time::Duration,
+    mut frame_tx: frame::SubmissionSender,
     idle_expired: counter::Counter,
     idle_rescheduled: counter::Counter,
     idle_lifetime: counter::Timer,
+    probes: IdleProbeCounters,
     budget: usize,
     task_counter: counter::Task,
 ) where
@@ -1214,14 +1240,49 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
             move |context: Rc<RefCell<send::Context>>| {
                 let now = clock.now();
                 let ctx = context.borrow();
+                let idle_timeout = ctx.path_secret_entry.idle_timeout();
+                let last_activity = ctx
+                    .last_peer_activity
+                    .max(ctx.path_secret_entry.last_activity());
+
+                // A quiet path with an open stream: this side has no unacknowledged packet, so
+                // an unreachable peer leaves nothing behind to fail, and a reader or a writer
+                // that waits on the peer would wait without end. Probe the peer with a Ping,
+                // once for each quiet period, so that the idle timeout decides on it as it
+                // decides on an unacknowledged packet. `probed` holds once the probe of the
+                // current quiet period went out; a later peer activity starts a new period.
+                let probed = ctx.idle_probe_for == Some(last_activity.nanos);
+                let open_stream = ctx.path_secret_entry.queue_state().has_open_stream();
+                let wants_probe =
+                    !probed && !ctx.invalidated && !ctx.inflight.has_inflight() && open_stream;
 
                 // Compute the reschedule target. If it's in a future wheel tick,
                 // reschedule and return early.
                 if !ctx.is_peer_idle(now) {
-                    let last_activity = ctx
-                        .last_peer_activity
-                        .max(ctx.path_secret_entry.last_activity());
-                    let target = last_activity + ctx.path_secret_entry.idle_timeout();
+                    let mut target = last_activity + idle_timeout;
+                    if wants_probe {
+                        // Probe half an idle timeout into the quiet period, which leaves the
+                        // other half for the probe and its retransmissions to be acknowledged
+                        // before the idle timeout decides.
+                        let probe_at = last_activity + idle_timeout / 2;
+                        if probe_at.nanos_since(now) >= wheel::SECOND_GRANULARITY_NANOS {
+                            target = probe_at;
+                        } else if target.nanos_since(now) >= wheel::SECOND_GRANULARITY_NANOS {
+                            drop(ctx);
+                            // A probe the submission channel refuses isn't recorded, and the
+                            // context waits for its idle deadline, which decides: the channel
+                            // refuses only once its receiver has closed it, and a closed channel
+                            // doesn't open again, so each try before the deadline is refused too.
+                            let _ =
+                                send_idle_probe(&context, last_activity, &mut frame_tx, &probes);
+                            context.borrow_mut().idle_wheel.target_time = Some(target);
+                            let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
+                            idle_rescheduled.add(1);
+                            return;
+                        }
+                        // Otherwise the idle timeout falls within this tick and no probe went
+                        // out: the check below probes now.
+                    }
                     if target.nanos_since(now) >= wheel::SECOND_GRANULARITY_NANOS {
                         drop(ctx);
                         context.borrow_mut().idle_wheel.target_time = Some(target);
@@ -1230,6 +1291,34 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                         return;
                     }
                 }
+
+                // An open stream whose quiet period wasn't probed yet, as where the path's first
+                // stream opened after its idle check was armed at the full idle timeout, or where
+                // the idle timeout is under two wheel ticks, so that the check half an idle
+                // timeout in can run within a tick of the deadline. Where the check runs on time,
+                // within a wheel tick of the idle deadline, probe the peer now and check again
+                // half an idle timeout later, or a wheel tick later where that is longer: a next
+                // check within this tick would run at once and mark the peer dead before it could
+                // answer. Where it runs later than that, as after this side was suspended, the
+                // peer has marked this side dead under the same rule by then: expire below. A
+                // probe the submission channel refuses here isn't tried again, since a closed
+                // channel doesn't open again: the idle timeout decides now, below.
+                let late = now.nanos_since(last_activity + idle_timeout)
+                    >= wheel::SECOND_GRANULARITY_NANOS;
+                let ctx = if wants_probe && !late {
+                    drop(ctx);
+                    if send_idle_probe(&context, last_activity, &mut frame_tx, &probes) {
+                        let tick = wheel::SECOND_GRANULARITY_NANOS;
+                        let wait = (idle_timeout / 2).max(core::time::Duration::from_nanos(tick));
+                        context.borrow_mut().idle_wheel.target_time = Some(now + wait);
+                        let _ = UnboundedSender::send(&mut idle_wheel_tx, context);
+                        idle_rescheduled.add(1);
+                        return;
+                    }
+                    context.borrow()
+                } else {
+                    ctx
+                };
 
                 // Expired: either is_peer_idle fired, or the target landed on
                 // the current tick (within wheel granularity).
@@ -1306,18 +1395,56 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     );
                 }
 
-                // Mark the peer dead only when we have packets in flight that
-                // were never acknowledged — that's evidence the peer is
-                // unreachable. If there are no inflight packets, both sides
+                // Mark the peer dead only when there is evidence the peer is unreachable or
+                // has given up on the path: packets it never acknowledged, a probe of the quiet
+                // path it didn't answer (`probed`), or an open stream on a path whose idle check
+                // ran late, as after this side was suspended (`open_stream`: an open stream
+                // checked on time with no probe yet is probed above instead, and is marked dead
+                // here only where the submission channel refused that probe, as once the
+                // endpoint shuts down). The peer marks this side dead under the same rule, so a
+                // stream doesn't stay open on one side alone. Without any of these, both sides
                 // simply stopped talking (natural idle) and we must not mark dead.
-                let marked_dead = has_inflight
-                    && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
+                let unresponsive = has_inflight || probed || open_stream;
 
-                let result = send_caches[local_id].borrow_mut().invalidate(
-                    &id,
+                // Keep the stream of each frame the invalidation fails. Where the peer is
+                // unresponsive, the dead mark resets this side's streams on the path: those whose
+                // frames failed, and each open stream, whose frames the context may not hold at
+                // all. The peer isn't told, and its end of each may wait on this side: record each
+                // before the dead mark, so that the packet that clears the mark finds it and
+                // resets the stream (`dispatch::process`).
+                let mut failed = FailedStreams {
+                    completed_tx: &mut completed_tx,
+                    streams: Vec::new(),
+                };
+                // Invalidate this context only where the cache still holds it. An earlier
+                // invalidation, as for a stale key, removes a context from the cache and leaves
+                // it on this wheel, and the cache may hold a newer context for the path by now:
+                // that context and its frames aren't this expiry's to remove or fail.
+                let result = send_caches[local_id].borrow_mut().invalidate_context(
+                    &context,
                     frame::FailureReason::PeerDead,
-                    &mut completed_tx,
+                    &mut failed,
                 );
+                let (recorded, reset) = if unresponsive {
+                    path_secret_entry.mark_dead_owing_resets(
+                        now,
+                        dead_peer_cooldown,
+                        failed.streams,
+                    )
+                } else {
+                    (0, None)
+                };
+                if recorded > 0 {
+                    send_caches[local_id]
+                        .borrow()
+                        .send_counters()
+                        .on_idle_owed_resets(recorded as u64);
+                    debug!(
+                        %credentials_id,
+                        recorded,
+                        "peer unresponsive - owed resets recorded"
+                    );
+                }
 
                 if let Some((drained, discarded_bytes, pending_acks)) = result {
                     if !pending_acks.is_empty() {
@@ -1329,8 +1456,18 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     counters.on_inflight_leaked_on_invalidate(discarded_bytes as u64);
                 }
 
-                if marked_dead {
-                    let _ = peer_dead_tx.send(Entry::new(PeerDead { path_secret_entry }));
+                if let Some(streams) = reset {
+                    // Count the dead marks of the quiet-path rules apart from the base's mark on
+                    // unacknowledged packets alone: an unanswered probe, then an open stream.
+                    if probed {
+                        probes.dead_probe_unanswered.add(1);
+                    } else if !has_inflight {
+                        probes.dead_open_stream.add(1);
+                    }
+                    let _ = peer_dead_tx.send(Entry::new(PeerDead {
+                        path_secret_entry,
+                        streams,
+                    }));
                 }
 
                 idle_expired.add(1);
@@ -1341,6 +1478,135 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
         task_counter,
     )
     .await;
+}
+
+/// Submits a Ping to the peer of `context`, the send idle wheel's probe of a quiet path that has
+/// an open stream, and where the submission channel accepts it, records the quiet period it
+/// probes by its last peer activity. Counts the Ping in `probes`, as sent or as refused, and
+/// returns whether the channel accepted it.
+///
+/// The Ping goes through the frame pipeline as any frame does, so it is transmitted,
+/// retransmitted after each probe timeout, and acknowledged as any packet is: an answer
+/// refreshes the context's `last_peer_activity`, and a peer that doesn't answer leaves it
+/// unacknowledged until the idle timeout decides. The submission channel has no backpressure,
+/// so it refuses the Ping only once its receiver has closed it, as when the endpoint shuts down.
+fn send_idle_probe(
+    context: &Rc<RefCell<send::Context>>,
+    last_activity: precision::Timestamp,
+    frame_tx: &mut frame::SubmissionSender,
+    probes: &IdleProbeCounters,
+) -> bool {
+    let path_secret_entry = context.borrow().path_secret_entry.clone();
+    let probe = Frame {
+        header: frame::Header::Ping,
+        payload: crate::byte_vec::ByteVec::new(),
+        path_secret_entry,
+        completion: None,
+        status: frame::TransmissionStatus::default(),
+        ttl: frame::DEFAULT_TTL,
+        enqueued_at: None,
+        flow_credits: 0,
+    };
+    let accepted = frame_tx.send_batch(Entry::new(probe)).is_ok();
+    if accepted {
+        context.borrow_mut().idle_probe_for = Some(last_activity.nanos);
+        probes.sent.add(1);
+    } else {
+        probes.refused.add(1);
+    }
+    accepted
+}
+
+/// Counts of the send idle wheel's probes of a quiet path that has an open stream, and of the
+/// peers it marks dead under the quiet-path rules instead of on unacknowledged packets alone.
+#[derive(Clone)]
+pub struct IdleProbeCounters {
+    /// Pings the frame submission channel accepted (`idle.send.probe_sent`).
+    pub sent: counter::Counter,
+    /// Pings the frame submission channel refused (`idle.send.probe_refused`).
+    pub refused: counter::Counter,
+    /// Peers marked dead at the idle timeout of a quiet period whose probe went out, whether or
+    /// not the Ping is still unacknowledged (`idle.send.dead_probe_unanswered`).
+    pub dead_probe_unanswered: counter::Counter,
+    /// Peers marked dead with nothing unacknowledged and no probe, on a path with an open stream
+    /// (`idle.send.dead_open_stream`).
+    pub dead_open_stream: counter::Counter,
+}
+
+impl IdleProbeCounters {
+    pub fn new(registry: &counter::Registry) -> Self {
+        Self {
+            sent: registry.register("idle.send.probe_sent"),
+            refused: registry.register("idle.send.probe_refused"),
+            dead_probe_unanswered: registry.register("idle.send.dead_probe_unanswered"),
+            dead_open_stream: registry.register("idle.send.dead_open_stream"),
+        }
+    }
+}
+
+/// Forwards each frame that a send context's invalidation fails to `completed_tx`, and keeps the
+/// stream it belongs to, so that the send idle wheel can owe the peer a reset of each stream
+/// (`Entry::owe_resets`).
+struct FailedStreams<'a, C> {
+    completed_tx: &'a mut C,
+    streams: Vec<crate::queue::OwedReset>,
+}
+
+impl<C> UnboundedSender<Entry<Frame>> for FailedStreams<'_, C>
+where
+    C: UnboundedSender<Entry<Frame>>,
+{
+    fn send(&mut self, frame: Entry<Frame>) -> Result<(), Entry<Frame>> {
+        if let Some(stream) = owed_reset_of(&frame.header) {
+            self.streams.push(stream);
+        }
+        self.completed_tx.send(frame)
+    }
+}
+
+/// The stream that a frame belongs to, as a reset of the stream routes: the frame's queue pair
+/// and binding. `None` for a frame of the path, and for `QueueDbg`, a diagnostic marker that
+/// doesn't carry stream state.
+fn owed_reset_of(header: &frame::Header) -> Option<crate::queue::OwedReset> {
+    use frame::Header;
+    match *header {
+        Header::QueueData {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueControl {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueMaxData {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueReset {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueMsg {
+            queue_pair,
+            binding_id,
+            ..
+        }
+        | Header::QueueDataBlocked {
+            queue_pair,
+            binding_id,
+            ..
+        } => Some(crate::queue::OwedReset {
+            queue_pair,
+            binding_id,
+        }),
+        Header::QueueFree { .. } | Header::Ack { .. } | Header::Ping | Header::QueueDbg { .. } => {
+            None
+        }
+    }
 }
 
 /// Drains the receive-side idle wheel for one receive worker.
@@ -1831,6 +2097,9 @@ where
 #[derive(Clone, Debug)]
 pub struct PeerDead {
     pub path_secret_entry: Arc<crate::path::secret::map::Entry>,
+    /// The streams open on the path as the dead mark read them, each owed a reset
+    /// (`Entry::mark_dead_owing_resets`): the streams `peer_dead_broadcast` resets on this side.
+    pub streams: Vec<crate::queue::OwedReset>,
 }
 
 #[derive(Clone)]
@@ -1839,15 +2108,18 @@ pub struct PeerDeadCounters {
     pub broadcasted: counter::Counter,
 }
 
-/// Resets the streams of each peer the send idle wheel marks dead, and, for a client path, asks
-/// for a handshake with the peer in the background through `request_rehandshake`.
+/// Resets on this side each stream of each dead mark (`PeerDead::streams`), the streams the mark
+/// owes the peer a reset of, and wakes their readers and writers, and the client's blocked alloc
+/// waiters. For a client path, it also asks for a handshake with the peer in the background
+/// through `request_rehandshake`.
 ///
 /// The idle wheel marks a peer dead only when a send context expires with packets the peer never
-/// acknowledged, and a send context expires only once its path secret has also gone an idle
-/// timeout, to within the wheel's one-second tick, without a packet from the peer. A new
-/// handshake builds a new path secret and queue state for the peer, so the next connect uses
-/// them instead of the silent entry. `stream::Client::connect` still evicts a dead and silent
-/// entry on demand where no handshake has replaced it, such as after a failed one.
+/// acknowledged, or with an open stream whose idle probe the peer didn't answer, and a send
+/// context expires only once its path secret has also gone an idle timeout, to within the
+/// wheel's one-second tick, without a packet from the peer. A new handshake builds a new path
+/// secret and queue state for the peer, so the next connect uses them instead of the silent
+/// entry. `stream::Client::connect` still evicts a dead and silent entry on demand where no
+/// handshake has replaced it, such as after a failed one.
 pub fn peer_dead_broadcast<R, WakerSink, Rehandshake>(
     peer_dead_rx: R,
     mut waker_sink: WakerSink,
@@ -1867,14 +2139,14 @@ where
 
         match peer_dead.path_secret_entry.queue_state() {
             QueueState::Client(state) => {
-                state.broadcast_reset(IDLE_TIMEOUT, &mut |aw| {
+                state.reset_streams(&peer_dead.streams, IDLE_TIMEOUT, &mut |aw| {
                     let _ = waker_sink.send(aw);
                 });
                 // Only a client handshakes, so only a client path asks for a new handshake.
                 request_rehandshake(*peer_dead.path_secret_entry.peer());
             }
             QueueState::Server(state) => {
-                state.broadcast_reset(IDLE_TIMEOUT, &mut |aw| {
+                state.reset_streams(&peer_dead.streams, IDLE_TIMEOUT, &mut |aw| {
                     let _ = waker_sink.send(aw);
                 });
             }

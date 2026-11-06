@@ -28,6 +28,7 @@ pub mod bach_handshake;
 pub mod deterministic;
 pub mod fair_share;
 pub mod half_close;
+pub mod network_change;
 pub mod unidirectional;
 
 #[test]
@@ -2593,7 +2594,7 @@ fn zombie_flow_not_invalidated_when_path_has_other_activity() {
                     .connect(format!("server:{SERVER_PORT}"), acceptor_id)
                     .await
                     .expect("connect zombie");
-                let (_reader_z, mut writer_z) = stream_z.into_split();
+                let (reader_z, mut writer_z) = stream_z.into_split();
                 let mut data = Data::new(1024);
                 writer_z
                     .write_all_from_fin(&mut data)
@@ -2625,7 +2626,13 @@ fn zombie_flow_not_invalidated_when_path_has_other_activity() {
                     }
                 }
 
-                // 85s have elapsed. Re-enable dropping to detect zombie probes.
+                // The zombie stream is still open, so the client's idle wheel would probe its
+                // quiet path half an idle timeout from now, and the server's ACK of that probe
+                // would count below. Close it, and give the server a second to acknowledge the
+                // client's reset of it, before the count starts.
+                drop((reader_z, writer_z));
+                1.s().sleep().await;
+                // 86s have elapsed. Re-enable dropping to detect zombie probes.
                 zombie_active.store(true, Ordering::Relaxed);
                 let before = probes_after_idle.load(Ordering::Relaxed);
                 30.s().sleep().await;
@@ -2642,12 +2649,12 @@ fn zombie_flow_not_invalidated_when_path_has_other_activity() {
     });
 
     // The zombie flow should have been invalidated despite other flows being active.
-    // If it's still probing after 115s, the shared path_secret_entry activity kept
+    // If it's still probing after 116s, the shared path_secret_entry activity kept
     // it alive — that's the bug.
     let still_probing = zombie_still_probing.load(Ordering::Relaxed);
     assert!(
         !still_probing,
-        "BUG: zombie flow is still probing after 115s. Other flows on the same path kept \
+        "BUG: zombie flow is still probing after 116s. Other flows on the same path kept \
          the path_secret_entry's last_activity fresh, preventing idle expiration of the \
          zombie send context."
     );

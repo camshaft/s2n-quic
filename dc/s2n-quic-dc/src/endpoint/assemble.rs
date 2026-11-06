@@ -645,8 +645,17 @@ where
                         time_sent,
                         sent_bytes: encoded_len as u16,
                     };
-                    // Restart idle timeout when transitioning from no inflight to inflight.
-                    if !context.inflight.has_inflight() {
+                    // Restart the idle timeout when this packet goes into an empty inflight map,
+                    // so that the peer has a whole idle timeout to acknowledge it, unless the
+                    // packet carries Pings alone. That is the send idle wheel's probe of a quiet
+                    // path (`send_idle_probe` in endpoint/tasks.rs), which the idle timeout of the
+                    // quiet period it probes decides on: a restart here would move that decision
+                    // to an idle timeout after the Ping's send, half an idle timeout or more past
+                    // the deadline.
+                    let pings_only = packet_frames
+                        .iter()
+                        .all(|f| matches!(f.header, frame::Header::Ping));
+                    if !context.inflight.has_inflight() && !pings_only {
                         context.last_peer_activity = now;
                     }
 

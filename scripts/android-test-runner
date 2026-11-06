@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# Cargo's target runner for the Android emulator: copies a test binary to the emulator, runs it there
+# with the arguments cargo passes, and exits with the binary's status.
+#
+# The mobile CI job sets CARGO_TARGET_X86_64_LINUX_ANDROID_RUNNER to this script while the emulator runs.
+#
+# The tests read files of the repository while they run: insta reads each stored snapshot, and bolero
+# looks up each test's source file to find its corpus. The runner copies the s2n-quic-dc directory to
+# the emulator once, at the same path under `$root` as in the repository, runs each binary from
+# `$root`, and sets INSTA_WORKSPACE_ROOT to `$root`, so that both read the files at the paths the
+# binary was built with. INSTA_UPDATE=no makes a snapshot that differs fail its test without writing
+# a new snapshot on the emulator.
+
+set -euo pipefail
+
+bin="$1"
+shift
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="/data/local/tmp/s2n-quic"
+crate="dc/s2n-quic-dc"
+parent="$root/$(dirname "$crate")"
+
+if ! adb shell "test -d $root/$crate"; then
+  adb shell "mkdir -p $parent"
+  adb push "$repo/$crate" "$parent/" > /dev/null
+fi
+
+# rustdoc names each doctest binary rust_out and runs several of them at once, so each binary gets a
+# directory of its own on the emulator, named for the binary's path on the host.
+dir="/data/local/tmp/bin/$(printf '%s' "$bin" | sha256sum | cut -c1-16)"
+dest="$dir/$(basename "$bin")"
+adb shell "mkdir -p $dir"
+adb push "$bin" "$dest" > /dev/null
+adb shell chmod 755 "$dest"
+
+args=""
+for arg in "$@"; do
+  args+=" $(printf '%q' "$arg")"
+done
+
+adb shell "cd $root && INSTA_WORKSPACE_ROOT=$root INSTA_UPDATE=no RUST_BACKTRACE=1 $dest$args"

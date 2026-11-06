@@ -28,7 +28,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     task::{Context, Poll, Waker},
@@ -110,6 +110,14 @@ pub struct ClientState {
     /// Per-stream unbacked initial recv window — bytes a peer may send before
     /// any pool-backed window grants flow. Configured at endpoint construction.
     pub(crate) initial_recv_window: u64,
+    /// How many allocated slots still have a receiver the app holds: counted up when
+    /// `alloc_local` opens a slot, and down when the second of its receivers is dropped.
+    /// While it isn't zero, a stream on this path may wait on the peer, so the send idle
+    /// wheel probes the path while it is quiet (`send_idle_wheel_drain`).
+    open_slots: AtomicUsize,
+    /// The resets this side owes the peer for the streams it reset when it marked the peer dead
+    /// (`path::secret::map::Entry::mark_dead_owing_resets`).
+    pub(crate) owed_resets: super::OwedResets,
 }
 
 impl ClientState {
@@ -120,12 +128,28 @@ impl ClientState {
             free: Mutex::new(ClientFreeList::new()),
             peer_free: sync::free_list::FreeList::new(max_peer_queues),
             initial_recv_window,
+            open_slots: AtomicUsize::new(0),
+            owed_resets: Default::default(),
         }
     }
 
     fn next_binding_id(&self) -> VarInt {
         let id = self.next_binding.fetch_add(1, Ordering::Relaxed);
         VarInt::new(id).expect("binding_id overflow")
+    }
+
+    /// Returns `true` while an allocated slot still has a receiver the app holds.
+    pub(crate) fn has_open_slot(&self) -> bool {
+        self.open_slots.load(Ordering::Relaxed) > 0
+    }
+
+    /// Counts a slot down once the second of its receivers is dropped.
+    pub(crate) fn on_slot_freed(&self) {
+        let previous = self.open_slots.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(
+            previous > 0,
+            "a slot was freed more often than it was opened"
+        );
     }
 
     /// Allocate a queue slot, waiting for a peer-side free ID if needed.
@@ -161,6 +185,44 @@ impl ClientState {
             .wake_all(&mut |w| waker_sink(AutoWake::new(Some(w))));
     }
 
+    /// Push Reset into the slot of each of `streams` that still holds the stream's binding, and
+    /// wake blocked alloc waiters, as [`Self::broadcast_reset`] does for every allocated slot.
+    ///
+    /// `streams` are the streams that [`Self::open_streams`] read as the dead mark recorded the
+    /// resets it owes the peer (`Entry::mark_dead_owing_resets`). A slot that read doesn't name,
+    /// one bound after it or one whose writer hadn't recorded the peer's queue yet, isn't reset,
+    /// and neither is a slot freed or bound again since: each stream the dead mark resets on this
+    /// side is owed a reset.
+    pub fn reset_streams(
+        &self,
+        streams: &[super::OwedReset],
+        error_code: VarInt,
+        waker_sink: &mut impl FnMut(AutoWake),
+    ) {
+        let mut view = SenderView::new();
+        for stream in streams {
+            let index = stream.queue_pair.source_queue_id.as_u64() as usize;
+            let Some(slot) = view.get(index, &self.pages) else {
+                continue;
+            };
+            let (sw, cw) = slot.reset_binding(stream.binding_id, error_code);
+            waker_sink(sw);
+            waker_sink(cw);
+        }
+        self.peer_free
+            .wake_all(&mut |w| waker_sink(AutoWake::new(Some(w))));
+    }
+
+    /// The stream of each allocated slot whose writer recorded the peer's queue, as a reset of it
+    /// that this side owes the peer routes. The dead mark resets these streams alone
+    /// ([`Self::reset_streams`]).
+    pub fn open_streams(&self) -> Vec<super::OwedReset> {
+        let mut streams = Vec::new();
+        let mut view = SenderView::new();
+        view.for_each_slot(&self.pages, |slot| streams.extend(slot.owed_reset()));
+        streams
+    }
+
     pub(crate) fn alloc_local(self: &Arc<Self>, dest_queue_id: VarInt) -> Option<AllocResult> {
         let index = {
             let mut free = self.free.lock().unwrap();
@@ -187,6 +249,7 @@ impl ClientState {
             free.push_freed(index);
             return None;
         }
+        self.open_slots.fetch_add(1, Ordering::Relaxed);
 
         let slot_ptr = slot_ref.as_ptr();
         let local_queue_id = VarInt::new(index as u64).expect("slot index exceeds VarInt range");
@@ -448,6 +511,24 @@ mod tests {
         assert!(try_alloc(&state).is_none());
     }
 
+    #[test]
+    fn open_slot_counts_until_both_receivers_drop() {
+        let state = test_state(10);
+        assert!(!state.has_open_slot());
+
+        let AllocResult {
+            stream, control, ..
+        } = try_alloc(&state).unwrap();
+        assert!(state.has_open_slot());
+        drop(stream);
+        assert!(
+            state.has_open_slot(),
+            "the control receiver still holds the slot"
+        );
+        drop(control);
+        assert!(!state.has_open_slot());
+    }
+
     // ── ClientDispatch ──────────────────────────────────────────────────────
 
     #[test]
@@ -485,5 +566,53 @@ mod tests {
         assert!(matches!(err, Err(Error::FutureBinding(_))));
 
         drop(result);
+    }
+
+    /// `reset_streams` wakes each alloc waiter that waits for a peer queue, as `broadcast_reset`
+    /// does, so that a caller blocked on a peer marked dead checks the dead mark again. It skips a
+    /// stream whose queue is past the page table's end and goes on to wake them.
+    #[test]
+    fn reset_streams_wakes_blocked_alloc_waiters() {
+        struct Noop;
+        impl std::task::Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let state = test_state(1);
+        let held = try_alloc(&state).expect("the one peer queue is free");
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = None;
+        assert!(
+            state
+                .peer_free
+                .poll_alloc(&mut waiter, &mut cx)
+                .is_pending(),
+            "every peer queue is taken"
+        );
+
+        // No alloc reaches queue 50, so the page table doesn't hold a slot for it.
+        assert!(
+            SenderView::new().get(50, &state.pages).is_none(),
+            "queue 50 is past the page table's end"
+        );
+        let past_end = crate::queue::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: v(50),
+                dest_queue_id: v(0),
+            },
+            binding_id: v(1),
+        };
+
+        let mut woken = 0;
+        state.reset_streams(&[past_end], v(42), &mut |wake| {
+            woken += wake.is_some() as usize
+        });
+        assert_eq!(woken, 1, "the waiter is woken");
+        assert!(
+            SenderView::new().get(50, &state.pages).is_none(),
+            "the call doesn't grow the page table to the stream it skips"
+        );
+        drop(held);
     }
 }
