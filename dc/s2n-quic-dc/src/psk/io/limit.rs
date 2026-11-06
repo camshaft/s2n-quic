@@ -587,6 +587,9 @@ mod tests {
             // path counts only the 110 ms of the two, and 51 ms is left: the acknowledgements the
             // peer held don't take more out of the handshake's time than the round trips.
             (ms(161), None, flights(80, 50, 60), Answer::Latency(ms(51))),
+            // An earlier round trip above the two the client timed doesn't take the path past
+            // them either.
+            (ms(161), Some(ms(80)), flights(90, 50, 60), Answer::Latency(ms(51))),
             // Without a round-trip time, the rest is the whole time.
             (ms(103), None, None, Answer::Latency(ms(103))),
             // Where the round trips take the whole time, the handshake doesn't show a time to
