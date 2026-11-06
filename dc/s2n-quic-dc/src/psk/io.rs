@@ -335,7 +335,10 @@ impl Client {
             .with_initial_round_trip_time(DEFAULT_INITIAL_RTT)?;
 
         let event = (
-            (ConfirmComplete, (MtuConfirmComplete, (DcPathCapture, PathRtt))),
+            (
+                ConfirmComplete,
+                (MtuConfirmComplete, (DcPathCapture, PathRtt)),
+            ),
             subscriber,
         );
 
