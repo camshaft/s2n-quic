@@ -83,18 +83,70 @@ impl CoreSub for DcPathCapture {
     }
 }
 
-/// Records the lowest and the highest round-trip times each connection's recovery measured, for
-/// the handshake queue's start limit to read a handshake's time against.
+/// Records, for the handshake queue's start limit to read a handshake's time against, the lowest
+/// round-trip time each connection's recovery measured, and the handshake's two round trips as
+/// the client timed them from its own packets.
 struct PathRtt;
 
+#[derive(Default)]
 struct PathRttContext {
     /// The `min_rtt` of the connection's newest recovery metrics, or `None` before the first.
     min_rtt: Option<Duration>,
-    /// The highest `latest_rtt` of the connection's recovery metrics, or `None` before the
-    /// first. s2n-quic publishes the metrics on a timeout too, and before the connection's first
-    /// round-trip sample they hold its initial round-trip time, so where a timeout came first,
-    /// the highest is at least that time.
-    highest_rtt: Option<Duration>,
+    /// When the connection sent its first packet, as the time since the start of the process.
+    first_sent: Option<Duration>,
+    /// The handshake's first round trip, from the first packet the connection sent to the first
+    /// packet it received, which the server sends only once the client's first flight arrives.
+    first_flight: Option<Duration>,
+    /// Whether the connection's path secrets are ready, after which a client sends its
+    /// `DC_STATELESS_RESET_TOKENS` frame.
+    secrets_ready: bool,
+    /// When the connection sent its first packet once its path secrets were ready.
+    second_sent: Option<Duration>,
+    /// The handshake's second round trip, from `second_sent` to dc.complete, when the server's
+    /// `DC_STATELESS_RESET_TOKENS` frame arrived, which the server sends only once it has the
+    /// client's.
+    second_flight: Option<Duration>,
+}
+
+impl PathRttContext {
+    /// Records a packet the connection sent at `now`, the time since the start of the process.
+    fn on_sent(&mut self, now: Duration) {
+        self.first_sent.get_or_insert(now);
+        if self.secrets_ready {
+            self.second_sent.get_or_insert(now);
+        }
+    }
+
+    /// Records a packet the connection received at `now`: the first ends the first round trip.
+    fn on_received(&mut self, now: Duration) {
+        if let (None, Some(sent)) = (self.first_flight, self.first_sent) {
+            self.first_flight = Some(now.saturating_sub(sent));
+        }
+    }
+
+    /// Records that the connection's path secrets are ready.
+    fn on_secrets_ready(&mut self) {
+        self.secrets_ready = true;
+    }
+
+    /// Records dc.complete at `now`, which ends the second round trip.
+    fn on_complete(&mut self, now: Duration) {
+        if let (None, Some(sent)) = (self.second_flight, self.second_sent) {
+            self.second_flight = Some(now.saturating_sub(sent));
+        }
+    }
+
+    /// The connection's lowest round-trip time beside its handshake's two round trips, or `None`
+    /// before its first recovery metrics. Until both round trips are timed, as before
+    /// dc.complete, each reads as the lowest, which leaves the spread out.
+    fn round_trips(&self) -> Option<limit::RoundTrips> {
+        let lowest = self.min_rtt?;
+        let flights = match (self.first_flight, self.second_flight) {
+            (Some(first), Some(second)) => [first, second],
+            _ => [lowest, lowest],
+        };
+        Some(limit::RoundTrips { lowest, flights })
+    }
 }
 
 impl CoreSub for PathRtt {
@@ -105,10 +157,7 @@ impl CoreSub for PathRtt {
         _meta: &events::ConnectionMeta,
         _info: &events::ConnectionInfo,
     ) -> Self::ConnectionContext {
-        PathRttContext {
-            min_rtt: None,
-            highest_rtt: None,
-        }
+        PathRttContext::default()
     }
 
     fn on_recovery_metrics(
@@ -118,20 +167,47 @@ impl CoreSub for PathRtt {
         event: &events::RecoveryMetrics,
     ) {
         context.min_rtt = Some(event.min_rtt);
-        context.highest_rtt = context.highest_rtt.max(Some(event.latest_rtt));
+    }
+
+    fn on_packet_sent(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        meta: &events::ConnectionMeta,
+        _event: &events::PacketSent,
+    ) {
+        context.on_sent(meta.timestamp.duration_since_start());
+    }
+
+    fn on_packet_received(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        meta: &events::ConnectionMeta,
+        _event: &events::PacketReceived,
+    ) {
+        context.on_received(meta.timestamp.duration_since_start());
+    }
+
+    fn on_dc_state_changed(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        meta: &events::ConnectionMeta,
+        event: &events::DcStateChanged,
+    ) {
+        match event.state {
+            events::DcState::PathSecretsReady { .. } => context.on_secrets_ready(),
+            events::DcState::Complete { .. } => {
+                context.on_complete(meta.timestamp.duration_since_start())
+            }
+            _ => {}
+        }
     }
 }
 
-/// The lowest and the highest round-trip times that a connection's recovery measured, or `None`
-/// before the first.
+/// The lowest round-trip time that a connection's recovery measured, beside its handshake's two
+/// round trips as the client timed them, or `None` before the first.
 fn connection_rtt(connection: &s2n_quic::Connection) -> Option<limit::RoundTrips> {
     connection
-        .query_event_context(|context: &PathRttContext| {
-            Some(limit::RoundTrips {
-                lowest: context.min_rtt?,
-                highest: context.highest_rtt?,
-            })
-        })
+        .query_event_context(|context: &PathRttContext| context.round_trips())
         .ok()
         .flatten()
 }
@@ -149,7 +225,7 @@ fn connection_entry(connection: &s2n_quic::Connection) -> Option<Arc<secret::map
 
 /// Reads the start limit's answer for a handshake that reached dc.complete in `elapsed` from its
 /// connect, as `Answer::for_handshake` reads it from `earlier_rtt`, the lowest round-trip time
-/// that the earlier handshakes with the peer measured, and the lowest and the highest that this
+/// that the earlier handshakes with the peer measured, and the round trips that this
 /// connection measured. It lowers the round-trip time of the connection's map entry to the lower
 /// of `earlier_rtt` and this connection's lowest, so that the next handshake with the peer reads
 /// it as its `earlier_rtt`.
@@ -986,11 +1062,55 @@ mod tests {
         assert_eq!(queue.limiter_inflight.current(), 1);
     }
 
-    /// Verifies that a client's connection has measured its path's lowest and highest round-trip
-    /// times by dc.complete, that the start limit's answer for its handshake takes two round
-    /// trips of the lower of its lowest and an earlier connection's, and the spread between its
-    /// highest and lowest, out of the handshake's time, and that the connection's map entry keeps
-    /// the lower time.
+    /// Verifies that a connection times its handshake's first round trip from the first packet
+    /// it sent to the first packet it received, and its second from the first packet it sent
+    /// once its path secrets were ready to dc.complete, each once, and that until both are timed
+    /// its round trips leave the spread out.
+    #[test]
+    fn a_connection_times_its_handshakes_two_round_trips_from_its_own_packets() {
+        let ms = Duration::from_millis;
+        let mut context = PathRttContext {
+            min_rtt: Some(ms(50)),
+            ..Default::default()
+        };
+        // The client's first flight goes out at 10 ms and 11 ms, and the server's reply arrives
+        // at 60 ms and 62 ms.
+        context.on_sent(ms(10));
+        context.on_sent(ms(11));
+        context.on_received(ms(60));
+        context.on_received(ms(62));
+        let first = context.round_trips().unwrap();
+        assert_eq!(first.flights, [ms(50), ms(50)]);
+        assert_eq!(first.spread(), Duration::ZERO);
+
+        // Once its path secrets are ready, the client sends its second flight at 64 ms and 65 ms.
+        // Packets that arrive at 63 ms and 100 ms don't end the second round trip, and dc.complete
+        // at 133 ms does, once.
+        context.on_secrets_ready();
+        context.on_received(ms(63));
+        context.on_sent(ms(64));
+        context.on_sent(ms(65));
+        context.on_received(ms(100));
+        context.on_complete(ms(133));
+        context.on_complete(ms(140));
+        assert_eq!(
+            context.round_trips(),
+            Some(limit::RoundTrips {
+                lowest: ms(50),
+                flights: [ms(50), ms(69)],
+            })
+        );
+
+        // Without recovery metrics, the connection doesn't show its round trips.
+        context.min_rtt = None;
+        assert_eq!(context.round_trips(), None);
+    }
+
+    /// Verifies that a client's connection has measured its path's lowest round-trip time and
+    /// timed its handshake's two round trips by dc.complete, that the start limit's answer for its
+    /// handshake takes the time its path accounts for out of the handshake's time, with two round
+    /// trips of the lower of its lowest and an earlier connection's, and that the connection's map
+    /// entry keeps the lower time.
     #[tokio::test]
     async fn the_start_answer_takes_two_measured_round_trips_out_of_the_time() {
         let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
@@ -1010,24 +1130,43 @@ mod tests {
             connection_rtt(&connection)
                 .expect("the connection measured a round-trip time by dc.complete")
         };
+
+        /// Checks that `answer` took out of `elapsed` a time between the paths that `earlier_rtt`
+        /// and the round trips read before and after it account for.
+        fn assert_between(
+            answer: limit::Answer,
+            elapsed: Duration,
+            earlier_rtt: Option<Duration>,
+            before: limit::RoundTrips,
+            after: limit::RoundTrips,
+        ) {
+            let first = elapsed - limit::RoundTrips::path(earlier_rtt, Some(before));
+            let last = elapsed - limit::RoundTrips::path(earlier_rtt, Some(after));
+            match answer {
+                limit::Answer::Latency(time) => {
+                    assert!(time >= first.min(last), "{time:?}, {before:?}, {after:?}");
+                    assert!(time <= first.max(last), "{time:?}, {before:?}, {after:?}");
+                }
+                other => panic!("expected a latency answer, got {other:?}"),
+            }
+        }
+
+        let timed = connection
+            .query_event_context(|context: &PathRttContext| {
+                (context.first_flight, context.second_flight)
+            })
+            .unwrap();
+        assert!(matches!(timed, (Some(_), Some(_))), "{timed:?}");
         // Once measured, the lowest round-trip time only goes down unless the connection meets
-        // persistent congestion, and the highest only goes up, so the round trips the answer
-        // used lie between the ones read before and after it.
+        // persistent congestion, and the timed round trips stay as they are, so the time the
+        // answer took out lies between the paths of the round trips read before and after it.
         let before = round_trips();
         let elapsed = Duration::from_secs(1);
         let answer = start_answer(&connection, None, elapsed);
         let after = round_trips();
         assert!(after.lowest > Duration::ZERO);
-        assert!(after.highest >= after.lowest, "{after:?}");
-        match answer {
-            limit::Answer::Latency(time) => {
-                let least = elapsed - before.lowest - after.highest;
-                let most = elapsed - after.lowest - before.highest;
-                assert!(time >= least, "{time:?}, {before:?}, {after:?}");
-                assert!(time <= most, "{time:?}, {before:?}, {after:?}");
-            }
-            other => panic!("expected a latency answer, got {other:?}"),
-        }
+        assert_eq!(after.flights, before.flights);
+        assert_between(answer, elapsed, None, before, after);
 
         // The connection's map entry, which the map holds for the peer, keeps the round trip
         // the answer used.
@@ -1041,20 +1180,12 @@ mod tests {
         );
 
         // An earlier connection's lower round trip counts instead of this connection's lowest,
-        // beside the spread of this connection's round trips, and the entry keeps it.
+        // beside the spread of this connection's longer round trip, and the entry keeps it.
         let earlier = Duration::from_nanos(1);
         let before = round_trips();
         let answer = start_answer(&connection, Some(earlier), elapsed);
         let after = round_trips();
-        match answer {
-            limit::Answer::Latency(time) => {
-                let least = elapsed - earlier * 2 - after.spread();
-                let most = elapsed - earlier * 2 - before.spread();
-                assert!(time >= least, "{time:?}, {before:?}, {after:?}");
-                assert!(time <= most, "{time:?}, {before:?}, {after:?}");
-            }
-            other => panic!("expected a latency answer, got {other:?}"),
-        }
+        assert_between(answer, elapsed, Some(earlier), before, after);
         assert_eq!(entry.path_rtt(), Some(earlier));
     }
 

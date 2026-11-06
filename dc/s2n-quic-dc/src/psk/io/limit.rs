@@ -43,17 +43,47 @@ pub(super) enum Answer {
 /// which the server sends once it has the client's.
 const HANDSHAKE_ROUND_TRIPS: u32 = 2;
 
-/// The lowest and the highest round-trip times that a connection measured.
+/// The round trips that a client's connection measured for its handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RoundTrips {
+    /// The lowest round-trip time that the connection's recovery measured.
     pub(super) lowest: Duration,
-    pub(super) highest: Duration,
+    /// The handshake's two round trips as the client timed them, each from a flight it sent to
+    /// the server's reply to that flight. The handshake's time holds both, so a peer that delays
+    /// its reply adds as much to that time as to the round trip.
+    pub(super) flights: [Duration; 2],
 }
 
 impl RoundTrips {
-    /// The spread between the highest round-trip time and the lowest.
+    /// The spread of the longer of the handshake's two round trips above the lowest round-trip
+    /// time.
     pub(super) fn spread(self) -> Duration {
-        self.highest.saturating_sub(self.lowest)
+        let [first, second] = self.flights;
+        first.max(second).saturating_sub(self.lowest)
+    }
+
+    /// The time of the handshake's two round trips together.
+    pub(super) fn flights_time(self) -> Duration {
+        let [first, second] = self.flights;
+        first.saturating_add(second)
+    }
+
+    /// The time that a handshake's path accounts for: `HANDSHAKE_ROUND_TRIPS` round trips of the
+    /// lower of `earlier_rtt` and the lowest of `rtt`, and the spread of `rtt` once, up to the
+    /// time of its two round trips together, and never below the round trips alone.
+    pub(super) fn path(earlier_rtt: Option<Duration>, rtt: Option<Self>) -> Duration {
+        let connection_lowest = rtt.map(|rtt| rtt.lowest);
+        let round_trips = match earlier_rtt.into_iter().chain(connection_lowest).min() {
+            Some(lowest) => lowest.saturating_mul(HANDSHAKE_ROUND_TRIPS),
+            None => Duration::ZERO,
+        };
+        match rtt {
+            Some(rtt) => round_trips
+                .saturating_add(rtt.spread())
+                .min(rtt.flights_time())
+                .max(round_trips),
+            None => round_trips,
+        }
     }
 }
 
@@ -68,34 +98,31 @@ impl Answer {
         }
     }
 
-    /// Reads a handshake that reached dc.complete in `elapsed` from its connect. The path
-    /// accounts for `HANDSHAKE_ROUND_TRIPS` round trips of the lower of two times, each where a
-    /// connection measured it: `earlier_rtt`, the lowest round-trip time that the earlier
-    /// handshakes with the same peer measured, and the lowest of `rtt`, the round-trip times that
-    /// this handshake's connection measured. The path also accounts for the spread between the
-    /// highest and the lowest of `rtt`, once: where the handshake's two round trips are the only
-    /// ones its connection measured, they are its lowest and its highest. The limit compares the
-    /// rest with the base. A handshake with a farther peer waits longer on its path, and a far
-    /// path's round trips can vary by more than twice the base, and neither is congestion. A
-    /// connection's own round trips also hold the time its packets waited in the endpoint's
-    /// receive queue, so under load `rtt` grows by that wait, and the lower `earlier_rtt` of a
-    /// connection that waited less keeps the wait in the rest; the spread takes out only the part
-    /// of the wait that one round trip held and another didn't. Without either time, the rest is
-    /// the whole time. Where the round trips take the whole time, the handshake doesn't show a
-    /// time to compare, and it answers `Finished`, a clean answer without a time, so that a time
-    /// of zero doesn't become the base.
+    /// Reads a handshake that reached dc.complete in `elapsed` from its connect, past the time its
+    /// path accounts for, as `RoundTrips::path` reads it: `HANDSHAKE_ROUND_TRIPS` round trips of
+    /// the lower of two times, each where a connection measured it, `earlier_rtt`, the lowest
+    /// round-trip time that the earlier handshakes with the same peer measured, and the lowest of
+    /// `rtt`, the one that this handshake's connection measured, and the spread of the longer of
+    /// the handshake's two round trips above that lowest, once. The limit compares the rest with
+    /// the base. A handshake with a farther peer waits longer on its path, and a far path's round
+    /// trips can vary by more than twice the base, and neither is congestion. The client times
+    /// each of the two round trips itself, from a flight it sent to the server's reply, and the
+    /// spread counts only up to the time of the two together, which the handshake's time holds:
+    /// a peer that delays its reply, or holds the acknowledgement that a recovery sample reads,
+    /// doesn't take more out of the handshake's time than it added to it. A connection's own
+    /// round trips also hold the time its packets waited in the endpoint's receive queue, so
+    /// under load `rtt` grows by that wait, and the lower `earlier_rtt` of a connection that
+    /// waited less keeps the wait in the rest; the spread takes out only the part of the wait
+    /// that the longer round trip held above the lowest. Without either time, the rest is the
+    /// whole time. Where the round trips take the whole time, the handshake doesn't show a time
+    /// to compare, and it answers `Finished`, a clean answer without a time, so that a time of
+    /// zero doesn't become the base.
     pub(super) fn for_handshake(
         elapsed: Duration,
         earlier_rtt: Option<Duration>,
         rtt: Option<RoundTrips>,
     ) -> Self {
-        let connection_lowest = rtt.map(|rtt| rtt.lowest);
-        let round_trips = match earlier_rtt.into_iter().chain(connection_lowest).min() {
-            Some(lowest) => lowest.saturating_mul(HANDSHAKE_ROUND_TRIPS),
-            None => Duration::ZERO,
-        };
-        let spread = rtt.map_or(Duration::ZERO, RoundTrips::spread);
-        let path = round_trips.saturating_add(spread);
+        let path = RoundTrips::path(earlier_rtt, rtt);
         match elapsed.checked_sub(path) {
             Some(latency) if !latency.is_zero() => Self::Latency(latency),
             _ => Self::Finished,
@@ -337,11 +364,17 @@ mod tests {
     }
 
     /// The round trips of a connection whose lowest round-trip time took `lowest` ms and whose
-    /// highest took `highest` ms.
+    /// handshake's two round trips took `lowest` ms and `highest` ms.
     fn rtt(lowest: u64, highest: u64) -> Option<RoundTrips> {
+        flights(lowest, lowest, highest)
+    }
+
+    /// The round trips of a connection whose lowest round-trip time took `lowest` ms and whose
+    /// handshake's two round trips took `first` ms and `second` ms.
+    fn flights(lowest: u64, first: u64, second: u64) -> Option<RoundTrips> {
         Some(RoundTrips {
             lowest: ms(lowest),
-            highest: ms(highest),
+            flights: [ms(first), ms(second)],
         })
     }
 
@@ -540,10 +573,17 @@ mod tests {
             (ms(103), Some(ms(40)), rtt(50, 50), Answer::Latency(ms(23))),
             (ms(103), Some(ms(60)), rtt(50, 50), Answer::Latency(ms(3))),
             (ms(103), Some(ms(50)), None, Answer::Latency(ms(3))),
-            // The spread between this connection's highest and lowest round trips counts once,
-            // beside two of the lower round trip.
+            // The spread of the handshake's longer round trip above this connection's lowest
+            // counts once, beside two of the lower round trip.
             (ms(120), None, rtt(50, 69), Answer::Latency(ms(1))),
             (ms(120), Some(ms(40)), rtt(50, 69), Answer::Latency(ms(21))),
+            // The spread counts only up to the handshake's two round trips together: where the
+            // peer held its acknowledgements, so that the lowest round trip its connection's
+            // recovery measured took 80 ms though the client timed 50 ms and 120 ms, 30 ms is
+            // left past the 170 ms of the two.
+            (ms(200), None, flights(80, 50, 120), Answer::Latency(ms(30))),
+            // Round trips the client timed below the lowest don't take the path below two of it.
+            (ms(161), None, flights(80, 50, 60), Answer::Latency(ms(1))),
             // Without a round-trip time, the rest is the whole time.
             (ms(103), None, None, Answer::Latency(ms(103))),
             // Where the round trips take the whole time, the handshake doesn't show a time to
@@ -554,6 +594,9 @@ mod tests {
         ] {
             assert_eq!(Answer::for_handshake(elapsed, earlier_rtt, rtt), expected);
         }
+        let below = flights(80, 50, 60).unwrap();
+        assert_eq!(below.spread(), Duration::ZERO);
+        assert_eq!(below.flights_time(), ms(110));
     }
 
     #[test]
@@ -607,10 +650,10 @@ mod tests {
         round(&limit, near);
         assert_eq!(limit.current(), 2);
 
-        // A far peer's lowest round trip takes 50 ms and its highest 69 ms, and its handshake
-        // 120 ms: past two of its lowest round trip, 20 ms is left, the 19 ms spread of its
-        // round trips and the 1 ms the endpoint added. Beside the near peer's handshake, the
-        // limit grows.
+        // A far peer's lowest round trip takes 50 ms, its handshake's two round trips 50 ms and
+        // 69 ms, and its handshake 120 ms: past two of its lowest round trip, 20 ms is left, the
+        // 19 ms spread of its longer round trip and the 1 ms the endpoint added. Beside the near
+        // peer's handshake, the limit grows.
         let far = Answer::for_handshake(ms(120), None, rtt(50, 69));
         assert_eq!(far, Answer::Latency(ms(1)));
         let mut permits = take_all(&limit).into_iter();
