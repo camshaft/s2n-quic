@@ -281,7 +281,7 @@ impl Client {
         Ok(Self {
             client,
             map: map.clone(),
-            queue: Arc::new(HandshakeQueue::new(builder.success_jitter)),
+            queue: Arc::new(HandshakeQueue::new(builder.success_jitter, &map)),
         })
     }
 
@@ -343,7 +343,9 @@ struct HandshakeQueue {
 }
 
 impl HandshakeQueue {
-    fn new(success_jitter: Duration) -> Self {
+    /// Makes a queue whose limits emit an event through `map` for each change of their size.
+    fn new(success_jitter: Duration, map: &secret::Map) -> Self {
+        use limit::Change::{Decreased, Increased};
         HandshakeQueue {
             // The "start" limit bounds TLS handshake concurrency.
             //
@@ -352,13 +354,25 @@ impl HandshakeQueue {
             // handshake's time from its connect to dc.complete, and halves where that time is
             // more than twice the base, or where handshakes with two peers timed out or were
             // refused since the last clean answer.
-            limiter_start: limit::Limit::new(),
+            limiter_start: limit::Limit::new({
+                let map = map.clone();
+                move |change| match change {
+                    Increased(size) => map.on_handshake_start_limit_increased(size),
+                    Decreased(size) => map.on_handshake_start_limit_decreased(size),
+                }
+            }),
             // The inflight limit bounds the total number of connections we have open. Keeping
             // that bounded helps avoid unbounded work ongoing in s2n-quic (which implies unbounded
             // packet transmit/receive work). The limit reads whether each connection finished its
             // MTU probing before its deadline, and halves where connections to two peers missed
             // it, or their handshakes timed out or were refused, since the last clean answer.
-            limiter_inflight: limit::Limit::new(),
+            limiter_inflight: limit::Limit::new({
+                let map = map.clone();
+                move |change| match change {
+                    Increased(size) => map.on_handshake_inflight_limit_increased(size),
+                    Decreased(size) => map.on_handshake_inflight_limit_decreased(size),
+                }
+            }),
             success_jitter,
             inner: Default::default(),
             hasher: Default::default(),
@@ -896,7 +910,7 @@ mod tests {
 
     #[test]
     fn alloc_entry_increments() {
-        let queue = HandshakeQueue::new(Duration::ZERO);
+        let queue = HandshakeQueue::new(Duration::ZERO, &test_map(NoopSubscriber {}));
         let peer_a = "127.0.0.1:3333".parse().unwrap();
         assert_eq!(
             queue
@@ -926,7 +940,7 @@ mod tests {
     /// a success where the map holds a newer entry for the peer.
     #[test]
     fn remove_completed_keeps_running_and_failed_handshakes() {
-        let queue = HandshakeQueue::new(Duration::from_secs(60));
+        let queue = HandshakeQueue::new(Duration::from_secs(60), &test_map(NoopSubscriber {}));
         let peer: SocketAddr = "127.0.0.1:3333".parse().unwrap();
 
         let running = queue.allocate_entry(peer, HandshakeReason::User);
@@ -962,6 +976,97 @@ mod tests {
                 &queue.allocate_entry(peer, HandshakeReason::User)
             ),
             "a successful handshake is no longer held"
+        );
+    }
+
+    /// Builds a map that sends its events to `subscriber`.
+    fn test_map<S: crate::event::Subscriber>(subscriber: S) -> Map {
+        Map::builder()
+            .with_signer(Signer::new(b"default"))
+            .with_capacity(50_000)
+            .with_clock(StdClock::default())
+            .with_subscriber(subscriber)
+            .build()
+            .unwrap()
+    }
+
+    /// Records each change of the handshake queue's limits that the map's events report.
+    #[derive(Clone, Default)]
+    struct LimitChanges(Arc<Mutex<Vec<(&'static str, usize)>>>);
+
+    impl LimitChanges {
+        fn push(&self, change: &'static str, size: usize) {
+            self.0.lock().unwrap().push((change, size));
+        }
+    }
+
+    impl crate::event::Subscriber for LimitChanges {
+        type ConnectionContext = ();
+
+        fn create_connection_context(
+            &self,
+            _meta: &crate::event::api::ConnectionMeta,
+            _info: &crate::event::api::ConnectionInfo,
+        ) -> Self::ConnectionContext {
+        }
+
+        fn on_handshake_start_limit_increased(
+            &self,
+            _meta: &crate::event::api::EndpointMeta,
+            event: &crate::event::api::HandshakeStartLimitIncreased,
+        ) {
+            self.push("start increased", event.size);
+        }
+
+        fn on_handshake_start_limit_decreased(
+            &self,
+            _meta: &crate::event::api::EndpointMeta,
+            event: &crate::event::api::HandshakeStartLimitDecreased,
+        ) {
+            self.push("start decreased", event.size);
+        }
+
+        fn on_handshake_inflight_limit_increased(
+            &self,
+            _meta: &crate::event::api::EndpointMeta,
+            event: &crate::event::api::HandshakeInflightLimitIncreased,
+        ) {
+            self.push("inflight increased", event.size);
+        }
+
+        fn on_handshake_inflight_limit_decreased(
+            &self,
+            _meta: &crate::event::api::EndpointMeta,
+            event: &crate::event::api::HandshakeInflightLimitDecreased,
+        ) {
+            self.push("inflight decreased", event.size);
+        }
+    }
+
+    /// Each change of the start and the inflight limit emits its event, with the limit's new size.
+    #[tokio::test]
+    async fn limit_changes_emit_events() {
+        let changes = LimitChanges::default();
+        let queue = HandshakeQueue::new(Duration::ZERO, &test_map(changes.clone()));
+        let peer_a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        for limiter in [&queue.limiter_start, &queue.limiter_inflight] {
+            // A clean answer of work that filled the limit of one grows the limit to two.
+            limiter.acquire().await.release(limit::Answer::Finished);
+            // The failures of two peers halve it back to one.
+            let first = limiter.acquire().await;
+            let second = limiter.acquire().await;
+            first.release(limit::Answer::Failed(peer_a));
+            second.release(limit::Answer::Failed(peer_b));
+        }
+        assert_eq!(
+            *changes.0.lock().unwrap(),
+            [
+                ("start increased", 2),
+                ("start decreased", 1),
+                ("inflight increased", 2),
+                ("inflight decreased", 1),
+            ]
         );
     }
 }

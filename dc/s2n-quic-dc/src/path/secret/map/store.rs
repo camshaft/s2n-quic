@@ -204,4 +204,12 @@ pub trait Store: 'static + Send + Sync + time::Clock {
     fn reset_all_senders(&self);
 
     fn on_dc_connection_timeout(&self, peer_address: &SocketAddr);
+
+    fn on_handshake_start_limit_increased(&self, size: usize);
+
+    fn on_handshake_start_limit_decreased(&self, size: usize);
+
+    fn on_handshake_inflight_limit_increased(&self, size: usize);
+
+    fn on_handshake_inflight_limit_decreased(&self, size: usize);
 }

@@ -1018,6 +1018,82 @@ pub mod api {
     impl Event for PathSecretMapAddressWriteLock {
         const NAME: &'static str = "path_secret_map:address_cache_write_lock";
     }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when the handshake queue's start limit, which bounds the handshakes it starts at"]
+    #[doc = " once, grows after a clean answer"]
+    pub struct HandshakeStartLimitIncreased {
+        #[doc = " The limit's size after the increase"]
+        pub size: usize,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for HandshakeStartLimitIncreased {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("HandshakeStartLimitIncreased");
+            fmt.field("size", &self.size);
+            fmt.finish()
+        }
+    }
+    impl Event for HandshakeStartLimitIncreased {
+        const NAME: &'static str = "handshake_queue:start_limit_increased";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when the handshake queue's start limit shrinks after an answer that signals"]
+    #[doc = " congestion"]
+    pub struct HandshakeStartLimitDecreased {
+        #[doc = " The limit's size after the decrease"]
+        pub size: usize,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for HandshakeStartLimitDecreased {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("HandshakeStartLimitDecreased");
+            fmt.field("size", &self.size);
+            fmt.finish()
+        }
+    }
+    impl Event for HandshakeStartLimitDecreased {
+        const NAME: &'static str = "handshake_queue:start_limit_decreased";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when the handshake queue's inflight limit, which bounds the connections it keeps"]
+    #[doc = " open at once, grows after a clean answer"]
+    pub struct HandshakeInflightLimitIncreased {
+        #[doc = " The limit's size after the increase"]
+        pub size: usize,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for HandshakeInflightLimitIncreased {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("HandshakeInflightLimitIncreased");
+            fmt.field("size", &self.size);
+            fmt.finish()
+        }
+    }
+    impl Event for HandshakeInflightLimitIncreased {
+        const NAME: &'static str = "handshake_queue:inflight_limit_increased";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when the handshake queue's inflight limit shrinks after an answer that signals"]
+    #[doc = " congestion"]
+    pub struct HandshakeInflightLimitDecreased {
+        #[doc = " The limit's size after the decrease"]
+        pub size: usize,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for HandshakeInflightLimitDecreased {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("HandshakeInflightLimitDecreased");
+            fmt.field("size", &self.size);
+            fmt.finish()
+        }
+    }
+    impl Event for HandshakeInflightLimitDecreased {
+        const NAME: &'static str = "handshake_queue:inflight_limit_decreased";
+    }
 }
 pub mod tracing {
     #![doc = r" This module contains event integration with [`tracing`](https://docs.rs/tracing)"]
@@ -1621,6 +1697,46 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapAddressWriteLock { acquire, duration } = event;
             tracing :: event ! (target : "path_secret_map_address_write_lock" , parent : parent , tracing :: Level :: DEBUG , { acquire = tracing :: field :: debug (acquire) , duration = tracing :: field :: debug (duration) });
+        }
+        #[inline]
+        fn on_handshake_start_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitIncreased,
+        ) {
+            let parent = self.parent(meta);
+            let api::HandshakeStartLimitIncreased { size } = event;
+            tracing :: event ! (target : "handshake_start_limit_increased" , parent : parent , tracing :: Level :: DEBUG , { size = tracing :: field :: debug (size) });
+        }
+        #[inline]
+        fn on_handshake_start_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitDecreased,
+        ) {
+            let parent = self.parent(meta);
+            let api::HandshakeStartLimitDecreased { size } = event;
+            tracing :: event ! (target : "handshake_start_limit_decreased" , parent : parent , tracing :: Level :: DEBUG , { size = tracing :: field :: debug (size) });
+        }
+        #[inline]
+        fn on_handshake_inflight_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitIncreased,
+        ) {
+            let parent = self.parent(meta);
+            let api::HandshakeInflightLimitIncreased { size } = event;
+            tracing :: event ! (target : "handshake_inflight_limit_increased" , parent : parent , tracing :: Level :: DEBUG , { size = tracing :: field :: debug (size) });
+        }
+        #[inline]
+        fn on_handshake_inflight_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitDecreased,
+        ) {
+            let parent = self.parent(meta);
+            let api::HandshakeInflightLimitDecreased { size } = event;
+            tracing :: event ! (target : "handshake_inflight_limit_decreased" , parent : parent , tracing :: Level :: DEBUG , { size = tracing :: field :: debug (size) });
         }
     }
 }
@@ -2644,6 +2760,70 @@ pub mod builder {
             }
         }
     }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when the handshake queue's start limit, which bounds the handshakes it starts at"]
+    #[doc = " once, grows after a clean answer"]
+    pub struct HandshakeStartLimitIncreased {
+        #[doc = " The limit's size after the increase"]
+        pub size: usize,
+    }
+    impl IntoEvent<api::HandshakeStartLimitIncreased> for HandshakeStartLimitIncreased {
+        #[inline]
+        fn into_event(self) -> api::HandshakeStartLimitIncreased {
+            let HandshakeStartLimitIncreased { size } = self;
+            api::HandshakeStartLimitIncreased {
+                size: size.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when the handshake queue's start limit shrinks after an answer that signals"]
+    #[doc = " congestion"]
+    pub struct HandshakeStartLimitDecreased {
+        #[doc = " The limit's size after the decrease"]
+        pub size: usize,
+    }
+    impl IntoEvent<api::HandshakeStartLimitDecreased> for HandshakeStartLimitDecreased {
+        #[inline]
+        fn into_event(self) -> api::HandshakeStartLimitDecreased {
+            let HandshakeStartLimitDecreased { size } = self;
+            api::HandshakeStartLimitDecreased {
+                size: size.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when the handshake queue's inflight limit, which bounds the connections it keeps"]
+    #[doc = " open at once, grows after a clean answer"]
+    pub struct HandshakeInflightLimitIncreased {
+        #[doc = " The limit's size after the increase"]
+        pub size: usize,
+    }
+    impl IntoEvent<api::HandshakeInflightLimitIncreased> for HandshakeInflightLimitIncreased {
+        #[inline]
+        fn into_event(self) -> api::HandshakeInflightLimitIncreased {
+            let HandshakeInflightLimitIncreased { size } = self;
+            api::HandshakeInflightLimitIncreased {
+                size: size.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when the handshake queue's inflight limit shrinks after an answer that signals"]
+    #[doc = " congestion"]
+    pub struct HandshakeInflightLimitDecreased {
+        #[doc = " The limit's size after the decrease"]
+        pub size: usize,
+    }
+    impl IntoEvent<api::HandshakeInflightLimitDecreased> for HandshakeInflightLimitDecreased {
+        #[inline]
+        fn into_event(self) -> api::HandshakeInflightLimitDecreased {
+            let HandshakeInflightLimitDecreased { size } = self;
+            api::HandshakeInflightLimitDecreased {
+                size: size.into_event(),
+            }
+        }
+    }
 }
 pub use traits::*;
 mod traits {
@@ -3142,6 +3322,46 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `HandshakeStartLimitIncreased` event is triggered"]
+        #[inline]
+        fn on_handshake_start_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitIncreased,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `HandshakeStartLimitDecreased` event is triggered"]
+        #[inline]
+        fn on_handshake_start_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitDecreased,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `HandshakeInflightLimitIncreased` event is triggered"]
+        #[inline]
+        fn on_handshake_inflight_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitIncreased,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `HandshakeInflightLimitDecreased` event is triggered"]
+        #[inline]
+        fn on_handshake_inflight_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitDecreased,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = r" Called for each event that relates to the endpoint and all connections"]
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -3550,6 +3770,42 @@ mod traits {
         ) {
             self.as_ref()
                 .on_path_secret_map_address_write_lock(meta, event);
+        }
+        #[inline]
+        fn on_handshake_start_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitIncreased,
+        ) {
+            self.as_ref()
+                .on_handshake_start_limit_increased(meta, event);
+        }
+        #[inline]
+        fn on_handshake_start_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitDecreased,
+        ) {
+            self.as_ref()
+                .on_handshake_start_limit_decreased(meta, event);
+        }
+        #[inline]
+        fn on_handshake_inflight_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitIncreased,
+        ) {
+            self.as_ref()
+                .on_handshake_inflight_limit_increased(meta, event);
+        }
+        #[inline]
+        fn on_handshake_inflight_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitDecreased,
+        ) {
+            self.as_ref()
+                .on_handshake_inflight_limit_decreased(meta, event);
         }
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -3979,6 +4235,42 @@ mod traits {
             (self.1).on_path_secret_map_address_write_lock(meta, event);
         }
         #[inline]
+        fn on_handshake_start_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitIncreased,
+        ) {
+            (self.0).on_handshake_start_limit_increased(meta, event);
+            (self.1).on_handshake_start_limit_increased(meta, event);
+        }
+        #[inline]
+        fn on_handshake_start_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitDecreased,
+        ) {
+            (self.0).on_handshake_start_limit_decreased(meta, event);
+            (self.1).on_handshake_start_limit_decreased(meta, event);
+        }
+        #[inline]
+        fn on_handshake_inflight_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitIncreased,
+        ) {
+            (self.0).on_handshake_inflight_limit_increased(meta, event);
+            (self.1).on_handshake_inflight_limit_increased(meta, event);
+        }
+        #[inline]
+        fn on_handshake_inflight_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitDecreased,
+        ) {
+            (self.0).on_handshake_inflight_limit_decreased(meta, event);
+            (self.1).on_handshake_inflight_limit_decreased(meta, event);
+        }
+        #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
             self.0.on_event(meta, event);
             self.1.on_event(meta, event);
@@ -4130,6 +4422,20 @@ mod traits {
         fn on_path_secret_map_address_write_lock(
             &self,
             event: builder::PathSecretMapAddressWriteLock,
+        );
+        #[doc = "Publishes a `HandshakeStartLimitIncreased` event to the publisher's subscriber"]
+        fn on_handshake_start_limit_increased(&self, event: builder::HandshakeStartLimitIncreased);
+        #[doc = "Publishes a `HandshakeStartLimitDecreased` event to the publisher's subscriber"]
+        fn on_handshake_start_limit_decreased(&self, event: builder::HandshakeStartLimitDecreased);
+        #[doc = "Publishes a `HandshakeInflightLimitIncreased` event to the publisher's subscriber"]
+        fn on_handshake_inflight_limit_increased(
+            &self,
+            event: builder::HandshakeInflightLimitIncreased,
+        );
+        #[doc = "Publishes a `HandshakeInflightLimitDecreased` event to the publisher's subscriber"]
+        fn on_handshake_inflight_limit_decreased(
+            &self,
+            event: builder::HandshakeInflightLimitDecreased,
         );
         #[doc = r" Returns the QUIC version, if any"]
         fn quic_version(&self) -> Option<u32>;
@@ -4495,6 +4801,40 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_handshake_start_limit_increased(&self, event: builder::HandshakeStartLimitIncreased) {
+            let event = event.into_event();
+            self.subscriber
+                .on_handshake_start_limit_increased(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_handshake_start_limit_decreased(&self, event: builder::HandshakeStartLimitDecreased) {
+            let event = event.into_event();
+            self.subscriber
+                .on_handshake_start_limit_decreased(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_handshake_inflight_limit_increased(
+            &self,
+            event: builder::HandshakeInflightLimitIncreased,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_handshake_inflight_limit_increased(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_handshake_inflight_limit_decreased(
+            &self,
+            event: builder::HandshakeInflightLimitDecreased,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_handshake_inflight_limit_decreased(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn quic_version(&self) -> Option<u32> {
             self.quic_version
         }
@@ -4622,6 +4962,10 @@ pub mod testing {
             pub path_secret_map_cleaner_cycled: AtomicU64,
             pub path_secret_map_id_write_lock: AtomicU64,
             pub path_secret_map_address_write_lock: AtomicU64,
+            pub handshake_start_limit_increased: AtomicU64,
+            pub handshake_start_limit_decreased: AtomicU64,
+            pub handshake_inflight_limit_increased: AtomicU64,
+            pub handshake_inflight_limit_decreased: AtomicU64,
         }
         impl Drop for Subscriber {
             fn drop(&mut self) {
@@ -4695,6 +5039,10 @@ pub mod testing {
                     path_secret_map_cleaner_cycled: AtomicU64::new(0),
                     path_secret_map_id_write_lock: AtomicU64::new(0),
                     path_secret_map_address_write_lock: AtomicU64::new(0),
+                    handshake_start_limit_increased: AtomicU64::new(0),
+                    handshake_start_limit_decreased: AtomicU64::new(0),
+                    handshake_inflight_limit_increased: AtomicU64::new(0),
+                    handshake_inflight_limit_decreased: AtomicU64::new(0),
                 }
             }
         }
@@ -5202,6 +5550,54 @@ pub mod testing {
                 let out = format!("{meta:?} {event:?}");
                 self.output.lock().unwrap().push(out);
             }
+            fn on_handshake_start_limit_increased(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::HandshakeStartLimitIncreased,
+            ) {
+                self.handshake_start_limit_increased
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_handshake_start_limit_decreased(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::HandshakeStartLimitDecreased,
+            ) {
+                self.handshake_start_limit_decreased
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_handshake_inflight_limit_increased(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::HandshakeInflightLimitIncreased,
+            ) {
+                self.handshake_inflight_limit_increased
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_handshake_inflight_limit_decreased(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::HandshakeInflightLimitDecreased,
+            ) {
+                self.handshake_inflight_limit_decreased
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
         }
     }
     #[derive(Debug)]
@@ -5252,6 +5648,10 @@ pub mod testing {
         pub path_secret_map_cleaner_cycled: AtomicU64,
         pub path_secret_map_id_write_lock: AtomicU64,
         pub path_secret_map_address_write_lock: AtomicU64,
+        pub handshake_start_limit_increased: AtomicU64,
+        pub handshake_start_limit_decreased: AtomicU64,
+        pub handshake_inflight_limit_increased: AtomicU64,
+        pub handshake_inflight_limit_decreased: AtomicU64,
     }
     impl Drop for Subscriber {
         fn drop(&mut self) {
@@ -5327,6 +5727,10 @@ pub mod testing {
                 path_secret_map_cleaner_cycled: AtomicU64::new(0),
                 path_secret_map_id_write_lock: AtomicU64::new(0),
                 path_secret_map_address_write_lock: AtomicU64::new(0),
+                handshake_start_limit_increased: AtomicU64::new(0),
+                handshake_start_limit_decreased: AtomicU64::new(0),
+                handshake_inflight_limit_increased: AtomicU64::new(0),
+                handshake_inflight_limit_decreased: AtomicU64::new(0),
             }
         }
     }
@@ -5863,6 +6267,54 @@ pub mod testing {
             let out = format!("{meta:?} {event:?}");
             self.output.lock().unwrap().push(out);
         }
+        fn on_handshake_start_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitIncreased,
+        ) {
+            self.handshake_start_limit_increased
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_handshake_start_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeStartLimitDecreased,
+        ) {
+            self.handshake_start_limit_decreased
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_handshake_inflight_limit_increased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitIncreased,
+        ) {
+            self.handshake_inflight_limit_increased
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_handshake_inflight_limit_decreased(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::HandshakeInflightLimitDecreased,
+        ) {
+            self.handshake_inflight_limit_decreased
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
     }
     #[derive(Debug)]
     pub struct Publisher {
@@ -5912,6 +6364,10 @@ pub mod testing {
         pub path_secret_map_cleaner_cycled: AtomicU64,
         pub path_secret_map_id_write_lock: AtomicU64,
         pub path_secret_map_address_write_lock: AtomicU64,
+        pub handshake_start_limit_increased: AtomicU64,
+        pub handshake_start_limit_decreased: AtomicU64,
+        pub handshake_inflight_limit_increased: AtomicU64,
+        pub handshake_inflight_limit_decreased: AtomicU64,
     }
     impl Publisher {
         #[doc = r" Creates a publisher with snapshot assertions enabled"]
@@ -5977,6 +6433,10 @@ pub mod testing {
                 path_secret_map_cleaner_cycled: AtomicU64::new(0),
                 path_secret_map_id_write_lock: AtomicU64::new(0),
                 path_secret_map_address_write_lock: AtomicU64::new(0),
+                handshake_start_limit_increased: AtomicU64::new(0),
+                handshake_start_limit_decreased: AtomicU64::new(0),
+                handshake_inflight_limit_increased: AtomicU64::new(0),
+                handshake_inflight_limit_decreased: AtomicU64::new(0),
             }
         }
     }
@@ -6349,6 +6809,44 @@ pub mod testing {
             event: builder::PathSecretMapAddressWriteLock,
         ) {
             self.path_secret_map_address_write_lock
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_handshake_start_limit_increased(&self, event: builder::HandshakeStartLimitIncreased) {
+            self.handshake_start_limit_increased
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_handshake_start_limit_decreased(&self, event: builder::HandshakeStartLimitDecreased) {
+            self.handshake_start_limit_decreased
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_handshake_inflight_limit_increased(
+            &self,
+            event: builder::HandshakeInflightLimitIncreased,
+        ) {
+            self.handshake_inflight_limit_increased
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_handshake_inflight_limit_decreased(
+            &self,
+            event: builder::HandshakeInflightLimitDecreased,
+        ) {
+            self.handshake_inflight_limit_decreased
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             let event = crate::event::snapshot::Fmt::to_snapshot(&event);

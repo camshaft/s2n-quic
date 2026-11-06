@@ -49,6 +49,13 @@ impl Answer {
     }
 }
 
+/// A change of a limit's size, with the size it changed to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Change {
+    Increased(usize),
+    Decreased(usize),
+}
+
 /// A limit on the work that runs at once, which the work's answers set.
 pub(super) struct Limit(Arc<Shared>);
 
@@ -56,6 +63,8 @@ struct Shared {
     /// Each permit the semaphore holds lets one more piece of work start.
     permits: Semaphore,
     state: Mutex<State>,
+    /// Called with each change of the limit's size, under the state's lock.
+    on_change: Box<dyn Fn(Change) + Send + Sync>,
 }
 
 struct State {
@@ -83,7 +92,9 @@ struct State {
 }
 
 impl Limit {
-    pub(super) fn new() -> Self {
+    /// Makes a limit of one, which calls `on_change` with each change of its size. It calls
+    /// `on_change` under its lock, so the calls come in the order of the changes.
+    pub(super) fn new(on_change: impl Fn(Change) + Send + Sync + 'static) -> Self {
         Self(Arc::new(Shared {
             permits: Semaphore::new(1),
             state: Mutex::new(State {
@@ -97,6 +108,7 @@ impl Limit {
                 base: None,
                 failed: None,
             }),
+            on_change: Box::new(on_change),
         }))
     }
 
@@ -176,7 +188,9 @@ impl Permit {
             let full = self.saturated_at_start || state.saturated != self.saturated;
             // The work ran alone where no other work held a permit at its start or at its end.
             let alone = self.alone && state.in_use == 1;
-            state.on_answer(&shared.permits, answer, full, alone);
+            if let Some(change) = state.on_answer(&shared.permits, answer, full, alone) {
+                (shared.on_change)(change);
+            }
         }
         state.in_use -= 1;
         state.add_permit(&shared.permits);
@@ -190,7 +204,14 @@ impl Drop for Permit {
 }
 
 impl State {
-    fn on_answer(&mut self, permits: &Semaphore, answer: Answer, full: bool, alone: bool) {
+    /// Takes the work's answer, and returns the change of the limit's size it made, if any.
+    fn on_answer(
+        &mut self,
+        permits: &Semaphore,
+        answer: Answer,
+        full: bool,
+        alone: bool,
+    ) -> Option<Change> {
         let congested = match answer {
             Answer::Latency(latency) => self.is_late(latency, alone),
             Answer::Finished => false,
@@ -198,17 +219,19 @@ impl State {
             // signals congestion.
             Answer::Failed(peer) => match self.failed.replace(peer) {
                 Some(other) if other != peer => true,
-                _ => return,
+                _ => return None,
             },
-            Answer::Neutral => return,
+            Answer::Neutral => return None,
         };
         if congested {
-            self.decrease(permits);
+            self.decrease(permits)
         } else {
             // A clean answer starts the count of failed peers again.
             self.failed = None;
             if full {
-                self.increase(permits);
+                self.increase(permits)
+            } else {
+                None
             }
         }
     }
@@ -225,24 +248,27 @@ impl State {
         }
     }
 
-    fn increase(&mut self, permits: &Semaphore) {
+    fn increase(&mut self, permits: &Semaphore) -> Option<Change> {
         if !self.slow_start {
             self.clean += 1;
             if self.clean < self.limit {
-                return;
+                return None;
             }
             self.clean = 0;
         }
         self.limit += 1;
         self.add_permit(permits);
+        Some(Change::Increased(self.limit))
     }
 
-    fn decrease(&mut self, permits: &Semaphore) {
+    fn decrease(&mut self, permits: &Semaphore) -> Option<Change> {
         self.generation += 1;
         self.slow_start = false;
         self.clean = 0;
         self.failed = None;
         let limit = (self.limit / 2).max(1);
+        // A limit of one stays one, which doesn't change its size.
+        let shrank = limit < self.limit;
         self.debt += self.limit - limit;
         self.limit = limit;
         // Retires the permits that no work holds at once, and the others as they come back.
@@ -253,6 +279,7 @@ impl State {
             permit.forget();
             self.debt -= 1;
         }
+        shrank.then_some(Change::Decreased(limit))
     }
 
     /// Adds a permit to the semaphore, or retires it where a decrease left permits to retire.
@@ -301,7 +328,7 @@ mod tests {
 
     #[test]
     fn starts_at_one_and_doubles_while_the_answers_are_clean() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         assert_eq!(limit.current(), 1);
         round(&limit, Answer::Latency(ms(1)));
         assert_eq!(limit.current(), 2);
@@ -313,7 +340,7 @@ mod tests {
 
     #[test]
     fn congestion_halves_the_limit_and_then_each_clean_round_adds_one() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         for _ in 0..3 {
             round(&limit, Answer::Finished);
         }
@@ -344,7 +371,7 @@ mod tests {
 
     #[test]
     fn a_decrease_starts_the_count_of_clean_answers_again() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         for _ in 0..3 {
             round(&limit, Answer::Finished);
         }
@@ -373,7 +400,7 @@ mod tests {
 
     #[test]
     fn a_second_decrease_while_permits_of_the_first_are_out_keeps_the_count() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         for _ in 0..4 {
             round(&limit, Answer::Finished);
         }
@@ -407,7 +434,7 @@ mod tests {
 
     #[test]
     fn one_peers_failures_dont_change_the_limit() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         round(&limit, Answer::Finished);
         round(&limit, Answer::Finished);
         round(&limit, Answer::Failed(peer(1)));
@@ -417,7 +444,7 @@ mod tests {
 
     #[test]
     fn a_clean_answer_between_two_peers_failures_keeps_the_limit() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         round(&limit, Answer::Finished);
         round(&limit, Answer::Finished);
 
@@ -435,7 +462,7 @@ mod tests {
 
     #[test]
     fn a_time_past_twice_the_base_is_congestion() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         round(&limit, Answer::Latency(ms(10)));
         assert_eq!(limit.current(), 2);
 
@@ -450,7 +477,7 @@ mod tests {
 
     #[test]
     fn work_that_ran_alone_sets_the_base_and_a_lower_time_lowers_it() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         round(&limit, Answer::Latency(ms(10)));
         // This work ran alone too, so its time is the base though it is higher. It didn't fill
         // the limit of 2, so the limit doesn't grow.
@@ -471,7 +498,7 @@ mod tests {
 
     #[test]
     fn work_that_doesnt_fill_the_limit_doesnt_grow_it() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         round(&limit, Answer::Finished);
         for _ in 0..10 {
             limit.try_acquire().unwrap().release(Answer::Finished);
@@ -481,7 +508,7 @@ mod tests {
 
     #[test]
     fn a_neutral_answer_or_a_dropped_permit_leaves_the_limit() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         limit.try_acquire().unwrap().release(Answer::Neutral);
         drop(limit.try_acquire().unwrap());
         assert_eq!(limit.current(), 1);
@@ -491,7 +518,7 @@ mod tests {
 
     #[test]
     fn the_limit_doesnt_go_below_one() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         for port in [1, 2, 1, 2] {
             let permit = limit.try_acquire().unwrap();
             permit.release(Answer::Failed(peer(port)));
@@ -514,7 +541,7 @@ mod tests {
 
     #[test]
     fn work_past_the_limit_waits_until_the_limit_lets_it_start() {
-        let limit = Limit::new();
+        let limit = Limit::new(|_| {});
         let mut cx = Context::from_waker(Waker::noop());
         let mut taking_first = pin!(limit.acquire());
         let Poll::Ready(first) = taking_first.as_mut().poll(&mut cx) else {
@@ -529,5 +556,49 @@ mod tests {
         let starts = taking_second.as_mut().poll(&mut cx).is_ready();
         assert!(starts, "the second piece of work starts");
         assert_eq!(limit.current(), 2);
+    }
+
+    /// Makes a limit that records each change of its size in the list it returns.
+    fn recording() -> (Limit, Arc<Mutex<Vec<Change>>>) {
+        let changes = Arc::new(Mutex::new(vec![]));
+        let limit = Limit::new({
+            let changes = changes.clone();
+            move |change| changes.lock().unwrap().push(change)
+        });
+        (limit, changes)
+    }
+
+    #[test]
+    fn each_change_of_the_limit_reports_its_new_size() {
+        let (limit, changes) = recording();
+        // Slow start grows the limit from one to two, and then to four.
+        round(&limit, Answer::Finished);
+        round(&limit, Answer::Finished);
+        // A second peer's failure halves it to two, and a clean round after that adds one.
+        round(&limit, Answer::Failed(peer(1)));
+        let permit = limit.try_acquire().unwrap();
+        permit.release(Answer::Failed(peer(2)));
+        round(&limit, Answer::Finished);
+        assert_eq!(
+            *changes.lock().unwrap(),
+            [
+                Change::Increased(2),
+                Change::Increased(3),
+                Change::Increased(4),
+                Change::Decreased(2),
+                Change::Increased(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_decrease_at_one_doesnt_report_a_change() {
+        let (limit, changes) = recording();
+        for port in [1, 2] {
+            let permit = limit.try_acquire().unwrap();
+            permit.release(Answer::Failed(peer(port)));
+        }
+        assert_eq!(limit.current(), 1);
+        assert!(changes.lock().unwrap().is_empty());
     }
 }

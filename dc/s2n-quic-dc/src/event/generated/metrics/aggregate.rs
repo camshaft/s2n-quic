@@ -14,7 +14,7 @@ use crate::event::{
 };
 #[allow(unused_imports)]
 use core::sync::atomic::{AtomicU64, Ordering};
-static INFO: &[Info; 132usize] = &[
+static INFO: &[Info; 140usize] = &[
     info::Builder {
         id: 0usize,
         name: Str::new("stream_write_key_updated\0"),
@@ -807,6 +807,54 @@ static INFO: &[Info; 132usize] = &[
         units: Units::Duration,
     }
     .build(),
+    info::Builder {
+        id: 132usize,
+        name: Str::new("handshake_start_limit_increased\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 133usize,
+        name: Str::new("handshake_start_limit_increased.size\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 134usize,
+        name: Str::new("handshake_start_limit_decreased\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 135usize,
+        name: Str::new("handshake_start_limit_decreased.size\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 136usize,
+        name: Str::new("handshake_inflight_limit_increased\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 137usize,
+        name: Str::new("handshake_inflight_limit_increased.size\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 138usize,
+        name: Str::new("handshake_inflight_limit_decreased\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 139usize,
+        name: Str::new("handshake_inflight_limit_decreased.size\0"),
+        units: Units::None,
+    }
+    .build(),
 ];
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -815,7 +863,7 @@ pub struct ConnectionContext {
 }
 pub struct Subscriber<R: Registry> {
     #[allow(dead_code)]
-    counters: Box<[R::Counter; 44usize]>,
+    counters: Box<[R::Counter; 48usize]>,
     #[allow(dead_code)]
     bool_counters: Box<[R::BoolCounter; 4usize]>,
     #[allow(dead_code)]
@@ -823,7 +871,7 @@ pub struct Subscriber<R: Registry> {
     #[allow(dead_code)]
     nominal_counter_offsets: Box<[usize; 32usize]>,
     #[allow(dead_code)]
-    measures: Box<[R::Measure; 52usize]>,
+    measures: Box<[R::Measure; 56usize]>,
     #[allow(dead_code)]
     gauges: Box<[R::Gauge; 0usize]>,
     #[allow(dead_code)]
@@ -850,11 +898,11 @@ impl<R: Registry> Subscriber<R> {
     #[allow(unused_mut)]
     #[inline]
     pub fn new(registry: R) -> Self {
-        let mut counters = Vec::with_capacity(44usize);
+        let mut counters = Vec::with_capacity(48usize);
         let mut bool_counters = Vec::with_capacity(4usize);
         let mut nominal_counters = Vec::with_capacity(32usize);
         let mut nominal_counter_offsets = Vec::with_capacity(32usize);
-        let mut measures = Vec::with_capacity(52usize);
+        let mut measures = Vec::with_capacity(56usize);
         let mut gauges = Vec::with_capacity(0usize);
         let mut timers = Vec::with_capacity(0usize);
         let mut nominal_timers = Vec::with_capacity(0usize);
@@ -903,6 +951,10 @@ impl<R: Registry> Subscriber<R> {
         counters.push(registry.register_counter(&INFO[109usize]));
         counters.push(registry.register_counter(&INFO[126usize]));
         counters.push(registry.register_counter(&INFO[129usize]));
+        counters.push(registry.register_counter(&INFO[132usize]));
+        counters.push(registry.register_counter(&INFO[134usize]));
+        counters.push(registry.register_counter(&INFO[136usize]));
+        counters.push(registry.register_counter(&INFO[138usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[5usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[6usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[101usize]));
@@ -1315,6 +1367,10 @@ impl<R: Registry> Subscriber<R> {
         measures.push(registry.register_measure(&INFO[128usize]));
         measures.push(registry.register_measure(&INFO[130usize]));
         measures.push(registry.register_measure(&INFO[131usize]));
+        measures.push(registry.register_measure(&INFO[133usize]));
+        measures.push(registry.register_measure(&INFO[135usize]));
+        measures.push(registry.register_measure(&INFO[137usize]));
+        measures.push(registry.register_measure(&INFO[139usize]));
         {
             #[allow(unused_imports)]
             use api::*;
@@ -1393,6 +1449,10 @@ impl<R: Registry> Subscriber<R> {
                 41usize => (&INFO[109usize], entry),
                 42usize => (&INFO[126usize], entry),
                 43usize => (&INFO[129usize], entry),
+                44usize => (&INFO[132usize], entry),
+                45usize => (&INFO[134usize], entry),
+                46usize => (&INFO[136usize], entry),
+                47usize => (&INFO[138usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -1697,6 +1757,10 @@ impl<R: Registry> Subscriber<R> {
                 49usize => (&INFO[128usize], entry),
                 50usize => (&INFO[130usize], entry),
                 51usize => (&INFO[131usize], entry),
+                52usize => (&INFO[133usize], entry),
+                53usize => (&INFO[135usize], entry),
+                54usize => (&INFO[137usize], entry),
+                55usize => (&INFO[139usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -2358,6 +2422,58 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
         self.count(129usize, 43usize, 1usize);
         self.measure(130usize, 50usize, event.acquire);
         self.measure(131usize, 51usize, event.duration);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_handshake_start_limit_increased(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::HandshakeStartLimitIncreased,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(132usize, 44usize, 1usize);
+        self.measure(133usize, 52usize, event.size);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_handshake_start_limit_decreased(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::HandshakeStartLimitDecreased,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(134usize, 45usize, 1usize);
+        self.measure(135usize, 53usize, event.size);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_handshake_inflight_limit_increased(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::HandshakeInflightLimitIncreased,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(136usize, 46usize, 1usize);
+        self.measure(137usize, 54usize, event.size);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_handshake_inflight_limit_decreased(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::HandshakeInflightLimitDecreased,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(138usize, 47usize, 1usize);
+        self.measure(139usize, 55usize, event.size);
         let _ = event;
         let _ = meta;
     }
