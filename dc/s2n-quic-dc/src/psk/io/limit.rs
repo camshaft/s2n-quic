@@ -58,13 +58,18 @@ impl Answer {
     /// whose lowest round-trip time was `min_rtt`, where the connection measured one: the path
     /// accounts for `HANDSHAKE_ROUND_TRIPS` of those round trips, and the rest is the time the
     /// endpoint added, which the limit compares with the base. A handshake with a farther peer
-    /// waits longer on its path, and that wait isn't congestion.
+    /// waits longer on its path, and that wait isn't congestion. Where the round trips take the
+    /// whole time, the handshake doesn't show the endpoint's time, and it answers `Finished`, a
+    /// clean answer without a time, so that a time of zero doesn't become the base.
     pub(super) fn for_handshake(elapsed: Duration, min_rtt: Option<Duration>) -> Self {
         let path = match min_rtt {
             Some(rtt) => rtt.saturating_mul(HANDSHAKE_ROUND_TRIPS),
             None => Duration::ZERO,
         };
-        Self::Latency(elapsed.saturating_sub(path))
+        match elapsed.checked_sub(path) {
+            Some(latency) if !latency.is_zero() => Self::Latency(latency),
+            _ => Self::Finished,
+        }
     }
 }
 
@@ -490,15 +495,16 @@ mod tests {
 
     #[test]
     fn a_handshake_answers_its_time_past_two_round_trips_of_its_path() {
-        for (elapsed, min_rtt, latency) in [
-            (ms(103), Some(ms(50)), ms(3)),
+        for (elapsed, min_rtt, expected) in [
+            (ms(103), Some(ms(50)), Answer::Latency(ms(3))),
             // Without a round-trip time, the whole time is the endpoint's.
-            (ms(103), None, ms(103)),
-            // Where the round trips take the whole time, the endpoint's time is zero.
-            (ms(90), Some(ms(50)), Duration::ZERO),
+            (ms(103), None, Answer::Latency(ms(103))),
+            // Where the round trips take the whole time, the handshake doesn't show the
+            // endpoint's time.
+            (ms(100), Some(ms(50)), Answer::Finished),
+            (ms(90), Some(ms(50)), Answer::Finished),
         ] {
-            let answer = Answer::for_handshake(elapsed, min_rtt);
-            assert_eq!(answer, Answer::Latency(latency));
+            assert_eq!(Answer::for_handshake(elapsed, min_rtt), expected);
         }
     }
 
@@ -542,6 +548,21 @@ mod tests {
         let mut permits = take_all(&limit).into_iter();
         permits.next().unwrap().release(far);
         assert_eq!(limit.current(), 1);
+    }
+
+    #[test]
+    fn a_handshake_whose_round_trips_take_its_whole_time_doesnt_set_the_base() {
+        let limit = Limit::new();
+        // The handshake runs alone, and its 1 ms past its round trips is the base.
+        round(&limit, Answer::for_handshake(ms(3), Some(ms(1))));
+        assert_eq!(limit.current(), 2);
+
+        // Beside a handshake whose round trips take its whole time, a handshake with 2 ms past
+        // its round trips is within twice the base, and the limit grows.
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(Answer::for_handshake(ms(90), Some(ms(50))));
+        permits.next().unwrap().release(Answer::for_handshake(ms(4), Some(ms(1))));
+        assert_eq!(limit.current(), 4);
     }
 
     #[test]
