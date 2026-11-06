@@ -1233,6 +1233,73 @@ fn send_idle_wheel_expiry_of_an_invalidated_context_keeps_its_paths_newer_contex
     });
 }
 
+/// A send context that a stale key's invalidation removed from the cache isn't probed, so its
+/// expiry on a quiet path with an open stream doesn't mark the peer dead: the cache's current
+/// context for the path probes the quiet path and decides on it.
+#[test]
+fn send_idle_wheel_expiry_of_an_invalidated_context_doesnt_mark_dead_a_path_with_an_open_stream() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) = setup_send();
+
+        let pse = test_entry();
+        let start = precision::Clock::now(&clock);
+        pse.touch_activity(start);
+        let id = *pse.id();
+        let stream = open_stream(&pse);
+
+        let invalidated = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!invalidated.borrow().inflight.has_inflight());
+        let idle = pse.idle_timeout();
+        invalidated.borrow_mut().idle_wheel.target_time = Some(start + idle);
+        let _ = idle_wheel_tx.send(invalidated.clone());
+
+        let key_id = invalidated.borrow().credentials.key_id;
+        let (mut retransmit_tx, _retransmit_rx) = unsync::new::<Frame>();
+        let _ = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .invalidate_stale_key(
+                &id,
+                LocalSenderId::from_index(0),
+                key_id,
+                &mut retransmit_tx,
+            )
+            .expect("the cache should hold the context the stale key invalidates");
+        assert!(invalidated.borrow().invalidated);
+
+        async move {
+            (idle + 3.s()).sleep().await;
+            assert_eq!(
+                Rc::strong_count(&invalidated),
+                1,
+                "the idle wheel should have expired the invalidated context"
+            );
+            assert!(
+                invalidated.borrow().idle_probe_for.is_none(),
+                "the idle wheel shouldn't probe an invalidated context"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                !pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "the expiry of an invalidated context shouldn't mark dead the peer of a path \
+                 with an open stream"
+            );
+            assert_eq!(
+                take_probe_counts(&registry),
+                ProbeCounts::default(),
+                "the invalidated context shouldn't be probed, and its expiry shouldn't count a \
+                 dead mark"
+            );
+            drop(stream);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// A send context first arms its idle check half an idle timeout out while its path has an
 /// open stream, so that the idle wheel can probe the quiet path before the idle timeout
 /// decides, and a full idle timeout out otherwise.

@@ -6,9 +6,10 @@
 //!
 //! In each test a phone (the client) uploads to a host (the server) and waits for the host's
 //! answer, and the network changes in the middle of the upload. Each test asserts that the
-//! phone's reader and writer each end in an `io::Error` of the expected kind within a bound,
-//! or that the work completes on a new connection within a bound. Every read, write and
-//! connect is wrapped in a timeout, so a stream that stops without an error fails the test.
+//! phone's read of the answer ends in an `io::Error` of the expected kind within a bound, and
+//! that its upload ends in that error or with each byte queued, or that the work completes on
+//! a new connection within a bound. Every read, write and connect is wrapped in a timeout, so
+//! a stream that stops without an error fails the test.
 //!
 //! How the changes are modeled: in bach each group has one address, and a network monitor can
 //! drop a packet but can't change its addresses. The endpoint doesn't route a stream's packets
@@ -50,8 +51,8 @@ use tokio::sync::oneshot;
 
 const ACCEPTOR_ID: VarInt = VarInt::from_u32(1);
 
-/// The phone's upload: larger than the 1 MiB initial flow-control window, so the phone's
-/// writer is still sending, or waits for MAX_DATA, when the network changes.
+/// The phone's upload: larger than the 1 MiB initial flow-control window, so part of it is
+/// still unsent when the network changes, though the phone's writer may have queued all of it.
 const UPLOAD_LEN: u64 = 4 * 1024 * 1024;
 
 /// The network changes once the host has read this much of the first upload.
@@ -183,12 +184,27 @@ fn assert_error_kind<T, E>(what: &str, result: Result<io::Result<T>, E>, kind: i
     }
 }
 
+/// Asserts that the phone's upload, a `write_all_from_fin` of `UPLOAD_LEN` bytes wrapped in a
+/// timeout, ended within its bound: in an error of `kind`, or with each byte queued. The writer
+/// returns once it has queued the bytes and the FIN, before the host acknowledges them, so a
+/// writer that queued the whole upload before the change returns its length, and the phone's
+/// read of the answer is what reports the loss.
+#[track_caller]
+fn assert_upload_ended<E>(result: Result<io::Result<usize>, E>, kind: io::ErrorKind) {
+    match result {
+        Ok(Ok(queued)) => assert_eq!(
+            queued as u64, UPLOAD_LEN,
+            "the phone's upload returned before queuing each byte"
+        ),
+        other => assert_error_kind("the phone's upload", other, kind),
+    }
+}
+
 /// Runs the phone's work on `stream`, the old connection, and changes the network in the
 /// middle of the upload: once the host has read `CHANGE_AT` bytes (`mid_stream`), it calls
-/// `change`. Asserts that the phone's read of the answer and its upload each end in an error
-/// of `kind` within `bound` of the change, and returns what `change` returned. Where the
-/// writer queues each byte of the upload before the change, which doesn't deliver them, the
-/// upload ends in the error the writer's `peer_cancellation` yields once the stream is reset.
+/// `change`. Asserts that the phone's read of the answer ends in an error of `kind` within
+/// `bound` of the change, and that its upload ended within `bound` as `assert_upload_ended`
+/// checks, and returns what `change` returned.
 async fn change_mid_stream<R>(
     stream: Stream,
     mid_stream: oneshot::Receiver<()>,
@@ -199,10 +215,7 @@ async fn change_mid_stream<R>(
     let (mut reader, mut writer) = stream.into_split();
     let upload = async move {
         let mut data = Data::new(UPLOAD_LEN);
-        writer.write_all_from_fin(&mut data).await?;
-        // Queuing the upload doesn't deliver it: the app learns that the change lost it from
-        // the writer's peer cancellation, which the reset of the stream resolves.
-        Err::<usize, io::Error>(writer.peer_cancellation().await)
+        writer.write_all_from_fin(&mut data).await
     }
     .spawn();
 
@@ -217,8 +230,7 @@ async fn change_mid_stream<R>(
         timeout(bound, upload),
     );
     assert_error_kind("the phone's read of the answer", read, kind);
-    assert_error_kind(
-        "the phone's upload",
+    assert_upload_ended(
         upload.map(|joined| joined.expect("the upload task completes")),
         kind,
     );
@@ -257,7 +269,7 @@ async fn complete_work(stream: Stream, bound: Duration, what: &str) {
 /// After the move, the phone's packets leave from its new address and still reach the host,
 /// and the host's packets to the old address are lost, so the phone doesn't hear from the
 /// host. The phone has packets the host hasn't acknowledged, so once its idle timeout passes it
-/// marks the host dead, and its reader and writer end in `TimedOut`. The app then opens its
+/// marks the host dead, and its read of the answer ends in `TimedOut`. The app then opens its
 /// endpoint again on the new network, a group of its own with an address of its own, and the
 /// work completes on a new connection there; from then on the old address doesn't send
 /// anything. Right after the move the host writes one byte on the old stream, which the move
@@ -356,8 +368,8 @@ fn wifi_move_mid_stream_times_out_then_completes_on_the_new_network() {
 /// The phone's own address doesn't change, and its packets still reach the host from the new
 /// mapping. The host's packets go to the address it knows, which the rebinding doesn't forward
 /// any more, so the phone doesn't hear from the host. The phone has packets the host hasn't
-/// acknowledged, so once its idle timeout passes it marks the host dead, and its reader and
-/// writer end in `TimedOut`. A connect right after is refused at once with `TimedOut`, since
+/// acknowledged, so once its idle timeout passes it marks the host dead, and its read of the
+/// answer ends in `TimedOut`. A connect right after is refused at once with `TimedOut`, since
 /// the dead-peer cooldown holds. Right after the change the host writes one byte on the
 /// stream, which the change drops, so the host holds a packet the phone hasn't acknowledged:
 /// once the phone stops sending and the host's idle timeout passes, the host marks the phone
@@ -433,7 +445,7 @@ fn address_change_mid_stream_times_out() {
 ///
 /// While the app is suspended, no packet goes either way, for half an idle timeout longer than
 /// the idle timeout. The phone has packets the host hasn't acknowledged, so once its idle
-/// timeout passes it marks the host dead, and its reader and writer end in `TimedOut`. When
+/// timeout passes it marks the host dead, and its read of the answer ends in `TimedOut`. When
 /// delivery resumes, the dead-peer cooldown still holds, so a connect is refused at once with
 /// `TimedOut`. Once the cooldown has passed, the work completes on a new connection.
 ///
@@ -903,13 +915,14 @@ async fn read_update(reader: &mut Reader, buf: &mut BytesMut, update: &[u8], bou
 /// while. Then no packet goes either way, and the host sends its last update with FIN. An idle
 /// timeout after its second update the host marks the phone dead and fails the stream's frames,
 /// while the phone would mark the host dead only an idle timeout after the third update.
-/// Delivery resumes in between, two fifths of an idle timeout after the third update. The
-/// phone's next packet reaches the host and clears its dead mark, so the host resets the stream
-/// whose frames it failed: the phone's read of the last update ends in the host's reset,
-/// `TimedOut` for the host's idle timeout, within two fifths of an idle timeout, and the phone
-/// hasn't marked the host dead.
+/// Delivery resumes in between, two fifths of an idle timeout after the third update, and the
+/// phone's next packet reaches the host and clears its dead mark. The phone's read then ends
+/// within two fifths of an idle timeout, before the phone marks the host dead: in the host's
+/// reset of the stream whose frames it failed, `TimedOut` for the host's idle timeout, or with
+/// each update and the FIN, where the host sends the rest of the stream once delivery resumes.
+/// Either way the phone's read ends within that bound.
 #[test]
-fn reading_phone_is_reset_once_delivery_resumes_after_the_host_marked_it_dead() {
+fn reading_phone_ends_once_delivery_resumes_after_the_host_marked_it_dead() {
     // Snapshot disabled: the test waits through idle timeouts, and its trace would be large.
     let _guard = crate::testing::without_snapshots();
     sim(|| {
@@ -1026,24 +1039,36 @@ fn reading_phone_is_reset_once_delivery_resumes_after_the_host_marked_it_dead() 
             let err = match read {
                 Err(_elapsed) => panic!(
                     "the phone's read of the last update was still pending at its bound: the \
-                     host didn't reset the stream whose frames it failed"
+                     host neither reset the stream nor sent the rest of it"
                 ),
-                Ok(Ok(())) => panic!("the phone read the stream to its end"),
-                Ok(Err(err)) => err,
+                Ok(Ok(())) => {
+                    // The host sent the rest of the stream once delivery resumed: the phone
+                    // read each update in order, and the FIN.
+                    let each = [FIRST_UPDATE, SECOND_UPDATE, THIRD_UPDATE, LAST_UPDATE].concat();
+                    assert!(
+                        updates[..] == each[..],
+                        "the phone read the stream to its end, but not each update in order: \
+                         {updates:?}"
+                    );
+                    None
+                }
+                Ok(Err(err)) => Some(err),
             };
-            assert_eq!(
-                err.kind(),
-                io::ErrorKind::TimedOut,
-                "the phone's read ended in {err:?}"
-            );
-            assert_eq!(
-                err.get_ref()
-                    .and_then(|inner| inner.downcast_ref::<crate::endpoint::error::Error>()),
-                Some(&crate::endpoint::error::Error::IdleTimeout),
-                "the phone's read ended in {err:?}, not in a reset for the host's idle timeout"
-            );
+            if let Some(err) = err {
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut,
+                    "the phone's read ended in {err:?}"
+                );
+                assert_eq!(
+                    err.get_ref()
+                        .and_then(|inner| inner.downcast_ref::<crate::endpoint::error::Error>()),
+                    Some(&crate::endpoint::error::Error::IdleTimeout),
+                    "the phone's read ended in {err:?}, not in a reset for the host's idle timeout"
+                );
+            }
 
-            // The read ended in the host's reset: the phone hasn't marked the host dead.
+            // The read ended before the phone marked the host dead.
             let entry = lookup_sim_map(phone.data_addr())
                 .expect("the phone's path-secret map is registered")
                 .get_raw(host)
@@ -1051,7 +1076,7 @@ fn reading_phone_is_reset_once_delivery_resumes_after_the_host_marked_it_dead() 
             let now = crate::time::precision::Clock::now(&crate::time::bach::Clock::default());
             assert!(
                 !entry.is_dead_during_cooldown(now, DEFAULT_DEAD_PEER_COOLDOWN),
-                "the phone marked the host dead, so its read didn't end in the host's reset"
+                "the phone marked the host dead before its read ended"
             );
             drop(writer);
         }
@@ -1064,7 +1089,7 @@ fn reading_phone_is_reset_once_delivery_resumes_after_the_host_marked_it_dead() 
 /// A stream that the host's dead mark resets while the host holds none of its frames.
 ///
 /// The first stream runs as in
-/// `reading_phone_is_reset_once_delivery_resumes_after_the_host_marked_it_dead`: the host marks
+/// `reading_phone_ends_once_delivery_resumes_after_the_host_marked_it_dead`: the host marks
 /// the phone dead an idle timeout after the phone's last packet, and delivery resumes before
 /// the phone marks the host dead. Beside it, the phone opens a second stream once the first is
 /// set up, sends a request on it and reads the host's first update, and the host writes nothing
@@ -1251,7 +1276,7 @@ fn quiet_stream_is_reset_once_delivery_resumes_after_the_host_marked_the_phone_d
 /// writes on it.
 ///
 /// The first stream runs as in
-/// `reading_phone_is_reset_once_delivery_resumes_after_the_host_marked_it_dead`. Beside it, the
+/// `reading_phone_ends_once_delivery_resumes_after_the_host_marked_it_dead`. Beside it, the
 /// phone opens a second stream once the first is set up and writes the first part of an upload
 /// on it, three quarters of the initial flow-control window, which the host reads, so that the
 /// host's reader grants the phone's writer more room. Every packet goes through for a tenth of

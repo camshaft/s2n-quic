@@ -1185,6 +1185,9 @@ where
 /// this side, each stream whose frames it fails and each stream open on the path, is owed a
 /// reset, which the receive path sends once a packet from the peer clears the dead mark
 /// (`Entry::mark_dead_owing_resets`).
+/// A context that an earlier invalidation removed from the cache, as for a stale key, isn't
+/// probed, and its expiry marks the peer dead only where it left packets unacknowledged: the
+/// cache's current context for the path probes the quiet path and decides on it.
 ///
 /// A context with no unacknowledged packet whose path has an open stream is probed with a Ping
 /// once in each quiet period, half an idle timeout into it, or at the idle deadline where its
@@ -1331,6 +1334,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let peer_addr = ctx.peer_addr;
                 let ever_responded = ctx.last_peer_activity.nanos != ctx.created_at.nanos;
                 let has_inflight = ctx.inflight.has_inflight();
+                let invalidated = ctx.invalidated;
                 let pto_backoff = ctx.pto.backoff;
                 let packets_sent = ctx.next_packet_number.as_u64();
 
@@ -1403,8 +1407,12 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // here only where the submission channel refused that probe, as once the
                 // endpoint shuts down). The peer marks this side dead under the same rule, so a
                 // stream doesn't stay open on one side alone. Without any of these, both sides
-                // simply stopped talking (natural idle) and we must not mark dead.
-                let unresponsive = has_inflight || probed || open_stream;
+                // simply stopped talking (natural idle) and we must not mark dead. A context an
+                // earlier invalidation removed from the cache, as for a stale key, isn't probed
+                // above, so its open stream and its probe don't count: the cache's current
+                // context for the path probes the quiet path and decides on it, and this
+                // context marks the peer dead only for packets it left unacknowledged.
+                let unresponsive = has_inflight || (!invalidated && (probed || open_stream));
 
                 // Keep the stream of each frame the invalidation fails. Where the peer is
                 // unresponsive, the dead mark resets this side's streams on the path: those whose
