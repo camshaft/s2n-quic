@@ -188,3 +188,24 @@ fn sender_with_more_queued_bytes_has_higher_load_score() {
         "sender 0 has more bytes queued so should have a higher load score"
     );
 }
+
+#[test]
+fn path_rtt_keeps_the_lowest_round_trip_time_it_was_lowered_to() {
+    let entry = test_entry_with_senders(0);
+    assert_eq!(entry.path_rtt(), None);
+
+    entry.lower_path_rtt(Duration::from_millis(5));
+    assert_eq!(entry.path_rtt(), Some(Duration::from_millis(5)));
+
+    // A higher time doesn't raise it.
+    entry.lower_path_rtt(Duration::from_millis(9));
+    assert_eq!(entry.path_rtt(), Some(Duration::from_millis(5)));
+
+    entry.lower_path_rtt(Duration::from_millis(2));
+    assert_eq!(entry.path_rtt(), Some(Duration::from_millis(2)));
+
+    // A time too long to keep is kept just below the value that stands for no time.
+    let entry = test_entry_with_senders(0);
+    entry.lower_path_rtt(Duration::MAX);
+    assert_eq!(entry.path_rtt(), Some(Duration::from_nanos(u64::MAX - 1)));
+}

@@ -6,13 +6,13 @@
 //!
 //! The limit starts at one. Until an answer first signals congestion, it grows by one for each
 //! clean answer, so it doubles with each round of answers, and after that by one for each round
-//! of clean answers. An answer that signals congestion halves it, down to one: work that took
-//! more than twice the base time, or work with a peer that timed out or that the peer refused,
-//! where work with another peer failed too since the last clean answer. One peer's failures
-//! alone say that the peer is slow or refuses the work, so they don't change the limit. Only work
-//! that ran while the limit was in full use grows it, and an answer of work that started before a
-//! decrease doesn't change it. Work past the limit waits for a permit, in the order it asked for
-//! one.
+//! of clean answers. An answer that signals congestion halves it, down to one: work whose time
+//! past what its path accounts for was more than twice the base, or work with a peer that timed
+//! out or that the peer refused, where work with another peer failed too since the last clean
+//! answer. One peer's failures alone say that the peer is slow or refuses the work, so they don't
+//! change the limit. Only work that ran while the limit was in full use grows it, and an answer
+//! of work that started before a decrease doesn't change it. Work past the limit waits for a
+//! permit, in the order it asked for one.
 
 use std::{
     io,
@@ -25,8 +25,9 @@ use tokio::sync::Semaphore;
 /// What the end of a piece of work says about the limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Answer {
-    /// The work finished in this time. A time more than twice the base signals congestion: the
-    /// work spent more than half of it waiting behind other work.
+    /// The work finished, and spent this time past what its path accounts for. A time more than
+    /// twice the base signals congestion: the work spent more than half of it waiting behind
+    /// other work.
     Latency(Duration),
     /// The work finished before its deadline, without a time to compare.
     Finished,
@@ -37,6 +38,11 @@ pub(super) enum Answer {
     Neutral,
 }
 
+/// The round trips a client's handshake waits on its peer from its connect to dc.complete: one
+/// for the server's first flight, and one for the server's `DC_STATELESS_RESET_TOKENS` frame,
+/// which the server sends once it has the client's.
+const HANDSHAKE_ROUND_TRIPS: u32 = 2;
+
 impl Answer {
     /// Reads what a failed handshake with `peer` says about the limit: a handshake that timed
     /// out, or that the peer refused, is a failure of that peer, and any other failure doesn't
@@ -45,6 +51,33 @@ impl Answer {
         match error.kind() {
             io::ErrorKind::TimedOut | io::ErrorKind::ConnectionRefused => Self::Failed(peer),
             _ => Self::Neutral,
+        }
+    }
+
+    /// Reads a handshake that reached dc.complete in `elapsed` from its connect. The path
+    /// accounts for `HANDSHAKE_ROUND_TRIPS` round trips of the lower of two times, each where a
+    /// connection measured it: `earlier_rtt`, the lowest round-trip time that the earlier
+    /// handshakes with the same peer measured, and `rtt`, the lowest that this handshake's
+    /// connection measured. The limit compares the rest with the base. A handshake with a
+    /// farther peer waits longer on its path, and that wait isn't congestion. A connection's own
+    /// round trips also hold the time its packets waited in the endpoint's receive queue, so
+    /// under load `rtt` grows by that wait, and the lower `earlier_rtt` of a connection that
+    /// waited less keeps the wait in the rest. Without either time, the rest is the whole time.
+    /// Where the round trips take the whole time, the handshake doesn't show a time to compare,
+    /// and it answers `Finished`, a clean answer without a time, so that a time of zero doesn't
+    /// become the base.
+    pub(super) fn for_handshake(
+        elapsed: Duration,
+        earlier_rtt: Option<Duration>,
+        rtt: Option<Duration>,
+    ) -> Self {
+        let path = match earlier_rtt.into_iter().chain(rtt).min() {
+            Some(lowest) => lowest.saturating_mul(HANDSHAKE_ROUND_TRIPS),
+            None => Duration::ZERO,
+        };
+        match elapsed.checked_sub(path) {
+            Some(latency) if !latency.is_zero() => Self::Latency(latency),
+            _ => Self::Finished,
         }
     }
 }
@@ -467,6 +500,110 @@ mod tests {
         let mut permits = take_all(&limit).into_iter();
         permits.next().unwrap().release(Answer::Latency(ms(41)));
         assert_eq!(limit.current(), 2, "41 ms is past twice the 20 ms base");
+    }
+
+    #[test]
+    fn a_handshake_answers_its_time_past_two_round_trips_of_its_path() {
+        for (elapsed, earlier_rtt, rtt, expected) in [
+            (ms(103), None, Some(ms(50)), Answer::Latency(ms(3))),
+            // The lower of an earlier connection's round trip and this connection's counts.
+            (ms(103), Some(ms(40)), Some(ms(50)), Answer::Latency(ms(23))),
+            (ms(103), Some(ms(60)), Some(ms(50)), Answer::Latency(ms(3))),
+            (ms(103), Some(ms(50)), None, Answer::Latency(ms(3))),
+            // Without a round-trip time, the rest is the whole time.
+            (ms(103), None, None, Answer::Latency(ms(103))),
+            // Where the round trips take the whole time, the handshake doesn't show a time to
+            // compare.
+            (ms(100), None, Some(ms(50)), Answer::Finished),
+            (ms(90), None, Some(ms(50)), Answer::Finished),
+        ] {
+            assert_eq!(Answer::for_handshake(elapsed, earlier_rtt, rtt), expected);
+        }
+    }
+
+    #[test]
+    fn handshakes_with_a_near_and_a_far_peer_at_once_dont_lower_the_limit() {
+        // A near peer's round trip takes 1 ms, and its handshake 3 ms: the endpoint added 1 ms.
+        let near = Answer::for_handshake(ms(3), None, Some(ms(1)));
+        // A far peer's round trip takes 50 ms, and its handshake 101 ms: the endpoint added 1 ms.
+        let far = Answer::for_handshake(ms(101), None, Some(ms(50)));
+        let limit = Limit::new();
+        // The near peer's handshake runs alone, and its 1 ms is the base.
+        round(&limit, near);
+        assert_eq!(limit.current(), 2);
+
+        // Each round runs a handshake with the far peer while handshakes with the near peer run,
+        // and the limit keeps doubling.
+        for expected in [4, 8] {
+            let mut permits = take_all(&limit).into_iter();
+            permits.next().unwrap().release(far);
+            for permit in permits {
+                permit.release(near);
+            }
+            assert_eq!(limit.current(), expected);
+        }
+
+        // Read without its path's round trips, the far peer's 101 ms is past twice the base,
+        // which halves the limit.
+        let far_without_its_path = Answer::for_handshake(ms(101), None, None);
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(far_without_its_path);
+        assert_eq!(limit.current(), 4);
+    }
+
+    #[test]
+    fn a_far_handshake_whose_endpoint_time_is_past_twice_the_base_is_congestion() {
+        let limit = Limit::new();
+        round(&limit, Answer::for_handshake(ms(3), None, Some(ms(1))));
+        // The far peer's round trips account for 100 ms of its 103 ms, and the endpoint's 3 ms
+        // is past twice the 1 ms base.
+        let far = Answer::for_handshake(ms(103), None, Some(ms(50)));
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(far);
+        assert_eq!(limit.current(), 1);
+    }
+
+    #[test]
+    fn a_handshake_whose_round_trips_take_its_whole_time_doesnt_set_the_base() {
+        let limit = Limit::new();
+        // The handshake runs alone, and its 1 ms past its round trips is the base.
+        round(&limit, Answer::for_handshake(ms(3), None, Some(ms(1))));
+        assert_eq!(limit.current(), 2);
+
+        // Beside a handshake whose round trips take its whole time, a handshake with 2 ms past
+        // its round trips is within twice the base, and the limit grows.
+        let finished = Answer::for_handshake(ms(90), None, Some(ms(50)));
+        let within = Answer::for_handshake(ms(4), None, Some(ms(1)));
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(finished);
+        permits.next().unwrap().release(within);
+        assert_eq!(limit.current(), 4);
+    }
+
+    #[test]
+    fn a_near_handshake_whose_round_trips_hold_the_endpoints_wait_still_halves_the_limit() {
+        let limit = Limit::new();
+        // A near peer's handshake runs alone: its connection measures a 1 ms round trip, and the
+        // 1 ms past two of them is the base.
+        round(&limit, Answer::for_handshake(ms(3), None, Some(ms(1))));
+        assert_eq!(limit.current(), 2);
+
+        // While the endpoint is busy, its receive queue holds each packet of the next handshake
+        // with the peer for 4 ms, so that handshake's connection measures a 5 ms round trip, and
+        // its two round trips take 10 ms of its 11 ms. Against the earlier connection's 1 ms
+        // round trip, 9 ms is past twice the base, which halves the limit.
+        let late = Answer::for_handshake(ms(11), Some(ms(1)), Some(ms(5)));
+        assert_eq!(late, Answer::Latency(ms(9)));
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(late);
+        assert_eq!(limit.current(), 1);
+
+        // Read against its own round trips alone, the same handshake shows 1 ms, within twice
+        // the base.
+        assert_eq!(
+            Answer::for_handshake(ms(11), None, Some(ms(5))),
+            Answer::Latency(ms(1))
+        );
     }
 
     #[test]
