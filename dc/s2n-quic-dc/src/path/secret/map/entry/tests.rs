@@ -46,9 +46,10 @@ fn entry_size() {
             Entry::builder((std::net::Ipv4Addr::LOCALHOST, 0).into())
                 .build(None)
                 .size(),
-            // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>) and the
-            // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes).
-            337
+            // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>), the
+            // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes), and the
+            // round-trip time kept for the peer's handshakes (one AtomicU64, 8 bytes).
+            345
         );
     }
 }
