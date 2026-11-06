@@ -113,6 +113,93 @@ impl CoreSub for PathRtt {
     }
 }
 
+/// The random of a ServerHello that is a HelloRetryRequest (RFC 8446, section 4.1.3).
+const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
+/// Counts what each client connection's handshake waited on its peer past its two round trips,
+/// for the handshake queue's start limit to read a handshake's time against.
+struct HandshakeWaits;
+
+struct HandshakeWaitsContext {
+    waits: limit::Waits,
+}
+
+impl CoreSub for HandshakeWaits {
+    type ConnectionContext = HandshakeWaitsContext;
+
+    fn create_connection_context(
+        &mut self,
+        _meta: &events::ConnectionMeta,
+        _info: &events::ConnectionInfo,
+    ) -> Self::ConnectionContext {
+        HandshakeWaitsContext {
+            waits: limit::Waits::default(),
+        }
+    }
+
+    /// A Retry that the client takes makes it send its first flight again.
+    fn on_packet_received(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &events::ConnectionMeta,
+        event: &events::PacketReceived,
+    ) {
+        if let events::PacketHeader::Retry { .. } = event.packet_header {
+            context.waits.round_trips = context.waits.round_trips.saturating_add(1);
+        }
+    }
+
+    /// The client publishes a Retry it receives before it checks it, and a Retry that it
+    /// discards doesn't add a round trip.
+    fn on_packet_dropped(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &events::ConnectionMeta,
+        event: &events::PacketDropped,
+    ) {
+        if let events::PacketDropReason::RetryDiscarded { .. } = event.reason {
+            context.waits.round_trips = context.waits.round_trips.saturating_sub(1);
+        }
+    }
+
+    /// A HelloRetryRequest makes the client send a new ClientHello.
+    fn on_tls_server_hello(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &events::ConnectionMeta,
+        event: &events::TlsServerHello,
+    ) {
+        if is_hello_retry_request(event.payload) {
+            context.waits.round_trips = context.waits.round_trips.saturating_add(1);
+        }
+    }
+
+    /// A lost packet's data arrives again after a wait that isn't a whole number of round trips.
+    /// A lost MTU probe doesn't hold up the handshake.
+    fn on_packet_lost(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &events::ConnectionMeta,
+        event: &events::PacketLost,
+    ) {
+        if !event.is_mtu_probe {
+            context.waits.lost = true;
+        }
+    }
+}
+
+/// Whether a ServerHello's body, in `payload`'s parts, is a HelloRetryRequest: its random is the
+/// 32 bytes after its 2-byte `legacy_version`.
+fn is_hello_retry_request(payload: &[&[u8]]) -> bool {
+    let mut random = payload.iter().copied().flatten().skip(2);
+    HELLO_RETRY_REQUEST_RANDOM
+        .iter()
+        .all(|byte| random.next() == Some(byte))
+}
+
 /// The lowest round-trip time that a connection's recovery measured, or `None` before the
 /// first.
 fn connection_rtt(connection: &s2n_quic::Connection) -> Option<Duration> {
@@ -120,6 +207,14 @@ fn connection_rtt(connection: &s2n_quic::Connection) -> Option<Duration> {
         .query_event_context(|context: &PathRttContext| context.min_rtt)
         .ok()
         .flatten()
+}
+
+/// What a connection's handshake waited on its peer past its two round trips, as its events
+/// showed it so far.
+fn connection_waits(connection: &s2n_quic::Connection) -> limit::Waits {
+    connection
+        .query_event_context(|context: &HandshakeWaitsContext| context.waits)
+        .unwrap_or_default()
 }
 
 /// The path secret map entry that a client's connection made once the server's
@@ -136,8 +231,9 @@ fn connection_entry(connection: &s2n_quic::Connection) -> Option<Arc<secret::map
 /// Reads the start limit's answer for a handshake that reached dc.complete in `elapsed` from its
 /// connect, as `Answer::for_handshake` reads it from `earlier_rtt`, the lowest round-trip time
 /// that the earlier handshakes with the peer measured, and the lowest that this connection
-/// measured. It lowers the round-trip time of the connection's map entry to the lower of the
-/// two, so that the next handshake with the peer reads it as its `earlier_rtt`.
+/// measured, and what the connection's handshake waited past its two round trips. It lowers
+/// the round-trip time of the connection's map entry to the lower of the two times, so that
+/// the next handshake with the peer reads it as its `earlier_rtt`.
 fn start_answer(
     connection: &s2n_quic::Connection,
     earlier_rtt: Option<Duration>,
@@ -148,7 +244,7 @@ fn start_answer(
     if let (Some(entry), Some(lowest)) = (connection_entry(connection), lowest) {
         entry.lower_path_rtt(lowest);
     }
-    limit::Answer::for_handshake(elapsed, earlier_rtt, rtt)
+    limit::Answer::for_handshake(elapsed, earlier_rtt, rtt, connection_waits(connection))
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -336,7 +432,7 @@ impl Client {
 
         let event = (
             (ConfirmComplete, (MtuConfirmComplete, (DcPathCapture, PathRtt))),
-            subscriber,
+            (HandshakeWaits, subscriber),
         );
 
         let client = client
@@ -749,7 +845,10 @@ mod tests {
         endpoint_limits::{ConnectionAttempt, Limiter, Outcome},
         tls::Provider,
     };
-    use s2n_quic_core::time::StdClock;
+    use s2n_quic_core::{
+        event::{builder, ConnectionPublisher as _, ConnectionPublisherSubscriber},
+        time::StdClock,
+    };
     use std::time::Instant;
     use tokio_util::sync::DropGuard;
 
@@ -1002,6 +1101,12 @@ mod tests {
         let answer = start_answer(&connection, None, elapsed);
         let after = min_rtt();
         assert!(after > Duration::ZERO);
+        // On the loopback path, the handshake didn't take a Retry or a HelloRetryRequest, or lose
+        // a packet, and the client counted what it waited.
+        let waits = connection
+            .query_event_context(|context: &HandshakeWaitsContext| context.waits)
+            .expect("the client counts what each handshake waited");
+        assert_eq!(waits, limit::Waits::default());
         match answer {
             limit::Answer::Latency(time) => {
                 assert!(time >= elapsed - before * 2, "{time:?}, {before:?}");
@@ -1137,5 +1242,122 @@ mod tests {
             ),
             "a successful handshake is no longer held"
         );
+    }
+
+    /// Publishes events to a client connection's count of what its handshake waited, and
+    /// returns what it counted.
+    fn waits_after(
+        publish: impl FnOnce(&mut ConnectionPublisherSubscriber<'_, HandshakeWaits>),
+    ) -> limit::Waits {
+        let mut subscriber = HandshakeWaits;
+        let mut context = HandshakeWaitsContext {
+            waits: limit::Waits::default(),
+        };
+        let meta = builder::ConnectionMeta {
+            endpoint_type: s2n_quic_core::endpoint::Type::Client,
+            id: 0,
+            timestamp: s2n_quic_core::time::clock::testing::now(),
+        };
+        {
+            let mut publisher =
+                ConnectionPublisherSubscriber::new(meta, 1, &mut subscriber, &mut context);
+            publish(&mut publisher);
+        }
+        context.waits
+    }
+
+    /// A path for the events that carry one.
+    fn path() -> builder::Path<'static> {
+        builder::Path {
+            local_addr: builder::SocketAddress::IpV4 {
+                ip: &[127, 0, 0, 1],
+                port: 1,
+            },
+            local_cid: builder::ConnectionId { bytes: &[1] },
+            remote_addr: builder::SocketAddress::IpV4 {
+                ip: &[127, 0, 0, 1],
+                port: 2,
+            },
+            remote_cid: builder::ConnectionId { bytes: &[2] },
+            id: 0,
+            is_active: true,
+        }
+    }
+
+    /// Verifies that a client's connection counts a Retry it takes as a round trip, and not a
+    /// packet of another kind.
+    #[test]
+    fn a_retry_the_client_takes_adds_a_round_trip() {
+        let waits = waits_after(|publisher| {
+            publisher.on_packet_received(builder::PacketReceived {
+                packet_header: builder::PacketHeader::Initial {
+                    number: 0,
+                    version: 1,
+                },
+            });
+            publisher.on_packet_received(builder::PacketReceived {
+                packet_header: builder::PacketHeader::Retry { version: 1 },
+            });
+        });
+        assert_eq!((waits.round_trips, waits.lost), (1, false));
+    }
+
+    /// Verifies that a Retry the client receives and then discards doesn't count.
+    #[test]
+    fn a_retry_the_client_discards_doesnt_add_a_round_trip() {
+        let waits = waits_after(|publisher| {
+            publisher.on_packet_received(builder::PacketReceived {
+                packet_header: builder::PacketHeader::Retry { version: 1 },
+            });
+            publisher.on_packet_dropped(builder::PacketDropped {
+                reason: builder::PacketDropReason::RetryDiscarded {
+                    reason: builder::RetryDiscardReason::InvalidIntegrityTag,
+                    path: path(),
+                },
+            });
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, false));
+    }
+
+    /// Verifies that a HelloRetryRequest counts as a round trip, and that a ServerHello with
+    /// another random, or a body too short to hold a random, doesn't.
+    #[test]
+    fn a_hello_retry_request_adds_a_round_trip() {
+        // A ServerHello's body starts with its 2-byte legacy_version and its 32-byte random. The
+        // event holds the body in parts.
+        let mut hello_retry_request = vec![0x03, 0x03];
+        hello_retry_request.extend_from_slice(&HELLO_RETRY_REQUEST_RANDOM);
+        hello_retry_request.push(0);
+        let (head, tail) = hello_retry_request.split_at(10);
+        let payload: &[&[u8]] = &[head, tail];
+        let waits = waits_after(|publisher| {
+            publisher.on_tls_server_hello(builder::TlsServerHello { payload });
+        });
+        assert_eq!((waits.round_trips, waits.lost), (1, false));
+
+        let mut server_hello = hello_retry_request.clone();
+        server_hello[33] ^= 1;
+        for body in [&server_hello[..], &hello_retry_request[..33]] {
+            let payload: &[&[u8]] = &[body];
+            let waits = waits_after(|publisher| {
+                publisher.on_tls_server_hello(builder::TlsServerHello { payload });
+            });
+            assert_eq!((waits.round_trips, waits.lost), (0, false));
+        }
+    }
+
+    /// Verifies that a lost packet marks the handshake, and that a lost MTU probe doesn't.
+    #[test]
+    fn a_lost_packet_other_than_an_mtu_probe_marks_the_handshake() {
+        let lost = |is_mtu_probe| builder::PacketLost {
+            packet_header: builder::PacketHeader::OneRtt { number: 0 },
+            path: path(),
+            bytes_lost: 1200,
+            is_mtu_probe,
+        };
+        let waits = waits_after(|publisher| publisher.on_packet_lost(lost(true)));
+        assert_eq!((waits.round_trips, waits.lost), (0, false));
+        let waits = waits_after(|publisher| publisher.on_packet_lost(lost(false)));
+        assert_eq!((waits.round_trips, waits.lost), (0, true));
     }
 }
