@@ -53,9 +53,9 @@ pub(super) struct Waits {
     /// ClientHello.
     pub(super) round_trips: u32,
     /// Whether the handshake lost a packet: one that the client sent, other than an MTU probe,
-    /// which the connection declared lost, or one of the server's Initial or Handshake packets,
-    /// which the client read from what it received of them. The wait for the loss to show and for
-    /// the packet's data to arrive again isn't a whole number of round trips.
+    /// which the connection declared lost, or one of the server's packets before its stateless
+    /// reset tokens, which the client read from what it received of them. The wait for the loss
+    /// to show and for the packet's data to arrive again isn't a whole number of round trips.
     pub(super) lost: bool,
 }
 
