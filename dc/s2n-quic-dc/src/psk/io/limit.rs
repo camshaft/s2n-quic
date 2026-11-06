@@ -391,7 +391,10 @@ mod tests {
         let first = limit.try_acquire().unwrap();
         let second = limit.try_acquire().unwrap();
         assert!(limit.try_acquire().is_none());
+        // The decrease started the count of failed peers again, so this failure alone leaves
+        // the limit.
         first.release(Answer::Failed(peer(1)));
+        assert_eq!(limit.current(), 8);
         second.release(Answer::Failed(peer(2)));
         assert_eq!(limit.current(), 4);
 
