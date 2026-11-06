@@ -29,7 +29,9 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::Semaphore, time::Instant as TokioInstant};
+
+mod limit;
+mod rt;
 
 pub use crate::endpoint::DEFAULT_IDLE_TIMEOUT;
 /// Connection-level flow-control window and the local send window. Bounds the peer's
@@ -109,6 +111,23 @@ impl Server {
             .with_internal_recv_buffer_size(BUFFER_SIZE)?
             .build()?;
 
+        Self::bind_with_io(io, map, tls_materials_provider, subscriber, builder)
+    }
+
+    /// Binds the server over `io`, an s2n-quic IO provider, such as the bach-backed provider that
+    /// the tests build; [`Self::bind`] builds the OS-socket provider from `builder`'s MTU.
+    fn bind_with_io<
+        Io: s2n_quic::provider::io::Provider,
+        Provider: Prov + Send + Sync + 'static,
+        Subscriber: Sub + Send + Sync + 'static,
+        Event: s2n_quic::provider::event::Subscriber,
+    >(
+        io: Io,
+        map: secret::Map,
+        tls_materials_provider: Provider,
+        subscriber: Subscriber,
+        builder: server::Builder<Event>,
+    ) -> Result<Self, Error> {
         let server = s2n_quic::Server::builder().with_io(io)?;
 
         let connection_limits = s2n_quic::provider::limits::Limits::new()
@@ -168,7 +187,7 @@ pub(super) async fn server<
     subscriber: Subscriber,
     on_ready: tokio::sync::oneshot::Sender<Result<SocketAddr, Error>>,
 ) {
-    let mut server = match Server::bind::<Provider, Subscriber, Event>(
+    let server = match Server::bind::<Provider, Subscriber, Event>(
         address,
         map.clone(),
         tls_materials_provider,
@@ -185,9 +204,16 @@ pub(super) async fn server<
 
     let _ = on_ready.send(Ok(server.local_addr().unwrap()));
 
+    serve(server, map, address).await;
+}
+
+/// Accepts `server`'s connections, each in a task of its own that keeps the connection open until
+/// its client closes it, or for at most 10 seconds. `address` is the address the server was bound
+/// to, for the logs.
+async fn serve(mut server: Server, map: secret::Map, address: SocketAddr) {
     while let Some(mut connection) = server.server.accept().await {
         let map_clone = map.clone();
-        tokio::spawn(async move {
+        rt::spawn(async move {
             // The accepted connection must remain open until the client has finished inserting
             // the entry into its map. The client indicates this by sending a ConnectionClose
             // when it is done.
@@ -196,17 +222,13 @@ pub(super) async fn server<
             // ConnectionClose from the client is lost. This timeout covers dc handshake
             // confirmation and MTU probing completion. Data addresses are exchanged via
             // transport parameters during the TLS handshake.
-            let deadline = TokioInstant::now() + Duration::from_secs(10);
+            let deadline = rt::Instant::now() + Duration::from_secs(10);
 
-            match tokio::time::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
-                .await
-            {
+            match rt::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection)).await {
                 Ok(Ok(())) => {
-                    let _ = tokio::time::timeout_at(
-                        deadline,
-                        MtuConfirmComplete::wait_ready(&mut connection),
-                    )
-                    .await;
+                    let _ =
+                        rt::timeout_at(deadline, MtuConfirmComplete::wait_ready(&mut connection))
+                            .await;
                 }
                 Ok(Err(e)) => {
                     debug!(
@@ -255,6 +277,23 @@ impl Client {
             .with_internal_recv_buffer_size(BUFFER_SIZE)?
             .build()?;
 
+        Self::bind_with_io(io, map, tls_materials_provider, subscriber, builder)
+    }
+
+    /// Binds the client over `io`, an s2n-quic IO provider, such as the bach-backed provider that
+    /// the tests build; [`Self::bind`] builds the OS-socket provider from `builder`'s MTU.
+    fn bind_with_io<
+        Io: s2n_quic::provider::io::Provider,
+        Provider: Prov + Send + Sync + 'static,
+        Subscriber: Sub + Send + Sync + 'static,
+        Event: s2n_quic::provider::event::Subscriber,
+    >(
+        io: Io,
+        map: secret::Map,
+        tls_materials_provider: Provider,
+        subscriber: Subscriber,
+        builder: client::Builder<Event>,
+    ) -> Result<Self, Error> {
         let client = s2n_quic::Client::builder().with_io(io)?;
 
         let connection_limits = s2n_quic::provider::limits::Limits::new()
@@ -334,8 +373,8 @@ struct HandshakeQueueInner {
 }
 struct HandshakeQueue {
     inner: Mutex<HandshakeQueueInner>,
-    limiter_start: Semaphore,
-    limiter_inflight: Arc<Semaphore>,
+    limiter_start: limit::Limit,
+    limiter_inflight: limit::Limit,
     success_jitter: Duration,
     hasher: std::collections::hash_map::RandomState,
 }
@@ -343,21 +382,20 @@ struct HandshakeQueue {
 impl HandshakeQueue {
     fn new(success_jitter: Duration) -> Self {
         HandshakeQueue {
-            // The "start" limiter bounds TLS handshake concurrency.
+            // The "start" limit bounds TLS handshake concurrency.
             //
-            // TLS handshakes have high CPU cost (~1ms) which stalls out the endpoint, we don't
-            // want too many of those to build up at the same time since that stalls out the
-            // endpoint, increasing our baseline latency ~linearly with increases here. For
-            // example, 5 here translates to 5ms avg handshake latency in our benchmarks. Lowering
-            // it to 2-3 reduces our latencies to the expected 2-3ms (now hitting lowest possible
-            // cost for the CPU work needed for a handshake).
-            limiter_start: Semaphore::new(5),
-            // The inflight limiter bounds the total number of connections we have open. Keeping
+            // TLS handshakes have high CPU cost (~1ms) which stalls out the endpoint, so too many
+            // of them at once raise our baseline latency ~linearly. The limit reads each
+            // handshake's time from its connect to dc.complete, and halves where that time is
+            // more than twice the base, or where handshakes with two peers timed out or were
+            // refused since the last clean answer.
+            limiter_start: limit::Limit::new(),
+            // The inflight limit bounds the total number of connections we have open. Keeping
             // that bounded helps avoid unbounded work ongoing in s2n-quic (which implies unbounded
-            // packet transmit/receive work), and helps our benchmarks exercise the maximum
-            // concurrency within s2n-quic. We haven't found a particular stress test for which is
-            // meaningful yet though.
-            limiter_inflight: Arc::new(Semaphore::new(750)),
+            // packet transmit/receive work). The limit reads whether each connection finished its
+            // MTU probing before its deadline, and halves where connections to two peers missed
+            // it, or their handshakes timed out or were refused, since the last clean answer.
+            limiter_inflight: limit::Limit::new(),
             success_jitter,
             inner: Default::default(),
             hasher: Default::default(),
@@ -446,9 +484,11 @@ impl HandshakeQueue {
 
     /// Handshake with a peer while rate limiting and de-duplicating handshakes.
     ///
-    /// This ensures that in-flight handshakes are bounded to a fixed amount (adjusted to maximize
-    /// throughput while avoiding unbounded latencies *within* the handshake itself, which causes
-    /// timeouts and can cause congestive collapse under enough load).
+    /// This ensures that the handshakes running at once are bounded by limits that the
+    /// handshakes' answers set: they grow while handshakes finish in time, and halve where
+    /// handshakes slow down or handshakes with two peers time out or are refused (avoiding
+    /// unbounded latencies *within* the handshake itself, which causes timeouts and can cause
+    /// congestive collapse under enough load).
     async fn handshake(
         self: Arc<Self>,
         client: &s2n_quic::Client,
@@ -464,8 +504,8 @@ impl HandshakeQueue {
         let handshake = async {
             // We've de-duplicated above already so the handshaker is unique per SocketAddr, so
             // this permit will only be used for the current handshake.
-            let start = std::time::Instant::now();
-            let permit_inflight = self.limiter_inflight.clone().acquire_owned().await;
+            let start = rt::Instant::now();
+            let permit_inflight = self.limiter_inflight.acquire().await;
             let permit_start = self.limiter_start.acquire().await;
             let limiter_duration = start.elapsed();
 
@@ -489,21 +529,39 @@ impl HandshakeQueue {
                 reason_counts,
             }));
 
-            let mut connection = attempt.await?;
+            let handshake_start = rt::Instant::now();
+            let handshake_result = async {
+                let mut connection = attempt.await?;
 
-            // A 10 second deadline is used to bound ConfirmComplete and
-            // MtuConfirmComplete, avoiding unbounded waits if the peer is slow.
-            // Data addresses are exchanged via transport parameters during the
-            // TLS handshake.
-            let deadline = TokioInstant::now() + Duration::from_secs(10);
+                // A 10 second deadline is used to bound ConfirmComplete and
+                // MtuConfirmComplete, avoiding unbounded waits if the peer is slow.
+                // Data addresses are exchanged via transport parameters during the
+                // TLS handshake.
+                let deadline = rt::Instant::now() + Duration::from_secs(10);
 
-            tokio::time::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+                rt::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+
+                Ok::<_, io::Error>((connection, deadline))
+            }
+            .await;
+            let (mut connection, deadline) = match handshake_result {
+                Ok(connected) => connected,
+                Err(error) => {
+                    // A handshake that timed out or that the server refused is a failure of this
+                    // peer, which halves both limits where another peer's handshake failed too
+                    // since the last clean answer. Any other failure doesn't change them.
+                    let answer = limit::Answer::for_error(&error, peer);
+                    permit_start.release(answer);
+                    permit_inflight.release(answer);
+                    return Err(error);
+                }
+            };
 
             // Don't wait for the connection to fully close, just wait until dc.complete to
-            // drop the permit.
-            drop(permit_start);
+            // release the permit, with the handshake's time as its answer.
+            permit_start.release(limit::Answer::Latency(handshake_start.elapsed()));
 
             // Spawn a task to leave the connection open for MTU probing to complete.
             // The 1-second wait for peers that don't support MtuProbingComplete
@@ -512,20 +570,18 @@ impl HandshakeQueue {
             // This task also owns pruning our de-duplication tracking.
             let this = self.clone();
             let map_clone = map.clone();
-            tokio::spawn(async move {
+            rt::spawn(async move {
                 // Use the same deadline for MTU probing - any remaining time from the 10s budget
-                if tokio::time::timeout_at(
-                    deadline,
+                let answer = mtu_probing_answer(
                     MtuConfirmComplete::wait_ready(&mut connection),
+                    deadline,
+                    &map_clone,
+                    peer,
                 )
-                .await
-                .is_err()
-                {
-                    map_clone.on_dc_connection_timeout(&peer);
-                }
+                .await;
 
                 drop(connection);
-                drop(permit_inflight);
+                permit_inflight.release(answer);
 
                 // Delay deleting the entry by a random time, up to 1 minute.
                 //
@@ -543,7 +599,7 @@ impl HandshakeQueue {
                     let mut rng = rand::rng();
                     rng.random_range(0..=(this.success_jitter.as_millis() as u64))
                 };
-                tokio::time::sleep(Duration::from_millis(duration)).await;
+                rt::sleep(Duration::from_millis(duration)).await;
 
                 this.remove_entry(&entry);
             });
@@ -562,7 +618,7 @@ impl HandshakeQueue {
                     error!("handshake with {peer} failed: {e}");
 
                     let this = self.clone();
-                    tokio::spawn(async move {
+                    rt::spawn(async move {
                         // Delay deleting the entry by a random time, up to 2 minutes.
                         //
                         // This avoids aggressively reconnecting to a given peer if handshakes
@@ -580,7 +636,7 @@ impl HandshakeQueue {
                             let mut rng = rand::rng();
                             rng.random_range(1000..120_000)
                         };
-                        tokio::time::sleep(Duration::from_millis(duration)).await;
+                        rt::sleep(Duration::from_millis(duration)).await;
 
                         // If the handshake fails, we also remove the entry from the map.
                         // This permits another handshake to start for the same peer.
@@ -596,6 +652,26 @@ impl HandshakeQueue {
             .as_ref()
             .map(|v| *v)
             .map_err(|e| e.duplicate())
+    }
+}
+
+/// Waits for `probing`, a connection's MTU probing, until `deadline`, and returns what it says
+/// about the inflight limit: `Answer::Finished` where the probing finished in time, and
+/// `Answer::Failed` of `peer` where it didn't, which `map` also reports as a dc connection
+/// timeout.
+async fn mtu_probing_answer(
+    probing: impl std::future::Future<Output = ()>,
+    deadline: rt::Instant,
+    map: &secret::Map,
+    peer: SocketAddr,
+) -> limit::Answer {
+    if rt::timeout_at(deadline, probing).await.is_err() {
+        map.on_dc_connection_timeout(&peer);
+        // A connection that didn't finish its MTU probing before the deadline is a failure of
+        // this peer for the inflight limit.
+        limit::Answer::Failed(peer)
+    } else {
+        limit::Answer::Finished
     }
 }
 
@@ -643,7 +719,10 @@ mod tests {
     use super::*;
     use crate::{
         path::secret::{stateless_reset::Signer, Map},
-        testing::{init_tracing, NoopSubscriber, TestTlsProvider},
+        testing::{
+            ext::{GroupExt as _, PrimaryExt as _, SpawnExt as _},
+            init_tracing, sim, without_snapshots, NoopSubscriber, TestTlsProvider,
+        },
     };
     use s2n_quic::provider::{
         endpoint_limits::{ConnectionAttempt, Limiter, Outcome},
@@ -651,6 +730,7 @@ mod tests {
     };
     use s2n_quic_core::time::StdClock;
     use std::time::Instant;
+    use tokio::time::Instant as TokioInstant;
     use tokio_util::sync::DropGuard;
 
     /// A test limiter that closes all incoming connections immediately
@@ -815,6 +895,301 @@ mod tests {
             duration < Duration::from_millis(500),
             "Connection took {:?}, expected < 500ms",
             duration
+        );
+    }
+
+    /// Verifies that the handshake queue's limits start at one and that the handshakes' answers
+    /// size them: a clean handshake that filled a limit grows it, one peer's refusal leaves the
+    /// limits as they are, and a second peer's refusal since the last clean answer halves them.
+    #[tokio::test]
+    async fn handshake_answers_size_the_limits() {
+        let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
+        let refusing_a = TestSetup::new(Some(CloseAllConnectionsLimiter)).await;
+        let refusing_b = TestSetup::new(Some(CloseAllConnectionsLimiter)).await;
+        let queue = &setup.client.queue;
+        let server_name: s2n_quic::server::Name = "localhost".into();
+        assert_eq!(queue.limiter_start.current(), 1);
+        assert_eq!(queue.limiter_inflight.current(), 1);
+
+        // The handshake filled the start limit of one and finished cleanly, so the limit grows.
+        setup
+            .client
+            .connect(
+                setup.server_addr,
+                HandshakeReason::User,
+                server_name.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.limiter_start.current(), 2);
+
+        // The first handshake's inflight permit comes back once its connection finished MTU
+        // probing, which grows the inflight limit and lets this handshake start. The server
+        // refuses it, and one peer's refusal doesn't change either limit.
+        let error = setup
+            .client
+            .connect(
+                refusing_a.server_addr,
+                HandshakeReason::User,
+                server_name.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(queue.limiter_start.current(), 2);
+        assert_eq!(queue.limiter_inflight.current(), 2);
+
+        // A second peer's refusal since the last clean answer halves both limits.
+        setup
+            .client
+            .connect(refusing_b.server_addr, HandshakeReason::User, server_name)
+            .await
+            .unwrap_err();
+        assert_eq!(queue.limiter_start.current(), 1);
+        assert_eq!(queue.limiter_inflight.current(), 1);
+    }
+
+    /// Verifies that a connection that doesn't finish its MTU probing before its deadline is a
+    /// failure of its peer for the inflight limit, which the map reports as a dc connection
+    /// timeout: one peer's missed deadline leaves the limit as it is, and a second peer's missed
+    /// deadline since the last clean answer halves it. The test runs on tokio's paused clock, so
+    /// each wait ends at its deadline without waiting in real time.
+    #[tokio::test(start_paused = true)]
+    async fn missed_mtu_deadlines_of_two_peers_halve_the_inflight_limit() {
+        let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+        let map = Map::builder()
+            .with_signer(Signer::new(b"default"))
+            .with_capacity(50_000)
+            .with_clock(StdClock::default())
+            .with_subscriber(subscriber.clone())
+            .build()
+            .unwrap();
+        let timeouts = || subscriber.dc_connection_timeout.load(Ordering::Relaxed);
+        let queue = HandshakeQueue::new(Duration::ZERO);
+        let inflight = &queue.limiter_inflight;
+        let peer_a: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.1:4434".parse().unwrap();
+
+        // A connection that finished its MTU probing before its deadline filled the limit of
+        // one, so the limit grows to 2.
+        let permit = inflight.acquire().await;
+        let deadline = TokioInstant::now() + Duration::from_secs(10);
+        let probing = tokio::time::sleep(Duration::from_secs(1));
+        let answer = mtu_probing_answer(probing, rt::Instant::Tokio(deadline), &map, peer_a).await;
+        assert_eq!(answer, limit::Answer::Finished);
+        assert_eq!(timeouts(), 0);
+        permit.release(answer);
+        assert_eq!(inflight.current(), 2);
+
+        // Connections to two peers hold the limit's two permits, and neither finishes its MTU
+        // probing before the deadline.
+        let permit_a = inflight.acquire().await;
+        let permit_b = inflight.acquire().await;
+        let deadline = TokioInstant::now() + Duration::from_secs(10);
+
+        let answer = mtu_probing_answer(
+            std::future::pending(),
+            rt::Instant::Tokio(deadline),
+            &map,
+            peer_a,
+        )
+        .await;
+        assert!(
+            TokioInstant::now() >= deadline,
+            "the wait lasts until the deadline"
+        );
+        assert_eq!(answer, limit::Answer::Failed(peer_a));
+        assert_eq!(timeouts(), 1);
+        // One peer's missed deadline leaves the limit as it is.
+        permit_a.release(answer);
+        assert_eq!(inflight.current(), 2);
+
+        let answer = mtu_probing_answer(
+            std::future::pending(),
+            rt::Instant::Tokio(deadline),
+            &map,
+            peer_b,
+        )
+        .await;
+        assert_eq!(answer, limit::Answer::Failed(peer_b));
+        assert_eq!(timeouts(), 2);
+        // A second peer's missed deadline since the last clean answer halves the limit.
+        permit_b.release(answer);
+        assert_eq!(inflight.current(), 1);
+    }
+
+    /// The largest MTU the simulated endpoints probe for, so that each connection's MTU probing
+    /// sends probes past the base MTU and finishes only once the peer answers them.
+    const SIM_MAX_MTU: u16 = 8940;
+    /// The port each simulated server listens on, in a bach group of its own.
+    const SIM_SERVER_PORT: u16 = 4433;
+
+    /// Returns the bach-backed IO provider for an endpoint on `port`, whose connections start at
+    /// the base MTU and probe up to [`SIM_MAX_MTU`].
+    fn sim_io(port: u16) -> s2n_quic::provider::io::bach::Provider {
+        s2n_quic::provider::io::bach::Provider::builder()
+            .with_address((std::net::Ipv4Addr::UNSPECIFIED, port).into())
+            .unwrap()
+            .with_base_mtu(DEFAULT_BASE_MTU)
+            .unwrap()
+            .with_initial_mtu(DEFAULT_BASE_MTU)
+            .unwrap()
+            .with_max_mtu(SIM_MAX_MTU)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// Returns a map for an endpoint of the current bach simulation, on the simulation's clock.
+    fn sim_map<S: crate::event::Subscriber>(subscriber: S) -> Map {
+        Map::builder()
+            .with_signer(Signer::new(b"default"))
+            .with_capacity(50_000)
+            .with_clock(crate::time::DefaultClock::default())
+            .with_subscriber(subscriber)
+            .build()
+            .unwrap()
+    }
+
+    /// Runs a PSK server in the current bach group, on [`SIM_SERVER_PORT`], until the simulation
+    /// ends.
+    async fn sim_server() {
+        let map = sim_map(NoopSubscriber {});
+        let server = Server::bind_with_io(
+            sim_io(SIM_SERVER_PORT),
+            map.clone(),
+            TestTlsProvider {},
+            NoopSubscriber {},
+            crate::psk::server::Builder::default(),
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        serve(server, map, address).await;
+    }
+
+    /// A map subscriber that sends a message for each dc connection timeout the map reports, so
+    /// that a test waits on that event.
+    struct DcConnectionTimeouts(tokio::sync::mpsc::UnboundedSender<()>);
+
+    impl crate::event::Subscriber for DcConnectionTimeouts {
+        type ConnectionContext = ();
+
+        fn create_connection_context(
+            &self,
+            _meta: &crate::event::api::ConnectionMeta,
+            _info: &crate::event::api::ConnectionInfo,
+        ) -> Self::ConnectionContext {
+        }
+
+        fn on_dc_connection_timeout(
+            &self,
+            _meta: &crate::event::api::EndpointMeta,
+            _event: &crate::event::api::DcConnectionTimeout,
+        ) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// Verifies the MTU deadline through `HandshakeQueue::handshake`, with the PSK client and its
+    /// servers in a bach simulation on the bach-backed IO provider. Once the dc handshake of a
+    /// connection to a slow peer completes, the network drops every packet to and from that peer,
+    /// so the server's MTU probing doesn't finish, and the connection misses its 10 second
+    /// deadline, which the client's map reports as a dc connection timeout. One peer's missed
+    /// deadline leaves the inflight limit as it is, and a second peer's missed deadline since the
+    /// last clean answer halves it.
+    #[test]
+    fn missed_mtu_deadlines_through_the_handshake_queue_halve_the_inflight_limit() {
+        // The handshakes run real TLS, whose record sizes, and so the times of its events, differ
+        // across platforms, so the test doesn't compare its logs with a snapshot.
+        let _no_snapshots = without_snapshots();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_check = done.clone();
+
+        sim(|| {
+            for peer in ["clean", "slow_a", "slow_b"] {
+                sim_server().group(peer).spawn();
+            }
+
+            async move {
+                // The network drops each packet from or to an IP address in `cut`.
+                let cut = Arc::new(Mutex::new(Vec::<std::net::IpAddr>::new()));
+                let monitor_cut = cut.clone();
+                bach::net::monitor::on_packet_sent(move |packet| {
+                    let cut = monitor_cut.lock().unwrap();
+                    if cut.contains(&packet.source().ip())
+                        || cut.contains(&packet.destination().ip())
+                    {
+                        bach::net::monitor::Command::Drop
+                    } else {
+                        bach::net::monitor::Command::Pass
+                    }
+                });
+
+                let (timeouts_sender, mut timeouts) = tokio::sync::mpsc::unbounded_channel();
+                let client = Client::bind_with_io(
+                    sim_io(0),
+                    sim_map(DcConnectionTimeouts(timeouts_sender)),
+                    TestTlsProvider {}.start_client().unwrap(),
+                    NoopSubscriber {},
+                    crate::psk::client::Builder::default().with_success_jitter(Duration::ZERO),
+                )
+                .unwrap();
+                let inflight = &client.queue.limiter_inflight;
+                let server_name: s2n_quic::server::Name = "localhost".into();
+                let peer = |group: &str| bach::net::try_lookup((group, SIM_SERVER_PORT)).unwrap();
+                let (clean, slow_a, slow_b) = (peer("clean"), peer("slow_a"), peer("slow_b"));
+                assert_eq!(inflight.current(), 1);
+
+                // The clean connection finishes its MTU probing before its deadline, with the
+                // limit of one filled, so the limit grows to 2 once its permit comes back.
+                client
+                    .connect(clean, HandshakeReason::User, server_name.clone())
+                    .await
+                    .unwrap();
+
+                // This handshake starts once the clean connection's permit came back. Its dc
+                // handshake completes before the server's MTU probing can finish, since that
+                // probing waits for the client's acknowledgments of the server's probes, and from
+                // then on the network drops the connection's packets.
+                let slow_a_start = bach::time::Instant::now();
+                client
+                    .connect(slow_a, HandshakeReason::User, server_name.clone())
+                    .await
+                    .unwrap();
+                cut.lock().unwrap().push(slow_a.ip());
+                assert_eq!(inflight.current(), 2);
+
+                client
+                    .connect(slow_b, HandshakeReason::User, server_name)
+                    .await
+                    .unwrap();
+                cut.lock().unwrap().push(slow_b.ip());
+
+                // Each wait below ends at a dc connection timeout of the client's map, which a
+                // connection's task reports just before it releases the connection's inflight
+                // permit, with no await between the two, so the limit has its answer by then.
+                timeouts.recv().await.unwrap();
+                assert!(
+                    slow_a_start.elapsed() >= Duration::from_secs(10),
+                    "the connection waits for its MTU probing until its deadline"
+                );
+                // One peer's missed deadline leaves the limit as it is.
+                assert_eq!(inflight.current(), 2);
+
+                timeouts.recv().await.unwrap();
+                // A second peer's missed deadline since the last clean answer halves the limit.
+                assert_eq!(inflight.current(), 1);
+
+                done.store(true, Ordering::SeqCst);
+            }
+            .group("client")
+            .primary()
+            .spawn();
+        });
+
+        assert!(
+            done_check.load(Ordering::SeqCst),
+            "the client task didn't finish"
         );
     }
 
