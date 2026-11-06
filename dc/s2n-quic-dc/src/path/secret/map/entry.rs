@@ -77,9 +77,9 @@ pub struct Entry {
     application_data: Option<ApplicationData>,
     last_activity: AtomicU64,
     dead_at: AtomicI64,
-    /// The lowest round-trip time, in nanoseconds, that the client's handshakes with this peer
-    /// measured, or `u64::MAX` where none did. The handshake queue reads it before a handshake
-    /// with the peer, and keeps the lower of it and the new connection's with the new entry.
+    /// The round-trip time, in nanoseconds, that the client's last handshake with this peer read
+    /// for its path, or `u64::MAX` where none did. The handshake queue reads it before a
+    /// handshake with the peer, and keeps the time the new handshake reads with the new entry.
     path_rtt_nanos: AtomicU64,
     /// The peer's data recv addresses, learned via the post-handshake exchange.
     peer_data_addrs: PeerDataAddrs,
@@ -592,7 +592,7 @@ impl Entry {
             .store(mtu, Ordering::Relaxed);
     }
 
-    /// The lowest round-trip time that the client's handshakes with this peer measured, as
+    /// The round-trip time that the client's last handshake with this peer read for its path, as
     /// [`lower_path_rtt`](Self::lower_path_rtt) kept it, or `None` where none did.
     pub fn path_rtt(&self) -> Option<Duration> {
         match self.path_rtt_nanos.load(Ordering::Relaxed) {

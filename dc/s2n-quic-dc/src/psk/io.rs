@@ -83,13 +83,61 @@ impl CoreSub for DcPathCapture {
     }
 }
 
-/// Records the lowest round-trip time each connection's recovery measured, for the handshake
-/// queue's start limit to read a handshake's time against.
-struct PathRtt;
+/// Records, for the handshake queue's start limit to read a handshake's time against, the lowest
+/// round-trip time each connection's recovery measured and the most that the packet of that
+/// round trip could have waited in the endpoint's receive queue.
+#[derive(Default)]
+struct PathRtt {
+    /// The endpoint's last pass of its event loop.
+    last_pass: Pass,
+}
 
+/// A pass of the endpoint's event loop: the times, from the start of the process, at which the
+/// pass woke and went back to sleep.
+#[derive(Clone, Copy, Default)]
+struct Pass {
+    woke: Duration,
+    slept: Duration,
+}
+
+impl Pass {
+    /// The part of this pass that ran after `sent`. The endpoint reads a packet that arrives while
+    /// a pass runs in its next pass, so where a packet sent at `sent` was read in the pass after
+    /// this one, this part is the most that the packet waited in the endpoint's receive queue.
+    fn after(self, sent: Duration) -> Duration {
+        self.slept.saturating_sub(self.woke.max(sent))
+    }
+}
+
+#[derive(Default)]
 struct PathRttContext {
     /// The `min_rtt` of the connection's newest recovery metrics, or `None` before the first.
     min_rtt: Option<Duration>,
+    /// The part of the round trip of `min_rtt` that the endpoint's last pass before the pass
+    /// that measured it ran.
+    waited: Duration,
+}
+
+impl PathRttContext {
+    /// Records the `min_rtt` of recovery metrics that the connection read at `read`, in the pass
+    /// after `last_pass`. Where it is a new lowest round trip, the round trip's packet was sent
+    /// at `read` less `min_rtt`, and the part of `last_pass` after that is the most that the
+    /// reply could have waited in the endpoint's receive queue.
+    fn on_metrics(&mut self, read: Duration, min_rtt: Duration, last_pass: Pass) {
+        if self.min_rtt != Some(min_rtt) {
+            self.min_rtt = Some(min_rtt);
+            self.waited = last_pass.after(read.saturating_sub(min_rtt));
+        }
+    }
+
+    /// The connection's round trips, or `None` before its first recovery metrics.
+    fn round_trips(&self) -> Option<limit::RoundTrips> {
+        let lowest = self.min_rtt?;
+        Some(limit::RoundTrips {
+            lowest,
+            waited: self.waited,
+        })
+    }
 }
 
 impl CoreSub for PathRtt {
@@ -100,24 +148,36 @@ impl CoreSub for PathRtt {
         _meta: &events::ConnectionMeta,
         _info: &events::ConnectionInfo,
     ) -> Self::ConnectionContext {
-        PathRttContext { min_rtt: None }
+        PathRttContext::default()
+    }
+
+    fn on_platform_event_loop_sleep(
+        &mut self,
+        meta: &events::EndpointMeta,
+        event: &events::PlatformEventLoopSleep,
+    ) {
+        let slept = meta.timestamp.duration_since_start();
+        self.last_pass = Pass {
+            woke: slept.saturating_sub(event.processing_duration),
+            slept,
+        };
     }
 
     fn on_recovery_metrics(
         &mut self,
         context: &mut Self::ConnectionContext,
-        _meta: &events::ConnectionMeta,
+        meta: &events::ConnectionMeta,
         event: &events::RecoveryMetrics,
     ) {
-        context.min_rtt = Some(event.min_rtt);
+        let read = meta.timestamp.duration_since_start();
+        context.on_metrics(read, event.min_rtt, self.last_pass);
     }
 }
 
-/// The lowest round-trip time that a connection's recovery measured, or `None` before the
-/// first.
-fn connection_rtt(connection: &s2n_quic::Connection) -> Option<Duration> {
+/// The round trips that a connection's recovery measured, or `None` before the first.
+fn connection_rtt(connection: &s2n_quic::Connection) -> Option<limit::RoundTrips> {
     connection
-        .query_event_context(|context: &PathRttContext| context.min_rtt)
+        .query_event_context(|context: &PathRttContext| context.round_trips())
         .ok()
         .flatten()
 }
@@ -134,19 +194,21 @@ fn connection_entry(connection: &s2n_quic::Connection) -> Option<Arc<secret::map
 }
 
 /// Reads the start limit's answer for a handshake that reached dc.complete in `elapsed` from its
-/// connect, as `Answer::for_handshake` reads it from `earlier_rtt`, the lowest round-trip time
-/// that the earlier handshakes with the peer measured, and the lowest that this connection
-/// measured. It lowers the round-trip time of the connection's map entry to the lower of the
-/// two, so that the next handshake with the peer reads it as its `earlier_rtt`.
+/// connect, as `Answer::for_handshake` reads it from `earlier_rtt`, the round-trip time that the
+/// last handshake with the peer read for its path, and the round trips that this connection
+/// measured. It keeps the time that this handshake reads for its path with the connection's map
+/// entry, so that the next handshake with the peer reads it as its `earlier_rtt`.
 fn start_answer(
     connection: &s2n_quic::Connection,
     earlier_rtt: Option<Duration>,
     elapsed: Duration,
 ) -> limit::Answer {
     let rtt = connection_rtt(connection);
-    let lowest = earlier_rtt.into_iter().chain(rtt).min();
-    if let (Some(entry), Some(lowest)) = (connection_entry(connection), lowest) {
-        entry.lower_path_rtt(lowest);
+    let path_rtt = limit::path_rtt(earlier_rtt, rtt);
+    if let (Some(entry), Some(path_rtt)) = (connection_entry(connection), path_rtt) {
+        // The entry is the one this handshake's connection made, which doesn't keep a time
+        // before this, so lowering its time keeps this handshake's time.
+        entry.lower_path_rtt(path_rtt);
     }
     limit::Answer::for_handshake(elapsed, earlier_rtt, rtt)
 }
@@ -337,7 +399,7 @@ impl Client {
         let event = (
             (
                 ConfirmComplete,
-                (MtuConfirmComplete, (DcPathCapture, PathRtt)),
+                (MtuConfirmComplete, (DcPathCapture, PathRtt::default())),
             ),
             subscriber,
         );
@@ -543,8 +605,8 @@ impl HandshakeQueue {
             let permit_start = self.limiter_start.acquire().await;
             let limiter_duration = start.elapsed();
 
-            // The lowest round-trip time that the earlier handshakes with this peer measured,
-            // read from the peer's map entry before this handshake's entry takes its place.
+            // The round-trip time that the last handshake with this peer read for its path, from
+            // the peer's map entry, read before this handshake's entry takes its place.
             let earlier_rtt = map.get_raw(peer).and_then(|entry| entry.path_rtt());
 
             let mut attempt =
@@ -599,8 +661,8 @@ impl HandshakeQueue {
 
             // Don't wait for the connection to fully close, just wait until dc.complete to
             // release the permit, with the handshake's time past what its path accounts for, from
-            // the lowest round-trip time of this connection and the peer's earlier ones, as its
-            // answer.
+            // the round-trip times of this connection and the time the peer's last handshake read
+            // for its path, as its answer.
             let answer = start_answer(&connection, earlier_rtt, handshake_start.elapsed());
             permit_start.release(answer);
 
@@ -972,10 +1034,10 @@ mod tests {
         assert_eq!(queue.limiter_inflight.current(), 1);
     }
 
-    /// Verifies that a client's connection has measured its path's lowest round-trip time by
-    /// dc.complete, that the start limit's answer for its handshake takes two round trips of the
-    /// lower of that time and an earlier connection's out of the handshake's time, and that the
-    /// connection's map entry keeps the lower time.
+    /// Verifies that a client's connection has measured its path's round trips by dc.complete,
+    /// that the start limit's answer for its handshake reads them as `Answer::for_handshake`
+    /// does, with or without the time the peer's last handshake read for its path, and that the
+    /// connection's map entry keeps the lowest time that the answers read for the path.
     #[tokio::test]
     async fn the_start_answer_takes_two_measured_round_trips_out_of_the_time() {
         let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
@@ -991,54 +1053,53 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let min_rtt = || {
-            connection
-                .query_event_context(|context: &PathRttContext| context.min_rtt)
-                .unwrap()
+        let round_trips = || {
+            connection_rtt(&connection)
                 .expect("the connection measured a round-trip time by dc.complete")
         };
-        // Once measured, the lowest round-trip time only goes down unless the connection meets
-        // persistent congestion, so the round trip the answer used lies between the ones read
-        // before and after it.
-        let before = min_rtt();
+        // The connection's recovery may measure a new lowest round trip while the answer reads
+        // the connection's round trips, so the answer read the round trips read before it or
+        // the ones read after it.
+        let before = round_trips();
         let elapsed = Duration::from_secs(1);
         let answer = start_answer(&connection, None, elapsed);
-        let after = min_rtt();
-        assert!(after > Duration::ZERO);
-        match answer {
-            limit::Answer::Latency(time) => {
-                assert!(time >= elapsed - before * 2, "{time:?}, {before:?}");
-                assert!(time <= elapsed - after * 2, "{time:?}, {after:?}");
-            }
-            other => panic!("expected a latency answer, got {other:?}"),
-        }
+        let after = round_trips();
+        assert!(after.lowest > Duration::ZERO);
+        assert!(matches!(answer, limit::Answer::Latency(_)), "{answer:?}");
+        let read = [before, after]
+            .into_iter()
+            .find(|rtt| answer == limit::Answer::for_handshake(elapsed, None, Some(*rtt)))
+            .unwrap_or_else(|| panic!("{answer:?}, {before:?}, {after:?}"));
 
-        // The connection's map entry, which the map holds for the peer, keeps the round trip
-        // the answer used.
+        // The connection's map entry, which the map holds for the peer, keeps the time that the
+        // answer read for the path.
         let entry = connection_entry(&connection).expect("its map entry");
         let peer_entry = setup.client.map.get_raw(setup.server_addr).unwrap();
         assert!(Arc::ptr_eq(&entry, &peer_entry));
         let kept = entry.path_rtt().expect("a kept round trip");
-        assert!(
-            kept <= before && kept >= after,
-            "{kept:?}, {before:?}, {after:?}"
-        );
+        assert_eq!(Some(kept), limit::path_rtt(None, Some(read)));
 
-        // An earlier connection's lower round trip counts instead of this connection's, and the
-        // entry keeps it.
+        // The time that the peer's last handshake read for its path counts within this
+        // connection's round trips, and the entry keeps the lower of the time that the answer
+        // read and the one it kept.
         let earlier = Duration::from_nanos(1);
-        assert_eq!(
-            start_answer(&connection, Some(earlier), elapsed),
-            limit::Answer::Latency(elapsed - earlier * 2)
-        );
-        assert_eq!(entry.path_rtt(), Some(earlier));
+        let before = round_trips();
+        let answer = start_answer(&connection, Some(earlier), elapsed);
+        let after = round_trips();
+        let read = [before, after]
+            .into_iter()
+            .find(|rtt| answer == limit::Answer::for_handshake(elapsed, Some(earlier), Some(*rtt)))
+            .unwrap_or_else(|| panic!("{answer:?}, {before:?}, {after:?}"));
+        let path = limit::path_rtt(Some(earlier), Some(read))
+            .expect("a time for the path");
+        assert_eq!(entry.path_rtt(), Some(path.min(kept)));
     }
 
-    /// Verifies that a handshake through the queue keeps its connection's round-trip time with
-    /// the peer's map entry, and that the next handshake with the peer reads that time and keeps
-    /// the lower of it and its own with the entry it makes.
+    /// Verifies that a handshake through the queue keeps the time it read for its path with the
+    /// peer's map entry, and that the next handshake with the peer reads that time, counts it
+    /// within its own connection's round trips, and keeps the time it reads with its entry.
     #[tokio::test]
-    async fn a_handshake_carries_the_peers_lowest_round_trip_time_to_its_next_entry() {
+    async fn a_handshake_carries_its_paths_round_trip_time_to_the_peers_next_entry() {
         let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
         let server_name: s2n_quic::server::Name = "localhost".into();
         let queue = &setup.client.queue;
@@ -1053,11 +1114,11 @@ mod tests {
             .await
             .unwrap();
         let first = setup.client.map.get_raw(setup.server_addr).unwrap();
-        let first_rtt = first.path_rtt().expect("a kept round trip");
-        assert!(first_rtt > Duration::ZERO);
+        assert!(first.path_rtt().is_some(), "a kept round trip");
 
-        // A time lower than any connection measures stands for an earlier connection's, which
-        // the next handshake reads and keeps with its entry instead of its connection's time.
+        // A time below the least that any path takes stands for a last handshake over a
+        // shorter route. The next handshake reads it, counts it as no less than the least time
+        // that its own path took, and keeps that time with its entry.
         let earlier = Duration::from_nanos(1);
         first.lower_path_rtt(earlier);
         queue.remove_completed(setup.server_addr, || false);
@@ -1068,7 +1129,118 @@ mod tests {
             .unwrap();
         let second = setup.client.map.get_raw(setup.server_addr).unwrap();
         assert!(!Arc::ptr_eq(&first, &second), "a new entry");
-        assert_eq!(second.path_rtt(), Some(earlier));
+        let kept = second.path_rtt().expect("a kept round trip");
+        assert!(kept >= earlier, "{kept:?}");
+    }
+
+    /// Verifies that a connection keeps, with each new lowest round-trip time, the part of the
+    /// endpoint's last event loop pass that ran after the round trip's packet was sent, and that
+    /// a round trip that doesn't change the lowest leaves that part as it is.
+    #[test]
+    fn a_new_lowest_round_trip_keeps_the_part_of_it_that_the_endpoints_last_pass_ran() {
+        use s2n_quic_core::{
+            endpoint,
+            event::{builder, IntoEvent},
+            time::{clock::testing as clock, Timestamp},
+        };
+
+        fn ms(ms: u64) -> Duration {
+            Duration::from_millis(ms)
+        }
+
+        /// Ends a pass of the endpoint's event loop that woke at `woke` ms and slept at `slept` ms.
+        fn sleep(path_rtt: &mut PathRtt, start: Timestamp, woke: u64, slept: u64) {
+            let meta = builder::EndpointMeta {
+                endpoint_type: endpoint::Type::Client,
+                timestamp: start + ms(slept),
+            }
+            .into_event();
+            let event = builder::PlatformEventLoopSleep {
+                timeout: None,
+                processing_duration: ms(slept - woke),
+            }
+            .into_event();
+            CoreSub::on_platform_event_loop_sleep(path_rtt, &meta, &event);
+        }
+
+        /// Publishes recovery metrics, read at `read` ms, whose lowest round trip took `min_rtt`
+        /// ms.
+        fn metrics(
+            path_rtt: &mut PathRtt,
+            context: &mut PathRttContext,
+            start: Timestamp,
+            read: u64,
+            min_rtt: u64,
+        ) {
+            let meta = builder::ConnectionMeta {
+                endpoint_type: endpoint::Type::Client,
+                id: 0,
+                timestamp: start + ms(read),
+            }
+            .into_event();
+            let event = builder::RecoveryMetrics {
+                path: builder::Path {
+                    local_addr: builder::SocketAddress::IpV4 {
+                        ip: &[127, 0, 0, 1],
+                        port: 4433,
+                    },
+                    local_cid: builder::ConnectionId { bytes: &[] },
+                    remote_addr: builder::SocketAddress::IpV4 {
+                        ip: &[127, 0, 0, 1],
+                        port: 4434,
+                    },
+                    remote_cid: builder::ConnectionId { bytes: &[] },
+                    id: 0,
+                    is_active: true,
+                },
+                min_rtt: ms(min_rtt),
+                smoothed_rtt: ms(min_rtt),
+                latest_rtt: ms(min_rtt),
+                rtt_variance: Duration::ZERO,
+                max_ack_delay: Duration::ZERO,
+                pto_count: 0,
+                congestion_window: 0,
+                bytes_in_flight: 0,
+                congestion_limited: false,
+            }
+            .into_event();
+            CoreSub::on_recovery_metrics(path_rtt, context, &meta, &event);
+        }
+
+        fn round_trips(lowest: u64, waited: u64) -> Option<limit::RoundTrips> {
+            Some(limit::RoundTrips {
+                lowest: ms(lowest),
+                waited: ms(waited),
+            })
+        }
+
+        let start = clock::now();
+        let mut path_rtt = PathRtt::default();
+        let mut context = PathRttContext::default();
+        assert_eq!(context.round_trips(), None);
+
+        // A 15 ms round trip read at 25 ms was sent at 10 ms, before the last pass woke at 12
+        // ms, so its reply could have waited the whole 2 ms of that pass.
+        sleep(&mut path_rtt, start, 12, 14);
+        metrics(&mut path_rtt, &mut context, start, 25, 15);
+        assert_eq!(context.round_trips(), round_trips(15, 2));
+
+        // A round trip that doesn't change the lowest leaves the part as it is.
+        sleep(&mut path_rtt, start, 30, 35);
+        metrics(&mut path_rtt, &mut context, start, 40, 15);
+        assert_eq!(context.round_trips(), round_trips(15, 2));
+
+        // A 5 ms round trip read at 46 ms was sent at 41 ms, after the last pass woke at 40 ms,
+        // so its reply could have waited the 4 ms of that pass after 41 ms.
+        sleep(&mut path_rtt, start, 40, 45);
+        metrics(&mut path_rtt, &mut context, start, 46, 5);
+        assert_eq!(context.round_trips(), round_trips(5, 4));
+
+        // A 1 ms round trip read at 60 ms was sent at 59 ms, after the last pass slept at 52 ms,
+        // so its reply couldn't have waited in that pass.
+        sleep(&mut path_rtt, start, 50, 52);
+        metrics(&mut path_rtt, &mut context, start, 60, 1);
+        assert_eq!(context.round_trips(), round_trips(1, 0));
     }
 
     #[test]
