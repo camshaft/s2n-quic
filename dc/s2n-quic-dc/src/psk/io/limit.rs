@@ -8,8 +8,10 @@
 //! clean answer, so it doubles with each round of answers, and after that by one for each round
 //! of clean answers. An answer that signals congestion halves it, down to one: work that took
 //! more than twice the base time, or work with a peer that timed out or that the peer refused,
-//! where work with another peer failed too since the last clean answer. One peer's failures
-//! alone say that the peer is slow or refuses the work, so they don't change the limit. Only work
+//! where the work took the last free permit and such work with another peer failed too since the
+//! last clean answer or the last decrease. One peer's failures alone say that the peer is slow or
+//! refuses the work, so they don't change the limit, and neither does a failure of work that took
+//! its permit while others were free, since that work didn't contend for the limit. Only work
 //! that ran while the limit was in full use grows it, and an answer of work that started before a
 //! decrease doesn't change it. Work past the limit waits for a permit, in the order it asked for
 //! one.
@@ -31,7 +33,8 @@ pub(super) enum Answer {
     /// The work finished before its deadline, without a time to compare.
     Finished,
     /// The work with this peer timed out, or the peer refused it. It signals congestion only
-    /// where work with another peer failed too since the last clean answer.
+    /// where the work took the last free permit, and such work with another peer failed too since
+    /// the last clean answer or the last decrease.
     Failed(SocketAddr),
     /// The work's end doesn't say anything about the limit, as with a TLS failure or a cancel.
     Neutral,
@@ -77,8 +80,8 @@ struct State {
     saturated: u64,
     /// The base time: the time of the last work that ran alone, or a lower time since.
     base: Option<Duration>,
-    /// The peer whose work failed since the last clean answer, if any: a failure of work with
-    /// another peer signals congestion.
+    /// The peer whose work failed after taking the last free permit, since the last clean answer
+    /// or the last decrease, if any: such a failure of work with another peer signals congestion.
     failed: Option<SocketAddr>,
 }
 
@@ -107,8 +110,9 @@ impl Limit {
         self.taken()
     }
 
+    /// Takes a permit where one is free, without waiting.
     #[cfg(test)]
-    fn try_acquire(&self) -> Option<Permit> {
+    pub(super) fn try_acquire(&self) -> Option<Permit> {
         self.0.permits.try_acquire().ok()?.forget();
         Some(self.taken())
     }
@@ -176,7 +180,10 @@ impl Permit {
             let full = self.saturated_at_start || state.saturated != self.saturated;
             // The work ran alone where no other work held a permit at its start or at its end.
             let alone = self.alone && state.in_use == 1;
-            state.on_answer(&shared.permits, answer, full, alone);
+            // The work contended for the limit where it took the last free permit: it took its
+            // permit while the limit was in full use.
+            let contended = self.saturated_at_start;
+            state.on_answer(&shared.permits, answer, full, contended, alone);
         }
         state.in_use -= 1;
         state.add_permit(&shared.permits);
@@ -190,10 +197,20 @@ impl Drop for Permit {
 }
 
 impl State {
-    fn on_answer(&mut self, permits: &Semaphore, answer: Answer, full: bool, alone: bool) {
+    fn on_answer(
+        &mut self,
+        permits: &Semaphore,
+        answer: Answer,
+        full: bool,
+        contended: bool,
+        alone: bool,
+    ) {
         let congested = match answer {
             Answer::Latency(latency) => self.is_late(latency, alone),
             Answer::Finished => false,
+            // A failure of work that took its permit while others were free says only that its
+            // peer is slow or refuses the work, since the work didn't contend for the limit.
+            Answer::Failed(_) if !contended => return,
             // One peer's failures alone don't change the limit, and a failure of a second peer
             // signals congestion.
             Answer::Failed(peer) => match self.failed.replace(peer) {
@@ -299,6 +316,22 @@ mod tests {
         }
     }
 
+    /// Takes the last free permit, so that its work takes its permit while the limit is in full
+    /// use. It keeps each other free permit it takes in `held`, and where no permit is free, it
+    /// releases one of `held` first.
+    fn take_last(limit: &Limit, held: &mut Vec<Permit>) -> Permit {
+        loop {
+            match limit.try_acquire() {
+                Some(permit) if permit.saturated_at_start => return permit,
+                Some(permit) => held.push(permit),
+                None => {
+                    let permit = held.pop().expect("work holds a permit");
+                    permit.release(Answer::Neutral);
+                }
+            }
+        }
+    }
+
     #[test]
     fn starts_at_one_and_doubles_while_the_answers_are_clean() {
         let limit = Limit::new();
@@ -319,19 +352,25 @@ mod tests {
         }
         assert_eq!(limit.current(), 8);
 
-        let mut permits = take_all(&limit).into_iter();
-        permits.next().unwrap().release(Answer::Failed(peer(1)));
+        // Four pieces of work each take the last free permit: the limit is in full use as each
+        // takes its permit.
+        let mut held = vec![];
+        let first = take_last(&limit, &mut held);
+        let second = take_last(&limit, &mut held);
+        let third = take_last(&limit, &mut held);
+        let fourth = take_last(&limit, &mut held);
+        first.release(Answer::Failed(peer(1)));
         assert_eq!(limit.current(), 8);
         // A second peer's failure since the last clean answer halves the limit.
-        permits.next().unwrap().release(Answer::Failed(peer(2)));
+        second.release(Answer::Failed(peer(2)));
         assert_eq!(limit.current(), 4);
         // The 6 permits still out are more than the new limit of 4, so no permit is free.
         assert!(limit.try_acquire().is_none());
         // Their work started under the larger limit, so their answers don't change it: neither
         // the failures of two more peers nor the clean answers after them.
-        permits.next().unwrap().release(Answer::Failed(peer(3)));
-        permits.next().unwrap().release(Answer::Failed(peer(4)));
-        for permit in permits {
+        third.release(Answer::Failed(peer(3)));
+        fourth.release(Answer::Failed(peer(4)));
+        for permit in held {
             permit.release(Answer::Finished);
         }
         assert_eq!(limit.current(), 4);
@@ -348,10 +387,10 @@ mod tests {
         for _ in 0..3 {
             round(&limit, Answer::Finished);
         }
-        let mut permits = take_all(&limit).into_iter();
-        permits.next().unwrap().release(Answer::Failed(peer(1)));
-        permits.next().unwrap().release(Answer::Failed(peer(2)));
-        drop(permits);
+        let mut held = vec![];
+        take_last(&limit, &mut held).release(Answer::Failed(peer(1)));
+        take_last(&limit, &mut held).release(Answer::Failed(peer(2)));
+        drop(held);
         assert_eq!(limit.current(), 4);
 
         // Two of the four clean answers that a round at 4 needs, then failures of two peers.
@@ -359,9 +398,11 @@ mod tests {
         for permit in permits.by_ref().take(2) {
             permit.release(Answer::Finished);
         }
-        permits.next().unwrap().release(Answer::Failed(peer(1)));
-        permits.next().unwrap().release(Answer::Failed(peer(2)));
+        let mut held: Vec<_> = permits.collect();
+        take_last(&limit, &mut held).release(Answer::Failed(peer(1)));
+        take_last(&limit, &mut held).release(Answer::Failed(peer(2)));
         assert_eq!(limit.current(), 2);
+        drop(held);
 
         // The count starts again, so the limit grows only once a whole round at 2 is clean.
         let mut permits = take_all(&limit).into_iter();
@@ -379,24 +420,25 @@ mod tests {
         }
         assert_eq!(limit.current(), 16);
 
-        let mut old = take_all(&limit);
-        old.pop().unwrap().release(Answer::Failed(peer(1)));
-        old.pop().unwrap().release(Answer::Failed(peer(2)));
+        let mut old = vec![];
+        take_last(&limit, &mut old).release(Answer::Failed(peer(1)));
+        take_last(&limit, &mut old).release(Answer::Failed(peer(2)));
         assert_eq!(limit.current(), 8);
-        // Of the 14 permits still out, the first 6 that come back are retired, and the next 2
+        // Of the 15 permits still out, the first 7 that come back are retired, and the next 2
         // are free.
-        for permit in old.drain(..8) {
+        for permit in old.drain(..9) {
             permit.release(Answer::Neutral);
         }
         let first = limit.try_acquire().unwrap();
         let second = limit.try_acquire().unwrap();
         assert!(limit.try_acquire().is_none());
         // The decrease started the count of failed peers again, so this failure alone leaves
-        // the limit.
-        first.release(Answer::Failed(peer(1)));
+        // the limit. The second permit is the last free one, and so is the one taken after it.
+        second.release(Answer::Failed(peer(1)));
         assert_eq!(limit.current(), 8);
-        second.release(Answer::Failed(peer(2)));
+        take_last(&limit, &mut old).release(Answer::Failed(peer(2)));
         assert_eq!(limit.current(), 4);
+        drop(first);
 
         // The last 6 old permits come back, and the limit has exactly 4 free.
         for permit in old {
@@ -416,20 +458,55 @@ mod tests {
     }
 
     #[test]
+    fn failures_of_two_peers_whose_work_didnt_contend_for_the_limit_leave_it() {
+        let limit = Limit::new();
+        round(&limit, Answer::Finished);
+        round(&limit, Answer::Finished);
+        // Each piece of work takes its permit while three others are free, so it doesn't contend
+        // for the limit, and the failures of two peers leave it.
+        for port in [1, 2, 1, 2] {
+            let permit = limit.try_acquire().unwrap();
+            permit.release(Answer::Failed(peer(port)));
+        }
+        assert_eq!(limit.current(), 4);
+
+        // This work takes its permit while three others are free too, though other work takes the
+        // last free permit while it runs, so its failure doesn't count toward a decrease either:
+        // the failure of another peer's work that took the last free permit leaves the limit.
+        let mut held = vec![limit.try_acquire().unwrap()];
+        let last = take_last(&limit, &mut held);
+        held.remove(0).release(Answer::Failed(peer(2)));
+        last.release(Answer::Failed(peer(1)));
+        assert_eq!(limit.current(), 4);
+    }
+
+    #[test]
+    fn failures_of_two_peers_whose_work_contended_for_the_limit_halve_it() {
+        let limit = Limit::new();
+        round(&limit, Answer::Finished);
+        round(&limit, Answer::Finished);
+        let mut held = vec![];
+        take_last(&limit, &mut held).release(Answer::Failed(peer(1)));
+        assert_eq!(limit.current(), 4);
+        take_last(&limit, &mut held).release(Answer::Failed(peer(2)));
+        assert_eq!(limit.current(), 2);
+    }
+
+    #[test]
     fn a_clean_answer_between_two_peers_failures_keeps_the_limit() {
         let limit = Limit::new();
         round(&limit, Answer::Finished);
         round(&limit, Answer::Finished);
 
-        let mut permits = take_all(&limit).into_iter();
-        permits.next().unwrap().release(Answer::Failed(peer(1)));
+        let mut held = vec![];
+        take_last(&limit, &mut held).release(Answer::Failed(peer(1)));
         // The clean answer starts the count of failed peers again, and grows the limit.
-        permits.next().unwrap().release(Answer::Finished);
+        held.pop().unwrap().release(Answer::Finished);
         assert_eq!(limit.current(), 5);
-        permits.next().unwrap().release(Answer::Failed(peer(2)));
+        take_last(&limit, &mut held).release(Answer::Failed(peer(2)));
         assert_eq!(limit.current(), 5);
         // A failure of a second peer since the last clean answer halves the limit.
-        permits.next().unwrap().release(Answer::Failed(peer(1)));
+        take_last(&limit, &mut held).release(Answer::Failed(peer(1)));
         assert_eq!(limit.current(), 2);
     }
 
