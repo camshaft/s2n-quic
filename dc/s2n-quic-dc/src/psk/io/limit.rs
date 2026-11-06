@@ -101,6 +101,22 @@ pub(super) fn kept_rtt(earlier: Option<Duration>, rtt: Option<RoundTrips>) -> Op
     }
 }
 
+/// Reads a handshake that reached dc.complete in `elapsed` from its connect: the round-trip time
+/// that it keeps with the peer's map entry, as `kept_rtt` reads it, and the start limit's answer,
+/// as `Answer::for_handshake` reads it, each from `earlier_rtt`, the round-trip time that the
+/// peer's map entry kept, and `rtt`, the round trips that this handshake's connection measured.
+/// The answer reads the same time for the path as the kept time, except without an earlier time:
+/// it then reads `RoundTrips::path`, and the entry keeps the whole lowest round trip.
+pub(super) fn read_handshake(
+    elapsed: Duration,
+    earlier_rtt: Option<Duration>,
+    rtt: Option<RoundTrips>,
+) -> (Option<Duration>, Answer) {
+    let kept = kept_rtt(earlier_rtt, rtt);
+    let answer = Answer::for_handshake(elapsed, earlier_rtt, rtt);
+    (kept, answer)
+}
+
 impl Answer {
     /// Reads what a failed handshake with `peer` says about the limit: a handshake that timed
     /// out, or that the peer refused, is a failure of that peer, and any other failure doesn't
@@ -771,6 +787,39 @@ mod tests {
         let next = Answer::for_handshake(ms(101), kept, rtt(50));
         assert_eq!(next, Answer::Latency(ms(1)));
         assert_eq!(kept_rtt(kept, rtt(50)), Some(ms(50)));
+    }
+
+    #[test]
+    fn a_handshake_keeps_its_whole_lowest_round_trip_and_answers_against_its_path() {
+        // A first handshake with a peer measures a 50 ms round trip, 10 ms of which its reply
+        // could have waited during the endpoint's last pass, and takes 101 ms. It keeps the whole
+        // 50 ms with the peer's entry, and its answer takes the 40 ms left out of its time twice.
+        assert_eq!(
+            read_handshake(ms(101), None, rtt_waiting(50, 10)),
+            (Some(ms(50)), Answer::Latency(ms(21)))
+        );
+
+        // With an earlier time, the handshake keeps the lower of it and its lowest round trip,
+        // and its answer takes that time out of its time twice.
+        assert_eq!(
+            read_handshake(ms(101), Some(ms(40)), rtt_waiting(50, 10)),
+            (Some(ms(40)), Answer::Latency(ms(21)))
+        );
+        assert_eq!(
+            read_handshake(ms(101), Some(ms(60)), rtt(50)),
+            (Some(ms(50)), Answer::Latency(ms(1)))
+        );
+
+        // Without this connection's round trips, it keeps and reads the earlier time, and
+        // without either time, it doesn't keep a time and its answer is the whole time.
+        assert_eq!(
+            read_handshake(ms(101), Some(ms(30)), None),
+            (Some(ms(30)), Answer::Latency(ms(41)))
+        );
+        assert_eq!(
+            read_handshake(ms(101), None, None),
+            (None, Answer::Latency(ms(101)))
+        );
     }
 
     #[test]

@@ -198,20 +198,21 @@ fn connection_entry(connection: &s2n_quic::Connection) -> Option<Arc<secret::map
 /// that the earlier handshakes with the peer measured, and the round trips that this connection
 /// measured. It lowers the round-trip time of the connection's map entry to the lower of
 /// `earlier_rtt` and this connection's lowest round trip, as `limit::kept_rtt` reads them, so
-/// that the next handshake with the peer reads it as its `earlier_rtt`.
+/// that the next handshake with the peer reads it as its `earlier_rtt`. `limit::read_handshake`
+/// reads the answer and that time together.
 fn start_answer(
     connection: &s2n_quic::Connection,
     earlier_rtt: Option<Duration>,
     elapsed: Duration,
 ) -> limit::Answer {
     let rtt = connection_rtt(connection);
-    let kept = limit::kept_rtt(earlier_rtt, rtt);
+    let (kept, answer) = limit::read_handshake(elapsed, earlier_rtt, rtt);
     if let (Some(entry), Some(kept)) = (connection_entry(connection), kept) {
         // The entry is the one this handshake's connection made, which doesn't keep a time
         // before this, so lowering its time keeps this handshake's time.
         entry.lower_path_rtt(kept);
     }
-    limit::Answer::for_handshake(elapsed, earlier_rtt, rtt)
+    answer
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -1117,7 +1118,8 @@ mod tests {
             .await
             .unwrap();
         let first = setup.client.map.get_raw(setup.server_addr).unwrap();
-        assert!(first.path_rtt().is_some(), "a kept round trip");
+        let first_rtt = first.path_rtt().expect("a kept round trip");
+        assert!(first_rtt > Duration::ZERO);
 
         // A time below the lowest round trip that any connection measures stands for a last
         // handshake whose path was shorter or whose packets waited less. The next handshake reads
