@@ -46,9 +46,10 @@ fn entry_size() {
             Entry::builder((std::net::Ipv4Addr::LOCALHOST, 0).into())
                 .build(None)
                 .size(),
-            // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>) and the
-            // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes).
-            337
+            // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>), the
+            // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes), and the
+            // round-trip time kept for the peer's handshakes (one AtomicU64, 8 bytes).
+            345
         );
     }
 }
@@ -187,4 +188,25 @@ fn sender_with_more_queued_bytes_has_higher_load_score() {
         score0 > score1,
         "sender 0 has more bytes queued so should have a higher load score"
     );
+}
+
+#[test]
+fn path_rtt_keeps_the_lowest_round_trip_time_it_was_lowered_to() {
+    let entry = test_entry_with_senders(0);
+    assert_eq!(entry.path_rtt(), None);
+
+    entry.lower_path_rtt(Duration::from_millis(5));
+    assert_eq!(entry.path_rtt(), Some(Duration::from_millis(5)));
+
+    // A higher time doesn't raise it.
+    entry.lower_path_rtt(Duration::from_millis(9));
+    assert_eq!(entry.path_rtt(), Some(Duration::from_millis(5)));
+
+    entry.lower_path_rtt(Duration::from_millis(2));
+    assert_eq!(entry.path_rtt(), Some(Duration::from_millis(2)));
+
+    // A time too long to keep is kept just below the value that stands for no time.
+    let entry = test_entry_with_senders(0);
+    entry.lower_path_rtt(Duration::MAX);
+    assert_eq!(entry.path_rtt(), Some(Duration::from_nanos(u64::MAX - 1)));
 }
