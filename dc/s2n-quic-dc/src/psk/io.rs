@@ -308,6 +308,17 @@ impl Client {
         let has_newer_entry = || map.get_raw(peer).is_some();
         self.queue.remove_completed(peer, has_newer_entry);
     }
+
+    /// Lets the next handshake with `peer` start at once where its last one succeeded and the
+    /// map no longer holds an entry for `peer`, as after an accepted UnknownPathSecret evicted
+    /// the entry that handshake built. A running or failed handshake stays held, and so does a
+    /// success where the map holds an entry for `peer`, as `HandshakeQueue::remove_completed`
+    /// says.
+    pub(super) fn forget_completed_handshake(&self, peer: SocketAddr) {
+        let map = &self.map;
+        let has_entry = || map.get_raw(peer).is_some();
+        self.queue.remove_completed(peer, has_entry);
+    }
 }
 
 #[cfg(test)]
