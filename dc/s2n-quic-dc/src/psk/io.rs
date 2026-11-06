@@ -123,8 +123,49 @@ const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
 /// for the handshake queue's start limit to read a handshake's time against.
 struct HandshakeWaits;
 
+#[derive(Default)]
 struct HandshakeWaitsContext {
     waits: limit::Waits,
+    /// What the client received of the server's Initial packets.
+    initial: ServerSpace,
+    /// What the client received of the server's Handshake packets.
+    handshake: ServerSpace,
+}
+
+/// What a client received of the server's packets in one of the handshake's packet number
+/// spaces, to read a loss of a packet the server sent there: the client's own events don't show
+/// that loss, and the client waits for the server's probe timeout and its retransmission.
+///
+/// The server numbers its packets in each space from 0. It skips a number for a probe it sends
+/// after its packet 0, so a gap between two later numbers isn't a loss, and a probe sends again
+/// CRYPTO data that the client may have received. A packet that arrives out of order reads as a
+/// loss, which leaves the start limit as it is.
+#[derive(Default)]
+struct ServerSpace {
+    /// Whether the client received a packet of the server's in this space.
+    received: bool,
+    /// The end of the CRYPTO data the client received from the server in this space, the
+    /// highest end of a CRYPTO frame's data.
+    crypto_end: u64,
+}
+
+impl ServerSpace {
+    /// Whether the server's packet `number`, which the client received, shows a lost packet:
+    /// the first packet the client receives in the space has a number past 0 where the server's
+    /// packet 0 didn't arrive.
+    fn on_packet(&mut self, number: u64) -> bool {
+        let first = !std::mem::replace(&mut self.received, true);
+        first && number > 0
+    }
+
+    /// Whether a CRYPTO frame of the server's, of `len` bytes at `offset`, shows a lost packet:
+    /// the server sends its CRYPTO data in order, so a frame that starts past the data the
+    /// client received follows data that didn't arrive.
+    fn on_crypto(&mut self, offset: u64, len: u16) -> bool {
+        let past = offset > self.crypto_end;
+        self.crypto_end = self.crypto_end.max(offset.saturating_add(len.into()));
+        past
+    }
 }
 
 impl CoreSub for HandshakeWaits {
@@ -135,21 +176,51 @@ impl CoreSub for HandshakeWaits {
         _meta: &events::ConnectionMeta,
         _info: &events::ConnectionInfo,
     ) -> Self::ConnectionContext {
-        HandshakeWaitsContext {
-            waits: limit::Waits::default(),
-        }
+        HandshakeWaitsContext::default()
     }
 
-    /// A Retry that the client takes makes it send its first flight again.
+    /// A Retry that the client takes makes it send its first flight again. The server's first
+    /// Initial or Handshake packet that the client receives shows whether a packet the server
+    /// sent before it was lost. The client doesn't read the server's 1-RTT packets for a loss:
+    /// the server skips packet numbers there to check its peer's acknowledgements, and its MTU
+    /// probes, whose loss doesn't hold up the handshake, go ahead of its other data.
     fn on_packet_received(
         &mut self,
         context: &mut Self::ConnectionContext,
         _meta: &events::ConnectionMeta,
         event: &events::PacketReceived,
     ) {
-        if let events::PacketHeader::Retry { .. } = event.packet_header {
-            context.waits.round_trips = context.waits.round_trips.saturating_add(1);
+        match event.packet_header {
+            events::PacketHeader::Retry { .. } => {
+                context.waits.round_trips = context.waits.round_trips.saturating_add(1);
+            }
+            events::PacketHeader::Initial { number, .. } => {
+                context.waits.lost |= context.initial.on_packet(number);
+            }
+            events::PacketHeader::Handshake { number, .. } => {
+                context.waits.lost |= context.handshake.on_packet(number);
+            }
+            _ => {}
         }
+    }
+
+    /// A CRYPTO frame of the server's Initial or Handshake data that starts past the data the
+    /// client received in its space shows that a packet the server sent before it was lost.
+    fn on_frame_received(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &events::ConnectionMeta,
+        event: &events::FrameReceived,
+    ) {
+        let events::Frame::Crypto { offset, len, .. } = event.frame else {
+            return;
+        };
+        let space = match event.packet_header {
+            events::PacketHeader::Initial { .. } => &mut context.initial,
+            events::PacketHeader::Handshake { .. } => &mut context.handshake,
+            _ => return,
+        };
+        context.waits.lost |= space.on_crypto(offset, len);
     }
 
     /// The client publishes a Retry it receives before it checks it, and a Retry that it
@@ -1253,9 +1324,7 @@ mod tests {
         publish: impl FnOnce(&mut ConnectionPublisherSubscriber<'_, HandshakeWaits>),
     ) -> limit::Waits {
         let mut subscriber = HandshakeWaits;
-        let mut context = HandshakeWaitsContext {
-            waits: limit::Waits::default(),
-        };
+        let mut context = HandshakeWaitsContext::default();
         let meta = builder::ConnectionMeta {
             endpoint_type: s2n_quic_core::endpoint::Type::Client,
             id: 0,
@@ -1362,6 +1431,151 @@ mod tests {
         assert_eq!((waits.round_trips, waits.lost), (0, false));
         let waits = waits_after(|publisher| publisher.on_packet_lost(lost(false)));
         assert_eq!((waits.round_trips, waits.lost), (0, true));
+    }
+
+    /// A header of the server's Initial packet `packet_number`.
+    fn initial_header(packet_number: u64) -> builder::PacketHeader {
+        builder::PacketHeader::Initial {
+            number: packet_number,
+            version: 1,
+        }
+    }
+
+    /// A header of the server's Handshake packet `packet_number`.
+    fn handshake_header(packet_number: u64) -> builder::PacketHeader {
+        builder::PacketHeader::Handshake {
+            number: packet_number,
+            version: 1,
+        }
+    }
+
+    /// The server's packet with `packet_header`, as the client receives it.
+    fn received(packet_header: builder::PacketHeader) -> builder::PacketReceived {
+        builder::PacketReceived { packet_header }
+    }
+
+    /// A CRYPTO frame of `len` bytes at `offset`, in the server's packet with `packet_header`.
+    fn crypto_received(
+        packet_header: builder::PacketHeader,
+        offset: u64,
+        len: u16,
+    ) -> builder::FrameReceived<'static> {
+        builder::FrameReceived {
+            packet_header,
+            path: path(),
+            frame: builder::Frame::Crypto { offset, len },
+        }
+    }
+
+    /// Verifies that the server's first packet that the client receives in the Initial or the
+    /// Handshake space marks the handshake where its number is past 0, and that a later gap in
+    /// the server's numbers, which a probe makes, or a 1-RTT packet doesn't.
+    #[test]
+    fn the_servers_first_packet_of_a_space_past_zero_marks_the_handshake() {
+        let waits = waits_after(|publisher| {
+            for packet_header in [
+                initial_header(0),
+                initial_header(2),
+                handshake_header(0),
+                handshake_header(2),
+                builder::PacketHeader::OneRtt { number: 3 },
+            ] {
+                publisher.on_packet_received(received(packet_header));
+            }
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, false));
+
+        for packets in [
+            [initial_header(2), handshake_header(0)],
+            [handshake_header(1), initial_header(0)],
+        ] {
+            let waits = waits_after(|publisher| {
+                for packet_header in packets {
+                    publisher.on_packet_received(received(packet_header));
+                }
+            });
+            assert_eq!((waits.round_trips, waits.lost), (0, true));
+        }
+    }
+
+    /// Verifies that a CRYPTO frame of the server's Initial or Handshake data that starts past
+    /// the data the client received in its space marks the handshake, and that data the client
+    /// received before, or a 1-RTT CRYPTO frame, doesn't.
+    #[test]
+    fn a_crypto_frame_past_the_servers_data_received_marks_the_handshake() {
+        let waits = waits_after(|publisher| {
+            for (packet_header, offset, len) in [
+                (initial_header(0), 0, 90),
+                // A probe sends data that the client received.
+                (initial_header(2), 0, 90),
+                (handshake_header(0), 0, 1000),
+                (handshake_header(1), 1000, 1000),
+                (handshake_header(3), 500, 1000),
+                (handshake_header(4), 2000, 100),
+                (builder::PacketHeader::OneRtt { number: 0 }, 5000, 100),
+            ] {
+                publisher.on_frame_received(crypto_received(packet_header, offset, len));
+            }
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, false));
+
+        for frames in [
+            // The server's Handshake packet that held the data from 1000 to 1500 didn't arrive.
+            [
+                (handshake_header(0), 0, 1000),
+                (handshake_header(2), 1500, 500),
+                (handshake_header(3), 1000, 500),
+            ],
+            // Each space has its own end: the Initial data ends at 90, the Handshake data at 1000.
+            [
+                (initial_header(0), 0, 90),
+                (handshake_header(0), 0, 1000),
+                (initial_header(1), 130, 100),
+            ],
+        ] {
+            let waits = waits_after(|publisher| {
+                for (packet_header, offset, len) in frames {
+                    publisher.on_frame_received(crypto_received(packet_header, offset, len));
+                }
+            });
+            assert_eq!((waits.round_trips, waits.lost), (0, true));
+        }
+    }
+
+    /// Verifies that a far handshake that waited for the server to send its first packets again
+    /// answers `Neutral` and leaves the start limit as it is, where its time past two round trips
+    /// would halve the limit.
+    #[tokio::test]
+    async fn a_far_handshake_that_waited_for_a_servers_retransmission_doesnt_halve_the_limit() {
+        let ms = Duration::from_millis;
+        let no_waits = limit::Waits::default();
+        // A near peer's round trip takes 1 ms, and its handshake 3 ms: the endpoint added 1 ms.
+        let near = limit::Answer::for_handshake(ms(3), None, Some(ms(1)), no_waits);
+        // A far peer's round trip takes 50 ms. The server's first Initial and Handshake packets
+        // don't arrive, the client receives the server's probes, and the handshake takes 251 ms.
+        let waits = waits_after(|publisher| {
+            publisher.on_packet_received(received(initial_header(2)));
+            publisher.on_packet_received(received(handshake_header(2)));
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, true));
+        let far = limit::Answer::for_handshake(ms(251), None, Some(ms(50)), waits);
+        assert_eq!(far, limit::Answer::Neutral);
+        // Read without the loss, the handshake's time past two round trips is 151 ms.
+        let far_without_the_loss =
+            limit::Answer::for_handshake(ms(251), None, Some(ms(50)), no_waits);
+        assert_eq!(far_without_the_loss, limit::Answer::Latency(ms(151)));
+
+        let start_limit = limit::Limit::new();
+        // The near peer's handshake runs alone, and its 1 ms is the base.
+        start_limit.acquire().await.release(near);
+        assert_eq!(start_limit.current(), 2);
+        let (first, second) = (start_limit.acquire().await, start_limit.acquire().await);
+        // The far handshake leaves the limit as it is.
+        first.release(far);
+        assert_eq!(start_limit.current(), 2);
+        // Read without the loss, its time is past twice the base, which halves the limit.
+        second.release(far_without_the_loss);
+        assert_eq!(start_limit.current(), 1);
     }
 
     /// A test limiter that asks each client for a Retry before its connection: the server takes

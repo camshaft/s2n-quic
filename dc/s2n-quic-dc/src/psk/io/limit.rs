@@ -52,9 +52,10 @@ pub(super) struct Waits {
     /// its first flight again, and one for a HelloRetryRequest, after which it sent a new
     /// ClientHello.
     pub(super) round_trips: u32,
-    /// Whether the connection declared a packet it sent lost, other than an MTU probe. Its wait
-    /// for the loss to show and for the packet's data to arrive again isn't a whole number of
-    /// round trips.
+    /// Whether the handshake lost a packet: one that the client sent, other than an MTU probe,
+    /// which the connection declared lost, or one of the server's Initial or Handshake packets,
+    /// which the client read from what it received of them. The wait for the loss to show and for
+    /// the packet's data to arrive again isn't a whole number of round trips.
     pub(super) lost: bool,
 }
 
@@ -82,9 +83,10 @@ impl Answer {
     /// waited less keeps the wait in the rest. Without either time, the rest is the whole time.
     /// Where the round trips take the whole time, the handshake doesn't show a time to compare,
     /// and it answers `Finished`, a clean answer without a time, so that a time of zero doesn't
-    /// become the base. A handshake whose connection lost a packet answers `Neutral`: it waited
-    /// for the loss to show and for the packet's data to arrive again, which isn't a whole number
-    /// of round trips, so its time doesn't say how long it waited behind other work.
+    /// become the base. A handshake that lost a packet, the client's or the server's, answers
+    /// `Neutral`: it waited for the loss to show and for the packet's data to arrive again, which
+    /// isn't a whole number of round trips, so its time doesn't say how long it waited behind
+    /// other work.
     pub(super) fn for_handshake(
         elapsed: Duration,
         earlier_rtt: Option<Duration>,
