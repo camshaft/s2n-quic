@@ -43,6 +43,80 @@ pub(super) enum Answer {
 /// which the server sends once it has the client's.
 const HANDSHAKE_ROUND_TRIPS: u32 = 2;
 
+/// The round trips that a connection measured: its lowest round-trip time, and the most that the
+/// packet of that round trip could have waited during the endpoint's last pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RoundTrips {
+    pub(super) lowest: Duration,
+    /// The part of the lowest round trip that the endpoint's pass of its event loop before the
+    /// pass that read the round trip's packet ran. The endpoint reads a packet that arrives
+    /// while a pass runs in its next pass, so this part is the most that the packet could have
+    /// waited during the endpoint's last pass. A packet that waited through more than one pass,
+    /// or past the end of the last pass, waited more. A packet that arrived after the pass began
+    /// waited less, and this part also counts the time that it was still on the path.
+    pub(super) waited: Duration,
+}
+
+impl RoundTrips {
+    /// The lowest round-trip time less the most that its packet could have waited during the
+    /// endpoint's last pass: the least time that the path took for that round trip, where the
+    /// packet waited during that pass alone. Where the packet arrived after the pass began, the
+    /// path took more, and a handshake's time read against this counts the rest as the endpoint's
+    /// time.
+    pub(super) fn path(self) -> Duration {
+        self.lowest.saturating_sub(self.waited)
+    }
+}
+
+/// The round-trip time that a handshake's path accounts for, from `earlier`, the lowest round-trip
+/// time that the earlier handshakes with the same peer measured, as `kept_rtt` keeps it, and
+/// `rtt`, the round trips that this handshake's connection measured. This connection's lowest
+/// round trip is the most that the path took, so an earlier time above it counts as the lowest.
+/// An earlier time below it may come from a connection whose packets waited less in the
+/// endpoint's receive queue, so counting it keeps the rest of this connection's wait in the
+/// handshake's time. An earlier time below `RoundTrips::path` counts as it is too: the reply may
+/// have waited past the endpoint's last pass, as with a late task wake or a socket that one pass
+/// doesn't drain, and this connection's round trips can't tell that wait from a longer route to
+/// the peer. Without an earlier time, `RoundTrips::path` counts, and without this connection's
+/// round trips, the earlier time.
+pub(super) fn path_rtt(earlier: Option<Duration>, rtt: Option<RoundTrips>) -> Option<Duration> {
+    match (earlier, rtt) {
+        (Some(earlier), Some(rtt)) => Some(earlier.min(rtt.lowest)),
+        (earlier, None) => earlier,
+        (None, Some(rtt)) => Some(rtt.path()),
+    }
+}
+
+/// The round-trip time that a handshake keeps with the peer's map entry, which the next handshake
+/// with the peer reads as its earlier time: the lower of `earlier` and this connection's lowest
+/// round trip. `RoundTrips::waited` stays in it, since that part is a bound of the reply's wait
+/// and may count time that the reply was still on the path: a kept `RoundTrips::path` could lie
+/// below the path, and since the kept time only goes down, every later handshake with the peer
+/// would read the difference as the endpoint's time.
+pub(super) fn kept_rtt(earlier: Option<Duration>, rtt: Option<RoundTrips>) -> Option<Duration> {
+    match (earlier, rtt) {
+        (Some(earlier), Some(rtt)) => Some(earlier.min(rtt.lowest)),
+        (earlier, None) => earlier,
+        (None, Some(rtt)) => Some(rtt.lowest),
+    }
+}
+
+/// Reads a handshake that reached dc.complete in `elapsed` from its connect: the round-trip time
+/// that it keeps with the peer's map entry, as `kept_rtt` reads it, and the start limit's answer,
+/// as `Answer::for_handshake` reads it, each from `earlier_rtt`, the round-trip time that the
+/// peer's map entry kept, and `rtt`, the round trips that this handshake's connection measured.
+/// The answer reads the same time for the path as the kept time, except without an earlier time:
+/// it then reads `RoundTrips::path`, and the entry keeps the whole lowest round trip.
+pub(super) fn read_handshake(
+    elapsed: Duration,
+    earlier_rtt: Option<Duration>,
+    rtt: Option<RoundTrips>,
+) -> (Option<Duration>, Answer) {
+    let kept = kept_rtt(earlier_rtt, rtt);
+    let answer = Answer::for_handshake(elapsed, earlier_rtt, rtt);
+    (kept, answer)
+}
+
 impl Answer {
     /// Reads what a failed handshake with `peer` says about the limit: a handshake that timed
     /// out, or that the peer refused, is a failure of that peer, and any other failure doesn't
@@ -55,24 +129,25 @@ impl Answer {
     }
 
     /// Reads a handshake that reached dc.complete in `elapsed` from its connect. The path
-    /// accounts for `HANDSHAKE_ROUND_TRIPS` round trips of the lower of two times, each where a
-    /// connection measured it: `earlier_rtt`, the lowest round-trip time that the earlier
-    /// handshakes with the same peer measured, and `rtt`, the lowest that this handshake's
-    /// connection measured. The limit compares the rest with the base. A handshake with a
-    /// farther peer waits longer on its path, and that wait isn't congestion. A connection's own
-    /// round trips also hold the time its packets waited in the endpoint's receive queue, so
-    /// under load `rtt` grows by that wait, and the lower `earlier_rtt` of a connection that
-    /// waited less keeps the wait in the rest. Without either time, the rest is the whole time.
-    /// Where the round trips take the whole time, the handshake doesn't show a time to compare,
-    /// and it answers `Finished`, a clean answer without a time, so that a time of zero doesn't
-    /// become the base.
+    /// accounts for `HANDSHAKE_ROUND_TRIPS` round trips of the time that `path_rtt` reads from
+    /// `earlier_rtt`, the lowest round-trip time that the earlier handshakes with the same peer
+    /// measured, and `rtt`, the round trips that this handshake's connection measured. The limit
+    /// compares the rest with the base. A handshake with a farther peer waits longer on its path,
+    /// and that wait isn't congestion. A connection's own round trips also hold the time their
+    /// packets waited in the endpoint's receive queue, which grows under load. An earlier time
+    /// from a connection whose packets waited less keeps that wait in the rest, and without an
+    /// earlier time, `path_rtt` doesn't count the most that the packet of the lowest round trip
+    /// could have waited during the endpoint's last pass. Without either time, the rest is the
+    /// whole time. Where the round trips take the whole time, the handshake doesn't show a time
+    /// to compare, and it answers `Finished`, a clean answer without a time, so that a time of
+    /// zero doesn't become the base.
     pub(super) fn for_handshake(
         elapsed: Duration,
         earlier_rtt: Option<Duration>,
-        rtt: Option<Duration>,
+        rtt: Option<RoundTrips>,
     ) -> Self {
-        let path = match earlier_rtt.into_iter().chain(rtt).min() {
-            Some(lowest) => lowest.saturating_mul(HANDSHAKE_ROUND_TRIPS),
+        let path = match path_rtt(earlier_rtt, rtt) {
+            Some(path_rtt) => path_rtt.saturating_mul(HANDSHAKE_ROUND_TRIPS),
             None => Duration::ZERO,
         };
         match elapsed.checked_sub(path) {
@@ -315,6 +390,21 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
+    /// The round trips of a connection whose lowest round-trip time took `lowest` ms, and whose
+    /// packet couldn't have waited during the endpoint's last pass.
+    fn rtt(lowest: u64) -> Option<RoundTrips> {
+        rtt_waiting(lowest, 0)
+    }
+
+    /// The round trips of a connection whose lowest round-trip time took `lowest` ms, and whose
+    /// packet could have waited `waited` ms of it during the endpoint's last pass.
+    fn rtt_waiting(lowest: u64, waited: u64) -> Option<RoundTrips> {
+        Some(RoundTrips {
+            lowest: ms(lowest),
+            waited: ms(waited),
+        })
+    }
+
     /// Takes each permit the limit has, and checks that it has as many as its limit.
     fn take_all(limit: &Limit) -> Vec<Permit> {
         let mut permits = vec![];
@@ -505,17 +595,27 @@ mod tests {
     #[test]
     fn a_handshake_answers_its_time_past_two_round_trips_of_its_path() {
         for (elapsed, earlier_rtt, rtt, expected) in [
-            (ms(103), None, Some(ms(50)), Answer::Latency(ms(3))),
-            // The lower of an earlier connection's round trip and this connection's counts.
-            (ms(103), Some(ms(40)), Some(ms(50)), Answer::Latency(ms(23))),
-            (ms(103), Some(ms(60)), Some(ms(50)), Answer::Latency(ms(3))),
+            (ms(103), None, rtt(50), Answer::Latency(ms(3))),
+            // An earlier time below this connection's lowest round trip counts as it is, and
+            // one above it as the lowest.
+            (ms(103), Some(ms(40)), rtt_waiting(50, 10), Answer::Latency(ms(23))),
+            (ms(103), Some(ms(45)), rtt_waiting(50, 10), Answer::Latency(ms(13))),
+            (ms(103), Some(ms(60)), rtt(50), Answer::Latency(ms(3))),
             (ms(103), Some(ms(50)), None, Answer::Latency(ms(3))),
+            // An earlier time below the lowest round trip less the most that its packet could
+            // have waited counts as it is too, since the round trips can't tell a longer route
+            // from a wait past the endpoint's last pass.
+            (ms(103), Some(ms(40)), rtt(50), Answer::Latency(ms(23))),
+            (ms(103), Some(ms(30)), rtt_waiting(50, 10), Answer::Latency(ms(43))),
+            // Without an earlier time, `RoundTrips::path` counts, and it doesn't go below zero.
+            (ms(103), None, rtt_waiting(50, 10), Answer::Latency(ms(23))),
+            (ms(103), None, rtt_waiting(5, 9), Answer::Latency(ms(103))),
             // Without a round-trip time, the rest is the whole time.
             (ms(103), None, None, Answer::Latency(ms(103))),
             // Where the round trips take the whole time, the handshake doesn't show a time to
             // compare.
-            (ms(100), None, Some(ms(50)), Answer::Finished),
-            (ms(90), None, Some(ms(50)), Answer::Finished),
+            (ms(100), None, rtt(50), Answer::Finished),
+            (ms(90), None, rtt(50), Answer::Finished),
         ] {
             assert_eq!(Answer::for_handshake(elapsed, earlier_rtt, rtt), expected);
         }
@@ -524,9 +624,9 @@ mod tests {
     #[test]
     fn handshakes_with_a_near_and_a_far_peer_at_once_dont_lower_the_limit() {
         // A near peer's round trip takes 1 ms, and its handshake 3 ms: the endpoint added 1 ms.
-        let near = Answer::for_handshake(ms(3), None, Some(ms(1)));
+        let near = Answer::for_handshake(ms(3), None, rtt(1));
         // A far peer's round trip takes 50 ms, and its handshake 101 ms: the endpoint added 1 ms.
-        let far = Answer::for_handshake(ms(101), None, Some(ms(50)));
+        let far = Answer::for_handshake(ms(101), None, rtt(50));
         let limit = Limit::new();
         // The near peer's handshake runs alone, and its 1 ms is the base.
         round(&limit, near);
@@ -554,10 +654,10 @@ mod tests {
     #[test]
     fn a_far_handshake_whose_endpoint_time_is_past_twice_the_base_is_congestion() {
         let limit = Limit::new();
-        round(&limit, Answer::for_handshake(ms(3), None, Some(ms(1))));
+        round(&limit, Answer::for_handshake(ms(3), None, rtt(1)));
         // The far peer's round trips account for 100 ms of its 103 ms, and the endpoint's 3 ms
         // is past twice the 1 ms base.
-        let far = Answer::for_handshake(ms(103), None, Some(ms(50)));
+        let far = Answer::for_handshake(ms(103), None, rtt(50));
         let mut permits = take_all(&limit).into_iter();
         permits.next().unwrap().release(far);
         assert_eq!(limit.current(), 1);
@@ -567,13 +667,13 @@ mod tests {
     fn a_handshake_whose_round_trips_take_its_whole_time_doesnt_set_the_base() {
         let limit = Limit::new();
         // The handshake runs alone, and its 1 ms past its round trips is the base.
-        round(&limit, Answer::for_handshake(ms(3), None, Some(ms(1))));
+        round(&limit, Answer::for_handshake(ms(3), None, rtt(1)));
         assert_eq!(limit.current(), 2);
 
         // Beside a handshake whose round trips take its whole time, a handshake with 2 ms past
         // its round trips is within twice the base, and the limit grows.
-        let finished = Answer::for_handshake(ms(90), None, Some(ms(50)));
-        let within = Answer::for_handshake(ms(4), None, Some(ms(1)));
+        let finished = Answer::for_handshake(ms(90), None, rtt(50));
+        let within = Answer::for_handshake(ms(4), None, rtt(1));
         let mut permits = take_all(&limit).into_iter();
         permits.next().unwrap().release(finished);
         permits.next().unwrap().release(within);
@@ -585,14 +685,16 @@ mod tests {
         let limit = Limit::new();
         // A near peer's handshake runs alone: its connection measures a 1 ms round trip, and the
         // 1 ms past two of them is the base.
-        round(&limit, Answer::for_handshake(ms(3), None, Some(ms(1))));
+        round(&limit, Answer::for_handshake(ms(3), None, rtt(1)));
         assert_eq!(limit.current(), 2);
 
         // While the endpoint is busy, its receive queue holds each packet of the next handshake
         // with the peer for 4 ms, so that handshake's connection measures a 5 ms round trip, and
-        // its two round trips take 10 ms of its 11 ms. Against the earlier connection's 1 ms
-        // round trip, 9 ms is past twice the base, which halves the limit.
-        let late = Answer::for_handshake(ms(11), Some(ms(1)), Some(ms(5)));
+        // its two round trips take 10 ms of its 11 ms. Where its packet waited past the endpoint's
+        // last pass, the connection can't tell any of that wait from its path. Against the
+        // earlier connection's 1 ms round trip, 9 ms is past twice the base, which halves the
+        // limit.
+        let late = Answer::for_handshake(ms(11), Some(ms(1)), rtt(5));
         assert_eq!(late, Answer::Latency(ms(9)));
         let mut permits = take_all(&limit).into_iter();
         permits.next().unwrap().release(late);
@@ -601,8 +703,122 @@ mod tests {
         // Read against its own round trips alone, the same handshake shows 1 ms, within twice
         // the base.
         assert_eq!(
-            Answer::for_handshake(ms(11), None, Some(ms(5))),
+            Answer::for_handshake(ms(11), None, rtt(5)),
             Answer::Latency(ms(1))
+        );
+    }
+
+    #[test]
+    fn a_first_handshake_whose_round_trips_hold_the_endpoints_wait_halves_the_limit() {
+        let limit = Limit::new();
+        // A near peer's handshake runs alone: its connection measures a 1 ms round trip, and the
+        // 1 ms past two of them is the base.
+        round(&limit, Answer::for_handshake(ms(3), None, rtt(1)));
+        assert_eq!(limit.current(), 2);
+
+        // While the endpoint is busy, its receive queue holds each packet of a handshake with a
+        // peer that no earlier handshake measured for 4 ms, so that handshake's connection
+        // measures a 5 ms round trip, 4 ms of which the endpoint's pass before the one that read
+        // its packet ran. Its path takes the 1 ms left of each round trip, and 9 ms of its 11 ms
+        // is past twice the base, which halves the limit.
+        let late = Answer::for_handshake(ms(11), None, rtt_waiting(5, 4));
+        assert_eq!(late, Answer::Latency(ms(9)));
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(late);
+        assert_eq!(limit.current(), 1);
+
+        // Read against its whole round trips, the same handshake shows 1 ms, within twice the
+        // base.
+        assert_eq!(
+            Answer::for_handshake(ms(11), None, rtt(5)),
+            Answer::Latency(ms(1))
+        );
+    }
+
+    #[test]
+    fn the_path_counts_the_lower_of_an_earlier_time_and_this_connections_lowest_round_trip() {
+        for (earlier, rtt, expected) in [
+            // An earlier time below this connection's 50 ms lowest round trip counts as it is,
+            // whether it is above or below the 40 ms left of that round trip past the 10 ms its
+            // packet could have waited, and one above the lowest round trip counts as the lowest.
+            (Some(ms(45)), rtt_waiting(50, 10), Some(ms(45))),
+            (Some(ms(30)), rtt_waiting(50, 10), Some(ms(30))),
+            (Some(ms(60)), rtt_waiting(50, 10), Some(ms(50))),
+            // Without an earlier time, the 40 ms counts, and without this connection's round
+            // trips, the earlier time.
+            (None, rtt_waiting(50, 10), Some(ms(40))),
+            (Some(ms(30)), None, Some(ms(30))),
+            (None, None, None),
+        ] {
+            assert_eq!(path_rtt(earlier, rtt), expected);
+        }
+    }
+
+    #[test]
+    fn a_handshake_keeps_the_lower_of_an_earlier_time_and_its_lowest_round_trip() {
+        for (earlier, rtt, expected) in [
+            // The part of the lowest round trip that its packet could have waited stays in the
+            // kept time.
+            (None, rtt_waiting(50, 10), Some(ms(50))),
+            (Some(ms(30)), rtt_waiting(50, 10), Some(ms(30))),
+            (Some(ms(60)), rtt_waiting(50, 10), Some(ms(50))),
+            (Some(ms(30)), None, Some(ms(30))),
+            (None, None, None),
+        ] {
+            assert_eq!(kept_rtt(earlier, rtt), expected);
+        }
+    }
+
+    #[test]
+    fn a_repeat_handshake_after_a_first_whose_reply_could_have_waited_answers_as_before() {
+        // A first handshake with a peer measures a 50 ms round trip, and the endpoint's last pass
+        // ran for 10 ms of it after its packet was sent, though the reply may have been on the
+        // path for all of those 10 ms. Its own answer takes the 40 ms left out of its time twice,
+        // and it keeps the whole 50 ms with the peer's entry.
+        let first = rtt_waiting(50, 10);
+        let first_answer = Answer::for_handshake(ms(101), None, first);
+        assert_eq!(first_answer, Answer::Latency(ms(21)));
+        let kept = kept_rtt(None, first);
+        assert_eq!(kept, Some(ms(50)));
+
+        // The next handshake with the peer runs alone and takes 101 ms over the same 50 ms round
+        // trip. Against the kept 50 ms, it answers the 1 ms that the endpoint added; against a
+        // kept 40 ms, it would answer 21 ms.
+        let next = Answer::for_handshake(ms(101), kept, rtt(50));
+        assert_eq!(next, Answer::Latency(ms(1)));
+        assert_eq!(kept_rtt(kept, rtt(50)), Some(ms(50)));
+    }
+
+    #[test]
+    fn a_handshake_keeps_its_whole_lowest_round_trip_and_answers_against_its_path() {
+        // A first handshake with a peer measures a 50 ms round trip, 10 ms of which its reply
+        // could have waited during the endpoint's last pass, and takes 101 ms. It keeps the whole
+        // 50 ms with the peer's entry, and its answer takes the 40 ms left out of its time twice.
+        assert_eq!(
+            read_handshake(ms(101), None, rtt_waiting(50, 10)),
+            (Some(ms(50)), Answer::Latency(ms(21)))
+        );
+
+        // With an earlier time, the handshake keeps the lower of it and its lowest round trip,
+        // and its answer takes that time out of its time twice.
+        assert_eq!(
+            read_handshake(ms(101), Some(ms(40)), rtt_waiting(50, 10)),
+            (Some(ms(40)), Answer::Latency(ms(21)))
+        );
+        assert_eq!(
+            read_handshake(ms(101), Some(ms(60)), rtt(50)),
+            (Some(ms(50)), Answer::Latency(ms(1)))
+        );
+
+        // Without this connection's round trips, it keeps and reads the earlier time, and
+        // without either time, it doesn't keep a time and its answer is the whole time.
+        assert_eq!(
+            read_handshake(ms(101), Some(ms(30)), None),
+            (Some(ms(30)), Answer::Latency(ms(41)))
+        );
+        assert_eq!(
+            read_handshake(ms(101), None, None),
+            (None, Answer::Latency(ms(101)))
         );
     }
 
