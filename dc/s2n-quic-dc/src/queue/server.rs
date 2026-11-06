@@ -115,7 +115,10 @@ impl ServerState {
     /// Counts a slot down once the second of its receivers is dropped.
     pub(crate) fn on_slot_freed(&self) {
         let previous = self.open_slots.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0, "a slot was freed more often than it was opened");
+        debug_assert!(
+            previous > 0,
+            "a slot was freed more often than it was opened"
+        );
     }
 
     /// Push Reset into all allocated slots.

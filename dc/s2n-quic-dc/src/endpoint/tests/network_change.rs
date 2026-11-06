@@ -186,7 +186,9 @@ fn assert_error_kind<T, E>(what: &str, result: Result<io::Result<T>, E>, kind: i
 /// Runs the phone's work on `stream`, the old connection, and changes the network in the
 /// middle of the upload: once the host has read `CHANGE_AT` bytes (`mid_stream`), it calls
 /// `change`. Asserts that the phone's read of the answer and its upload each end in an error
-/// of `kind` within `bound` of the change, and returns what `change` returned.
+/// of `kind` within `bound` of the change, and returns what `change` returned. Where the
+/// writer queues each byte of the upload before the change, which doesn't deliver them, the
+/// upload ends in the error the writer's `peer_cancellation` yields once the stream is reset.
 async fn change_mid_stream<R>(
     stream: Stream,
     mid_stream: oneshot::Receiver<()>,
@@ -197,7 +199,10 @@ async fn change_mid_stream<R>(
     let (mut reader, mut writer) = stream.into_split();
     let upload = async move {
         let mut data = Data::new(UPLOAD_LEN);
-        writer.write_all_from_fin(&mut data).await
+        writer.write_all_from_fin(&mut data).await?;
+        // Queuing the upload doesn't deliver it: the app learns that the change lost it from
+        // the writer's peer cancellation, which the reset of the stream resolves.
+        Err::<usize, io::Error>(writer.peer_cancellation().await)
     }
     .spawn();
 
@@ -234,7 +239,10 @@ async fn complete_work(stream: Stream, bound: Duration, what: &str) {
     let uploaded = upload
         .unwrap_or_else(|_| panic!("the upload {what} was still pending after {bound:?}"))
         .unwrap_or_else(|err| panic!("the upload {what} failed: {err:?}"));
-    assert_eq!(uploaded as u64, UPLOAD_LEN, "the upload {what} queued every byte");
+    assert_eq!(
+        uploaded as u64, UPLOAD_LEN,
+        "the upload {what} queued every byte"
+    );
     let answer = answer
         .unwrap_or_else(|_| {
             panic!("the read of the answer {what} was still pending after {bound:?}")

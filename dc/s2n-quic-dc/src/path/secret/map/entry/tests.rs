@@ -360,9 +360,16 @@ fn the_dead_mark_resets_only_the_streams_it_owes_a_reset_of() {
     let unwritten = alloc(8);
 
     let (recorded, reset) = entry.mark_dead_owing_resets(t0, cooldown, core::iter::empty());
-    assert_eq!(recorded, 1, "the stream whose writer recorded the peer's queue is owed");
+    assert_eq!(
+        recorded, 1,
+        "the stream whose writer recorded the peer's queue is owed"
+    );
     let reset = reset.expect("the mark should take effect");
-    assert_eq!(reset, vec![open_stream], "the read names the owed stream alone");
+    assert_eq!(
+        reset,
+        vec![open_stream],
+        "the read names the owed stream alone"
+    );
     assert_eq!(
         entry.mark_dead_owing_resets(t0, cooldown, core::iter::empty()),
         (0, None),
@@ -381,8 +388,16 @@ fn the_dead_mark_resets_only_the_streams_it_owes_a_reset_of() {
         let diag = dispatch.slot_diag(queue_id).expect("the slot exists");
         (diag.stream_depth, diag.control_depth)
     };
-    assert_eq!(depth(open.local_queue_id), (1, 1), "the owed stream is reset");
-    assert_eq!(depth(unwritten.local_queue_id), (0, 0), "case 1 isn't reset");
+    assert_eq!(
+        depth(open.local_queue_id),
+        (1, 1),
+        "the owed stream is reset"
+    );
+    assert_eq!(
+        depth(unwritten.local_queue_id),
+        (0, 0),
+        "case 1 isn't reset"
+    );
     assert_eq!(depth(late.local_queue_id), (0, 0), "case 2 isn't reset");
 
     let t1 = t0 + Duration::from_secs(1);

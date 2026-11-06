@@ -416,7 +416,9 @@ impl Send {
                 debug_assert!(false, "ACK frames should never appear as inflight entries")
             }
             Header::Ping => {
-                debug_assert!(false, "Ping frames should never appear as inflight entries")
+                // The send idle wheel probes a quiet path that has an open stream with a Ping
+                // frame, which the assembler sends as an inflight entry, so the peer's ACK of
+                // the probe acknowledges a Ping frame here.
             }
             Header::QueueMsg { .. } => self.tx_acked_frame_queue_msg.add(1),
             Header::QueueDbg { .. } => self.tx_acked_frame_queue_dbg.add(1),

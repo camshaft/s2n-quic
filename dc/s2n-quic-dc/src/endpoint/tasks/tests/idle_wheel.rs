@@ -144,7 +144,10 @@ fn setup_send_and_frame_receiver_recording(
     );
     async move { peer_dead_broadcast_task.drain_budgeted(Some(32)).await }.spawn();
 
-    ((send_caches, idle_wheel_tx, completed_rx, clock, registry), frame_rx)
+    (
+        (send_caches, idle_wheel_tx, completed_rx, clock, registry),
+        frame_rx,
+    )
 }
 
 /// The counts of the drain's probe counters, `tasks::IdleProbeCounters`.
@@ -511,7 +514,10 @@ fn send_idle_wheel_marks_dead_a_peer_that_doesnt_answer_the_probe_of_an_open_str
             // The on-time check at the idle deadline doesn't probe the quiet period again.
             let mut later = frame::PriorityStorage::default();
             assert!(
-                matches!(frame_rx.poll_swap(&mut cx, &mut later), core::task::Poll::Pending),
+                matches!(
+                    frame_rx.poll_swap(&mut cx, &mut later),
+                    core::task::Poll::Pending
+                ),
                 "the quiet period should be probed once"
             );
             assert_eq!(
@@ -2255,7 +2261,9 @@ fn send_idle_wheel_waits_a_tick_for_the_probe_answer_with_an_idle_timeout_under_
             // deadline 1.5 s in.
             let now = precision::Clock::now(&clock);
             let to_next_tick = core::time::Duration::from_nanos(tick - now.nanos % tick);
-            (to_next_tick + core::time::Duration::from_millis(300)).sleep().await;
+            (to_next_tick + core::time::Duration::from_millis(300))
+                .sleep()
+                .await;
             let start = precision::Clock::now(&clock);
             pse.touch_activity(start);
             let stream = open_stream(&pse);

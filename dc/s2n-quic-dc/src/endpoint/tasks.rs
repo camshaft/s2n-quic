@@ -1603,10 +1603,9 @@ fn owed_reset_of(header: &frame::Header) -> Option<crate::queue::OwedReset> {
             queue_pair,
             binding_id,
         }),
-        Header::QueueFree { .. }
-        | Header::Ack { .. }
-        | Header::Ping
-        | Header::QueueDbg { .. } => None,
+        Header::QueueFree { .. } | Header::Ack { .. } | Header::Ping | Header::QueueDbg { .. } => {
+            None
+        }
     }
 }
 

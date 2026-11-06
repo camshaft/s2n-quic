@@ -1206,10 +1206,18 @@ mod tests {
     #[test]
     fn owed_reset_names_the_held_stream_once_its_peer_queue_is_recorded() {
         let slot = Slot::with_queue_id(v(3));
-        assert_eq!(slot.owed_reset(), None, "an unallocated slot doesn't hold a stream");
+        assert_eq!(
+            slot.owed_reset(),
+            None,
+            "an unallocated slot doesn't hold a stream"
+        );
 
         slot.allocate_and_open(v(5), 0).unwrap();
-        assert_eq!(slot.owed_reset(), None, "the peer's queue isn't recorded yet");
+        assert_eq!(
+            slot.owed_reset(),
+            None,
+            "the peer's queue isn't recorded yet"
+        );
 
         slot.set_peer_queue_id(v(9));
         assert_eq!(
@@ -1224,7 +1232,11 @@ mod tests {
         );
 
         simulate_receiver_drop(&slot);
-        assert_eq!(slot.owed_reset(), None, "a freed slot doesn't hold a stream");
+        assert_eq!(
+            slot.owed_reset(),
+            None,
+            "a freed slot doesn't hold a stream"
+        );
 
         slot.allocate_and_open(v(6), 0).unwrap();
         assert_eq!(

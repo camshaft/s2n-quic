@@ -146,7 +146,10 @@ impl ClientState {
     /// Counts a slot down once the second of its receivers is dropped.
     pub(crate) fn on_slot_freed(&self) {
         let previous = self.open_slots.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0, "a slot was freed more often than it was opened");
+        debug_assert!(
+            previous > 0,
+            "a slot was freed more often than it was opened"
+        );
     }
 
     /// Allocate a queue slot, waiting for a peer-side free ID if needed.
@@ -581,7 +584,10 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let mut waiter = None;
         assert!(
-            state.peer_free.poll_alloc(&mut waiter, &mut cx).is_pending(),
+            state
+                .peer_free
+                .poll_alloc(&mut waiter, &mut cx)
+                .is_pending(),
             "every peer queue is taken"
         );
 
