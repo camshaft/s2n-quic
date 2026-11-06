@@ -535,19 +535,13 @@ impl HandshakeQueue {
             let map_clone = map.clone();
             tokio::spawn(async move {
                 // Use the same deadline for MTU probing - any remaining time from the 10s budget
-                let probed = tokio::time::timeout_at(
-                    deadline,
+                let answer = mtu_probing_answer(
                     MtuConfirmComplete::wait_ready(&mut connection),
+                    deadline,
+                    &map_clone,
+                    peer,
                 )
                 .await;
-                let answer = if probed.is_err() {
-                    map_clone.on_dc_connection_timeout(&peer);
-                    // A connection that didn't finish its MTU probing before the deadline is a
-                    // failure of this peer for the inflight limit.
-                    limit::Answer::Failed(peer)
-                } else {
-                    limit::Answer::Finished
-                };
 
                 drop(connection);
                 permit_inflight.release(answer);
@@ -621,6 +615,26 @@ impl HandshakeQueue {
             .as_ref()
             .map(|v| *v)
             .map_err(|e| e.duplicate())
+    }
+}
+
+/// Waits for `probing`, a connection's MTU probing, until `deadline`, and returns what it says
+/// about the inflight limit: `Answer::Finished` where the probing finished in time, and
+/// `Answer::Failed` of `peer` where it didn't, which `map` also reports as a dc connection
+/// timeout.
+async fn mtu_probing_answer(
+    probing: impl std::future::Future<Output = ()>,
+    deadline: TokioInstant,
+    map: &secret::Map,
+    peer: SocketAddr,
+) -> limit::Answer {
+    if tokio::time::timeout_at(deadline, probing).await.is_err() {
+        map.on_dc_connection_timeout(&peer);
+        // A connection that didn't finish its MTU probing before the deadline is a failure of
+        // this peer for the inflight limit.
+        limit::Answer::Failed(peer)
+    } else {
+        limit::Answer::Finished
     }
 }
 
@@ -892,6 +906,60 @@ mod tests {
             .unwrap_err();
         assert_eq!(queue.limiter_start.current(), 1);
         assert_eq!(queue.limiter_inflight.current(), 1);
+    }
+
+    /// Verifies that a connection that doesn't finish its MTU probing before its deadline is a
+    /// failure of its peer for the inflight limit, which the map reports as a dc connection
+    /// timeout: one peer's missed deadline leaves the limit as it is, and a second peer's missed
+    /// deadline since the last clean answer halves it. The test runs on tokio's paused clock, so
+    /// each wait ends at its deadline without waiting in real time.
+    #[tokio::test(start_paused = true)]
+    async fn missed_mtu_deadlines_of_two_peers_halve_the_inflight_limit() {
+        let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+        let map = Map::builder()
+            .with_signer(Signer::new(b"default"))
+            .with_capacity(50_000)
+            .with_clock(StdClock::default())
+            .with_subscriber(subscriber.clone())
+            .build()
+            .unwrap();
+        let timeouts = || subscriber.dc_connection_timeout.load(Ordering::Relaxed);
+        let queue = HandshakeQueue::new(Duration::ZERO);
+        let inflight = &queue.limiter_inflight;
+        let peer_a: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.1:4434".parse().unwrap();
+
+        // A connection that finished its MTU probing before its deadline filled the limit of
+        // one, so the limit grows to 2.
+        let permit = inflight.acquire().await;
+        let deadline = TokioInstant::now() + Duration::from_secs(10);
+        let probing = tokio::time::sleep(Duration::from_secs(1));
+        let answer = mtu_probing_answer(probing, deadline, &map, peer_a).await;
+        assert_eq!(answer, limit::Answer::Finished);
+        assert_eq!(timeouts(), 0);
+        permit.release(answer);
+        assert_eq!(inflight.current(), 2);
+
+        // Connections to two peers hold the limit's two permits, and neither finishes its MTU
+        // probing before the deadline.
+        let permit_a = inflight.acquire().await;
+        let permit_b = inflight.acquire().await;
+        let deadline = TokioInstant::now() + Duration::from_secs(10);
+
+        let answer = mtu_probing_answer(std::future::pending(), deadline, &map, peer_a).await;
+        assert!(TokioInstant::now() >= deadline, "the wait lasts until the deadline");
+        assert_eq!(answer, limit::Answer::Failed(peer_a));
+        assert_eq!(timeouts(), 1);
+        // One peer's missed deadline leaves the limit as it is.
+        permit_a.release(answer);
+        assert_eq!(inflight.current(), 2);
+
+        let answer = mtu_probing_answer(std::future::pending(), deadline, &map, peer_b).await;
+        assert_eq!(answer, limit::Answer::Failed(peer_b));
+        assert_eq!(timeouts(), 2);
+        // A second peer's missed deadline since the last clean answer halves the limit.
+        permit_b.release(answer);
+        assert_eq!(inflight.current(), 1);
     }
 
     #[test]
