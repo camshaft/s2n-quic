@@ -1689,6 +1689,16 @@ mod tests {
         });
         assert_eq!((waits.round_trips, waits.lost), (0, false));
 
+        // The server's packet 1 arrives after its probe 3, and its packet 4, which follows the
+        // probe without a gap, brings data the server hadn't sent before.
+        let waits = waits_after(|publisher| {
+            crypto_packet_received(publisher, handshake_header, 0, 0, 1000);
+            crypto_packet_received(publisher, handshake_header, 3, 0, 1000);
+            crypto_packet_received(publisher, handshake_header, 1, 1000, 1000);
+            crypto_packet_received(publisher, handshake_header, 4, 2000, 500);
+        });
+        assert_eq!((waits.round_trips, waits.lost), (0, false));
+
         for frames in [
             // The server's last Handshake packet 1, with the data from 1000 to 2000, didn't
             // arrive, and its probe 3 sends that data again.
