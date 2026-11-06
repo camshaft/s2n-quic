@@ -296,6 +296,26 @@ impl Map {
         self.store.on_dc_connection_timeout(peer_address);
     }
 
+    /// Emits a HandshakeStartLimitIncreased event via the subscriber
+    pub(crate) fn on_handshake_start_limit_increased(&self, size: usize) {
+        self.store.on_handshake_start_limit_increased(size);
+    }
+
+    /// Emits a HandshakeStartLimitDecreased event via the subscriber
+    pub(crate) fn on_handshake_start_limit_decreased(&self, size: usize) {
+        self.store.on_handshake_start_limit_decreased(size);
+    }
+
+    /// Emits a HandshakeInflightLimitIncreased event via the subscriber
+    pub(crate) fn on_handshake_inflight_limit_increased(&self, size: usize) {
+        self.store.on_handshake_inflight_limit_increased(size);
+    }
+
+    /// Emits a HandshakeInflightLimitDecreased event via the subscriber
+    pub(crate) fn on_handshake_inflight_limit_decreased(&self, size: usize) {
+        self.store.on_handshake_inflight_limit_decreased(size);
+    }
+
     pub fn handle_control_packet(&self, packet: &control::Packet, peer: &SocketAddr) {
         match packet {
             control::Packet::StaleKey(packet) => {

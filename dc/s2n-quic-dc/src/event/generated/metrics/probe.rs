@@ -61,6 +61,10 @@ mod counter {
                 109usize => Self(path_secret_map_cleaner_cycled),
                 126usize => Self(path_secret_map_id_write_lock),
                 129usize => Self(path_secret_map_address_write_lock),
+                132usize => Self(handshake_start_limit_increased),
+                134usize => Self(handshake_start_limit_decreased),
+                136usize => Self(handshake_inflight_limit_increased),
+                138usize => Self(handshake_inflight_limit_decreased),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -160,6 +164,14 @@ mod counter {
             fn path_secret_map_id_write_lock(value: u64);
             # [link_name = s2n_quic_dc__event__counter__path_secret_map_address_write_lock]
             fn path_secret_map_address_write_lock(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__handshake_start_limit_increased]
+            fn handshake_start_limit_increased(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__handshake_start_limit_decreased]
+            fn handshake_start_limit_decreased(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__handshake_inflight_limit_increased]
+            fn handshake_inflight_limit_increased(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__handshake_inflight_limit_decreased]
+            fn handshake_inflight_limit_decreased(value: u64);
         }
     );
     pub mod bool {
@@ -517,6 +529,10 @@ mod measure {
                 128usize => Self(path_secret_map_id_write_lock__duration),
                 130usize => Self(path_secret_map_address_write_lock__acquire),
                 131usize => Self(path_secret_map_address_write_lock__duration),
+                133usize => Self(handshake_start_limit_increased__size),
+                135usize => Self(handshake_start_limit_decreased__size),
+                137usize => Self(handshake_inflight_limit_increased__size),
+                139usize => Self(handshake_inflight_limit_decreased__size),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -632,6 +648,14 @@ mod measure {
             fn path_secret_map_address_write_lock__acquire(value: u64);
             # [link_name = s2n_quic_dc__event__measure__path_secret_map_address_write_lock__duration]
             fn path_secret_map_address_write_lock__duration(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__handshake_start_limit_increased__size]
+            fn handshake_start_limit_increased__size(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__handshake_start_limit_decreased__size]
+            fn handshake_start_limit_decreased__size(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__handshake_inflight_limit_increased__size]
+            fn handshake_inflight_limit_increased__size(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__handshake_inflight_limit_decreased__size]
+            fn handshake_inflight_limit_decreased__size(value: u64);
         }
     );
 }

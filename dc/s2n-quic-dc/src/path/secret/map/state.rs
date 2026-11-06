@@ -1443,6 +1443,30 @@ where
                 peer_address: SocketAddress::from(*peer_address).into_event(),
             });
     }
+
+    fn on_handshake_start_limit_increased(&self, size: usize) {
+        let limit_changed = event::builder::HandshakeStartLimitIncreased { size };
+        self.subscriber()
+            .on_handshake_start_limit_increased(limit_changed);
+    }
+
+    fn on_handshake_start_limit_decreased(&self, size: usize) {
+        let limit_changed = event::builder::HandshakeStartLimitDecreased { size };
+        self.subscriber()
+            .on_handshake_start_limit_decreased(limit_changed);
+    }
+
+    fn on_handshake_inflight_limit_increased(&self, size: usize) {
+        let limit_changed = event::builder::HandshakeInflightLimitIncreased { size };
+        self.subscriber()
+            .on_handshake_inflight_limit_increased(limit_changed);
+    }
+
+    fn on_handshake_inflight_limit_decreased(&self, size: usize) {
+        let limit_changed = event::builder::HandshakeInflightLimitDecreased { size };
+        self.subscriber()
+            .on_handshake_inflight_limit_decreased(limit_changed);
+    }
 }
 
 impl<C, S> Drop for State<C, S>
