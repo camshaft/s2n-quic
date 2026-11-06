@@ -84,6 +84,7 @@ impl MessageTrait for Message {
         let header = datagram::Header {
             path,
             ecn: Default::default(),
+            receive_wait: None,
         };
         let payload = self.payload_mut();
 

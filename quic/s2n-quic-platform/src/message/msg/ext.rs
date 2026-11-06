@@ -24,10 +24,17 @@ impl Ext for msghdr {
 
         let ancillary_data = unsafe { cmsg::decode::Iter::from_msghdr(self) }.collect();
         let ecn = ancillary_data.ecn;
+        let receive_wait = ancillary_data
+            .receive_wait_nanos
+            .map(core::time::Duration::from_nanos);
 
         path.with_ancillary_data(ancillary_data);
 
-        let header = datagram::Header { path, ecn };
+        let header = datagram::Header {
+            path,
+            ecn,
+            receive_wait,
+        };
 
         Some((header, ancillary_data))
     }

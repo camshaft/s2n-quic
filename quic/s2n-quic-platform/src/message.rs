@@ -177,7 +177,11 @@ mod tests {
             .for_each(|(path, ecn, segment_size, payload_len)| {
                 let mut payload = vec![0u8; payload_len];
                 let rx_message = RxMessage {
-                    header: datagram::Header { path, ecn },
+                    header: datagram::Header {
+                        path,
+                        ecn,
+                        receive_wait: None,
+                    },
                     segment_size,
                     payload: &mut payload,
                 };

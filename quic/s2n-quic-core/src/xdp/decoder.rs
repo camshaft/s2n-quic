@@ -108,6 +108,7 @@ pub fn decode_packet<'a, D: Decoder<'a>>(
     let mut header = datagram::Header {
         path: path::Tuple::UNSPECIFIED,
         ecn: Default::default(),
+        receive_wait: None,
     };
     match decode_packet_with_event(buffer, &mut header)? {
         Some(buffer) => Ok(Some((header, buffer))),

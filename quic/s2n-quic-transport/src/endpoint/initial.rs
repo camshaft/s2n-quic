@@ -386,6 +386,16 @@ impl<Config: endpoint::Config> endpoint::Endpoint<Config> {
                     connection::Error::unspecified()
                 })?;
 
+                if let Some(wait) = header.receive_wait {
+                    let receive_wait = event::builder::DatagramReceiveWait { wait };
+                    connection.with_event_publisher(
+                        datagram.timestamp,
+                        Some(path_id),
+                        endpoint_context.event_subscriber,
+                        |publisher, _path| publisher.on_datagram_receive_wait(receive_wait),
+                    );
+                }
+
                 connection
                     .handle_cleartext_initial_packet(
                         datagram,

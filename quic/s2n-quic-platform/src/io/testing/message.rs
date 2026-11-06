@@ -3,6 +3,7 @@
 
 use crate::message::{self, Message as MessageTrait};
 use core::alloc::Layout;
+use core::time::Duration;
 use s2n_quic_core::{
     inet::{datagram, ExplicitCongestionNotification},
     io::tx,
@@ -16,6 +17,7 @@ use s2n_quic_core::{
 pub struct Message {
     handle: Handle,
     ecn: ExplicitCongestionNotification,
+    receive_wait: Option<Duration>,
     payload_ptr: *mut u8,
     payload_len: usize,
 }
@@ -39,6 +41,11 @@ impl Message {
     #[inline]
     pub(crate) fn ecn_mut(&mut self) -> &mut ExplicitCongestionNotification {
         &mut self.ecn
+    }
+
+    #[inline]
+    pub(crate) fn receive_wait_mut(&mut self) -> &mut Option<Duration> {
+        &mut self.receive_wait
     }
 
     #[inline]
@@ -95,6 +102,7 @@ impl MessageTrait for Message {
         let header = datagram::Header {
             path,
             ecn: self.ecn,
+            receive_wait: self.receive_wait,
         };
         let payload = self.payload_mut();
 
@@ -144,6 +152,7 @@ unsafe fn alloc(entries: u32, payload_len: u32, offset: usize) -> message::Stora
             let entry = &mut *entry_ptr;
             entry.payload_ptr = payload_ptr;
             entry.payload_len = payload_len as _;
+            entry.receive_wait = None;
 
             entry_ptr = entry_ptr.add(1);
             payload_ptr = payload_ptr.add(payload_len as _);

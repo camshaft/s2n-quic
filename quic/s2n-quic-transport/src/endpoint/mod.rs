@@ -623,6 +623,16 @@ impl<Cfg: Config> Endpoint<Cfg> {
                         );
                     })?;
 
+                if let Some(wait) = header.receive_wait {
+                    let receive_wait = event::builder::DatagramReceiveWait { wait };
+                    conn.with_event_publisher(
+                        datagram.timestamp,
+                        Some(path_id),
+                        endpoint_context.event_subscriber,
+                        |publisher, _path| publisher.on_datagram_receive_wait(receive_wait),
+                    );
+                }
+
                 if let Err(err) = conn.handle_packet(
                     &datagram,
                     path_id,
