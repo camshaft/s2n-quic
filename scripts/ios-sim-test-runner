@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#
+# Cargo's target runner for the iOS simulator: runs a test binary in the booted simulator with the
+# arguments cargo passes, and exits with the binary's status.
+#
+# The mobile CI job sets CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUNNER to this script once the simulator
+# has booted.
+#
+# The simulator runs the binary on the host's file system, so the tests read the repository's files at
+# the paths the binary was built with. insta otherwise finds the workspace by running `cargo metadata`,
+# which may not be on the simulator's PATH, so the runner sets INSTA_WORKSPACE_ROOT to the repository's
+# root. simctl passes each SIMCTL_CHILD_ variable to the binary without that prefix. INSTA_UPDATE=no
+# makes a snapshot that differs fail its test without writing a new snapshot.
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+export SIMCTL_CHILD_INSTA_WORKSPACE_ROOT="$repo"
+export SIMCTL_CHILD_INSTA_UPDATE=no
+export SIMCTL_CHILD_RUST_BACKTRACE=1
+
+exec xcrun simctl spawn booted "$@"
