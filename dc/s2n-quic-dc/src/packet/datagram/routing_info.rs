@@ -37,7 +37,7 @@ pub enum RoutingInfo {
 }
 
 /// Queue pair used in frame-level headers for stream routing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(bolero_generator::TypeGenerator))]
 pub struct QueuePair {
     /// The queue ID used for routing messages to the sender

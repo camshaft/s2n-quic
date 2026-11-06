@@ -34,7 +34,10 @@ use super::{
 };
 use crate::{endpoint::msg, intrusive};
 use s2n_quic_core::varint::VarInt;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use crate::path::secret::map::Entry as PathSecretEntry;
 
@@ -74,6 +77,14 @@ pub struct ServerState {
     /// before any pool-backed window grants flow. Configured at endpoint
     /// construction; passed into slot bind to seed `initial_window_remaining`.
     pub(crate) initial_recv_window: u64,
+    /// How many bound slots still have a receiver the app holds: counted up when a binding
+    /// opens a slot, and down when the second of its receivers is dropped. While it isn't
+    /// zero, a stream on this path may wait on the peer, so the send idle wheel probes the
+    /// path while it is quiet (`send_idle_wheel_drain`).
+    open_slots: AtomicUsize,
+    /// The resets this side owes the peer for the streams it reset when it marked the peer dead
+    /// (`path::secret::map::Entry::mark_dead_owing_resets`).
+    pub(crate) owed_resets: super::OwedResets,
 }
 
 impl ServerState {
@@ -83,6 +94,8 @@ impl ServerState {
             freed: FreedInner::new(),
             max_queue_id: max_queues.as_u64().saturating_sub(1),
             initial_recv_window,
+            open_slots: AtomicUsize::new(0),
+            owed_resets: Default::default(),
         }
     }
 
@@ -92,6 +105,17 @@ impl ServerState {
             state: self.clone(),
             view: SenderView::new(),
         }
+    }
+
+    /// Returns `true` while a bound slot still has a receiver the app holds.
+    pub(crate) fn has_open_slot(&self) -> bool {
+        self.open_slots.load(Ordering::Relaxed) > 0
+    }
+
+    /// Counts a slot down once the second of its receivers is dropped.
+    pub(crate) fn on_slot_freed(&self) {
+        let previous = self.open_slots.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "a slot was freed more often than it was opened");
     }
 
     /// Push Reset into all allocated slots.
@@ -105,6 +129,42 @@ impl ServerState {
             waker_sink(sw);
             waker_sink(cw);
         });
+    }
+
+    /// Push Reset into the slot of each of `streams` that still holds the stream's binding, as
+    /// [`Self::broadcast_reset`] does for every allocated slot.
+    ///
+    /// `streams` are the streams that [`Self::open_streams`] read as the dead mark recorded the
+    /// resets it owes the peer (`Entry::mark_dead_owing_resets`). A slot that read doesn't name,
+    /// one bound after it or one whose writer hadn't recorded the peer's queue yet, isn't reset,
+    /// and neither is a slot freed or bound again since: each stream the dead mark resets on this
+    /// side is owed a reset.
+    pub fn reset_streams(
+        &self,
+        streams: &[super::OwedReset],
+        error_code: VarInt,
+        waker_sink: &mut impl FnMut(AutoWake),
+    ) {
+        let mut view = SenderView::new();
+        for stream in streams {
+            let index = stream.queue_pair.source_queue_id.as_u64() as usize;
+            let Some(slot) = view.get(index, &self.pages) else {
+                continue;
+            };
+            let (sw, cw) = slot.reset_binding(stream.binding_id, error_code);
+            waker_sink(sw);
+            waker_sink(cw);
+        }
+    }
+
+    /// The stream of each bound slot whose writer recorded the peer's queue, as a reset of it
+    /// that this side owes the peer routes. The dead mark resets these streams alone
+    /// ([`Self::reset_streams`]).
+    pub fn open_streams(&self) -> Vec<super::OwedReset> {
+        let mut streams = Vec::new();
+        let mut view = SenderView::new();
+        view.for_each_slot(&self.pages, |slot| streams.extend(slot.owed_reset()));
+        streams
     }
 }
 
@@ -164,6 +224,7 @@ impl ServerView {
                 release_bytes,
             }),
             BindState::NewBinding(waker) => {
+                self.state.open_slots.fetch_add(1, Ordering::Relaxed);
                 let slot_ptr = slot.as_ptr();
                 let on_free = OnFree::Server {
                     path_entry: path_entry.clone(),
@@ -242,6 +303,7 @@ impl ServerView {
         // Slot is unallocated — bind it (tombstone re-checked under the lock).
         match slot.allocate_and_open(binding_id, self.state.initial_recv_window) {
             Ok(super::slot::AllocateOutcome::Allocated) => {
+                self.state.open_slots.fetch_add(1, Ordering::Relaxed);
                 let slot_ptr = slot.as_ptr();
                 let on_free = OnFree::Server {
                     path_entry: path_entry.clone(),
@@ -644,5 +706,136 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Ok(BindResult::NewBinding { .. })));
+    }
+
+    #[test]
+    fn open_slot_counts_until_both_receivers_drop() {
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+        assert!(!server.state.has_open_slot());
+
+        // A slot bound by a QueueMsg init.
+        let result = server.bind_for_msg(v(0), v(5), &path_entry, &mut tx);
+        let Ok(BindResult::NewBinding {
+            stream, control, ..
+        }) = result
+        else {
+            panic!("expected NewBinding");
+        };
+        assert!(server.state.has_open_slot());
+        drop(stream);
+        assert!(
+            server.state.has_open_slot(),
+            "the control receiver still holds the slot"
+        );
+        drop(control);
+        assert!(!server.state.has_open_slot());
+
+        // A slot bound with its first stream entry.
+        let result =
+            server.bind_and_send_stream(v(1), v(1), make_stream_entry(), &path_entry, &mut tx);
+        let Ok(BindResult::NewBinding {
+            stream, control, ..
+        }) = result
+        else {
+            panic!("expected NewBinding");
+        };
+        assert!(server.state.has_open_slot());
+        drop(control);
+        assert!(
+            server.state.has_open_slot(),
+            "the stream receiver still holds the slot"
+        );
+        drop(stream);
+        assert!(!server.state.has_open_slot());
+    }
+
+    /// `open_streams` names the stream of each bound slot whose writer recorded the peer's
+    /// queue, as a reset of it that the server owes the client routes, and none of a freed slot.
+    #[test]
+    fn open_streams_names_each_bound_stream_whose_peer_queue_is_recorded() {
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+        let result = server.bind_for_msg(v(2), v(5), &path_entry, &mut tx);
+        let Ok(BindResult::NewBinding {
+            stream, control, ..
+        }) = result
+        else {
+            panic!("expected NewBinding");
+        };
+        assert!(
+            server.state.open_streams().is_empty(),
+            "the client's queue isn't recorded yet"
+        );
+
+        // As the stream's writer does when it is made.
+        control.set_peer_queue_id(v(8));
+        assert_eq!(
+            server.state.open_streams(),
+            vec![crate::queue::OwedReset {
+                queue_pair: crate::packet::datagram::QueuePair {
+                    source_queue_id: v(2),
+                    dest_queue_id: v(8),
+                },
+                binding_id: v(5),
+            }]
+        );
+
+        drop((stream, control));
+        assert!(
+            server.state.open_streams().is_empty(),
+            "a freed slot doesn't hold a stream"
+        );
+    }
+
+    /// `reset_streams` resets the slot of each stream it names while the slot holds that
+    /// stream's binding, and no other slot: one it doesn't name, as one bound after the dead mark
+    /// read the open streams, and one that holds another binding than the one it names. It skips
+    /// a stream whose queue is past the page table's end.
+    #[test]
+    fn reset_streams_resets_each_named_stream_and_no_other() {
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+        let mut receivers = Vec::new();
+        for (queue_id, binding_id) in [(0, 1), (1, 1), (2, 3)] {
+            let Ok(BindResult::NewBinding {
+                stream, control, ..
+            }) = server.bind_for_msg(v(queue_id), v(binding_id), &path_entry, &mut tx)
+            else {
+                panic!("expected NewBinding");
+            };
+            receivers.push((stream, control));
+        }
+        let named = |queue_id, binding_id| crate::queue::OwedReset {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: v(queue_id),
+                dest_queue_id: v(8),
+            },
+            binding_id: v(binding_id),
+        };
+
+        // Slot 2 holds binding 3, and the call's stream for slot 2 has binding 2. No bind reaches
+        // queue 50, so the page table doesn't hold a slot for the call's first stream, and the
+        // call goes on past it to the other two.
+        assert!(
+            server.slot_diag(v(50)).is_none(),
+            "queue 50 is past the page table's end"
+        );
+        let streams = [named(50, 1), named(0, 1), named(2, 2)];
+        server.state.reset_streams(&streams, v(42), &mut |_| {});
+
+        let mut depth = |queue_id| {
+            let diag = server.slot_diag(v(queue_id)).expect("the slot exists");
+            (diag.stream_depth, diag.control_depth)
+        };
+        assert_eq!(depth(0), (1, 1), "a named stream is reset");
+        assert_eq!(depth(1), (0, 0), "a stream it doesn't name isn't reset");
+        assert_eq!(
+            depth(2),
+            (0, 0),
+            "a slot that holds another binding isn't reset"
+        );
+        assert!(
+            server.slot_diag(v(50)).is_none(),
+            "the call skips the stream past the page table's end and doesn't grow the table"
+        );
+        drop(receivers);
     }
 }

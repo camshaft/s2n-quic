@@ -14,6 +14,7 @@ use crate::{
         schedule::{self, Initiator},
         seal, sender,
     },
+    queue::{OwedReset, OwedResets},
     tracing::*,
 };
 use s2n_codec::EncoderBuffer;
@@ -104,6 +105,36 @@ pub enum QueueState {
     Client(Arc<crate::queue::ClientState>),
     /// Server: owns the page table that the client addresses into.
     Server(Arc<crate::queue::ServerState>),
+}
+
+impl QueueState {
+    /// Returns `true` while a stream on this path has a receiver its app still holds, so that
+    /// a reader or a writer on this side may wait on the peer.
+    pub fn has_open_stream(&self) -> bool {
+        match self {
+            Self::Client(state) => state.has_open_slot(),
+            Self::Server(state) => state.has_open_slot(),
+        }
+    }
+
+    /// The resets this side owes the peer for the streams it reset when it found the peer
+    /// unresponsive and marked it dead ([`Entry::mark_dead_owing_resets`]).
+    pub fn owed_resets(&self) -> &OwedResets {
+        match self {
+            Self::Client(state) => &state.owed_resets,
+            Self::Server(state) => &state.owed_resets,
+        }
+    }
+
+    /// The stream of each slot this side holds whose writer recorded the peer's queue, as a reset
+    /// of it that this side owes the peer routes: each stream on the path that the dead mark
+    /// resets on this side (`peer_dead_broadcast`).
+    pub fn open_streams(&self) -> Vec<OwedReset> {
+        match self {
+            Self::Client(state) => state.open_streams(),
+            Self::Server(state) => state.open_streams(),
+        }
+    }
 }
 
 impl SizeOf for Entry {
@@ -402,14 +433,60 @@ impl Entry {
     /// after a transient blip (e.g. a deploy restart) — and an idle probe re-arms the window, so it
     /// never claws out. Clearing here is the recovery path. The clear is idempotent and cheap: a
     /// relaxed load skips the store in the common (already-clear) case.
-    pub fn touch_activity(&self, now: crate::time::precision::Timestamp) {
+    ///
+    /// Returns `true` where this call cleared a dead mark: the peer is reachable again, so the
+    /// caller sends the resets this side owes it ([`Self::take_owed_resets`]).
+    pub fn touch_activity(&self, now: crate::time::precision::Timestamp) -> bool {
         self.last_activity.store(now.nanos, Ordering::Release);
 
         // Common case: not dead — avoid a needless store (and its cache-line invalidation) on the
         // hot receive path. Only pay the write when a mark actually needs clearing.
         if self.dead_at.load(Ordering::Relaxed) >= 0 {
-            self.dead_at.store(-1, Ordering::Release);
+            // A swap, so that where two receive workers clear the mark at once, only one of them
+            // reports it and sends the owed resets.
+            return self.dead_at.swap(-1, Ordering::AcqRel) >= 0;
         }
+        false
+    }
+
+    /// Records `resets`, streams that this side reset as it found the peer unresponsive and
+    /// marked it dead, until a packet from the peer clears the dead mark
+    /// ([`Self::touch_activity`]): the peer isn't told that this side reset those streams, so its
+    /// end of each may still wait on this side. [`Self::mark_dead_owing_resets`] records them
+    /// before it marks the peer dead, so that the packet that clears the mark finds them. Returns
+    /// how many of them weren't owed already.
+    pub fn owe_resets(&self, resets: impl IntoIterator<Item = OwedReset>) -> usize {
+        self.queue_state.owed_resets().record(resets)
+    }
+
+    /// Takes the resets this side owes the peer, once a packet from it cleared the dead mark.
+    pub fn take_owed_resets(&self) -> Vec<OwedReset> {
+        self.queue_state.owed_resets().take()
+    }
+
+    /// Marks the entry dead at `now` unless it was marked within `cooldown`, as
+    /// [`Self::mark_dead_if_cooldown_elapsed`] does, once it records a reset this side owes the
+    /// peer for each stream of `failed` and for each stream open on the path
+    /// ([`QueueState::open_streams`]). These are the streams the dead mark resets on this side:
+    /// `failed` holds the streams whose frames the send idle wheel failed, and an open stream may
+    /// have none of its frames held at all, as an idle writer's or that of a reader that sent
+    /// every MaxData update. The records come before the mark, so that a packet from the peer
+    /// that arrives between the two doesn't find a mark to clear, and the packet that clears the
+    /// mark finds every record. Returns how many of the streams weren't owed already, as
+    /// [`Self::owe_resets`] does, and, where it marked the entry dead, the open streams it read:
+    /// the streams the dead mark resets on this side (`peer_dead_broadcast`), each of them owed a
+    /// reset. A stream that read doesn't name, one bound after it or one whose writer hadn't
+    /// recorded the peer's queue yet, isn't reset on this side, and so isn't owed.
+    pub fn mark_dead_owing_resets(
+        &self,
+        now: crate::time::precision::Timestamp,
+        cooldown: Duration,
+        failed: impl IntoIterator<Item = OwedReset>,
+    ) -> (usize, Option<Vec<OwedReset>>) {
+        let open = self.queue_state.open_streams();
+        let recorded = self.owe_resets(failed.into_iter().chain(open.iter().copied()));
+        let marked = self.mark_dead_if_cooldown_elapsed(now, cooldown);
+        (recorded, marked.then_some(open))
     }
 
     pub fn last_activity(&self) -> crate::time::precision::Timestamp {

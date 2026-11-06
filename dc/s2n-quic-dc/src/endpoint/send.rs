@@ -608,6 +608,10 @@ pub(crate) struct Context {
     /// periodically makes an ACK-only packet ack-eliciting so that the peer
     /// responds and we can measure the round-trip time.
     pub rtt_tracker: AckRttTracker,
+    /// The quiet period the send idle wheel last probed with a Ping, by the nanoseconds of
+    /// its last peer activity: set by `send_idle_wheel_drain` when it probes a quiet path that
+    /// has an open stream, so that it probes each quiet period once.
+    pub idle_probe_for: Option<u64>,
 }
 
 impl crate::socket::channel::ByteCost for Context {
@@ -764,6 +768,7 @@ impl Context {
             last_peer_activity: clock.now(),
             invalidated: false,
             rtt_tracker: AckRttTracker::default(),
+            idle_probe_for: None,
         })
     }
 
@@ -925,6 +930,14 @@ impl Context {
 
         let idle_timeout = if !self.is_idle_scheduled() {
             let timeout = self.path_secret_entry.idle_timeout();
+            // A path with an open stream is first checked half an idle timeout from now, so
+            // that the idle wheel can probe it while it is quiet, before the idle timeout
+            // decides (`send_idle_wheel_drain`).
+            let timeout = if self.path_secret_entry.queue_state().has_open_stream() {
+                timeout / 2
+            } else {
+                timeout
+            };
             let target = clock.now() + timeout;
             self.idle_wheel.target_time = Some(target);
             true
@@ -1535,6 +1548,39 @@ impl Cache {
         ctx.invalidated = true;
         debug!(%id, sender_idx = %self.sender_idx, "invalidating send context");
         Some(ctx.drain_frames(Some(reason), cancelled))
+    }
+
+    /// Invalidates `context` as [`Self::invalidate`] does, where the cache still holds that
+    /// context for its path. Otherwise it leaves the cache as it is and returns `None`.
+    ///
+    /// The send idle wheel calls this at a context's expiry. A context that an earlier
+    /// invalidation removed from the cache, such as [`Self::invalidate_stale_key`], stays on
+    /// the idle wheel until its deadline, and by then the cache may hold a newer context for
+    /// the same path: that context and its frames are left as they are.
+    pub fn invalidate_context(
+        &mut self,
+        context: &Rc<RefCell<Context>>,
+        reason: frame::FailureReason,
+        cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
+    ) -> Option<(
+        usize,
+        usize,
+        intrusive::Queue<crate::stream::endpoint::msg::Sender>,
+    )> {
+        let id = *context.borrow().path_secret_entry.id();
+        let holds = self
+            .contexts
+            .get(&id)
+            .is_some_and(|ctx| Rc::ptr_eq(ctx, context));
+        if !holds {
+            trace!(
+                %id,
+                sender_idx = %self.sender_idx,
+                "invalidate_context: the cache holds another context for the path, or none"
+            );
+            return None;
+        }
+        self.invalidate(&id, reason, cancelled)
     }
 
     pub fn invalidate_stale_key(
