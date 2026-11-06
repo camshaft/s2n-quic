@@ -226,11 +226,9 @@ async fn serve(mut server: Server, map: secret::Map, address: SocketAddr) {
 
             match rt::timeout_at(deadline, ConfirmComplete::wait_ready(&mut connection)).await {
                 Ok(Ok(())) => {
-                    let _ = rt::timeout_at(
-                        deadline,
-                        MtuConfirmComplete::wait_ready(&mut connection),
-                    )
-                    .await;
+                    let _ =
+                        rt::timeout_at(deadline, MtuConfirmComplete::wait_ready(&mut connection))
+                            .await;
                 }
                 Ok(Err(e)) => {
                     debug!(
@@ -723,11 +721,7 @@ mod tests {
         path::secret::{stateless_reset::Signer, Map},
         testing::{
             ext::{GroupExt as _, PrimaryExt as _, SpawnExt as _},
-            init_tracing,
-            sim,
-            without_snapshots,
-            NoopSubscriber,
-            TestTlsProvider,
+            init_tracing, sim, without_snapshots, NoopSubscriber, TestTlsProvider,
         },
     };
     use s2n_quic::provider::{
@@ -1000,7 +994,10 @@ mod tests {
             peer_a,
         )
         .await;
-        assert!(TokioInstant::now() >= deadline, "the wait lasts until the deadline");
+        assert!(
+            TokioInstant::now() >= deadline,
+            "the wait lasts until the deadline"
+        );
         assert_eq!(answer, limit::Answer::Failed(peer_a));
         assert_eq!(timeouts(), 1);
         // One peer's missed deadline leaves the limit as it is.
@@ -1190,7 +1187,10 @@ mod tests {
             .spawn();
         });
 
-        assert!(done_check.load(Ordering::SeqCst), "the client task didn't finish");
+        assert!(
+            done_check.load(Ordering::SeqCst),
+            "the client task didn't finish"
+        );
     }
 
     #[test]
