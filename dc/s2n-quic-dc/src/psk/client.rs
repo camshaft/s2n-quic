@@ -159,6 +159,12 @@ impl Provider {
             return Ok((entry, HandshakeKind::Cached));
         }
 
+        // Where the handshake queue still holds the success of the handshake that built an
+        // entry the map has since evicted, as after an accepted UnknownPathSecret, the connect
+        // below would get that success back without handshaking, and this call would fail. Drop
+        // that hold, so the connect handshakes again.
+        self.state.client.forget_completed_handshake(peer);
+
         // Unconditionally request a background handshake. This schedules any re-handshaking
         // needed. We put this after get_tracked because that saves us a global lock to check
         // presence in the map in the happy path.
@@ -342,7 +348,7 @@ mod tests {
         testing::{init_tracing, server_name, NoopSubscriber, TestTlsProvider},
     };
     use s2n_quic_core::time::StdClock;
-    use std::{io::ErrorKind, time::Duration};
+    use std::time::Duration;
 
     fn test_map() -> Map {
         Map::builder()
@@ -355,10 +361,9 @@ mod tests {
     }
 
     /// The case `handshake_replacing` covers, with a real handshake. While the handshake queue
-    /// still holds the success of the handshake that built an evicted entry, the next handshake
-    /// returns that success without handshaking, and fails since the map has no entry.
-    /// `handshake_replacing` drops the hold, so its handshake builds a new entry, here for an
-    /// entry that another caller evicted first.
+    /// still holds the success of the handshake that built an evicted entry, here one that
+    /// another caller evicted first, `handshake_replacing` drops the hold, so its handshake
+    /// builds a new entry.
     #[tokio::test]
     async fn handshake_replacing_replaces_an_evicted_entry() {
         init_tracing();
@@ -399,14 +404,10 @@ mod tests {
         client.map().evict_entry(&first);
         assert!(!client.map().contains(&server_addr));
 
-        // While the hold stands, the held success comes back without a handshake, and the map
-        // has no entry for the peer.
-        let error = client
-            .handshake_with_entry(server_addr, server_name())
-            .await
-            .map(|_| ())
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+        assert!(
+            client.state.client.has_pending_entry(server_addr),
+            "the handshake queue still holds the first handshake's success"
+        );
 
         let (second, kind) = client
             .handshake_replacing(server_addr, &first, server_name())
@@ -414,6 +415,89 @@ mod tests {
             .unwrap();
         assert!(matches!(kind, HandshakeKind::Fresh));
         assert_ne!(*second.into_raw().id(), first_id);
+    }
+
+    /// An UnknownPathSecret that the client accepts evicts the entry of a handshake whose
+    /// success the handshake queue still holds. The next `handshake_with_entry` drops that hold
+    /// and handshakes again, so it gets a new entry instead of the held success and an error.
+    #[tokio::test]
+    async fn unknown_path_secret_eviction_inside_the_success_hold_handshakes_again() {
+        init_tracing();
+
+        let tls = TestTlsProvider {};
+        let server = crate::psk::server::Provider::builder()
+            .start(
+                "[::1]:0".parse().unwrap(),
+                tls.clone(),
+                NoopSubscriber {},
+                test_map(),
+            )
+            .await
+            .unwrap();
+        let server_addr = server.local_addr();
+
+        // A client map that evicts an entry once it accepts an UnknownPathSecret for it.
+        let map = Map::builder()
+            .with_signer(Signer::new(b"default"))
+            .with_capacity(50_000)
+            .with_evict_on_unknown_path_secret(true)
+            .with_clock(StdClock::default())
+            .with_subscriber(NoopSubscriber {})
+            .build()
+            .unwrap();
+        // A success hold far longer than the test, so the first handshake's success is still
+        // held when the packet evicts its entry.
+        let client = Provider::builder()
+            .with_success_jitter(Duration::from_secs(1_000_000))
+            .start(
+                "[::]:0".parse().unwrap(),
+                map,
+                tls,
+                NoopSubscriber {},
+                server_name(),
+            )
+            .unwrap();
+
+        let (first, kind) = client
+            .handshake_with_entry(server_addr, server_name())
+            .await
+            .unwrap();
+        assert!(matches!(kind, HandshakeKind::Fresh));
+        let first = first.into_raw();
+
+        // While the map holds the first handshake's entry, the queue keeps that success.
+        client.state.client.forget_completed_handshake(server_addr);
+        assert!(
+            client.state.client.has_pending_entry(server_addr),
+            "the queue keeps a success whose entry the map holds"
+        );
+
+        // An UnknownPathSecret from the server for the first entry: its credential id is the one
+        // the client sent on the wire, and its tag is the entry's stateless reset.
+        let packet = crate::packet::secret_control::unknown_path_secret::Packet::new_for_test(
+            first.id().for_peer(),
+            &first.sender().stateless_reset,
+        );
+        let accepted = client
+            .map()
+            .handle_unknown_path_secret_packet(&packet, &server_addr);
+        assert!(accepted.is_some(), "the map accepts the packet");
+        assert!(
+            !client.map().contains(&server_addr),
+            "the map evicted the entry"
+        );
+        assert!(
+            client.state.client.has_pending_entry(server_addr),
+            "the queue still holds the first handshake's success"
+        );
+
+        let (second, kind) = client
+            .handshake_with_entry(server_addr, server_name())
+            .await
+            .expect("the next handshake builds a new entry");
+        assert!(matches!(kind, HandshakeKind::Fresh));
+        assert_ne!(*second.into_raw().id(), *first.id());
+        assert!(client.map().contains(&server_addr));
     }
 
     /// A thousand concurrent `handshake_replacing` calls for one dead entry share one handshake.
