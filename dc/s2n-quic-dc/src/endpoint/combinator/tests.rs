@@ -2539,6 +2539,11 @@ fn interface_paced_pick_two_returns_the_credit_of_each_waiting_peer_when_the_wor
         CAP + 2 * CREDIT,
         "the router didn't return the credit of each waiting batch to the pool",
     );
+    assert_eq!(
+        router.waiter_entries(),
+        0,
+        "the router kept the waiters of its dropped batches",
+    );
 
     // A poll after the end finds that the router holds nothing.
     assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
@@ -2577,7 +2582,7 @@ fn interface_paced_pick_two_ends_when_a_waiting_batch_finds_its_worker_gone() {
     let sender = LocalSenderId::from_index;
     assert!(entry.set_sender_lost(sender(1), true));
     let mut values = test_items(&entry, 3, 100_000, &drop_counter);
-    values[1].flow_credits = CREDIT;
+    values[2].flow_credits = CREDIT;
     let gone = Rc::new(std::cell::Cell::new(false));
     let senders: Vec<_> = (0..2)
         .map(|_| GoneSender {
@@ -2601,17 +2606,21 @@ fn interface_paced_pick_two_ends_when_a_waiting_batch_finds_its_worker_gone() {
     // router. The input stays open.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
 
-    // Once the pair of the second interface's sender delivers again, the waiting batch goes to
-    // that sender, whose receiver is gone: the router ends in that poll, though its input is
-    // open, and returns the credit of the batch held on the first interface.
-    assert!(entry.set_sender_lost(sender(1), false));
+    // The pacer releases the second batch to the first interface's sender.
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_once(&mut router), Poll::Ready(Some(())));
+
+    // Once the first interface may send again, the router offers the waiting batch to its
+    // sender, whose receiver is gone: the router ends in that poll, though its input is open,
+    // and returns the credit of the waiting batch.
+    clock.advance(std::time::Duration::from_millis(1));
     gone.set(true);
     assert_eq!(poll_once(&mut router), Poll::Ready(None));
     assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
     assert_eq!(
         pool.debug_available() as u64 + pool.debug_returned(),
         CAP + CREDIT,
-        "the router didn't return the held batch's send credit to the pool",
+        "the router didn't return the waiting batch's send credit to the pool",
     );
 }
 
@@ -2651,6 +2660,236 @@ fn interface_paced_pick_two_ends_without_consuming_a_batch_whose_worker_is_gone(
     assert_eq!(poll_once(&mut router), Poll::Ready(None));
     assert_eq!(consumed.get(), 0);
     assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn interface_paced_pick_two_offers_a_waiting_batch_only_once_an_interface_it_waits_on_frees() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    // The pair of the second interface's sender is lost, so the first interface's sender takes
+    // each batch, and a batch that waits waits on the first interface alone.
+    let entry = test_path_secret_entry();
+    let sender = LocalSenderId::from_index;
+    assert!(entry.set_sender_lost(sender(1), true));
+    let consumed = Rc::new(std::cell::Cell::new(0));
+    let rx = SharedTestReceiver {
+        values: test_items(&entry, 3, 100_000, &drop_counter),
+        consumed: Rc::clone(&consumed),
+    };
+    let first = Sends::default();
+    let second = Sends::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&first, &second]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    // The first batch goes at once, the second waits on the first interface, and the third
+    // waits in the router.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(first.borrow().len(), 1);
+
+    // The pair of the second interface's sender delivers again, and that interface is free, but
+    // the first interface, which the waiting batch waits on, still holds a batch: the poll
+    // doesn't offer the waiting batch again, so the second interface's sender doesn't get it.
+    assert!(entry.set_sender_lost(sender(1), false));
+    assert_eq!(poll_once(&mut router), Poll::Pending);
+    assert!(
+        second.borrow().is_empty(),
+        "the router offered the waiting batch before an interface it waits on freed",
+    );
+    assert_eq!(first.borrow().len(), 1);
+
+    // Once the first interface frees, the router offers the waiting batch, and each batch goes.
+    clock.advance(std::time::Duration::from_millis(1));
+    let _ = poll_until_idle(&mut router);
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(first.borrow().len() + second.borrow().len(), 3);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+    assert_eq!(consumed.get(), 300_000);
+}
+
+#[test]
+fn interface_paced_pick_two_skips_the_interfaces_a_peer_still_waits_on_when_it_waits_again() {
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let sender = LocalSenderId::from_index;
+    let peer = |address: &str, lost: &[usize]| {
+        let entry = PathSecretEntry::builder(address.parse().unwrap())
+            .socket_sender_count(3)
+            .build(None);
+        for &idx in lost {
+            assert!(entry.set_sender_lost(sender(idx), true));
+        }
+        entry
+    };
+    // The first peer's batches go to the first interface's sender alone, and the second peer's
+    // to the second interface's. The third peer's batches may go to either of those two senders.
+    let first_peer = peer("127.0.0.1:4433", &[1, 2]);
+    let second_peer = peer("127.0.0.1:4434", &[0, 2]);
+    let third_peer = peer("127.0.0.1:4435", &[2]);
+    let mut values = test_items(&first_peer, 2, 100_000, &drop_counter);
+    values.extend(test_items(&second_peer, 2, 100_000, &drop_counter));
+    values.extend(test_items(&third_peer, 2, 100_000, &drop_counter));
+    let consumed = Rc::new(std::cell::Cell::new(0));
+    let rx = SharedTestReceiver {
+        values,
+        consumed: Rc::clone(&consumed),
+    };
+    let sends: [Sends; 3] = Default::default();
+    // The second interface sends a hundredth as fast, so it holds its batch while the first
+    // interface frees twice.
+    let pacing = SendPacing::new(
+        vec![Rate::new(1.0), Rate::new(0.01), Rate::new(1.0)],
+        vec![0, 1, 2],
+    );
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&sends[0], &sends[1], &sends[2]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+    let counts = || [0, 1, 2].map(|idx| sends[idx].borrow().len());
+
+    // The first batch of each of the first two peers goes, and its second waits on its
+    // interface. The third peer's first batch waits in the router on the first two interfaces,
+    // and its second waits behind it.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(counts(), [1, 1, 0]);
+    assert_eq!(router.waiter_entries(), 2);
+
+    // The first interface frees: the router sends the first peer's second batch, and then holds
+    // the third peer's first batch on that interface. The third peer's second batch waits again
+    // on the first interface, and the third peer stays listed once on the second.
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_once(&mut router), Poll::Ready(Some(())));
+    assert_eq!(poll_once(&mut router), Poll::Ready(Some(())));
+    assert_eq!(poll_once(&mut router), Poll::Pending);
+    assert_eq!(counts(), [2, 1, 0]);
+    assert_eq!(router.waiter_entries(), 2);
+
+    // The first interface frees again: the router sends the third peer's first batch and holds
+    // its second on that interface, and the third peer no longer waits.
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(counts(), [3, 1, 0]);
+
+    // Once the second interface frees, the router skips the third peer's entry in its waiters,
+    // and ends once each batch went.
+    clock.advance(std::time::Duration::from_millis(100));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(counts(), [4, 2, 0]);
+    assert_eq!(router.waiter_entries(), 0);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 6);
+    assert_eq!(consumed.get(), 600_000);
+}
+
+#[test]
+fn interface_paced_pick_two_offers_a_waiting_highest_priority_batch_as_an_interface_frees() {
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    // The second interface carries the highest-priority traffic. The pair of its sender is lost
+    // for the first peer, so the first interface's sender takes that peer's highest-priority
+    // batches, paced. The pair of the first interface's sender is lost for the second peer, so
+    // the second interface's sender takes each batch of that peer.
+    let waits = test_path_secret_entry();
+    assert!(waits.set_sender_lost(LocalSenderId::from_index(1), true));
+    let other = PathSecretEntry::builder("127.0.0.1:4434".parse().unwrap())
+        .socket_sender_count(2)
+        .build(None);
+    assert!(other.set_sender_lost(LocalSenderId::from_index(0), true));
+    // The input holds two highest-priority batches of the first peer, two other batches of the
+    // second peer, and a third highest-priority batch of the first peer.
+    let mut values = VecDeque::new();
+    for (entry, highest_priority) in [
+        (&waits, true),
+        (&waits, true),
+        (&other, false),
+        (&other, false),
+        (&waits, true),
+    ] {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = 100_000;
+        item.highest_priority = highest_priority;
+        values.push_back(item);
+    }
+    let consumed = Rc::new(std::cell::Cell::new(0));
+    let rx = SharedTestReceiver {
+        values,
+        consumed: Rc::clone(&consumed),
+    };
+    let first = Sends::default();
+    let second = Sends::default();
+    // The second interface sends a hundredth as fast, so it holds its batch while the first
+    // interface frees.
+    let pacing = SendPacing::new(vec![Rate::new(1.0), Rate::new(0.01)], vec![0, 1])
+        .with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&first, &second]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    // Each peer's first batch goes at once to its interface, and its second waits on that
+    // interface. Each interface holds a batch, so the first peer's third batch waits in the
+    // router on the first interface.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(first.borrow().len(), 1);
+    assert_eq!(second.borrow().len(), 1);
+    assert_eq!(router.waiter_entries(), 1);
+
+    // The pair of the second interface's sender delivers to the first peer again, but the first
+    // interface, which the waiting batch waits on, still holds a batch: the poll doesn't offer
+    // the waiting batch again, so the second interface's sender doesn't get it.
+    assert!(waits.set_sender_lost(LocalSenderId::from_index(1), false));
+    assert_eq!(poll_once(&mut router), Poll::Pending);
+    assert_eq!(
+        second.borrow().len(),
+        1,
+        "the router offered the waiting batch before an interface it waits on freed",
+    );
+
+    // The pacer releases the first peer's second batch to the first interface's sender, and the
+    // first interface frees.
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_once(&mut router), Poll::Ready(Some(())));
+    assert_eq!(first.borrow().len(), 2);
+
+    // The router offers the waiting batch, which goes at once to the interface for the
+    // highest-priority traffic now that its sender delivers to the first peer.
+    assert_eq!(poll_once(&mut router), Poll::Ready(Some(())));
+    assert_eq!(
+        second.borrow().len(),
+        2,
+        "the waiting batch didn't go to the interface for the highest-priority traffic",
+    );
+    assert_eq!(first.borrow().len(), 2);
+
+    // Once the second interface may send again, its held batch goes, and the router ends.
+    clock.advance(std::time::Duration::from_secs(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(first.borrow().len(), 2);
+    assert_eq!(second.borrow().len(), 3);
+    assert_eq!(router.waiter_entries(), 0);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 5);
+    assert_eq!(consumed.get(), 500_000);
 }
 
 #[test]
