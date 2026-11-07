@@ -480,7 +480,9 @@ where
     >,
 
     advertised_peer_info: Option<bytes::Bytes>,
-    advertised_data_addrs: Option<bytes::Bytes>,
+    /// The `DcDataAddresses` payload, which `set_advertised_data_interfaces` tags with the
+    /// interface of each address once the endpoint knows its interfaces.
+    advertised_data_addrs: RwLock<Option<bytes::Bytes>>,
 
     cleaner: Cleaner,
 
@@ -615,7 +617,7 @@ where
             subscriber,
             request_handshake: RwLock::new(None),
             advertised_peer_info,
-            advertised_data_addrs,
+            advertised_data_addrs: RwLock::new(advertised_data_addrs),
             mk_application_data: RwLock::new(None),
         };
 
@@ -917,7 +919,29 @@ where
     }
 
     fn advertised_data_addrs(&self) -> Option<bytes::Bytes> {
-        self.advertised_data_addrs.clone()
+        self.advertised_data_addrs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_advertised_data_interfaces(&self, local: &[(SocketAddr, u16)]) {
+        let mut advertised = self
+            .advertised_data_addrs
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let tagged = advertised
+            .as_ref()
+            .and_then(|payload| super::data_addresses::tag_interfaces(payload, local));
+        if let Some(tagged) = tagged {
+            tracing::debug!(
+                target: "dc_negotiation",
+                interfaces = local.len(),
+                encoded_len = tagged.len(),
+                "set_advertised_data_interfaces: tagging local DcDataAddresses payload"
+            );
+            *advertised = Some(tagged);
+        }
     }
 
     #[allow(clippy::type_complexity)]

@@ -1,7 +1,11 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{entry::ApplicationData, Entry, Map};
+use super::{
+    data_addresses::DataAddr,
+    entry::{ApplicationData, PeerDataAddrs, PeerDataInterfaces},
+    Entry, Map,
+};
 use crate::{
     packet::secret_control as control,
     path::secret::{receiver, schedule, sender},
@@ -36,9 +40,10 @@ struct HandshakingPathInner {
     /// Raw bytes of the peer's `DcDataAddresses` transport parameter, decoded
     /// and validated lazily in `validate_peer_data_addrs`.
     peer_data_addrs_bytes: Option<bytes::Bytes>,
-    /// Decoded and validated peer data addresses, populated by
-    /// `validate_peer_data_addrs` and consumed by `on_peer_stateless_reset_tokens`.
-    peer_data_addrs: Option<Vec<SocketAddr>>,
+    /// Decoded and validated peer data addresses, each with its interface where the peer
+    /// tags it, populated by `validate_peer_data_addrs` and consumed by
+    /// `on_peer_stateless_reset_tokens`.
+    peer_data_addrs: Option<Vec<DataAddr>>,
     map: Map,
 
     error: Option<Box<dyn Error + Send + Sync>>,
@@ -158,12 +163,15 @@ impl dc::Path for HandshakingPath {
 /// kernel an `AF_INET` sockaddr on an IPv6 socket. An empty list is left as-is (the peer simply
 /// advertised nothing); per-send context creation handles the no-addrs case.
 ///
+/// Each address keeps the interface the peer tagged it with: the substitution and the
+/// normalization change the address alone.
+///
 /// Returns `TRANSPORT_PARAMETER_ERROR` if the peer advertised more than
 /// [`MAX_PEER_DATA_ADDRS`](super::MAX_PEER_DATA_ADDRS) addresses, a wildcard port, or a loopback
 /// address from a non-loopback peer.
 fn validate_peer_data_addrs(
     peer: SocketAddr,
-    addrs: &mut [SocketAddr],
+    addrs: &mut [DataAddr],
 ) -> Result<(), s2n_quic_core::transport::Error> {
     use std::net::IpAddr;
 
@@ -188,7 +196,7 @@ fn validate_peer_data_addrs(
     let peer_ip = peer.ip();
     let peer_is_loopback = peer_ip.is_loopback();
 
-    for addr in addrs.iter_mut() {
+    for DataAddr { addr, .. } in addrs.iter_mut() {
         if addr.port() == 0 {
             ::tracing::error!(%addr, %peer, "peer data addr has wildcard port");
             return Err(
@@ -231,6 +239,20 @@ fn validate_peer_data_addrs(
     ::tracing::debug!(%peer, ?addrs, "validated peer data addresses");
 
     Ok(())
+}
+
+/// Splits the validated addresses into the entry's address list and its interface list,
+/// which is empty where the peer didn't tag an address, as a peer without interface
+/// entries advertises one untagged interface.
+fn split_peer_data_addrs(addrs: Option<Vec<DataAddr>>) -> (PeerDataAddrs, PeerDataInterfaces) {
+    let addrs = addrs.unwrap_or_default();
+    let interfaces: PeerDataInterfaces = if addrs.iter().any(|addr| addr.interface.is_some()) {
+        addrs.iter().map(|addr| addr.interface).collect()
+    } else {
+        Arc::from([])
+    };
+    let addrs: PeerDataAddrs = addrs.iter().map(|addr| addr.addr).collect();
+    (addrs, interfaces)
 }
 
 impl HandshakingPathInner {
@@ -332,7 +354,8 @@ impl HandshakingPathInner {
 
         let receiver = receiver::State::new();
         let socket_sender_count = self.map.store.socket_sender_count();
-        let peer_data_addrs = core::mem::take(&mut self.peer_data_addrs);
+        let (peer_data_addrs, peer_data_interfaces) =
+            split_peer_data_addrs(core::mem::take(&mut self.peer_data_addrs));
 
         let entry = Entry::new_with_socket_senders(
             self.peer,
@@ -344,9 +367,10 @@ impl HandshakingPathInner {
             self.parameters.clone(),
             self.map.store.get_time(),
             self.application_data.take(),
-            peer_data_addrs.unwrap_or_default().into(),
+            peer_data_addrs,
             socket_sender_count,
-        );
+        )
+        .with_peer_data_interfaces(peer_data_interfaces);
         let entry = Arc::new(entry);
         self.entry = Some(entry.clone());
         self.map.store.on_new_path_secrets(entry);
@@ -369,7 +393,7 @@ impl HandshakingPathInner {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_peer_data_addrs;
+    use super::{split_peer_data_addrs, validate_peer_data_addrs, DataAddr};
     use std::net::SocketAddr;
 
     fn addr(s: &str) -> SocketAddr {
@@ -377,9 +401,9 @@ mod tests {
     }
 
     fn validate(peer: &str, addrs: &[&str]) -> Result<Vec<SocketAddr>, ()> {
-        let mut addrs: Vec<SocketAddr> = addrs.iter().map(|s| addr(s)).collect();
+        let mut addrs: Vec<DataAddr> = addrs.iter().map(|s| DataAddr::untagged(addr(s))).collect();
         validate_peer_data_addrs(addr(peer), &mut addrs)
-            .map(|()| addrs)
+            .map(|()| addrs.iter().map(|addr| addr.addr).collect())
             .map_err(|_| ())
     }
 
@@ -444,5 +468,112 @@ mod tests {
             .collect();
         let refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
         assert!(validate("10.0.0.5:443", &refs).is_err());
+    }
+
+    /// The wildcard substitution and the family normalization keep each address's interface.
+    #[test]
+    fn tags_stay_with_their_addresses() {
+        let mut addrs = vec![
+            DataAddr {
+                addr: addr("[::]:9000"),
+                interface: Some(1),
+            },
+            DataAddr::untagged(addr("10.0.0.1:9001")),
+            DataAddr {
+                addr: addr("0.0.0.0:9002"),
+                interface: Some(2),
+            },
+        ];
+        validate_peer_data_addrs(addr("[2001:db8::1]:443"), &mut addrs).unwrap();
+        assert_eq!(
+            addrs,
+            vec![
+                DataAddr {
+                    addr: addr("[2001:db8::1]:9000"),
+                    interface: Some(1),
+                },
+                DataAddr::untagged(addr("[::ffff:10.0.0.1]:9001")),
+                DataAddr {
+                    addr: addr("[2001:db8::1]:9002"),
+                    interface: Some(2),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn untagged_addresses_split_into_an_empty_interface_list() {
+        let addrs = vec![
+            DataAddr::untagged(addr("10.0.0.1:9000")),
+            DataAddr::untagged(addr("10.0.0.2:9001")),
+        ];
+        let (addrs, interfaces) = split_peer_data_addrs(Some(addrs));
+        assert_eq!(&addrs[..], &[addr("10.0.0.1:9000"), addr("10.0.0.2:9001")]);
+        assert!(interfaces.is_empty());
+    }
+
+    #[test]
+    fn tagged_addresses_split_into_one_interface_for_each_address() {
+        let addrs = vec![
+            DataAddr {
+                addr: addr("10.0.0.1:9000"),
+                interface: Some(3),
+            },
+            DataAddr::untagged(addr("10.0.0.2:9001")),
+        ];
+        let (addrs, interfaces) = split_peer_data_addrs(Some(addrs));
+        assert_eq!(&addrs[..], &[addr("10.0.0.1:9000"), addr("10.0.0.2:9001")]);
+        assert_eq!(&interfaces[..], &[Some(3), None]);
+    }
+
+    #[test]
+    fn absent_addresses_split_into_empty_lists() {
+        let (addrs, interfaces) = split_peer_data_addrs(None);
+        assert!(addrs.is_empty());
+        assert!(interfaces.is_empty());
+    }
+
+    /// A tagged payload goes through the handshake's steps, `decode`, validation and the
+    /// split, to the path secret entry, which keeps each interface in the order of its address.
+    #[test]
+    fn a_tagged_payload_reaches_the_entry_with_each_interface_on_its_address() {
+        use super::super::data_addresses::{decode, encode_tagged};
+        use super::Entry;
+
+        let peer = addr("[2001:db8::1]:443");
+        let advertised = [
+            DataAddr {
+                addr: addr("[::]:9000"),
+                interface: Some(1),
+            },
+            DataAddr::untagged(addr("10.0.0.1:9001")),
+            DataAddr {
+                addr: addr("0.0.0.0:9002"),
+                interface: Some(2),
+            },
+        ];
+        let mut addrs = decode(&encode_tagged(&advertised)).unwrap();
+        validate_peer_data_addrs(peer, &mut addrs).unwrap();
+        let (peer_data_addrs, peer_data_interfaces) = split_peer_data_addrs(Some(addrs));
+        let entry = Entry::builder(peer)
+            .peer_data_addrs(peer_data_addrs)
+            .peer_data_interfaces(peer_data_interfaces)
+            .build(None);
+
+        assert_eq!(entry.peer_data_interfaces().len(), entry.peer_data_addrs().len());
+        let pairs: Vec<(SocketAddr, Option<u16>)> = entry
+            .peer_data_addrs()
+            .iter()
+            .copied()
+            .zip(entry.peer_data_interfaces().iter().copied())
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (addr("[2001:db8::1]:9000"), Some(1)),
+                (addr("[::ffff:10.0.0.1]:9001"), None),
+                (addr("[2001:db8::1]:9002"), Some(2)),
+            ]
+        );
     }
 }
