@@ -1276,3 +1276,7 @@ fn an_acknowledgement_only_context_probes_once_the_peer_is_quiet() {
     ctx.ack_only_since_peer_ack = true;
     clock.advance(threshold - Duration::from_millis(1));
     assert!(
+        !ctx.needs_delivery_probe(clock.get_time()),
+        "the peer acknowledged a packet less than a persistent congestion period ago"
+    );
+}
