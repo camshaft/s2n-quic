@@ -1147,7 +1147,11 @@ mod tests {
                     && entry.path_rtt() == kept_now.map(|time| time.min(kept))
             })
             .unwrap_or_else(|| panic!("{answer:?}, {kept:?}, {before:?}, {after:?}"));
-        let path = if read.measured { read.path() } else { earlier };
+        let path = if read.checked().measured {
+            read.path()
+        } else {
+            earlier
+        };
         assert_eq!(limit::path_rtt(Some(earlier), Some(read)), Some(path));
     }
 
