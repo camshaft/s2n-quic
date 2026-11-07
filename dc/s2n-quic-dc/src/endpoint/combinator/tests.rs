@@ -4349,6 +4349,10 @@ impl CreditlessCost for TestItem {
     fn set_waited(&mut self) {
         self.waited = true;
     }
+
+    fn creditless_peer(&self) -> Option<PeerKey> {
+        (self.flow_credits == 0).then(|| PeerKey::of(&self.path_secret_entry))
+    }
 }
 
 /// The window admits a frame while it holds nothing, refuses one past its limit, and grows its
@@ -4444,6 +4448,35 @@ fn creditless_window_starts_at_its_minimum_and_doesnt_halve_below_it() {
 
     window.release(1000, true);
     assert_eq!(window.limit(), 1000);
+}
+
+/// A frame of one peer that the window refused still grows the limit where a worker could take
+/// a batch, though the window admitted another peer's frame after it, and a frame of that peer
+/// that the window admits leaves nothing held back.
+#[test]
+fn creditless_window_grows_its_limit_while_it_holds_back_a_peers_frame() {
+    let window = CreditlessWindow::new(100);
+    // A clone stands for the batch router's, so that the window counts the frames.
+    let _router = window.clone();
+    // The two entries stay alive, so that their keys stay two peers'.
+    let (first_entry, second_entry) = (test_path_secret_entry(), test_path_secret_entry());
+    let (first, second) = (PeerKey::of(&first_entry), PeerKey::of(&second_entry));
+
+    // The window holds the first peer's bytes, so it refuses the first peer's next frame past
+    // its limit, and admits the second peer's frame as the first of its peer.
+    assert!(window.admit_peer(Some(first), 100));
+    assert!(!window.admit_peer(Some(first), 1));
+    assert!(window.admit_peer(Some(second), 1));
+    // The first peer's frame still waits, so the limit grows by the minimum.
+    window.starved();
+    assert_eq!(window.limit(), 200);
+
+    // A frame of the first peer that the window admits after it refused one of that peer leaves
+    // nothing held back, so the limit doesn't grow.
+    assert!(!window.admit_peer(Some(first), 1000));
+    assert!(window.admit_peer(Some(first), 1));
+    window.starved();
+    assert_eq!(window.limit(), 200);
 }
 
 /// A waker that counts its wakes.
@@ -4614,6 +4647,7 @@ fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window
 #[test]
 fn frame_batch_counts_the_bytes_of_its_frames_without_send_credit() {
     let path = test_path_secret_entry();
+    let peer = PeerKey::of(&path);
     let first = new_test_frame(path.clone(), 16);
     let first_cost = first.byte_cost();
     let mut batch = FrameBatch::new(first);
@@ -4635,6 +4669,36 @@ fn frame_batch_counts_the_bytes_of_its_frames_without_send_credit() {
     assert!(!entry.waited());
     entry.set_waited();
     assert!(entry.waited());
+    // The batch holds one peer's frames, whose bytes the window counts for that peer.
+    assert_eq!(entry.creditless_peer(), Some(peer));
+    // A batch of frames with send credit alone has no peer for the window.
+    let mut credited_only = new_test_frame(test_path_secret_entry(), 8);
+    credited_only.flow_credits = 1;
+    assert_eq!(FrameBatch::new(credited_only).creditless_peer(), None);
+}
+
+/// A worker's sender releases a batch's bytes for the batch's peer.
+#[test]
+fn window_sender_releases_a_batchs_bytes_for_its_peer() {
+    let entry = test_path_secret_entry();
+    let peer = PeerKey::of(&entry);
+    let window = CreditlessWindow::default();
+    let mut sender = WindowSender::new(
+        TestSender {
+            accept: true,
+            calls: 0,
+        },
+        window.clone(),
+    );
+    let mut item = new_test_item(entry, Arc::new(AtomicUsize::new(0)));
+    item.byte_cost = 1000;
+    assert_eq!(item.creditless_peer(), Some(peer));
+
+    assert!(window.admit_peer(Some(peer), item.creditless_bytes()));
+    assert_eq!(window.peer_held(peer), 1000);
+    assert!(sender.send(item).is_ok());
+    assert_eq!(window.held(), 0);
+    assert_eq!(window.peer_held(peer), 0);
 }
 
 /// The priority router of the window's pacing tests: it moves its items into the batch router's
@@ -5056,11 +5120,13 @@ fn creditless_window_records_its_refusals_and_limit_changes_as_events() {
     // A clone stands for the batch router's, so that the window counts the frames.
     let _router = window.clone();
 
-    // A frame while the window holds nothing doesn't record an event.
-    assert!(window.admit(100));
+    // A frame while the window holds nothing doesn't record an event. It is of the same peer as
+    // the next frame, so the window doesn't admit that frame as the first of its peer.
+    let path_secret_entry = test_path_secret_entry();
+    let peer_key = PeerKey::of(&path_secret_entry);
+    assert!(window.admit_peer(Some(peer_key), 100));
     assert!(events.take().is_empty());
     // A refused frame records its peer, its bytes, the bytes the window holds and the limit.
-    let path_secret_entry = test_path_secret_entry();
     let peer = *path_secret_entry.peer();
     let frame = new_test_frame(path_secret_entry, 1);
     let frame_bytes = frame.byte_cost();
@@ -5081,7 +5147,8 @@ fn creditless_window_records_its_refusals_and_limit_changes_as_events() {
 
     // A batch that didn't wait, a worker that could take a batch without a refusal and a release
     // of no bytes leave the limit as it is and don't record an event.
-    window.release(100, false);
+    window.release_peer(Some(peer_key), 100, false);
+    assert_eq!(window.peer_held(peer_key), 0);
     window.starved();
     window.release(0, true);
     assert_eq!(window.limit(), 128);
