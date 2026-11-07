@@ -84,8 +84,10 @@ impl CoreSub for DcPathCapture {
 }
 
 /// Records, for the handshake queue's start limit to read a handshake's time against, the lowest
-/// round-trip time each connection's recovery measured and the most that the packet of that
-/// round trip could have waited during the endpoint's last pass.
+/// round-trip time each connection's recovery measured and the part of it that the packet of that
+/// round trip waited in the endpoint's receive queue: the wait that the socket measured, where the
+/// packet's datagram holds one, or else the most that the packet could have waited during the
+/// endpoint's last pass.
 #[derive(Default)]
 struct PathRtt {
     /// The endpoint's last pass of its event loop.
@@ -113,20 +115,33 @@ impl Pass {
 struct PathRttContext {
     /// The `min_rtt` of the connection's newest recovery metrics, or `None` before the first.
     min_rtt: Option<Duration>,
-    /// The part of the round trip of `min_rtt` that the endpoint's last pass before the pass
-    /// that measured it ran.
+    /// The part of the round trip of `min_rtt` that its reply waited in the endpoint's receive
+    /// queue: the wait that the socket measured for the reply's datagram, where `measured`, or
+    /// else the part of it that the endpoint's last pass before the pass that measured it ran.
     waited: Duration,
+    /// Whether `waited` is the wait that the socket measured for the reply's datagram.
+    measured: bool,
+    /// The wait that the socket measured for the datagram that the connection reads now, from
+    /// the datagram's `DatagramReceiveWait`, or `None` where the datagram doesn't hold one.
+    receive_wait: Option<Duration>,
 }
 
 impl PathRttContext {
     /// Records the `min_rtt` of recovery metrics that the connection read at `read`, in the pass
-    /// after `last_pass`. Where `min_rtt` changed, the round trip that measured it sent its packet
-    /// at `read` less `min_rtt`, and the part of `last_pass` after that is the most that the
-    /// reply could have waited during the endpoint's last pass.
+    /// after `last_pass`. Recovery measures a new `min_rtt` as it reads an acknowledgement, so
+    /// where `min_rtt` changed, the datagram that the connection reads now holds the reply of the
+    /// round trip that measured it. Where the socket measured that datagram's wait, the part of
+    /// `min_rtt` that the reply waited is that whole wait, through each pass that ran while it
+    /// waited. Otherwise the round trip sent its packet at `read` less `min_rtt`, and the part of
+    /// `last_pass` after that is the most that the reply could have waited during the endpoint's
+    /// last pass.
     fn on_metrics(&mut self, read: Duration, min_rtt: Duration, last_pass: Pass) {
         if self.min_rtt != Some(min_rtt) {
             self.min_rtt = Some(min_rtt);
-            self.waited = last_pass.after(read.saturating_sub(min_rtt));
+            (self.waited, self.measured) = match self.receive_wait {
+                Some(wait) => (wait, true),
+                None => (last_pass.after(read.saturating_sub(min_rtt)), false),
+            };
         }
     }
 
@@ -136,6 +151,7 @@ impl PathRttContext {
         Some(limit::RoundTrips {
             lowest,
             waited: self.waited,
+            measured: self.measured,
         })
     }
 }
@@ -172,6 +188,27 @@ impl CoreSub for PathRtt {
         let read = meta.timestamp.duration_since_start();
         context.on_metrics(read, event.min_rtt, self.last_pass);
     }
+
+    fn on_datagram_received(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &events::ConnectionMeta,
+        _event: &events::DatagramReceived,
+    ) {
+        // A datagram's `DatagramReceiveWait`, where it holds one, comes after its
+        // `DatagramReceived` and before the recovery metrics that its packets publish, so a
+        // datagram without one doesn't read the wait of the datagram before it.
+        context.receive_wait = None;
+    }
+
+    fn on_datagram_receive_wait(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        _meta: &events::ConnectionMeta,
+        event: &events::DatagramReceiveWait,
+    ) {
+        context.receive_wait = Some(event.wait);
+    }
 }
 
 /// The round trips that a connection's recovery measured, or `None` before the first.
@@ -194,12 +231,13 @@ fn connection_entry(connection: &s2n_quic::Connection) -> Option<Arc<secret::map
 }
 
 /// Reads the start limit's answer for a handshake that reached dc.complete in `elapsed` from its
-/// connect, as `Answer::for_handshake` reads it from `earlier_rtt`, the lowest round-trip time
-/// that the earlier handshakes with the peer measured, and the round trips that this connection
-/// measured. It lowers the round-trip time of the connection's map entry to the lower of
-/// `earlier_rtt` and this connection's lowest round trip, as `limit::kept_rtt` reads them, so
-/// that the next handshake with the peer reads it as its `earlier_rtt`. `limit::read_handshake`
-/// reads the answer and that time together.
+/// connect, as `Answer::for_handshake` reads it from `earlier_rtt`, the round-trip time that the
+/// earlier handshakes with the peer kept, and the round trips that this connection measured. It
+/// sets the round-trip time of the connection's map entry to the time that `limit::kept_rtt`
+/// reads from them, so that the next handshake with the peer reads it as its `earlier_rtt`: the
+/// lower of `earlier_rtt` and this connection's lowest round trip, or, where the socket measured
+/// the wait of that round trip's reply, this connection's path alone, which may be above
+/// `earlier_rtt`. `limit::read_handshake` reads the answer and that time together.
 fn start_answer(
     connection: &s2n_quic::Connection,
     earlier_rtt: Option<Duration>,
@@ -209,7 +247,8 @@ fn start_answer(
     let (kept, answer) = limit::read_handshake(elapsed, earlier_rtt, rtt);
     if let (Some(entry), Some(kept)) = (connection_entry(connection), kept) {
         // The entry is the one this handshake's connection made, which doesn't keep a time
-        // before this, so lowering its time keeps this handshake's time.
+        // before this, so lowering its time keeps this handshake's time, whether or not it is
+        // above `earlier_rtt`.
         entry.lower_path_rtt(kept);
     }
     answer
@@ -387,6 +426,10 @@ impl Client {
             .with_initial_mtu(builder.mtu)?
             .with_max_mtu(builder.mtu)?
             .with_internal_recv_buffer_size(BUFFER_SIZE)?
+            // The socket's receive time of each datagram lets a connection count the whole time
+            // that a reply waited in the endpoint's receive queue, which the start limit doesn't
+            // count as the path's time.
+            .with_rx_timestamps(true)?
             .build()?;
 
         let client = s2n_quic::Client::builder().with_io(io)?;
@@ -607,8 +650,8 @@ impl HandshakeQueue {
             let permit_start = self.limiter_start.acquire().await;
             let limiter_duration = start.elapsed();
 
-            // The lowest round-trip time that the earlier handshakes with this peer measured, from
-            // the peer's map entry, read before this handshake's entry takes its place.
+            // The round-trip time that the earlier handshakes with this peer kept for its path,
+            // from the peer's map entry, read before this handshake's entry takes its place.
             let earlier_rtt = map.get_raw(peer).and_then(|entry| entry.path_rtt());
 
             let mut attempt =
@@ -816,7 +859,11 @@ mod tests {
         endpoint_limits::{ConnectionAttempt, Limiter, Outcome},
         tls::Provider,
     };
-    use s2n_quic_core::time::StdClock;
+    use s2n_quic_core::{
+        endpoint,
+        event::{builder, IntoEvent},
+        time::{clock::testing as clock, StdClock, Timestamp},
+    };
     use std::time::Instant;
     use tokio_util::sync::DropGuard;
 
@@ -1039,7 +1086,7 @@ mod tests {
     /// Verifies that a client's connection has measured its path's round trips by dc.complete,
     /// that the start limit's answer for its handshake reads them as `Answer::for_handshake`
     /// does, with or without the time that the peer's map entry kept, and that the connection's
-    /// map entry keeps the lower of the earlier time and its lowest round trip.
+    /// map entry keeps the time that `limit::kept_rtt` reads from them.
     #[tokio::test]
     async fn the_start_answer_takes_two_measured_round_trips_out_of_the_time() {
         let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
@@ -1068,40 +1115,47 @@ mod tests {
         let after = round_trips();
         assert!(after.lowest > Duration::ZERO);
         assert!(matches!(answer, limit::Answer::Latency(_)), "{answer:?}");
-        // The connection's map entry, which the map holds for the peer, keeps the lowest round
-        // trip of the round trips that the answer read, without the part that its reply could
-        // have waited taken out.
+        // The connection's map entry, which the map holds for the peer, keeps the time that
+        // `limit::kept_rtt` reads from the round trips that the answer read: their lowest round
+        // trip, or, where the socket measured the wait of its reply, the lowest less that wait.
         let entry = connection_entry(&connection).expect("its map entry");
         let peer_entry = setup.client.map.get_raw(setup.server_addr).unwrap();
         assert!(Arc::ptr_eq(&entry, &peer_entry));
         let kept = entry.path_rtt().expect("a kept round trip");
-        let read = [before, after]
+        [before, after]
             .into_iter()
             .find(|rtt| {
                 answer == limit::Answer::for_handshake(elapsed, None, Some(*rtt))
-                    && kept == rtt.lowest
+                    && Some(kept) == limit::kept_rtt(None, Some(*rtt))
             })
             .unwrap_or_else(|| panic!("{answer:?}, {kept:?}, {before:?}, {after:?}"));
-        assert_eq!(kept, read.lowest);
 
-        // An earlier time that the peer's map entry kept counts as it is where it is below this
-        // connection's lowest round trip, and the entry keeps the lower of it and the time that
-        // the entry kept.
+        // Where the socket didn't measure the wait of the lowest round trip's reply, an earlier
+        // time that the peer's map entry kept counts as it is where it is below this connection's
+        // lowest round trip; where the socket measured it, this connection's path counts instead.
+        // The entry keeps the lower of the time that it kept and the time that `limit::kept_rtt`
+        // reads.
         let earlier = Duration::from_nanos(1);
         let before = round_trips();
         let answer = start_answer(&connection, Some(earlier), elapsed);
         let after = round_trips();
         let read = [before, after]
             .into_iter()
-            .find(|rtt| answer == limit::Answer::for_handshake(elapsed, Some(earlier), Some(*rtt)))
-            .unwrap_or_else(|| panic!("{answer:?}, {before:?}, {after:?}"));
-        assert_eq!(limit::path_rtt(Some(earlier), Some(read)), Some(earlier));
-        assert_eq!(entry.path_rtt(), Some(earlier));
+            .find(|rtt| {
+                let kept_now = limit::kept_rtt(Some(earlier), Some(*rtt));
+                answer == limit::Answer::for_handshake(elapsed, Some(earlier), Some(*rtt))
+                    && entry.path_rtt() == kept_now.map(|time| time.min(kept))
+            })
+            .unwrap_or_else(|| panic!("{answer:?}, {kept:?}, {before:?}, {after:?}"));
+        let path = if read.measured { read.path() } else { earlier };
+        assert_eq!(limit::path_rtt(Some(earlier), Some(read)), Some(path));
     }
 
     /// Verifies that a handshake through the queue keeps its connection's round-trip time with the
-    /// peer's map entry, and that the next handshake with the peer reads that time, counts it as
-    /// it is where it is below its connection's lowest round trip, and keeps it with its entry.
+    /// peer's map entry, and that the next handshake with the peer reads that time: where the
+    /// socket doesn't measure the wait of a reply, it counts the time as it is where it is below
+    /// its connection's lowest round trip, and keeps it with its entry; where the socket measures
+    /// it, the next handshake keeps its own path's time instead.
     #[tokio::test]
     async fn a_handshake_carries_its_paths_round_trip_time_to_the_peers_next_entry() {
         let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
@@ -1118,12 +1172,13 @@ mod tests {
             .await
             .unwrap();
         let first = setup.client.map.get_raw(setup.server_addr).unwrap();
-        let first_rtt = first.path_rtt().expect("a kept round trip");
-        assert!(first_rtt > Duration::ZERO);
+        assert!(first.path_rtt().is_some(), "a kept round trip");
 
         // A time below the lowest round trip that any connection measures stands for a last
         // handshake whose path was shorter or whose packets waited less. The next handshake reads
-        // it, counts it as it is, and keeps it with its entry.
+        // it. Where the socket doesn't measure the wait of a reply, the handshake counts the time
+        // as it is and keeps it with its entry; where the socket measures it, the handshake keeps
+        // its own path's time instead.
         let earlier = Duration::from_nanos(1);
         first.lower_path_rtt(earlier);
         queue.remove_completed(setup.server_addr, || false);
@@ -1134,7 +1189,97 @@ mod tests {
             .unwrap();
         let second = setup.client.map.get_raw(setup.server_addr).unwrap();
         assert!(!Arc::ptr_eq(&first, &second), "a new entry");
-        assert_eq!(second.path_rtt(), Some(earlier));
+        if s2n_quic_platform::features::rx_timestamps::SOCKOPT.is_some() {
+            assert!(second.path_rtt().is_some(), "a kept round trip");
+            assert_ne!(second.path_rtt(), Some(earlier));
+        } else {
+            assert_eq!(second.path_rtt(), Some(earlier));
+        }
+    }
+
+    fn ms(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
+    /// Ends a pass of the endpoint's event loop that woke at `woke` ms and slept at `slept` ms.
+    fn sleep(path_rtt: &mut PathRtt, start: Timestamp, woke: u64, slept: u64) {
+        let meta = builder::EndpointMeta {
+            endpoint_type: endpoint::Type::Client,
+            timestamp: start + ms(slept),
+        }
+        .into_event();
+        let event = builder::PlatformEventLoopSleep {
+            timeout: None,
+            processing_duration: ms(slept - woke),
+        }
+        .into_event();
+        CoreSub::on_platform_event_loop_sleep(path_rtt, &meta, &event);
+    }
+
+    /// Publishes recovery metrics, read at `read` ms, whose lowest round trip took `min_rtt` ms.
+    fn metrics(
+        path_rtt: &mut PathRtt,
+        context: &mut PathRttContext,
+        start: Timestamp,
+        read: u64,
+        min_rtt: u64,
+    ) {
+        let meta = builder::ConnectionMeta {
+            endpoint_type: endpoint::Type::Client,
+            id: 0,
+            timestamp: start + ms(read),
+        }
+        .into_event();
+        let event = builder::RecoveryMetrics {
+            path: builder::Path {
+                local_addr: builder::SocketAddress::IpV4 {
+                    ip: &[127, 0, 0, 1],
+                    port: 4433,
+                },
+                local_cid: builder::ConnectionId { bytes: &[] },
+                remote_addr: builder::SocketAddress::IpV4 {
+                    ip: &[127, 0, 0, 1],
+                    port: 4434,
+                },
+                remote_cid: builder::ConnectionId { bytes: &[] },
+                id: 0,
+                is_active: true,
+            },
+            min_rtt: ms(min_rtt),
+            smoothed_rtt: ms(min_rtt),
+            latest_rtt: ms(min_rtt),
+            rtt_variance: Duration::ZERO,
+            max_ack_delay: Duration::ZERO,
+            pto_count: 0,
+            congestion_window: 0,
+            bytes_in_flight: 0,
+            congestion_limited: false,
+        }
+        .into_event();
+        CoreSub::on_recovery_metrics(path_rtt, context, &meta, &event);
+    }
+
+    /// Publishes the receive of a datagram that the connection read at `read` ms and, where the
+    /// socket measured its wait as `wait` ms, the datagram's `DatagramReceiveWait`.
+    fn receive(
+        path_rtt: &mut PathRtt,
+        context: &mut PathRttContext,
+        start: Timestamp,
+        read: u64,
+        wait: Option<u64>,
+    ) {
+        let meta = builder::ConnectionMeta {
+            endpoint_type: endpoint::Type::Client,
+            id: 0,
+            timestamp: start + ms(read),
+        }
+        .into_event();
+        let event = builder::DatagramReceived { len: 1200 }.into_event();
+        CoreSub::on_datagram_received(path_rtt, context, &meta, &event);
+        if let Some(wait) = wait {
+            let event = builder::DatagramReceiveWait { wait: ms(wait) }.into_event();
+            CoreSub::on_datagram_receive_wait(path_rtt, context, &meta, &event);
+        }
     }
 
     /// Verifies that a connection keeps, with each new lowest round-trip time, the part of the
@@ -1142,79 +1287,11 @@ mod tests {
     /// a round trip that doesn't change the lowest leaves that part as it is.
     #[test]
     fn a_new_lowest_round_trip_keeps_the_part_of_it_that_the_endpoints_last_pass_ran() {
-        use s2n_quic_core::{
-            endpoint,
-            event::{builder, IntoEvent},
-            time::{clock::testing as clock, Timestamp},
-        };
-
-        fn ms(ms: u64) -> Duration {
-            Duration::from_millis(ms)
-        }
-
-        /// Ends a pass of the endpoint's event loop that woke at `woke` ms and slept at `slept` ms.
-        fn sleep(path_rtt: &mut PathRtt, start: Timestamp, woke: u64, slept: u64) {
-            let meta = builder::EndpointMeta {
-                endpoint_type: endpoint::Type::Client,
-                timestamp: start + ms(slept),
-            }
-            .into_event();
-            let event = builder::PlatformEventLoopSleep {
-                timeout: None,
-                processing_duration: ms(slept - woke),
-            }
-            .into_event();
-            CoreSub::on_platform_event_loop_sleep(path_rtt, &meta, &event);
-        }
-
-        /// Publishes recovery metrics, read at `read` ms, whose lowest round trip took `min_rtt`
-        /// ms.
-        fn metrics(
-            path_rtt: &mut PathRtt,
-            context: &mut PathRttContext,
-            start: Timestamp,
-            read: u64,
-            min_rtt: u64,
-        ) {
-            let meta = builder::ConnectionMeta {
-                endpoint_type: endpoint::Type::Client,
-                id: 0,
-                timestamp: start + ms(read),
-            }
-            .into_event();
-            let event = builder::RecoveryMetrics {
-                path: builder::Path {
-                    local_addr: builder::SocketAddress::IpV4 {
-                        ip: &[127, 0, 0, 1],
-                        port: 4433,
-                    },
-                    local_cid: builder::ConnectionId { bytes: &[] },
-                    remote_addr: builder::SocketAddress::IpV4 {
-                        ip: &[127, 0, 0, 1],
-                        port: 4434,
-                    },
-                    remote_cid: builder::ConnectionId { bytes: &[] },
-                    id: 0,
-                    is_active: true,
-                },
-                min_rtt: ms(min_rtt),
-                smoothed_rtt: ms(min_rtt),
-                latest_rtt: ms(min_rtt),
-                rtt_variance: Duration::ZERO,
-                max_ack_delay: Duration::ZERO,
-                pto_count: 0,
-                congestion_window: 0,
-                bytes_in_flight: 0,
-                congestion_limited: false,
-            }
-            .into_event();
-            CoreSub::on_recovery_metrics(path_rtt, context, &meta, &event);
-        }
-
         fn round_trips(lowest: u64, waited: u64) -> Option<limit::RoundTrips> {
             Some(limit::RoundTrips {
                 lowest: ms(lowest),
                 waited: ms(waited),
+                measured: false,
             })
         }
 
@@ -1251,6 +1328,51 @@ mod tests {
         sleep(&mut path_rtt, start, 50, 52);
         metrics(&mut path_rtt, &mut context, start, 60, 1);
         assert_eq!(context.round_trips(), round_trips(1, 0));
+    }
+
+    /// Verifies that where the socket measured the wait of the datagram that holds a new lowest
+    /// round trip's reply, the connection keeps that whole wait, though the reply waited through
+    /// two passes of the endpoint's event loop, and that a datagram without a measured wait reads
+    /// the part of the last pass that ran after the round trip's packet was sent, as before.
+    #[test]
+    fn a_new_lowest_round_trip_keeps_the_whole_wait_that_the_socket_measured() {
+        fn round_trips(lowest: u64, waited: u64, measured: bool) -> Option<limit::RoundTrips> {
+            Some(limit::RoundTrips {
+                lowest: ms(lowest),
+                waited: ms(waited),
+                measured,
+            })
+        }
+
+        let start = clock::now();
+        let mut path_rtt = PathRtt::default();
+        let mut context = PathRttContext::default();
+
+        // A 12 ms round trip read at 22 ms sent its packet at 10 ms, and its reply arrived at 13
+        // ms, while the endpoint's pass from 10 ms to 14 ms ran. The pass from 16 ms to 20 ms
+        // didn't read it, and the next pass read it at 22 ms, so the reply waited 9 ms through
+        // two passes, which the socket measured. The connection keeps the 9 ms, where the last
+        // pass alone would bound the wait at the 4 ms of it that ran after 10 ms.
+        sleep(&mut path_rtt, start, 10, 14);
+        sleep(&mut path_rtt, start, 16, 20);
+        receive(&mut path_rtt, &mut context, start, 22, Some(9));
+        metrics(&mut path_rtt, &mut context, start, 22, 12);
+        assert_eq!(context.round_trips(), round_trips(12, 9, true));
+        assert_eq!(context.round_trips().unwrap().path(), ms(3));
+
+        // A round trip that doesn't change the lowest leaves the wait as it is, though its
+        // datagram's wait differs.
+        receive(&mut path_rtt, &mut context, start, 30, Some(1));
+        metrics(&mut path_rtt, &mut context, start, 30, 12);
+        assert_eq!(context.round_trips(), round_trips(12, 9, true));
+
+        // A datagram without a measured wait, after one that held a wait, doesn't read that
+        // wait: a 5 ms round trip read at 46 ms was sent at 41 ms, and the 4 ms of the last pass
+        // after 41 ms is the most that its reply could have waited.
+        sleep(&mut path_rtt, start, 40, 45);
+        receive(&mut path_rtt, &mut context, start, 46, None);
+        metrics(&mut path_rtt, &mut context, start, 46, 5);
+        assert_eq!(context.round_trips(), round_trips(5, 4, false));
     }
 
     #[test]
