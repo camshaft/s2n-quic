@@ -13,7 +13,7 @@ use crate::time::precision::Timestamp;
 /// has a bounded capacity to allow microbursts — if the sender was idle, it
 /// can burst up to `burst_nanos` worth of data at line rate before pacing
 /// kicks in.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Rate {
     /// Nanoseconds per byte at the configured rate.
     nanos_per_byte: f64,
