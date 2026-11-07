@@ -904,6 +904,7 @@ where
         socket_senders,
         clock: clock.clone(),
         pacing,
+        path_secret_map: path_secret_map.clone(),
         send_credit_distributor,
         recv_credit_distributor,
         send_credit_waker_sink: send_credit_distributor_waker_sink,
@@ -1160,6 +1161,8 @@ struct FrameDispatchParts<Clk> {
     clock: Clk,
     /// How the pacing stage paces the send sockets of each interface.
     pacing: combinator::SendPacing,
+    /// The path secret map whose subscriber records the creditless window's events.
+    path_secret_map: crate::path::secret::Map,
     /// Send-direction credit-pool distributor. Spawned alongside the frame-dispatch
     /// task on the same worker so distribution and submission share a thread.
     send_credit_distributor: crate::credit::Distributor,
@@ -1396,6 +1399,7 @@ where
                     fd.pacing,
                     budgets,
                     counter_registry.clone(),
+                    Some(fd.path_secret_map),
                     fd.send_credit_pool,
                 );
                 tasks::spawn_credit_distributor(

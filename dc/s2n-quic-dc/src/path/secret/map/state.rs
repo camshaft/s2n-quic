@@ -1502,6 +1502,51 @@ where
             },
         );
     }
+
+    fn on_creditless_window_frame_refused(
+        &self,
+        frame_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.subscriber().on_creditless_window_frame_refused(
+            event::builder::CreditlessWindowFrameRefused {
+                frame_bytes,
+                held_bytes,
+                limit_bytes,
+            },
+        );
+    }
+
+    fn on_creditless_window_limit_grew(
+        &self,
+        released_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.subscriber().on_creditless_window_limit_grew(
+            event::builder::CreditlessWindowLimitGrew {
+                released_bytes,
+                held_bytes,
+                limit_bytes,
+            },
+        );
+    }
+
+    fn on_creditless_window_limit_halved(
+        &self,
+        held_bytes: u64,
+        previous_limit_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.subscriber().on_creditless_window_limit_halved(
+            event::builder::CreditlessWindowLimitHalved {
+                held_bytes,
+                previous_limit_bytes,
+                limit_bytes,
+            },
+        );
+    }
 }
 
 impl<C, S> Drop for State<C, S>

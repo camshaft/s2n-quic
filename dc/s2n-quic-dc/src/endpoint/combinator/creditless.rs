@@ -63,6 +63,9 @@ struct State {
     refused: Cell<bool>,
     /// The priority router's waker, which it registers as the window refuses a frame.
     waker: Cell<Option<task::Waker>>,
+    /// The path secret map whose subscriber records the window's events, where the window has
+    /// one.
+    path_secret_map: Option<crate::path::secret::Map>,
 }
 
 impl CreditlessWindow {
@@ -72,6 +75,19 @@ impl CreditlessWindow {
             state: Rc::new(State {
                 limit: Cell::new(minimum),
                 minimum,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Returns a window like [`Self::new`] that records each frame it refuses and each change
+    /// of its limit as an event of `path_secret_map`'s subscriber.
+    pub fn with_path_secret_map(minimum: u64, path_secret_map: crate::path::secret::Map) -> Self {
+        Self {
+            state: Rc::new(State {
+                limit: Cell::new(minimum),
+                minimum,
+                path_secret_map: Some(path_secret_map),
                 ..Default::default()
             }),
         }
@@ -104,6 +120,9 @@ impl CreditlessWindow {
     /// Admits `bytes` of frames without send credit and returns `true` where the window holds
     /// nothing, where the bytes it holds stay within its limit with them, or where no other
     /// clone of the window is left. Otherwise it refuses them and returns `false`.
+    ///
+    /// Each refusal records a frame-refused event of the window's path secret map, where it
+    /// has one.
     pub fn admit(&self, bytes: u64) -> bool {
         let state = &self.state;
         if Rc::strong_count(&self.state) == 1 {
@@ -112,6 +131,9 @@ impl CreditlessWindow {
         let held = state.held.get();
         if held != 0 && held.saturating_add(bytes) > state.limit.get() {
             state.refused.set(true);
+            if let Some(path_secret_map) = &state.path_secret_map {
+                path_secret_map.on_creditless_window_frame_refused(bytes, held, state.limit.get());
+            }
             return false;
         }
         state.held.set(held.saturating_add(bytes));
@@ -129,20 +151,33 @@ impl CreditlessWindow {
     ///
     /// The limit halves, once a round, where the batch was read in an earlier round, and grows
     /// by `bytes` where the batch was read in this round and the window refused a frame in it.
+    /// Each halving, and each round in which the minimum keeps the limit from halving, records
+    /// a limit-halved event, and each growth a limit-grew event, of the window's path secret
+    /// map, where it has one.
     pub fn release(&self, bytes: u64, read_in: u64) {
         if bytes == 0 {
             return;
         }
         let state = &self.state;
-        state.held.set(state.held.get().saturating_sub(bytes));
+        let held = state.held.get().saturating_sub(bytes);
+        state.held.set(held);
         let round = state.round.get();
         if read_in < round {
             if state.halved_in.get() != Some(round) {
                 state.halved_in.set(Some(round));
-                state.limit.set((state.limit.get() / 2).max(state.minimum));
+                let previous_limit = state.limit.get();
+                let limit = (previous_limit / 2).max(state.minimum);
+                state.limit.set(limit);
+                if let Some(path_secret_map) = &state.path_secret_map {
+                    path_secret_map.on_creditless_window_limit_halved(held, previous_limit, limit);
+                }
             }
         } else if state.refused.get() {
-            state.limit.set(state.limit.get().saturating_add(bytes));
+            let limit = state.limit.get().saturating_add(bytes);
+            state.limit.set(limit);
+            if let Some(path_secret_map) = &state.path_secret_map {
+                path_secret_map.on_creditless_window_limit_grew(bytes, held, limit);
+            }
         }
         self.wake();
     }
