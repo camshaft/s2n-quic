@@ -631,6 +631,7 @@ fn publishes_the_lost_mark_of_a_pair_that_sends_acknowledgements_alone() {
             let ctx = build_send_context(&entry, 0, &registry, &clock);
             let threshold = {
                 let mut ctx = ctx.borrow_mut();
+                ctx.spreads_over_interfaces = true;
                 ctx.last_peer_activity = clock.now();
                 ctx.ack_only_probe_sent = Some(clock.now());
                 ctx.rtt_estimator.persistent_congestion_threshold()

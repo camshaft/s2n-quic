@@ -1734,6 +1734,7 @@ fn the_assembler_marks_an_ack_only_pair_lost_with_its_time_count_and_event() {
     let mtu = 1500;
     let registry = Registry::new();
     let (mut context, _entry) = make_context(mtu, &registry);
+    context.spreads_over_interfaces = true;
 
     let clock = Clock::new(Duration::from_millis(10));
     let gso = make_gso(1);
