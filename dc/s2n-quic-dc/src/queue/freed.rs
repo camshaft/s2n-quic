@@ -67,25 +67,30 @@ struct FreedState {
     /// The assembler drains this first, retransmitting with the original request_id
     /// and encoding so the client deduplicates via seen_requests.
     retry_queue: VecDeque<RetryEntry>,
-    /// The slots held for a reset that hasn't left the priority router yet, of a rejected init or
-    /// of the slot's stream, by queue id. A slot freed while it is held is recorded once `release`
-    /// ends its hold.
+    /// The slots held for the resets that haven't left the priority router yet, of a rejected
+    /// init or of the slot's stream, by queue id. A slot freed while it is held is recorded once
+    /// `release` ends its hold.
     held: HashMap<u64, Held>,
 }
 
-/// The hold of a slot for a reset of `binding_id`, of a rejected init or of the slot's stream.
+/// The hold of a slot for the resets of `binding_id`, of a rejected init or of the slot's stream.
 struct Held {
     binding_id: u64,
+    /// The resets of `binding_id` that hold the slot and haven't left the priority router yet.
+    resets: usize,
     /// Whether the slot was freed while it was held.
     freed: bool,
 }
 
-/// What [`FreedInner::hold_reset`] did with a stream's reset.
+/// What the hold of a stream's reset did with it: [`FreedInner::hold_reset`] holds the slot or
+/// refuses the reset, and a reset that doesn't hold a slot is `Unheld`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResetHold {
-    /// The reset holds the slot until it leaves the priority router.
+    /// The reset holds the slot until it leaves the priority router, beside each other reset of
+    /// its binding that holds the slot.
     Held,
-    /// The reset is sent without a hold of its own, as where the slot is held for its binding.
+    /// The reset is sent without a hold, as a reset that a producer waits on or a reset of a
+    /// client's slot.
     Unheld,
     /// The slot is held for another binding's reset, so the reset isn't sent.
     Refused,
@@ -165,6 +170,7 @@ impl FreedInner {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(Held {
                     binding_id: binding_id.as_u64(),
+                    resets: 1,
                     freed: false,
                 });
                 true
@@ -173,28 +179,30 @@ impl FreedInner {
     }
 
     /// Hold the slot `queue_id` for a reset of the stream of `binding_id` that no producer waits
-    /// on, so that a `record` of the slot waits until `release` ends the hold. A slot held for the
-    /// binding already isn't held again, and a reset of another binding is refused while that
-    /// hold lasts.
+    /// on, so that a `record` of the slot waits until `release` ends the hold. A reset of the
+    /// binding that holds the slot already adds to the hold, which lasts until each of its resets
+    /// leaves, and a reset of another binding is refused while that hold lasts.
     pub fn hold_reset(&self, queue_id: VarInt, binding_id: VarInt) -> ResetHold {
         let mut state = self.state.lock().unwrap();
-        if let Some(held) = state.held.get(&queue_id.as_u64()) {
-            return if held.binding_id == binding_id.as_u64() {
-                ResetHold::Unheld
-            } else {
-                ResetHold::Refused
-            };
+        if let Some(held) = state.held.get_mut(&queue_id.as_u64()) {
+            if held.binding_id != binding_id.as_u64() {
+                return ResetHold::Refused;
+            }
+            held.resets += 1;
+            return ResetHold::Held;
         }
         let held = Held {
             binding_id: binding_id.as_u64(),
+            resets: 1,
             freed: false,
         };
         state.held.insert(queue_id.as_u64(), held);
         ResetHold::Held
     }
 
-    /// End the hold of `queue_id` for `binding_id` once its reset leaves, and record the slot as
-    /// freed where a `record` waited on the hold. A hold for another binding stays.
+    /// Release a reset's part of the hold of `queue_id` for `binding_id` once the reset leaves,
+    /// and end the hold once each reset of the binding that holds the slot has left, recording the
+    /// slot as freed where a `record` waited on the hold. A hold for another binding stays.
     pub fn release(
         &self,
         queue_id: VarInt,
@@ -203,8 +211,14 @@ impl FreedInner {
         endpoint_tx: &mut FreedBatchTx,
     ) {
         let mut state = self.state.lock().unwrap();
-        let freed = match state.held.get(&queue_id.as_u64()) {
-            Some(held) if held.binding_id == binding_id.as_u64() => held.freed,
+        let freed = match state.held.get_mut(&queue_id.as_u64()) {
+            Some(held) if held.binding_id == binding_id.as_u64() => {
+                held.resets -= 1;
+                if held.resets > 0 {
+                    return;
+                }
+                held.freed
+            }
             _ => return,
         };
         state.held.remove(&queue_id.as_u64());
@@ -390,8 +404,6 @@ mod tests {
                 let slot = VarInt::from_u8(5);
                 let (b1, b2) = (VarInt::from_u8(1), VarInt::from_u8(2));
                 assert_eq!(freed.hold_reset(slot, b1), ResetHold::Held);
-                // A second reset of the binding that holds the slot is sent without a hold.
-                assert_eq!(freed.hold_reset(slot, b1), ResetHold::Unheld);
                 // A reset of another binding isn't sent, and its rejected init doesn't get a hold.
                 assert_eq!(freed.hold_reset(slot, b2), ResetHold::Refused);
                 assert!(!freed.hold(slot, b2));
@@ -407,13 +419,60 @@ mod tests {
                 assert!(dest.contains(5));
                 assert_eq!(freed.hold_reset(slot, b2), ResetHold::Held);
 
-                // Where a rejected init holds the slot, a reset of its binding is sent without a
-                // hold of its own, and a reset of another binding is refused.
+                // Where a rejected init holds the slot, a reset of its binding adds to the hold,
+                // and a reset of another binding is refused.
                 let slot = VarInt::from_u8(6);
                 let (b3, b4) = (VarInt::from_u8(3), VarInt::from_u8(4));
                 assert!(freed.hold(slot, b3));
-                assert_eq!(freed.hold_reset(slot, b3), ResetHold::Unheld);
+                assert_eq!(freed.hold_reset(slot, b3), ResetHold::Held);
                 assert_eq!(freed.hold_reset(slot, b4), ResetHold::Refused);
+            }
+            .primary()
+            .spawn();
+        });
+    }
+
+    #[test]
+    fn a_slot_stays_held_until_each_reset_of_its_binding_leaves() {
+        sim(|| {
+            let (path_entry, freed, mut tx, rx) = test_setup();
+
+            async move {
+                let _rx = rx;
+                let slot = VarInt::from_u8(5);
+                let (b1, b2) = (VarInt::from_u8(1), VarInt::from_u8(2));
+                // Each half of the stream sends a reset that holds the slot.
+                assert_eq!(freed.hold_reset(slot, b1), ResetHold::Held);
+                assert_eq!(freed.hold_reset(slot, b1), ResetHold::Held);
+                freed.record(slot, &path_entry, &mut tx);
+
+                // One reset leaves: the other still waits, so the slot isn't recorded as freed,
+                // another binding's reset is refused, and its rejected init doesn't get a hold.
+                freed.release(slot, b1, &path_entry, &mut tx);
+                assert!(!freed.has_pending_work());
+                assert_eq!(freed.hold_reset(slot, b2), ResetHold::Refused);
+                assert!(!freed.hold(slot, b2));
+
+                // The other reset leaves: the slot is recorded as freed, and can be held again.
+                freed.release(slot, b1, &path_entry, &mut tx);
+                let mut dest = HierarchicalBitSet::new(1);
+                freed.take(&mut dest).unwrap();
+                assert!(dest.contains(5));
+                assert_eq!(freed.hold_reset(slot, b2), ResetHold::Held);
+
+                // A stream's reset adds to the hold of its binding's rejected init, and the slot
+                // is recorded as freed once both resets have left.
+                let slot = VarInt::from_u8(6);
+                let b3 = VarInt::from_u8(3);
+                assert!(freed.hold(slot, b3));
+                assert_eq!(freed.hold_reset(slot, b3), ResetHold::Held);
+                freed.record(slot, &path_entry, &mut tx);
+                freed.release(slot, b3, &path_entry, &mut tx);
+                assert!(!freed.has_pending_work());
+                freed.release(slot, b3, &path_entry, &mut tx);
+                let mut dest = HierarchicalBitSet::new(1);
+                freed.take(&mut dest).unwrap();
+                assert!(dest.contains(6));
             }
             .primary()
             .spawn();

@@ -840,7 +840,8 @@ fn evicted_streams_leave_one_reset_for_each_slot_until_it_leaves() {
 
 /// A reset that a producer waits on, or that holds send credit, is sent while the slot is held
 /// for another binding's reset and doesn't hold the slot. A reset that no producer waits on holds
-/// it, and the reset of the binding that holds the slot is sent without a hold of its own.
+/// it, and each reset of the binding that holds the slot adds to the hold, which lasts until each
+/// of them leaves or isn't sent.
 #[test]
 fn a_reset_that_a_producer_waits_on_is_sent_while_the_slot_is_held() {
     use crate::queue::freed::ResetHold;
@@ -879,7 +880,7 @@ fn a_reset_that_a_producer_waits_on_is_sent_while_the_slot_is_held() {
     assert_eq!(control.hold_reset(&credited), ResetHold::Unheld);
 
     // That reset leaves: the stream's reset holds the slot, and the other half's reset of the
-    // same binding is sent without a hold of its own.
+    // same binding adds to the hold.
     state.freed.release(
         slot,
         other,
@@ -887,11 +888,12 @@ fn a_reset_that_a_producer_waits_on_is_sent_while_the_slot_is_held() {
         &mut harness.freed_batch_tx,
     );
     assert_eq!(stream.hold_reset(&unawaited), ResetHold::Held);
-    assert_eq!(control.hold_reset(&unawaited), ResetHold::Unheld);
-
-    // A reset that isn't sent ends its hold, so the other half's reset can hold the slot.
-    stream.release_reset();
     assert_eq!(control.hold_reset(&unawaited), ResetHold::Held);
+
+    // A reset that isn't sent releases its part of the hold: the slot stays held for the other
+    // half's reset, and the hold ends once that reset isn't sent either.
+    stream.release_reset();
+    assert_eq!(state.freed.hold_reset(slot, other), ResetHold::Refused);
     control.release_reset();
 
     // The stream's halves drop: no hold is left, so the slot is recorded as freed.

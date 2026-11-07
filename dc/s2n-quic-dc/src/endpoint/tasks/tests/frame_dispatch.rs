@@ -816,7 +816,8 @@ fn the_waiting_resets_forget_a_reset_that_leaves_for_its_lane() {
     let mut queue = crate::intrusive::Queue::<frame::Frame>::new();
     queue.push_back(reset_frame(&pse, 2, 1));
     queue.push_back(reset_frame(&pse, 2, 1));
-    let mut kept = resets.take_new(queue);
+    let (mut freed_tx, _freed_rx) = crate::queue::freed_batch_channel();
+    let mut kept = resets.take_new(queue, &mut freed_tx);
     assert_eq!(kept.len(), 1, "the copy is dropped");
     let reset = kept.pop_front().expect("the first reset is kept");
     resets.remove(&reset);
@@ -868,6 +869,125 @@ fn the_priority_router_releases_the_slot_of_a_reset_that_leaves_for_its_lane() {
     assert_eq!(take_lanes(&mut lanes), [(reset_cost, 0)]);
     assert!(state.freed.has_pending_work(), "the slot is recorded as freed");
     assert!(state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)));
+
+    drop(frame_tx);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
+}
+
+/// A slot that two resets of its binding hold, as where each half of a stream sends one, is
+/// recorded as freed only once both have left for their lane: while one of them still waits,
+/// another binding's reset is refused and its rejected init doesn't get a hold.
+#[test]
+fn the_priority_router_holds_a_slot_until_each_reset_of_its_binding_leaves() {
+    use crate::{queue::freed::ResetHold, socket::channel::ByteCost as _};
+    use core::task::Poll;
+    use s2n_quic_core::varint::VarInt;
+
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(1)
+        .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+        .build(None);
+    let crate::path::secret::map::entry::QueueState::Server(state) = pse.queue_state() else {
+        unreachable!("a server entry has a server queue state");
+    };
+    let state = state.clone();
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    let holder = holding_frame(&pse);
+    let holder_cost = holder.byte_cost();
+    submit(&mut frame_tx, [holder]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(holder_cost, 0)]);
+
+    // Each half of the stream of binding 1 on slot 1 sends a reset, and the slot is freed while
+    // the resets wait.
+    let (slot, binding) = (VarInt::from_u8(1), VarInt::from_u8(1));
+    let (mut freed_tx, _freed_rx) = crate::queue::freed_batch_channel();
+    assert_eq!(state.freed.hold_reset(slot, binding), ResetHold::Held);
+    assert_eq!(state.freed.hold_reset(slot, binding), ResetHold::Held);
+    state.freed.record(slot, &pse, &mut freed_tx);
+    let first = reset_frame(&pse, 2, 1);
+    let first_cost = first.byte_cost();
+    submit(&mut frame_tx, [first]);
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    assert!(take_lanes(&mut lanes).is_empty());
+
+    // The first reset leaves for its lane: the slot stays held for the second reset.
+    window.release(holder_cost, window.round());
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(first_cost, 0)]);
+    assert!(!state.freed.has_pending_work(), "the second reset holds the slot");
+
+    // The second reset waits at the window, which the first holds now: the slot isn't recorded
+    // as freed, another binding's reset is refused, and its rejected init doesn't get a hold.
+    let second = reset_frame(&pse, 2, 2);
+    let second_cost = second.byte_cost();
+    submit(&mut frame_tx, [second]);
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    assert!(take_lanes(&mut lanes).is_empty());
+    assert!(!state.freed.has_pending_work(), "the slot waits on the second reset");
+    let other = VarInt::from_u8(2);
+    assert_eq!(state.freed.hold_reset(slot, other), ResetHold::Refused);
+    assert!(!state.freed.hold(slot, other));
+
+    // The second reset leaves: the slot is recorded as freed, and a later rejected init can hold
+    // it again.
+    window.release(first_cost, window.round());
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(second_cost, 0)]);
+    assert!(state.freed.has_pending_work(), "the slot is recorded as freed");
+    assert!(state.freed.hold(slot, other));
+
+    drop(frame_tx);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
+}
+
+/// A copy of a waiting reset that the priority router drops releases its part of its slot's
+/// hold, as a reset that leaves for its lane does, so that the slot is recorded as freed once the
+/// waiting reset leaves.
+#[test]
+fn the_priority_router_releases_the_hold_of_a_reset_copy_it_drops() {
+    use crate::{queue::freed::ResetHold, socket::channel::ByteCost as _};
+    use core::task::Poll;
+    use s2n_quic_core::varint::VarInt;
+
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(1)
+        .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+        .build(None);
+    let crate::path::secret::map::entry::QueueState::Server(state) = pse.queue_state() else {
+        unreachable!("a server entry has a server queue state");
+    };
+    let state = state.clone();
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    let holder = holding_frame(&pse);
+    let holder_cost = holder.byte_cost();
+    submit(&mut frame_tx, [holder]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(holder_cost, 0)]);
+
+    // Each half of the stream of binding 1 on slot 1 sends the same reset, and the slot is freed
+    // while the resets wait at the window, which drops the second as a copy.
+    let (slot, binding) = (VarInt::from_u8(1), VarInt::from_u8(1));
+    let (mut freed_tx, _freed_rx) = crate::queue::freed_batch_channel();
+    assert_eq!(state.freed.hold_reset(slot, binding), ResetHold::Held);
+    assert_eq!(state.freed.hold_reset(slot, binding), ResetHold::Held);
+    state.freed.record(slot, &pse, &mut freed_tx);
+    let reset_cost = reset_frame(&pse, 2, 1).byte_cost();
+    submit(&mut frame_tx, [reset_frame(&pse, 2, 1), reset_frame(&pse, 2, 1)]);
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    assert!(take_lanes(&mut lanes).is_empty());
+    assert!(!state.freed.has_pending_work(), "the waiting reset holds the slot");
+
+    // The waiting reset leaves for its lane: the copy released its part of the hold, so the slot
+    // is recorded as freed.
+    window.release(holder_cost, window.round());
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(reset_cost, 0)]);
+    assert!(state.freed.has_pending_work(), "the slot is recorded as freed");
 
     drop(frame_tx);
     assert_eq!(poll_router(&mut router), Poll::Ready(None));

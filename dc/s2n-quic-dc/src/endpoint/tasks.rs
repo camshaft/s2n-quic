@@ -71,9 +71,10 @@ mod tests;
 /// - Frames from different priority classes are never merged into the same batch.
 /// - The spawned tasks are the only side effect; callers do not receive a handle back and must
 ///   keep the underlying executor running for progress.
-/// - A reset that leaves the priority router for its lane releases the slot that a rejected init,
-///   or the stream that sent the reset, held for it, and `freed_batch_tx` takes the slot's freed
-///   record where the slot was freed while the reset waited.
+/// - A reset that leaves the priority router for its lane releases its part of the hold of the
+///   slot that a rejected init, or the stream that sent the reset, held for it, and
+///   `freed_batch_tx` takes the slot's freed record once each reset that holds the slot has left,
+///   where the slot was freed while they waited.
 /// - `pacing` and `budgets` bound how aggressively work is drained once the tasks are spawned.
 ///   With one interface, a [`Paced`] stage paces every send socket at its rate before
 ///   [`PickTwo`] chooses a worker; with more, [`InterfacePacedPickTwo`] chooses the worker first
@@ -1847,15 +1848,16 @@ where
 /// send credit pool bounds it, but it waits behind a refused frame of its lane or of a lane
 /// before it.
 ///
-/// A reset that leaves for its lane releases the slot that its rejected init, or the stream that
-/// sent it, held for it, and the slot is recorded as freed then, so that the client sends another
-/// init on the slot only once the reset is on its way. A stream's reset isn't sent while its slot
-/// is held for another binding's reset, as where a client sends inits on a slot before it learns
-/// that the slot is free, each of them evicting the stream before it from a full acceptor. This
-/// bounds the resets that a peer's frames add here by the peer's queues, whatever the queue and
-/// binding ids of its frames: while a reset of the binding that holds a queue's slot waits here,
-/// a reset of another binding on that queue isn't sent, and `WaitingResets` drops the copies of a
-/// reset that wait here already.
+/// A reset that leaves for its lane releases its part of the hold of the slot that its rejected
+/// init, or the stream that sent it, held for it, and the slot is recorded as freed once each
+/// reset that holds it has left, so that the client sends another init on the slot only once
+/// those resets are on their way. A stream's reset isn't sent while its slot is held for another
+/// binding's reset, as where a client sends inits on a slot before it learns that the slot is
+/// free, each of them evicting the stream before it from a full acceptor. This bounds the resets
+/// that a peer's frames add here by the peer's queues, whatever the queue and binding ids of its
+/// frames: while a reset of the binding that holds a queue's slot waits here, a reset of another
+/// binding on that queue isn't sent, and `WaitingResets` drops the copies of a reset that wait
+/// here already, each of which releases its part of its slot's hold.
 struct FrameReceiver<Tx> {
     frame_rx: SubmissionReceiver,
     /// The frames the window didn't admit yet, each lane's in the order the swaps brought them.
@@ -1919,7 +1921,7 @@ where
                 }
                 let frame = queue.pop_front().expect("the queue holds a front frame");
                 // A reset that leaves for its lane doesn't wait any longer, so a later copy waits,
-                // and the slot its rejected init held is released.
+                // and its part of its slot's hold is released.
                 self.resets.remove(&frame);
                 release_held(&frame, &mut self.freed_batch_tx);
                 admitted.push_back(frame);
@@ -1940,11 +1942,12 @@ where
     }
 
     /// Moves the frames that `poll_swap` put into `swapped` behind the frames of `staging`,
-    /// each lane's in order, and drops each reset whose copy waits in `staging` already.
+    /// each lane's in order, and drops each reset whose copy waits in `staging` already, releasing
+    /// its part of its slot's hold.
     fn take_swapped(&mut self) {
         for (priority, queue) in self.swapped.drain() {
             let queue = if priority == Priority::QueueReset {
-                self.resets.take_new(queue)
+                self.resets.take_new(queue, &mut self.freed_batch_tx)
             } else {
                 queue
             };
@@ -1953,9 +1956,9 @@ where
     }
 }
 
-/// Releases the server slot that a rejected init, or the stream that sent `frame`, held for
-/// `frame`, where `frame` is a reset that no producer waits on, so that the slot is recorded as
-/// freed once the reset leaves for its lane.
+/// Releases `frame`'s part of the hold of the server slot that a rejected init, or the stream that
+/// sent `frame`, held for it, where `frame` is a reset that no producer waits on, so that the slot
+/// is recorded as freed once each reset that holds it leaves for its lane or is dropped as a copy.
 fn release_held(frame: &Frame, freed_batch_tx: &mut crate::queue::FreedBatchTx) {
     let Some((queue_pair, binding_id)) = frame.unawaited_reset() else {
         return;
@@ -1997,14 +2000,21 @@ impl WaitingResets {
     }
 
     /// Returns the frames of `queue` in order, without each reset whose copy waits already,
-    /// and records each other reset that `key` returns a key for as waiting.
-    fn take_new(&mut self, mut queue: Queue<Frame>) -> Queue<Frame> {
+    /// and records each other reset that `key` returns a key for as waiting. A reset it drops
+    /// releases its part of its slot's hold through `freed_batch_tx`, as a reset that leaves does.
+    fn take_new(
+        &mut self,
+        mut queue: Queue<Frame>,
+        freed_batch_tx: &mut crate::queue::FreedBatchTx,
+    ) -> Queue<Frame> {
         let mut kept = Queue::<Frame>::new();
         while let Some(frame) = queue.pop_front() {
             if let Some(key) = Self::key(&frame) {
                 let headers = self.waiting.entry(key).or_default();
                 if headers.contains(&frame.header) {
-                    // The waiting copy resets the same queue, and no producer waits on this one.
+                    // The waiting copy resets the same queue, and no producer waits on this one,
+                    // so this one doesn't hold its slot any longer.
+                    release_held(&frame, freed_batch_tx);
                     continue;
                 }
                 headers.push(frame.header);
