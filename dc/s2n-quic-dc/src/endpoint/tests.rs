@@ -29,6 +29,7 @@ pub mod deterministic;
 pub mod fair_share;
 pub mod half_close;
 pub mod interface_pacing;
+pub mod interfaces;
 pub mod unidirectional;
 
 #[test]
