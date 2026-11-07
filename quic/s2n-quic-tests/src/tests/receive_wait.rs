@@ -3,29 +3,45 @@
 
 use super::*;
 
-/// Runs a connection over a network whose packets report `receive_wait`, and returns the waits
-/// the server's and the client's connections published
-fn published_waits(receive_wait: Option<Duration>) -> (Vec<Duration>, Vec<Duration>) {
+/// What one side's connections published: the waits, and how many datagrams they received
+struct Published {
+    waits: Vec<Duration>,
+    received: usize,
+}
+
+/// Runs a connection over a network whose packets report `receive_wait`, and returns what the
+/// server's and the client's connections published
+fn published(receive_wait: Option<Duration>) -> (Published, Published) {
     let model = Model::default();
     model.set_receive_wait(receive_wait);
 
     let server_recorder = recorder::DatagramReceiveWait::new();
     let server_events = server_recorder.events();
+    let server_received = recorder::DatagramReceived::new();
+    let server_received_events = server_received.events();
     let client_recorder = recorder::DatagramReceiveWait::new();
     let client_events = client_recorder.events();
+    let client_received = recorder::DatagramReceived::new();
+    let client_received_events = client_received.events();
 
     test(model.clone(), |handle| {
         let server = Server::builder()
             .with_io(handle.builder().build().unwrap())?
             .with_tls(SERVER_CERTS)?
-            .with_event((tracing_events(true, model.clone()), server_recorder))?
+            .with_event((
+                tracing_events(true, model.clone()),
+                (server_recorder, server_received),
+            ))?
             .with_random(Random::with_seed(456))?
             .start()?;
 
         let client = Client::builder()
             .with_io(handle.builder().build().unwrap())?
             .with_tls(certificates::CERT_PEM)?
-            .with_event((tracing_events(true, model.clone()), client_recorder))?
+            .with_event((
+                tracing_events(true, model.clone()),
+                (client_recorder, client_received),
+            ))?
             .with_random(Random::with_seed(456))?
             .start()?;
 
@@ -35,39 +51,50 @@ fn published_waits(receive_wait: Option<Duration>) -> (Vec<Duration>, Vec<Durati
     })
     .unwrap();
 
-    let server_waits = server_events
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|event| event.wait)
-        .collect();
-    let client_waits = client_events
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|event| event.wait)
-        .collect();
+    let server = Published {
+        waits: server_events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.wait)
+            .collect(),
+        received: server_received_events.lock().unwrap().len(),
+    };
+    let client = Published {
+        waits: client_events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.wait)
+            .collect(),
+        received: client_received_events.lock().unwrap().len(),
+    };
 
-    (server_waits, client_waits)
+    (server, client)
 }
 
-/// Each datagram that holds a receive wait publishes that wait to the connection that reads it
+/// Each datagram a connection received publishes the wait it carried, the server's first
+/// datagram among them
 #[test]
 fn datagram_receive_wait_test() {
     let receive_wait = Duration::from_micros(1500);
-    let (server_waits, client_waits) = published_waits(Some(receive_wait));
+    let (server, client) = published(Some(receive_wait));
 
-    assert!(!server_waits.is_empty());
-    assert!(server_waits.iter().all(|wait| *wait == receive_wait));
-    assert!(!client_waits.is_empty());
-    assert!(client_waits.iter().all(|wait| *wait == receive_wait));
+    assert!(server.received > 0);
+    assert_eq!(server.waits.len(), server.received);
+    assert!(server.waits.iter().all(|wait| *wait == receive_wait));
+    assert!(client.received > 0);
+    assert_eq!(client.waits.len(), client.received);
+    assert!(client.waits.iter().all(|wait| *wait == receive_wait));
 }
 
 /// A datagram without a receive wait doesn't publish one
 #[test]
 fn no_datagram_receive_wait_test() {
-    let (server_waits, client_waits) = published_waits(None);
+    let (server, client) = published(None);
 
-    assert!(server_waits.is_empty());
-    assert!(client_waits.is_empty());
+    assert!(server.received > 0);
+    assert!(server.waits.is_empty());
+    assert!(client.received > 0);
+    assert!(client.waits.is_empty());
 }
