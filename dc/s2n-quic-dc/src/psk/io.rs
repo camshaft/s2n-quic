@@ -890,6 +890,19 @@ mod tests {
         where
             L: s2n_quic::provider::endpoint_limits::Limiter + Send + Sync + 'static,
         {
+            Self::with_client_subscriber(endpoint_limits, NoopSubscriber).await
+        }
+
+        /// Creates a test setup with an optional endpoint limiter for the server, whose client's
+        /// endpoint publishes its events to `client_subscriber` too
+        async fn with_client_subscriber<L, S>(
+            endpoint_limits: Option<L>,
+            client_subscriber: S,
+        ) -> Self
+        where
+            L: s2n_quic::provider::endpoint_limits::Limiter + Send + Sync + 'static,
+            S: Sub + Send + Sync + 'static,
+        {
             init_tracing();
 
             let tls = TestTlsProvider {};
@@ -926,19 +939,19 @@ mod tests {
                 .with_signer(Signer::new(b"default"))
                 .with_capacity(50_000)
                 .with_clock(StdClock::default())
-                .with_subscriber(subscriber.clone())
+                .with_subscriber(subscriber)
                 .build()
                 .unwrap();
 
             let client = Client::bind::<
                 <TestTlsProvider as Provider>::Client,
-                NoopSubscriber,
+                S,
                 s2n_quic::provider::event::default::Subscriber,
             >(
                 "0.0.0.0:0".parse().unwrap(),
                 client_map,
                 tls.start_client().unwrap(),
-                subscriber,
+                client_subscriber,
                 crate::psk::client::Builder::default().with_success_jitter(Duration::ZERO),
             )
             .unwrap();
@@ -1151,14 +1164,118 @@ mod tests {
         assert_eq!(limit::path_rtt(Some(earlier), Some(read)), Some(path));
     }
 
+    /// What a test reads of the events that the client's endpoint publishes.
+    #[derive(Default)]
+    struct Recorded {
+        /// The `enabled` of each rx timestamps configuration that the endpoint's io published.
+        rx_timestamps: Vec<bool>,
+        /// For each connection, in the order that the endpoint made them, the round trips that
+        /// `PathRtt` read from the connection's events after each of its recovery metrics.
+        round_trips: Vec<Vec<limit::RoundTrips>>,
+    }
+
+    /// A subscriber of the client's endpoint that records `Recorded`, as the platform's tokio io
+    /// tests record each rx timestamps configuration. It reads each connection's round trips with
+    /// a `PathRtt` of its own, from the same events that the client's `PathRtt` reads them from.
+    struct Recorder {
+        path_rtt: PathRtt,
+        recorded: Arc<Mutex<Recorded>>,
+    }
+
+    /// A connection's context of `Recorder`.
+    struct RecorderContext {
+        /// The connection's place in `Recorded::round_trips`.
+        index: usize,
+        path_rtt: PathRttContext,
+    }
+
+    impl CoreSub for Recorder {
+        type ConnectionContext = RecorderContext;
+
+        fn create_connection_context(
+            &mut self,
+            meta: &events::ConnectionMeta,
+            info: &events::ConnectionInfo,
+        ) -> Self::ConnectionContext {
+            let mut recorded = self.recorded.lock().unwrap();
+            recorded.round_trips.push(vec![]);
+            RecorderContext {
+                index: recorded.round_trips.len() - 1,
+                path_rtt: CoreSub::create_connection_context(&mut self.path_rtt, meta, info),
+            }
+        }
+
+        fn on_platform_feature_configured(
+            &mut self,
+            _meta: &events::EndpointMeta,
+            event: &events::PlatformFeatureConfigured,
+        ) {
+            if let events::PlatformFeatureConfiguration::RxTimestamps { enabled, .. } =
+                &event.configuration
+            {
+                self.recorded.lock().unwrap().rx_timestamps.push(*enabled);
+            }
+        }
+
+        fn on_platform_event_loop_sleep(
+            &mut self,
+            meta: &events::EndpointMeta,
+            event: &events::PlatformEventLoopSleep,
+        ) {
+            CoreSub::on_platform_event_loop_sleep(&mut self.path_rtt, meta, event);
+        }
+
+        fn on_datagram_received(
+            &mut self,
+            context: &mut Self::ConnectionContext,
+            meta: &events::ConnectionMeta,
+            event: &events::DatagramReceived,
+        ) {
+            CoreSub::on_datagram_received(&mut self.path_rtt, &mut context.path_rtt, meta, event);
+        }
+
+        fn on_datagram_receive_wait(
+            &mut self,
+            context: &mut Self::ConnectionContext,
+            meta: &events::ConnectionMeta,
+            event: &events::DatagramReceiveWait,
+        ) {
+            CoreSub::on_datagram_receive_wait(
+                &mut self.path_rtt,
+                &mut context.path_rtt,
+                meta,
+                event,
+            );
+        }
+
+        fn on_recovery_metrics(
+            &mut self,
+            context: &mut Self::ConnectionContext,
+            meta: &events::ConnectionMeta,
+            event: &events::RecoveryMetrics,
+        ) {
+            CoreSub::on_recovery_metrics(&mut self.path_rtt, &mut context.path_rtt, meta, event);
+            if let Some(round_trips) = context.path_rtt.round_trips() {
+                self.recorded.lock().unwrap().round_trips[context.index].push(round_trips);
+            }
+        }
+    }
+
     /// Verifies that a handshake through the queue keeps its connection's round-trip time with the
     /// peer's map entry, and that the next handshake with the peer reads that time: where the
     /// socket doesn't measure the wait of a reply, it counts the time as it is where it is below
     /// its connection's lowest round trip, and keeps it with its entry; where the socket measures
-    /// it, the next handshake keeps its own path's time instead.
+    /// it, the next handshake keeps its own path's time instead. Whether the socket measures it is
+    /// whether the client's socket accepted the rx timestamps option, as the client's io publishes.
     #[tokio::test]
     async fn a_handshake_carries_its_paths_round_trip_time_to_the_peers_next_entry() {
-        let setup = TestSetup::new::<CloseAllConnectionsLimiter>(None).await;
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let recorder = Recorder {
+            path_rtt: PathRtt::default(),
+            recorded: recorded.clone(),
+        };
+        let setup =
+            TestSetup::with_client_subscriber(None::<CloseAllConnectionsLimiter>, recorder).await;
         let server_name: s2n_quic::server::Name = "localhost".into();
         let queue = &setup.client.queue;
 
@@ -1189,11 +1306,35 @@ mod tests {
             .unwrap();
         let second = setup.client.map.get_raw(setup.server_addr).unwrap();
         assert!(!Arc::ptr_eq(&first, &second), "a new entry");
-        if s2n_quic_platform::features::rx_timestamps::SOCKOPT.is_some() {
-            assert!(second.path_rtt().is_some(), "a kept round trip");
-            assert_ne!(second.path_rtt(), Some(earlier));
+        let kept = second.path_rtt().expect("a kept round trip");
+
+        // The client's io publishes whether its socket accepted the rx timestamps option, which
+        // `Client::bind` turns on, and the second handshake's connection is the last one that
+        // the client's endpoint made.
+        let (rx_timestamps, round_trips) = {
+            let recorded = recorded.lock().unwrap();
+            let round_trips = recorded.round_trips.last().cloned();
+            (recorded.rx_timestamps.clone(), round_trips)
+        };
+        assert_eq!(rx_timestamps.len(), 1, "{rx_timestamps:?}");
+        let enabled = rx_timestamps[0];
+        let round_trips = round_trips.expect("the second handshake's connection");
+
+        // The second handshake kept the time that `limit::kept_rtt` reads from the earlier time
+        // and the round trips that its connection read.
+        let read = round_trips
+            .iter()
+            .copied()
+            .find(|rtt| Some(kept) == limit::kept_rtt(Some(earlier), Some(*rtt)))
+            .unwrap_or_else(|| panic!("{kept:?}, {round_trips:?}"));
+        if enabled {
+            // The socket measured the wait of the reply of the connection's lowest round trip, so
+            // the handshake kept its own path's time.
+            assert!(read.measured, "{read:?}");
         } else {
-            assert_eq!(second.path_rtt(), Some(earlier));
+            // No reply holds a wait, so the handshake kept the earlier time as it is.
+            assert!(!read.measured, "{read:?}");
+            assert_eq!(kept, earlier);
         }
     }
 
