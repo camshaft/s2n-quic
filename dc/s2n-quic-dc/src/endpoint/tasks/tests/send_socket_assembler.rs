@@ -584,6 +584,8 @@ fn shuts_down_on_closed_input() {
 /// pipeline publishes the lost-pair event through the path secret map it was given.
 #[test]
 fn publishes_the_lost_mark_of_a_pair_that_sends_acknowledgements_alone() {
+    let _snapshots = crate::testing::without_snapshots();
+
     sim(|| {
         let registry = crate::counter::Registry::default();
         let clock = Clock::default();
