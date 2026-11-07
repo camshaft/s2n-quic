@@ -22,7 +22,7 @@ use std::{
     any::Any,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -95,6 +95,9 @@ pub struct Entry {
     /// The end of the routers' preference for the senders that deliver since a lost pair
     /// stopped delivering, as u64 nanoseconds.
     senders_preferred_until: AtomicU64,
+    /// Whether a router counts each socket sender as lost for sharing an interface with a lost
+    /// pair, so that the routers record each start and each end of that count once.
+    sender_counted_lost: Box<[AtomicBool]>,
     /// Per-socket-sender load scores encoded as u64 nanoseconds.
     ///
     /// A lower score means the sender is expected to drain its queue sooner and is
@@ -142,6 +145,7 @@ impl SizeOf for Entry {
             sender_delivered_at,
             senders_lost_since,
             senders_preferred_until,
+            sender_counted_lost,
             queue_state: _,
         } = self;
         creation_time.size()
@@ -165,6 +169,8 @@ impl SizeOf for Entry {
             + sender_delivered_at.len() * std::mem::size_of::<AtomicU64>()
             + senders_lost_since.size()
             + senders_preferred_until.size()
+            + std::mem::size_of::<Box<[AtomicBool]>>()
+            + sender_counted_lost.len() * std::mem::size_of::<AtomicBool>()
             + std::mem::size_of::<QueueState>()
     }
 }
@@ -270,6 +276,9 @@ impl Entry {
             sender_delivered_at: Self::init_load_scores(socket_sender_count),
             senders_lost_since: AtomicU64::new(0),
             senders_preferred_until: AtomicU64::new(0),
+            sender_counted_lost: (0..socket_sender_count)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
             queue_state,
         }
     }
@@ -537,6 +546,28 @@ impl Entry {
                 .sender_delivered_at
                 .iter()
                 .all(|delivered_at| delivered_at.load(Ordering::Acquire) <= until)
+    }
+
+    /// Records whether a router counts the sender as lost for sharing an interface with a
+    /// lost pair, and returns true where that changes what the entry recorded before.
+    pub fn set_sender_counted_lost(&self, sender_idx: LocalSenderId, counted: bool) -> bool {
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return false;
+        };
+        let slot = &self.sender_counted_lost[sender_idx];
+        if slot.load(Ordering::Acquire) == counted {
+            return false;
+        }
+        slot.swap(counted, Ordering::AcqRel) != counted
+    }
+
+    /// True when a router counts at least one sender as lost for sharing an interface with
+    /// a lost pair.
+    #[inline]
+    pub fn has_sender_counted_lost(&self) -> bool {
+        self.sender_counted_lost
+            .iter()
+            .any(|counted| counted.load(Ordering::Acquire))
     }
 
     pub fn idle_timeout(&self) -> Duration {

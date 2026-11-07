@@ -79,6 +79,8 @@ mod tests;
 ///   With one interface, a [`Paced`] stage paces every send socket at its rate before
 ///   [`PickTwo`] chooses a worker; with more, [`InterfacePacedPickTwo`] chooses the worker first
 ///   and paces each interface's sockets with a token bucket of their own.
+/// - Where `path_secret_map` is set, the routers publish through it each start and each end of
+///   their count of a sender as lost for sharing an interface with a lost pair.
 #[allow(clippy::too_many_arguments)]
 pub fn frame_dispatch<S, Clk>(
     spawner: &mut impl Spawner,
@@ -102,7 +104,7 @@ pub fn frame_dispatch<S, Clk>(
     // workers take the batches.
     // Where the endpoint passes its path secret map, the window records each frame it refuses
     // and each change of its limit as an event of the map's subscriber.
-    let window = match path_secret_map {
+    let window = match path_secret_map.clone() {
         Some(path_secret_map) => {
             CreditlessWindow::with_path_secret_map(BATCH_TARGET_BYTES, path_secret_map)
         }
@@ -118,6 +120,7 @@ pub fn frame_dispatch<S, Clk>(
         budgets,
         counter_registry,
         send_credit_pool,
+        path_secret_map,
         window,
     );
 }
@@ -135,6 +138,7 @@ fn frame_dispatch_over<S, Clk>(
     budgets: Budgets,
     counter_registry: counter::Registry,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    path_secret_map: Option<crate::path::secret::Map>,
     window: CreditlessWindow,
 ) where
     S: UnboundedSender<Entry<FrameBatch>> + 'static,
@@ -225,7 +229,8 @@ fn frame_dispatch_over<S, Clk>(
             // a worker for each batch.
             let rx = batch_frames(priority_batch_rxs);
             let rx = Paced::new(rx, clock, pacing.total_rate());
-            let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
+            let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool)
+                .with_path_secret_map(path_secret_map);
             let task_counter = register_task_counter();
             spawner.spawn_receiver_task(
                 rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
@@ -253,7 +258,8 @@ fn frame_dispatch_over<S, Clk>(
                 &pacing,
                 &counter_registry,
                 send_credit_pool,
-            );
+            )
+            .with_path_secret_map(path_secret_map);
             let rx = match highest_rx {
                 Some(highest_rx) => rx.with_highest_priority_input(highest_rx),
                 None => rx,

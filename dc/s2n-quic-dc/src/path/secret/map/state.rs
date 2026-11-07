@@ -1547,6 +1547,23 @@ where
             },
         );
     }
+
+    fn on_sender_counted_lost(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_sender_counted_lost(
+            event::builder::PathSecretMapSenderCountedLost {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
+
+    fn on_sender_counted_lost_cleared(&self, peer_address: &SocketAddr) {
+        self.subscriber()
+            .on_path_secret_map_sender_counted_lost_cleared(
+                event::builder::PathSecretMapSenderCountedLostCleared {
+                    peer_address: SocketAddress::from(*peer_address).into_event(),
+                },
+            );
+    }
 }
 
 impl<C, S> Drop for State<C, S>

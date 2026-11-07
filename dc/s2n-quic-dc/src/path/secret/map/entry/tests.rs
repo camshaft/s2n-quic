@@ -53,7 +53,9 @@ fn entry_size() {
             // lost pairs stopped delivering an AtomicU64 (8 bytes).
             // The end of the preference for the senders that deliver since a loss adds an
             // AtomicU64 (8 bytes).
-            385
+            // The senders a router counts as lost for sharing a lost pair's interface add a
+            // Box<[AtomicBool]> (16 bytes).
+            401
         );
     }
 }

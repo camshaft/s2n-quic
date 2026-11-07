@@ -521,3 +521,17 @@ struct CreditlessWindowLimitHalved {
     #[measure("limit_bytes", Bytes)]
     limit_bytes: u64,
 }
+
+#[event("path_secret_map:sender_counted_lost")]
+#[subject(endpoint)]
+/// Emitted when a router counts a sender as lost for sharing an interface with a lost pair
+struct PathSecretMapSenderCountedLost<'a> {
+    peer_address: SocketAddress<'a>,
+}
+
+#[event("path_secret_map:sender_counted_lost_cleared")]
+#[subject(endpoint)]
+/// Emitted when a router stops counting a sender as lost for a lost pair's interface
+struct PathSecretMapSenderCountedLostCleared<'a> {
+    peer_address: SocketAddress<'a>,
+}
