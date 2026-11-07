@@ -1808,3 +1808,71 @@ fn a_context_of_one_interface_neither_probes_nor_stops_delivering() {
     assert!(!ctx.is_path_lost());
     assert!(!entry.is_sender_lost(sender));
 }
+
+/// A lost mark records on the path secret entry when the pair stopped delivering: one smoothed
+/// RTT after the later of its last acknowledgement and the time it began to wait for one. A
+/// sender delivers since the loss only with an acknowledgement after that time.
+#[test]
+fn a_lost_mark_records_when_the_pair_stopped_delivering() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let at = |nanos| PreciseTimestamp { nanos };
+    let other = crate::endpoint::id::LocalSenderId::from_index(1);
+    // The last acknowledgement, the time the context began to wait for one, and the later of
+    // the two.
+    for (last_peer_activity, ack_wait_since, waiting_since) in [
+        (1_000_000, Some(5_000_000), 5_000_000),
+        (7_000_000, Some(5_000_000), 7_000_000),
+        (3_000_000, None, 3_000_000),
+    ] {
+        let registry = Registry::default();
+        let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+        ctx.last_peer_activity = at(last_peer_activity);
+        ctx.ack_wait_since = ack_wait_since.map(at);
+        let stopped_at = waiting_since + ctx.rtt_estimator.smoothed_rtt().as_nanos() as u64;
+        ctx.set_path_lost(true);
+
+        entry.record_sender_delivered(other, at(stopped_at));
+        assert!(
+            !entry.has_sender_delivering_since_lost(),
+            "an acknowledgement at the stop time doesn't count"
+        );
+        entry.record_sender_delivered(other, at(stopped_at + 1));
+        assert!(entry.delivers_since_lost(other));
+        assert!(entry.has_sender_delivering_since_lost());
+    }
+}
+
+/// An acknowledgement from the peer records the peer's activity and the sender's delivery on
+/// the path secret entry, and clears a lost mark that it covers.
+#[test]
+fn a_peer_acknowledgement_records_the_senders_delivery() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    ctx.last_peer_activity = PreciseTimestamp { nanos: 1_000 };
+    ctx.ack_wait_since = None;
+    ctx.next_packet_number = VarInt::from_u8(5);
+    ctx.set_path_lost(true);
+
+    let now = PreciseTimestamp {
+        nanos: 1_000_000_000,
+    };
+    ctx.on_peer_acknowledgement(now, VarInt::from_u8(4));
+    assert_eq!(ctx.last_peer_activity, now);
+    assert!(
+        ctx.is_path_lost(),
+        "an ack of a packet sent before the mark keeps it"
+    );
+    assert!(
+        !entry.delivers_since_lost(sender),
+        "a lost sender doesn't deliver, whatever its acknowledgements"
+    );
+
+    ctx.on_peer_acknowledgement(now + Duration::from_millis(1), VarInt::from_u8(5));
+    assert!(!ctx.is_path_lost());
+    assert!(
+        entry.delivers_since_lost(sender),
+        "the acknowledgement that clears the mark is a delivery after the loss"
+    );
+}

@@ -49,7 +49,9 @@ fn entry_size() {
             // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>) and the
             // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes), and the
             // empty peer_data_interfaces list (an Arc<[Option<u16>]>, 16 bytes).
-            353
+            // The senders' delivery times add a Box<[AtomicU64]> (16 bytes), and the time the
+            // lost pairs stopped delivering an AtomicU64 (8 bytes).
+            377
         );
     }
 }
@@ -274,4 +276,55 @@ fn a_message_for_a_lost_sender_goes_to_the_next_sender_that_delivers() {
         sender(2),
         "where every pair is lost, the preferred sender keeps the message"
     );
+}
+
+#[test]
+fn a_sender_delivers_since_a_loss_only_after_the_lost_pairs_stopped() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let entry = test_entry_with_senders(3);
+    let sender0 = crate::endpoint::id::LocalSenderId::from_index(0);
+    let sender1 = crate::endpoint::id::LocalSenderId::from_index(1);
+    let sender2 = crate::endpoint::id::LocalSenderId::from_index(2);
+    let at = |nanos| PreciseTimestamp { nanos };
+
+    entry.record_sender_delivered(sender1, at(150));
+    entry.record_sender_delivered(sender2, at(300));
+    assert!(
+        !entry.has_sender_delivering_since_lost(),
+        "no sender delivers since a loss while no pair is lost"
+    );
+
+    entry.set_senders_lost_since(at(200));
+    assert!(entry.set_sender_lost(sender0, true));
+    entry.record_sender_delivered(sender0, at(400));
+    assert!(
+        !entry.delivers_since_lost(sender0),
+        "a lost sender doesn't deliver, whatever its delivery time"
+    );
+    assert!(
+        !entry.delivers_since_lost(sender1),
+        "a sender acknowledged before the lost pairs stopped may be on the same down interface"
+    );
+    assert!(entry.delivers_since_lost(sender2));
+    assert!(entry.has_sender_delivering_since_lost());
+
+    entry.set_senders_lost_since(at(100));
+    assert!(
+        !entry.delivers_since_lost(sender1),
+        "an earlier stop time doesn't move the recorded one back"
+    );
+    entry.set_senders_lost_since(at(300));
+    assert!(
+        !entry.delivers_since_lost(sender2),
+        "a delivery at the stop time doesn't count"
+    );
+    assert!(!entry.has_sender_delivering_since_lost());
+
+    entry.record_sender_delivered(sender1, at(500));
+    entry.record_sender_delivered(sender1, at(50));
+    assert!(
+        entry.delivers_since_lost(sender1),
+        "an earlier delivery doesn't move the recorded one back"
+    );
+    assert!(entry.has_sender_delivering_since_lost());
 }
