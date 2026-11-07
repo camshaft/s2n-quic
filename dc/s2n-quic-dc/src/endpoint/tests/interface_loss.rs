@@ -43,6 +43,9 @@ const LOSS_AFTER: u64 = STREAMS as u64 * STREAM_LEN / 4;
 /// How long the client may take, once the interface delivers again, to write on it again: a
 /// lost pair probes again at its next probe timeout, whose backoff grows with the outage.
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the client waits after each stream while the interface recovers, so that the sim
+/// doesn't carry one stream after another until the lost pairs probe again.
+const RECOVERY_PAUSE: Duration = Duration::from_secs(1);
 /// How long neither endpoint sends while the interface is lost: longer than the 30 s idle
 /// timeout of the sim's paths, so that the send contexts of the lost pairs expire.
 const QUIET: Duration = Duration::from_secs(45);
@@ -80,6 +83,12 @@ struct Shared {
     recording: AtomicBool,
     /// The socket writes the monitor recorded.
     writes: Mutex<Vec<Write>>,
+    /// Whether the monitor watches for a socket write from the client's lost interface to the
+    /// server.
+    watching: AtomicBool,
+    /// Whether the client wrote from its lost interface to the server while the monitor
+    /// watched.
+    wrote_on_lost: AtomicBool,
     /// The client's data addresses, by socket.
     client_addrs: Mutex<Vec<SocketAddr>>,
     /// The server's data addresses, by socket.
@@ -119,15 +128,22 @@ impl Shared {
         lost_addrs.contains(&source) || lost_addrs.contains(&destination)
     }
 
-    /// Whether the monitor recorded a write from the client's lost interface to the server.
+    /// Records a socket write from `local` to `peer` where the monitor watches for one from the
+    /// client's lost interface to the server.
+    fn on_write(&self, local: SocketAddr, peer: SocketAddr) {
+        if !self.watching.load(Ordering::Relaxed) {
+            return;
+        }
+        let from_lost = self.lost_addrs.lock().unwrap().contains(&local);
+        if from_lost && self.server_addrs.lock().unwrap().contains(&peer) {
+            self.wrote_on_lost.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the client wrote from its lost interface to the server while the monitor
+    /// watched.
     fn wrote_on_lost_interface(&self) -> bool {
-        let lost_addrs = self.lost_addrs.lock().unwrap();
-        let server_addrs = self.server_addrs.lock().unwrap();
-        self.writes
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|write| lost_addrs.contains(&write.local) && server_addrs.contains(&write.peer))
+        self.wrote_on_lost.load(Ordering::Relaxed)
     }
 }
 
@@ -219,6 +235,7 @@ fn traffic_moves_off_a_lost_interface_and_back() {
     sim(move || {
         let monitor = in_sim.clone();
         bach::net::monitor::on_socket_write(move |write| {
+            monitor.on_write(*write.local_addr, *write.peer_addr);
             if monitor.recording.load(Ordering::Relaxed) {
                 let bytes: usize = write.payload.iter().map(|slice| slice.len()).sum();
                 monitor.writes.lock().unwrap().push(Write {
@@ -306,11 +323,11 @@ fn traffic_moves_off_a_lost_interface_and_back() {
             .expect("a new stream finishes while an interface is lost");
 
             // The interface delivers again, and its pairs probe at their next probe timeouts,
-            // whose backoff grows with the outage. The client opens a stream at a time until it
+            // whose backoff grows with the outage. The client opens one stream a second until it
             // writes on that interface again, and then opens the streams whose writes the test
             // counts.
             client_side.losing.store(false, Ordering::Relaxed);
-            client_side.recording.store(true, Ordering::Relaxed);
+            client_side.watching.store(true, Ordering::Relaxed);
             timeout(RECOVERY_TIMEOUT, async {
                 while !client_side.wrote_on_lost_interface() {
                     timeout(
@@ -319,11 +336,12 @@ fn traffic_moves_off_a_lost_interface_and_back() {
                     )
                     .await
                     .expect("a stream finishes while the interface recovers");
+                    RECOVERY_PAUSE.sleep().await;
                 }
             })
             .await
             .expect("the client writes on the interface again once it delivers");
-            client_side.writes.lock().unwrap().clear();
+            client_side.recording.store(true, Ordering::Relaxed);
 
             timeout(
                 ROUND_TIMEOUT,

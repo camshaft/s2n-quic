@@ -615,6 +615,9 @@ pub(crate) struct Context {
     /// Whether this context sent an ACK-only packet that isn't ack-eliciting since the peer
     /// last acknowledged one of its packets: it sends acknowledgements alone.
     pub ack_only_since_peer_ack: bool,
+    /// When this context last sent an ACK-only packet while its inflight map was empty, or
+    /// `None` where it hasn't sent one. [`Self::check_acknowledgement_only_delivery`] reads it.
+    pub ack_only_sent: Option<precision::Timestamp>,
     /// RTT sampler for ACK-only (read-heavy) sends.
     ///
     /// When `inflight` is empty we have no ack-eliciting packets in flight and
@@ -815,6 +818,7 @@ impl Context {
             ack_wait_since: None,
             ack_only_probe_sent: None,
             ack_only_since_peer_ack: false,
+            ack_only_sent: None,
             rtt_tracker: AckRttTracker::default(),
         })
     }
@@ -1334,8 +1338,8 @@ impl Context {
     /// began to wait for one. The PTO wheel checks it each time it fires for this
     /// context, at least once a base probe timeout period, so a pair is marked lost within
     /// about one probe timeout of the period's end. A context whose inflight map is empty has
-    /// no probe timeout armed, so the assembler checks it each time it assembles a packet for
-    /// the context.
+    /// no probe timeout armed, so [`Self::check_acknowledgement_only_delivery`] checks it each
+    /// time the assembler assembles packets for the context.
     pub fn has_stopped_delivering(&self, now: precision::Timestamp) -> bool {
         let waiting_since = if self.inflight.has_inflight() {
             self.ack_wait_since
@@ -1367,6 +1371,38 @@ impl Context {
             && self.ack_only_probe_sent.is_none()
             && self.ack_only_since_peer_ack
             && now.nanos_since(self.last_peer_activity) >= threshold.as_nanos() as u64
+    }
+
+    /// Marks the interface pair lost where this context sends acknowledgements alone and its
+    /// last ack-eliciting packet waited for a persistent congestion period without an
+    /// acknowledgement while the context kept sending ACK-only packets. The assembler calls it
+    /// each time it assembles packets for the context: a context whose inflight map is empty
+    /// has no probe timeout armed to check [`Self::has_stopped_delivering`].
+    ///
+    /// Where the context didn't send an ACK-only packet for a persistent congestion period
+    /// before `now`, that wait doesn't show that the pair stopped delivering: the probe may
+    /// have been lost in an earlier outage, and the context didn't send anything since that
+    /// would show that the pair delivers again. The context then forgets the probe and doesn't
+    /// mark the pair lost, so that it probes again as [`Self::needs_delivery_probe`] says.
+    pub fn check_acknowledgement_only_delivery(&mut self, now: precision::Timestamp) {
+        if self.inflight.has_inflight()
+            || self.is_path_lost()
+            || self.ack_only_probe_sent.is_none()
+        {
+            return;
+        }
+        let threshold = self.rtt_estimator.persistent_congestion_threshold();
+        let quiet = match self.ack_only_sent {
+            Some(sent) => now.nanos_since(sent) >= threshold.as_nanos() as u64,
+            None => true,
+        };
+        if quiet {
+            self.ack_only_probe_sent = None;
+            return;
+        }
+        if self.has_stopped_delivering(now) {
+            self.set_path_lost(true);
+        }
     }
 
     /// True when this context's pair is lost, it holds frames to move, and another sender of

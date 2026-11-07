@@ -91,15 +91,8 @@ where
     let now = clock.now();
     let time_sent = now.into();
     // A context that sends acknowledgements alone has no packet in the inflight map for its
-    // probe timeout to check, so its interface pair is marked lost here once its last
-    // ack-eliciting packet waited for a persistent congestion period without an
-    // acknowledgement.
-    if !context.inflight.has_inflight()
-        && !context.is_path_lost()
-        && context.has_stopped_delivering(now)
-    {
-        context.set_path_lost(true);
-    }
+    // probe timeout to check, so its interface pair is checked here.
+    context.check_acknowledgement_only_delivery(now);
     let PathInfo {
         max_datagram_size: mtu,
         max_segments,
@@ -725,6 +718,7 @@ where
                     if context.ack_only_probe_sent.is_none() {
                         context.ack_only_probe_sent = Some(now);
                     }
+                    context.ack_only_sent = Some(now);
                 }
                 context.invariants();
             } else if rtt_sample_needed {
@@ -736,6 +730,7 @@ where
                     .rtt_tracker
                     .on_non_eliciting_sent(packet_number, time_sent);
                 context.ack_only_since_peer_ack = true;
+                context.ack_only_sent = Some(now);
                 context.invariants();
             } else {
                 context.invariants();
