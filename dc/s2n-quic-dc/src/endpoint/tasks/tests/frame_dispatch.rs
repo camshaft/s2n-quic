@@ -1352,7 +1352,7 @@ fn counted_lost_events(pacing: SendPacing) -> (u64, u64) {
                 .peer_data_addrs(vec![peer(1), peer(2)])
                 .peer_data_interfaces(vec![Some(1), Some(2)])
                 .build(None);
-            assert!(pse.set_sender_lost(crate::endpoint::id::LocalSenderId::from_index(0), true));
+            assert!(pse.set_sender_lost(<crate::endpoint::id::LocalSenderId as crate::endpoint::id::Id>::from_index(0), true));
             let mut input = PriorityInput::default();
             input.push(test_frame(&pse));
             frame_tx.send_batch(input).unwrap();
@@ -1424,7 +1424,7 @@ fn the_priority_router_releases_the_slots_of_its_waiting_resets_as_it_ends() {
     let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
 
     // A frame without send credit takes the window, so that the resets below wait.
-    submit(&mut frame_tx, [holding_frame(&pse)]);
+    submit(&mut frame_tx, [ping(&pse)]);
     assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
     assert_eq!(take_lanes(&mut lanes).len(), 1);
 
