@@ -742,6 +742,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             freed_batch_tx.clone(),
             asm_counters,
             send_counters,
+            Some(path_secret_map.clone()),
             st.socket,
             immediate_tx.clone(),
             tx_wheel_tx,
@@ -1171,6 +1172,8 @@ async fn wheel_drain<A, T, F, const GRANULARITY_US: u64>(
 ///   `context_rx`.
 /// - Each input context is assembled into encrypted UDP segments for `socket`.
 /// - Any post-assembly scheduling interest is routed back through the supplied wheel senders.
+/// - The assembler publishes the lost mark of a pair that sends acknowledgements alone
+///   through `path_secret_map`, where one is set.
 /// - Socket send errors are logged and dropped; they do not terminate the pipeline.
 ///
 /// Returns a `Receiver<()>` — callers must drain it (typically via
@@ -1188,6 +1191,7 @@ pub fn send_socket_assembler<ImmediateRx, ContextRx, Clk, Socket, C, A, ImmW, Tx
     freed_batch_tx: crate::queue::FreedBatchTx,
     asm_counters: AssemblerCounters,
     send_counters: Rc<endpoint::counters::Send>,
+    path_secret_map: Option<crate::path::secret::Map>,
     socket: Socket,
     immediate_tx: ImmW,
     tx_wheel_tx: TxW,
@@ -1221,6 +1225,7 @@ where
         freed_batch_tx,
         asm_counters,
         send_counters,
+        path_secret_map,
         initial_tx_descriptor_allocs,
         send_credit_pool,
     );
