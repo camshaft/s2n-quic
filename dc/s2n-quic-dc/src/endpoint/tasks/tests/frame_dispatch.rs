@@ -584,14 +584,9 @@ fn the_priority_router_holds_frames_without_send_credit_at_the_window() {
     // The second frame, and the frame with send credit in the later lane, wait at the window.
     assert_eq!(poll_router(&mut router), Poll::Pending);
     assert!(take_lanes(&mut lanes).is_empty());
-    assert_eq!(
-        window.round(),
-        2,
-        "each pass of the priority router starts a round"
-    );
 
     // A worker's sender takes the first frame's batch, which releases its bytes.
-    window.release(costs[0], window.round());
+    window.release(costs[0], false);
     assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
     assert_eq!(take_lanes(&mut lanes), [(costs[1], 0), (costs[2], 4096)]);
     assert_eq!(window.held(), costs[1]);
@@ -629,7 +624,7 @@ fn the_priority_router_moves_every_frame_once_the_batch_router_is_gone() {
     assert_eq!(poll_router(&mut router), Poll::Ready(None));
 }
 
-// -- The window's round in each batch router of `frame_dispatch` ---------------------------
+// -- The window in each batch router of `frame_dispatch` -----------------------------------
 
 /// Like [`setup_with_pacing`] but over `window`, the window of the frames without send credit,
 /// whose limit the test reads through a clone.
@@ -667,17 +662,17 @@ fn setup_over(
     (frame_tx, rxs)
 }
 
-/// Each batch router of `frame_dispatch`, the highest lane's among them, sets on each batch the
-/// window's round in which it reads the batch. A worker's sender that takes the batch then
-/// releases its bytes in that round, and the window's limit doesn't halve, as it would for a
-/// batch read in an earlier round.
+/// A batch of the highest lane goes at once to the interface for the highest-priority traffic,
+/// so it doesn't wait in the batch router, and the window's limit doesn't halve as a worker's
+/// sender takes it, as it would for a batch that waited. The bulk frame's batch finds a free
+/// interface and doesn't wait either.
 #[test]
-fn a_highest_priority_batch_keeps_the_windows_round_and_its_limit() {
+fn a_highest_priority_batch_that_doesnt_wait_keeps_the_windows_limit() {
     use crate::endpoint::combinator::{CreditlessCost as _, CreditlessWindow};
 
     const LIMIT: u64 = 1_000_000;
     let _snapshots = crate::testing::without_snapshots();
-    let arrivals = Arc::new(Mutex::new(Vec::<(usize, bool, u64, u64)>::new()));
+    let arrivals = Arc::new(Mutex::new(Vec::<(usize, bool, bool, u64)>::new()));
     let arrivals_in_sim = arrivals.clone();
 
     sim(move || {
@@ -690,7 +685,7 @@ fn a_highest_priority_batch_keeps_the_windows_round_and_its_limit() {
 
         async move {
             // One submission holds a bulk frame and a ping of the same peer, neither of which
-            // borrows send credit, so the priority router moves both in one round. The ping goes
+            // borrows send credit, so the priority router moves both in one pass. The ping goes
             // in a batch of the highest lane, and the bulk frame in a batch of the other lanes.
             let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
                 .socket_sender_count(2)
@@ -714,7 +709,7 @@ fn a_highest_priority_batch_keeps_the_windows_round_and_its_limit() {
                     arrivals.lock().unwrap().push((
                         worker,
                         batch.holds_highest_priority(),
-                        batch.window_round(),
+                        batch.waited(),
                         window.limit(),
                     ));
                 }
@@ -736,14 +731,101 @@ fn a_highest_priority_batch_keeps_the_windows_round_and_its_limit() {
             .any(|&(worker, highest, _, _)| highest && worker == 1),
         "the ping's batch is of the highest priority level and goes to the fast interface"
     );
-    for &(worker, highest, round, limit) in arrivals.iter() {
-        assert_eq!(
-            round, 1,
-            "worker {worker}'s batch (highest: {highest}) keeps the window's round"
+    for &(worker, highest, waited, limit) in arrivals.iter() {
+        assert!(
+            !waited,
+            "worker {worker}'s batch (highest: {highest}) didn't wait in the batch router"
         );
         assert_eq!(
             limit, LIMIT,
             "the window's limit after worker {worker}'s batch (highest: {highest})"
         );
     }
+}
+
+/// `frame_dispatch` shares one window among its priority router, its batch router and each
+/// worker's sender: each batch's bytes leave the window as the batch reaches its worker, and the
+/// window's limit grows where the worker could take a batch while the window refuses a frame.
+#[test]
+fn frame_dispatch_shares_its_window_among_the_routers_and_the_workers_senders() {
+    shares_its_window(SendPacing::single(Rate::new(100.0)), 1);
+}
+
+/// As `frame_dispatch_shares_its_window_among_the_routers_and_the_workers_senders`, where the
+/// workers' send sockets are on two interfaces, which `InterfacePacedPickTwo` paces.
+#[test]
+fn frame_dispatch_shares_its_window_under_two_interfaces() {
+    let rate = Rate::new(100.0);
+    shares_its_window(SendPacing::new(vec![rate, rate], vec![0, 1]), 2);
+}
+
+/// Runs `frame_dispatch` with `pacing` and a worker for each of `workers` send sockets over a
+/// window of the test's, and checks the bytes the window holds and its limit as each batch
+/// reaches its worker.
+fn shares_its_window(pacing: SendPacing, workers: usize) {
+    const FRAMES: usize = 10;
+    let _snapshots = crate::testing::without_snapshots();
+    // The bytes the window holds and its limit as each batch reaches a worker.
+    let arrivals = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+    let arrivals_in_sim = arrivals.clone();
+
+    sim(move || {
+        let window = crate::endpoint::combinator::CreditlessWindow::new(
+            crate::endpoint::combinator::BATCH_TARGET_BYTES,
+        );
+        let (mut frame_tx, worker_rxs) = setup_over(workers, pacing.clone(), window.clone());
+
+        // Each frame fills a batch of its own, as in `pacing_delays_frames_beyond_burst`, and
+        // doesn't borrow send credit.
+        async move {
+            let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+                .socket_sender_count(workers)
+                .build(None);
+            let mut input = PriorityInput::default();
+            for _ in 0..FRAMES {
+                input.push(test_frame_with_payload(&pse, u16::MAX as usize));
+            }
+            frame_tx.send_batch(input).unwrap();
+        }
+        .primary()
+        .spawn();
+
+        for mut worker_rx in worker_rxs {
+            let arrivals = arrivals_in_sim.clone();
+            let window = window.clone();
+            async move {
+                while let Some(_batch) = worker_rx.recv().await {
+                    arrivals
+                        .lock()
+                        .unwrap()
+                        .push((window.held(), window.limit()));
+                }
+            }
+            .primary()
+            .spawn();
+        }
+    });
+
+    let arrivals = arrivals.lock().unwrap();
+    assert_eq!(arrivals.len(), FRAMES, "one batch for each frame");
+    // The priority router admits the frames into the window that the worker's sender releases:
+    // a batch arrives while the next one's bytes are in the window, and none are left once the
+    // last batch arrives.
+    assert!(
+        arrivals.iter().any(|&(held, _)| held > 0),
+        "the window didn't hold a batch as another arrived: {arrivals:?}",
+    );
+    assert_eq!(
+        arrivals.last().map(|&(held, _)| held),
+        Some(0),
+        "{arrivals:?}"
+    );
+    // The batch router tells the same window where the worker could take a batch that it
+    // doesn't have, so the limit grows past its minimum.
+    assert!(
+        arrivals
+            .iter()
+            .any(|&(_, limit)| limit > crate::endpoint::combinator::BATCH_TARGET_BYTES),
+        "the limit didn't grow: {arrivals:?}",
+    );
 }
