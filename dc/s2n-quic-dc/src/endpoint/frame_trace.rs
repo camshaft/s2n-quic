@@ -217,6 +217,24 @@ pub(crate) enum BindOutcome {
     StaleOrBound = 4,
 }
 
+/// What a server did with the slot of an init it rejected, or with the slot's hold as the hold's
+/// reset leaves the priority router. Stored in [`SlotHold::outcome`].
+///
+/// Discriminants are stable dump values - append, never renumber.
+#[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum HoldOutcome {
+    /// The slot is held for the init's binding until its reset leaves, and the reset is sent.
+    Held = 0,
+    /// The slot is held already for an earlier rejected init whose reset hasn't left, so the
+    /// init's reset isn't sent.
+    AlreadyHeld = 1,
+    /// The slot is past the peer's queues: it isn't held, and the init's reset isn't sent.
+    PastQueues = 2,
+    /// The hold's reset left the priority router for its lane, and the hold ended.
+    Released = 3,
+}
+
 /// Why a reader's window-growth attempt advertised no — or no new — MAX_DATA. Stored in
 /// [`MaxDataStall::outcome`]. [`Entered`](MaxDataOutcome::Entered) is the "an `Open` reader was
 /// polled and reached the window-growth logic" marker: for an `Open` reader, its *absence* after a
@@ -618,6 +636,24 @@ pub struct ServerBind {
     pub _pad: [u8; 7],
 }
 
+/// What a server did with a slot as it rejected an init on it, or as the slot's hold ended: one
+/// record for each init that `reject_init` rejects and each hold whose reset leaves the priority
+/// router for its lane. [`queue_id`](Self::queue_id) is the server's slot, the init's
+/// `dest_queue_id` and the reset's `source_queue_id`, so a record of a rejected init joins its
+/// [`ServerBind`] through `(cred_id, binding_id)`.
+#[derive(Event, IntoBytes, Immutable, Debug)]
+#[event(namespace = "s2n_quic_dc::recv::slot_hold")]
+#[repr(C)]
+pub struct SlotHold {
+    pub queue_id: u64,
+    #[event(key)]
+    pub binding_id: u64,
+    #[event(key)]
+    pub cred_id: [u8; 16],
+    pub outcome: HoldOutcome,
+    pub _pad: [u8; 7],
+}
+
 /// A reader's window-growth decision in `maybe_send_max_data`: why it advertised no — or no new —
 /// MAX_DATA. Proves why a streaming reader's window freezes and starves the peer writer.
 /// [`peer_max_offset`](Self::peer_max_offset) is what the writer has told us it wants to reach;
@@ -877,6 +913,26 @@ pub(crate) fn server_bind(
         backbeat::global::record(&ServerBind {
             source_queue_id: source_queue_id.as_u64(),
             dest_queue_id: dest_queue_id.as_u64(),
+            binding_id: binding_id.as_u64(),
+            cred_id: canonicalize_cred(*cred_id),
+            outcome,
+            _pad: [0; 7],
+        })
+    });
+}
+
+/// Records a [`SlotHold`]: what a server did with its slot `queue_id` as it rejected an init of
+/// `binding_id`, or the end of the slot's hold as its reset leaves the priority router.
+#[inline]
+pub(crate) fn slot_hold(
+    queue_id: VarInt,
+    binding_id: VarInt,
+    outcome: HoldOutcome,
+    cred_id: CredId,
+) {
+    super::dbg::on_enabled(|| {
+        backbeat::global::record(&SlotHold {
+            queue_id: queue_id.as_u64(),
             binding_id: binding_id.as_u64(),
             cred_id: canonicalize_cred(*cred_id),
             outcome,
@@ -1313,4 +1369,59 @@ pub(crate) fn resident_event_kinds() -> (
     }
 
     (lifecycles, packet_events, event_ids)
+}
+
+/// Test-only: each [`SlotHold`] resident in the global recorder for the credentials `cred_id`, as
+/// `(queue_id, binding_id, outcome)`, sorted.
+#[cfg(test)]
+pub(crate) fn resident_slot_holds(cred_id: CredId) -> Vec<(u64, u64, u8)> {
+    use backbeat::record::RecordView;
+
+    let cred_id = canonicalize_cred(*cred_id);
+    let bytes = backbeat::global::recorder().dump(
+        backbeat::registry::schemas(),
+        core::iter::empty(),
+        backbeat::registry::views(),
+        "",
+    );
+
+    let mut holds = Vec::new();
+    let Ok(reader) = backbeat::wire::DumpReader::new(bytes) else {
+        return holds;
+    };
+    let Ok(shards) = reader.shards() else {
+        return holds;
+    };
+    let u64_at = |fields: &[u8], offset: usize| -> Option<u64> {
+        let word = fields.get(offset..offset + 8)?;
+        Some(u64::from_ne_bytes(word.try_into().ok()?))
+    };
+    let cred = core::mem::offset_of!(SlotHold, cred_id);
+    for shard in shards {
+        backbeat::ring::walk(
+            &shard.region,
+            shard.head as usize,
+            shard.capacity as usize,
+            |payload| {
+                let Some(view) = RecordView::parse(&payload) else {
+                    return false;
+                };
+                if view.event_id == SlotHold::ID
+                    && view.fields.get(cred..cred + 16) == Some(&cred_id[..])
+                {
+                    let fields = view.fields;
+                    if let (Some(queue_id), Some(binding_id), Some(&outcome)) = (
+                        u64_at(fields, core::mem::offset_of!(SlotHold, queue_id)),
+                        u64_at(fields, core::mem::offset_of!(SlotHold, binding_id)),
+                        fields.get(core::mem::offset_of!(SlotHold, outcome)),
+                    ) {
+                        holds.push((queue_id, binding_id, outcome));
+                    }
+                }
+                true
+            },
+        );
+    }
+    holds.sort_unstable();
+    holds
 }

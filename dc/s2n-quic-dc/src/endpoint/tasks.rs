@@ -1951,6 +1951,7 @@ where
 
 /// Releases the server slot that a rejected init held for `frame`, where `frame` is a reset that
 /// no producer waits on, so that the slot is recorded as freed once the reset leaves for its lane.
+/// Each hold that ends is recorded as a [`SlotHold`](crate::endpoint::frame_trace::SlotHold).
 fn release_held(frame: &Frame, freed_batch_tx: &mut crate::queue::FreedBatchTx) {
     if WaitingResets::key(frame).is_none() {
         return;
@@ -1966,12 +1967,20 @@ fn release_held(frame: &Frame, freed_batch_tx: &mut crate::queue::FreedBatchTx) 
     if let crate::path::secret::map::entry::QueueState::Server(ref state) =
         *frame.path_secret_entry.queue_state()
     {
-        state.freed.release(
+        let released = state.freed.release(
             queue_pair.source_queue_id,
             binding_id,
             &frame.path_secret_entry,
             freed_batch_tx,
         );
+        if released {
+            crate::endpoint::frame_trace::slot_hold(
+                queue_pair.source_queue_id,
+                binding_id,
+                crate::endpoint::frame_trace::HoldOutcome::Released,
+                *frame.path_secret_entry.id(),
+            );
+        }
     }
 }
 
