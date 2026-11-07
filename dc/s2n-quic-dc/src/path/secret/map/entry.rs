@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     credentials::{self, Credentials},
-    endpoint::id::LocalSenderId,
+    endpoint::id::{Id as _, LocalSenderId},
     packet::{secret_control as control, WireVersion},
     path::secret::{
         open, receiver,
@@ -54,6 +54,10 @@ pub const MAX_PEER_DATA_ADDRS: usize = 128;
 
 pub type PeerDataAddrs = Arc<[SocketAddr]>;
 
+/// The interface of each of the peer's data recv addresses, where the peer tags them, in the
+/// order of [`PeerDataAddrs`], or empty where the peer doesn't tag an address.
+pub type PeerDataInterfaces = Arc<[Option<u16>]>;
+
 #[derive(Debug, thiserror::Error)]
 #[error("{inner}")]
 pub struct ApplicationDataError {
@@ -79,6 +83,18 @@ pub struct Entry {
     dead_at: AtomicI64,
     /// The peer's data recv addresses, learned via the post-handshake exchange.
     peer_data_addrs: PeerDataAddrs,
+    /// The interface of each of the peer's data recv addresses, or empty where the peer
+    /// doesn't tag an address.
+    peer_data_interfaces: PeerDataInterfaces,
+    /// When the peer last acknowledged a packet of each socket sender, as u64 nanoseconds, so
+    /// that the routers can tell the senders that deliver since a pair was lost from the
+    /// senders on the same down interface that aren't marked lost yet.
+    sender_delivered_at: Box<[AtomicU64]>,
+    /// The latest time a lost interface pair stopped delivering, as u64 nanoseconds.
+    senders_lost_since: AtomicU64,
+    /// The end of the routers' preference for the senders that deliver since a lost pair
+    /// stopped delivering, as u64 nanoseconds.
+    senders_preferred_until: AtomicU64,
     /// Per-socket-sender load scores encoded as u64 nanoseconds.
     ///
     /// A lower score means the sender is expected to drain its queue sooner and is
@@ -121,7 +137,11 @@ impl SizeOf for Entry {
             last_activity,
             dead_at,
             peer_data_addrs,
+            peer_data_interfaces,
             sender_load_scores,
+            sender_delivered_at,
+            senders_lost_since,
+            senders_preferred_until,
             queue_state: _,
         } = self;
         creation_time.size()
@@ -137,8 +157,14 @@ impl SizeOf for Entry {
             + dead_at.size()
             + std::mem::size_of::<PeerDataAddrs>()
             + peer_data_addrs.len() * std::mem::size_of::<SocketAddr>()
+            + std::mem::size_of::<PeerDataInterfaces>()
+            + peer_data_interfaces.len() * std::mem::size_of::<Option<u16>>()
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + sender_load_scores.len() * std::mem::size_of::<AtomicU64>()
+            + std::mem::size_of::<Box<[AtomicU64]>>()
+            + sender_delivered_at.len() * std::mem::size_of::<AtomicU64>()
+            + senders_lost_since.size()
+            + senders_preferred_until.size()
             + std::mem::size_of::<QueueState>()
     }
 }
@@ -239,9 +265,21 @@ impl Entry {
             last_activity: AtomicU64::new(0),
             dead_at: AtomicI64::new(-1),
             peer_data_addrs,
+            peer_data_interfaces: Arc::from([]),
             sender_load_scores: Self::init_load_scores(socket_sender_count),
+            sender_delivered_at: Self::init_load_scores(socket_sender_count),
+            senders_lost_since: AtomicU64::new(0),
+            senders_preferred_until: AtomicU64::new(0),
             queue_state,
         }
+    }
+
+    /// Sets the interface of each of the peer's data recv addresses, in the order of
+    /// [`Self::peer_data_addrs`], or empty where the peer doesn't tag an address.
+    pub(crate) fn with_peer_data_interfaces(mut self, interfaces: PeerDataInterfaces) -> Self {
+        debug_assert!(interfaces.is_empty() || interfaces.len() == self.peer_data_addrs.len());
+        self.peer_data_interfaces = interfaces;
+        self
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -258,12 +296,22 @@ impl Entry {
         &self.peer_data_addrs
     }
 
+    /// Returns the interface of each of the peer's data recv addresses, in the order of
+    /// [`Self::peer_data_addrs`], or an empty list where the peer doesn't tag an address.
+    pub fn peer_data_interfaces(&self) -> &PeerDataInterfaces {
+        &self.peer_data_interfaces
+    }
+
     /// Returns true if the peer advertised a non-empty data address list (via the
     /// `DcDataAddresses` transport parameter), validated at handshake completion.
     #[inline]
     pub fn has_data_addrs(&self) -> bool {
         !self.peer_data_addrs.is_empty()
     }
+
+    /// The bit of a sender's load score slot that marks the sender's interface pair lost. A
+    /// load score is nanoseconds since the epoch, far below this bit.
+    const LOST_SENDER: u64 = 1 << 63;
 
     fn sender_index(&self, sender_idx: LocalSenderId) -> Option<usize> {
         let len = self.sender_load_scores.len();
@@ -321,7 +369,7 @@ impl Entry {
         let Some(sender_idx) = self.sender_index(sender_idx) else {
             return 0;
         };
-        self.sender_load_scores[sender_idx].load(Ordering::Acquire)
+        self.sender_load_scores[sender_idx].load(Ordering::Acquire) & !Self::LOST_SENDER
     }
 
     /// Update the load score for the given sender slot.
@@ -345,9 +393,150 @@ impl Entry {
         };
         let delay = Self::queue_drain_delay(queued_bytes, bandwidth);
         let score = base + delay;
-        let score_value = Self::score_as_u64(score);
-        self.sender_load_scores[sender_idx].store(score_value, Ordering::Release);
+        let score_value = Self::score_as_u64(score).min(Self::LOST_SENDER - 1);
+        // Only this sender's send worker writes its slot, so the lost mark read here is still
+        // the slot's mark at the store.
+        let slot = &self.sender_load_scores[sender_idx];
+        let lost = slot.load(Ordering::Relaxed) & Self::LOST_SENDER;
+        slot.store(score_value | lost, Ordering::Release);
         score
+    }
+
+    /// Marks the interface pair of a sender lost, or delivering again, so that the routers
+    /// stop choosing it for new batches while another sender delivers. Returns whether the
+    /// mark changed; an entry without sender slots doesn't keep one.
+    pub fn set_sender_lost(&self, sender_idx: LocalSenderId, lost: bool) -> bool {
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return false;
+        };
+        let slot = &self.sender_load_scores[sender_idx];
+        let previous = if lost {
+            slot.fetch_or(Self::LOST_SENDER, Ordering::AcqRel)
+        } else {
+            slot.fetch_and(!Self::LOST_SENDER, Ordering::AcqRel)
+        };
+        ((previous & Self::LOST_SENDER) != 0) != lost
+    }
+
+    /// True when the interface pair of the sender is marked lost.
+    #[inline]
+    pub fn is_sender_lost(&self, sender_idx: LocalSenderId) -> bool {
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return false;
+        };
+        self.sender_load_scores[sender_idx].load(Ordering::Acquire) & Self::LOST_SENDER != 0
+    }
+
+    /// True when the interface pair of at least one sender is marked lost.
+    #[inline]
+    pub fn has_lost_sender(&self) -> bool {
+        self.sender_load_scores
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) & Self::LOST_SENDER != 0)
+    }
+
+    /// True when the interface pair of at least one sender isn't marked lost.
+    #[inline]
+    pub fn has_delivering_sender(&self) -> bool {
+        self.sender_load_scores
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) & Self::LOST_SENDER == 0)
+    }
+
+    /// Returns `preferred` while its interface pair delivers, and otherwise the first sender
+    /// after it, by slot, whose pair delivers, so that a message bound for a lost pair goes to a
+    /// pair that delivers. While a pair is marked lost and a sender has an acknowledgement after
+    /// the lost pairs stopped delivering, a pair delivers only where its sender has one too, as
+    /// the routers choose, since a sender on the same down interface may not be marked lost yet,
+    /// until a sender has an acknowledgement after the end of that preference, as
+    /// [`Self::prefers_senders_delivering_since_lost`] says; otherwise a pair delivers while it
+    /// isn't marked lost. Returns `preferred` where no pair delivers, or where the entry doesn't
+    /// keep sender slots.
+    pub fn delivering_sender(&self, preferred: LocalSenderId) -> LocalSenderId {
+        let Some(start) = self.sender_index(preferred) else {
+            return preferred;
+        };
+        let prefer_delivered = self.prefers_senders_delivering_since_lost();
+        let delivers = |index: usize| {
+            if prefer_delivered {
+                self.delivers_since_lost(LocalSenderId::from_index(index))
+            } else {
+                self.sender_load_scores[index].load(Ordering::Acquire) & Self::LOST_SENDER == 0
+            }
+        };
+        if delivers(start) {
+            return preferred;
+        }
+        let len = self.sender_load_scores.len();
+        (1..len)
+            .map(|offset| (start + offset) % len)
+            .find(|&index| delivers(index))
+            .map_or(
+                preferred,
+                <LocalSenderId as crate::endpoint::id::Id>::from_index,
+            )
+    }
+
+    /// Records that the peer acknowledged a packet of the sender at `at`, so that the routers
+    /// can tell the senders that deliver since a pair was lost.
+    pub fn record_sender_delivered(
+        &self,
+        sender_idx: LocalSenderId,
+        at: crate::time::precision::Timestamp,
+    ) {
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return;
+        };
+        self.sender_delivered_at[sender_idx].fetch_max(at.nanos, Ordering::AcqRel);
+    }
+
+    /// Records the time a lost interface pair stopped delivering. The entry keeps the latest
+    /// such time, so that a sender delivers since the loss only with an acknowledgement after
+    /// every lost pair stopped.
+    pub fn set_senders_lost_since(&self, since: crate::time::precision::Timestamp) {
+        self.senders_lost_since
+            .fetch_max(since.nanos, Ordering::AcqRel);
+    }
+
+    /// True when the interface pair of the sender isn't marked lost and the peer acknowledged
+    /// one of its packets after the latest time a lost pair stopped delivering.
+    pub fn delivers_since_lost(&self, sender_idx: LocalSenderId) -> bool {
+        let Some(idx) = self.sender_index(sender_idx) else {
+            return false;
+        };
+        !self.is_sender_lost(sender_idx)
+            && self.sender_delivered_at[idx].load(Ordering::Acquire)
+                > self.senders_lost_since.load(Ordering::Acquire)
+    }
+
+    /// True when the interface pair of at least one sender is marked lost and another sender
+    /// delivers since the lost pairs stopped delivering.
+    pub fn has_sender_delivering_since_lost(&self) -> bool {
+        self.has_lost_sender()
+            && (0..self.sender_delivered_at.len())
+                .any(|idx| self.delivers_since_lost(LocalSenderId::from_index(idx)))
+    }
+
+    /// Records the end of the routers' preference for the senders that deliver since a lost
+    /// pair stopped delivering. The entry keeps the latest such end, so that a later mark
+    /// extends the preference and an earlier one doesn't move it back.
+    pub fn set_senders_preferred_until(&self, until: crate::time::precision::Timestamp) {
+        self.senders_preferred_until
+            .fetch_max(until.nanos, Ordering::AcqRel);
+    }
+
+    /// True while the routers prefer the senders that deliver since the loss: some sender does,
+    /// as [`Self::has_sender_delivering_since_lost`] says, and no sender has an acknowledgement
+    /// after the end of the preference. The routers don't read a clock, so an acknowledgement
+    /// after the end shows that it passed; from then on, a sender that was idle at the loss
+    /// gets items again.
+    pub fn prefers_senders_delivering_since_lost(&self) -> bool {
+        let until = self.senders_preferred_until.load(Ordering::Acquire);
+        self.has_sender_delivering_since_lost()
+            && self
+                .sender_delivered_at
+                .iter()
+                .all(|delivered_at| delivered_at.load(Ordering::Acquire) <= until)
     }
 
     pub fn idle_timeout(&self) -> Duration {
@@ -625,6 +814,7 @@ pub struct TestEntryBuilder {
     params: Option<dc::ApplicationParams>,
     application_data: Option<ApplicationData>,
     peer_data_addrs: Arc<[SocketAddr]>,
+    peer_data_interfaces: Arc<[Option<u16>]>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -641,6 +831,7 @@ impl TestEntryBuilder {
             // Default to the single peer address so the common test entry can resolve a
             // send context without extra setup. Override via `peer_data_addrs`.
             peer_data_addrs: Arc::from([peer]),
+            peer_data_interfaces: Arc::from([]),
         }
     }
 
@@ -680,6 +871,13 @@ impl TestEntryBuilder {
     /// validated `DcDataAddresses` transport parameter would supply at handshake time.
     pub fn peer_data_addrs(mut self, addrs: impl Into<Arc<[SocketAddr]>>) -> Self {
         self.peer_data_addrs = addrs.into();
+        self
+    }
+
+    /// Set the interface of each of the peer's data-plane addresses, in the order of
+    /// `peer_data_addrs`, as the transport parameter's interface entries would supply them.
+    pub fn peer_data_interfaces(mut self, interfaces: impl Into<Arc<[Option<u16>]>>) -> Self {
+        self.peer_data_interfaces = interfaces.into();
         self
     }
 
@@ -724,7 +922,7 @@ impl TestEntryBuilder {
 
         let stateless_reset = signer.sign(secret.id());
 
-        Arc::new(Entry::new_with_socket_senders(
+        let entry = Entry::new_with_socket_senders(
             self.peer,
             secret,
             sender::State::new(stateless_reset),
@@ -734,7 +932,8 @@ impl TestEntryBuilder {
             self.application_data.clone(),
             self.peer_data_addrs.clone(),
             self.socket_sender_count,
-        ))
+        );
+        Arc::new(entry.with_peer_data_interfaces(self.peer_data_interfaces.clone()))
     }
 
     fn deterministic_secret(
