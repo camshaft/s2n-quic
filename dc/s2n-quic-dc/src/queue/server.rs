@@ -133,6 +133,17 @@ impl ServerView {
         self.state.freed.record(queue_id, path_entry, endpoint_tx);
     }
 
+    /// Hold the slot `queue_id` for the rejected init of `binding_id` until its reset leaves the
+    /// priority router, so that the slot is recorded as freed only then. Returns false where the
+    /// slot is held already, and for a slot past the peer's queues, which `bind_for_msg` rejects
+    /// without a reset.
+    pub fn hold_freed(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
+        if queue_id.as_u64() > self.state.max_queue_id {
+            return false;
+        }
+        self.state.freed.hold(queue_id, binding_id)
+    }
+
     /// Attempt to bind a slot and push the first stream entry.
     pub fn bind_and_send_stream(
         &mut self,

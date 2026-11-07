@@ -76,6 +76,9 @@ mod tests;
 /// - Frames from different priority classes are never merged into the same batch.
 /// - The spawned tasks are the only side effect; callers do not receive a handle back and must
 ///   keep the underlying executor running for progress.
+/// - A reset that leaves the priority router for its lane releases the slot that a rejected init
+///   held for it, and `freed_batch_tx` takes the slot's freed record where the slot was freed
+///   while the reset waited.
 /// - `pacing` and `budgets` bound how aggressively work is drained once the tasks are spawned.
 ///   With one interface, a [`Paced`] stage paces every send socket at its rate before
 ///   [`PickTwo`] chooses a worker; with more, [`InterfacePacedPickTwo`] chooses the worker first
@@ -94,6 +97,7 @@ pub fn frame_dispatch<S, Clk>(
     counter_registry: counter::Registry,
     path_secret_map: Option<crate::path::secret::Map>,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    freed_batch_tx: crate::queue::FreedBatchTx,
 ) where
     S: UnboundedSender<Entry<FrameBatch>> + 'static,
     Clk: precision::Clock + Clone + 'static,
@@ -123,6 +127,7 @@ pub fn frame_dispatch<S, Clk>(
         send_credit_pool,
         path_secret_map,
         window,
+        freed_batch_tx,
     );
 }
 
@@ -141,6 +146,7 @@ fn frame_dispatch_over<S, Clk>(
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
     path_secret_map: Option<crate::path::secret::Map>,
     window: CreditlessWindow,
+    freed_batch_tx: crate::queue::FreedBatchTx,
 ) where
     S: UnboundedSender<Entry<FrameBatch>> + 'static,
     Clk: precision::Clock + Clone + 'static,
@@ -171,6 +177,7 @@ fn frame_dispatch_over<S, Clk>(
             priority_list_txs,
             q_router_to_batcher.clone(),
             window.clone(),
+            freed_batch_tx,
         );
         let task_counter = counter_registry
             .register_task("task.priority_router")
@@ -1988,6 +1995,12 @@ where
 /// A frame with a completion sender isn't dropped here, since its producer waits on that
 /// completion. A reset without one or send credit is dropped where a copy of it waits in
 /// `staging` already: no producer waits on it, and the waiting copy resets the same queue.
+///
+/// A reset that leaves for its lane releases the slot that its rejected init held, and the slot
+/// is recorded as freed then, so that the client sends another init on the slot only once the
+/// reset is on its way. This bounds the resets of a peer's rejected inits that wait here to one
+/// for each of the peer's queues, whatever the queue and binding ids of its frames, and
+/// `WaitingResets` drops the copies of a reset that wait here already.
 struct FrameReceiver<Tx> {
     frame_rx: SubmissionReceiver,
     /// The frames that the window didn't admit yet, and the frames of their peers after them.
@@ -2005,6 +2018,8 @@ struct FrameReceiver<Tx> {
     priority_list_txs: [Tx; Priority::LEVELS],
     q_router_to_batcher: [QueueGauge; Priority::LEVELS],
     window: CreditlessWindow,
+    /// Takes the freed record of a slot that a reset leaving for its lane releases.
+    freed_batch_tx: crate::queue::FreedBatchTx,
 }
 
 impl<Tx> FrameReceiver<Tx>
@@ -2016,6 +2031,7 @@ where
         priority_list_txs: [Tx; Priority::LEVELS],
         q_router_to_batcher: [QueueGauge; Priority::LEVELS],
         window: CreditlessWindow,
+        freed_batch_tx: crate::queue::FreedBatchTx,
     ) -> Self {
         Self {
             frame_rx,
@@ -2028,6 +2044,7 @@ where
             priority_list_txs,
             q_router_to_batcher,
             window,
+            freed_batch_tx,
         }
     }
 
@@ -2052,8 +2069,10 @@ where
                     self.held_back.insert(peer);
                     kept.push_back(frame);
                 } else {
-                    // A reset that leaves for its lane stops waiting, so a later copy waits.
+                    // A reset that leaves for its lane stops waiting, so a later copy waits, and
+                    // the slot its rejected init held is released.
                     self.resets.remove(&frame);
+                    release_held(&frame, &mut self.freed_batch_tx);
                     admitted.push_back(frame);
                 }
             }
@@ -2087,6 +2106,32 @@ where
             };
             frame::HomogeneousBatch { queue, priority }.append_to(&mut self.staging);
         }
+    }
+}
+
+/// Releases the server slot that a rejected init held for `frame`, where `frame` is a reset that
+/// no producer waits on, so that the slot is recorded as freed once the reset leaves for its lane.
+fn release_held(frame: &Frame, freed_batch_tx: &mut crate::queue::FreedBatchTx) {
+    if WaitingResets::key(frame).is_none() {
+        return;
+    }
+    let frame::Header::QueueReset {
+        queue_pair,
+        binding_id,
+        ..
+    } = frame.header
+    else {
+        return;
+    };
+    if let crate::path::secret::map::entry::QueueState::Server(ref state) =
+        *frame.path_secret_entry.queue_state()
+    {
+        state.freed.release(
+            queue_pair.source_queue_id,
+            binding_id,
+            &frame.path_secret_entry,
+            freed_batch_tx,
+        );
     }
 }
 
