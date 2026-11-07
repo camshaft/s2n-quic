@@ -420,3 +420,73 @@ fn an_endpoint_keeps_its_configured_interfaces_and_socket_assignments() {
     assert_eq!(table.send_sockets(), &[Id(1), Id(1), Id::DEFAULT, Id(2)]);
     assert_eq!(table.recv_sockets(), &[Id(2), Id(1)]);
 }
+
+#[test]
+fn recv_sockets_are_advertised_with_their_interfaces_where_interfaces_are_listed() {
+    let recv = addrs(&["10.0.0.1:1", "10.0.0.1:2", "10.0.0.1:3"]);
+    let table = Table::resolve(&[], OVERALL, &[], &recv, &TestOs::default());
+    assert_eq!(table.advertised_recv_interfaces(), None);
+
+    let configs = [
+        Config {
+            recv_sockets: vec![2],
+            ..Default::default()
+        },
+        Config {
+            recv_sockets: vec![0],
+            ..Default::default()
+        },
+    ];
+    let table = Table::resolve(&configs, OVERALL, &[], &recv, &TestOs::default());
+    // Socket 0 is on the second listed interface, socket 1 on the default interface, and
+    // socket 2 on the first listed interface.
+    assert_eq!(table.advertised_recv_interfaces(), Some(vec![2, 0, 1]));
+
+    let config = Config {
+        recv_sockets: vec![1],
+        ..Default::default()
+    };
+    let table = Table::resolve(&[config], OVERALL, &[], &recv, &TestOs::default());
+    // The table holds the default interface beside the listed one, so one listed interface
+    // is tagged too: socket 1 is on it, and sockets 0 and 2 on the default interface.
+    assert_eq!(table.advertised_recv_interfaces(), Some(vec![0, 1, 0]));
+}
+
+#[test]
+fn an_endpoint_tags_its_advertised_addresses_with_their_interfaces() {
+    use crate::path::secret::map::data_addresses::{decode, DataAddr};
+
+    let configs = vec![
+        Config {
+            recv_sockets: vec![1],
+            ..Default::default()
+        },
+        Config {
+            recv_sockets: vec![0],
+            ..Default::default()
+        },
+    ];
+    // The inspector runtime binds its recv sockets to 127.0.0.1:20000 and up.
+    let advertised = addrs(&["127.0.0.1:20000", "127.0.0.1:20001"]);
+    let map = crate::path::secret::Map::builder()
+        .with_signer(crate::path::secret::stateless_reset::Signer::new(b"secret"))
+        .with_capacity(50_000)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber(crate::event::tracing::Subscriber::default())
+        .with_advertised_data_addrs(&advertised)
+        .build()
+        .unwrap();
+    let mut config = endpoint_config(configs);
+    config.path_secret_map = map.clone();
+    crate::runtime::inspector::endpoint_interfaces(config, 4, 2);
+
+    let tagged: Vec<DataAddr> = advertised
+        .iter()
+        .zip([2, 1])
+        .map(|(addr, interface)| DataAddr {
+            addr: *addr,
+            interface: Some(interface),
+        })
+        .collect();
+    assert_eq!(decode(&map.advertised_data_addrs().unwrap()).unwrap(), tagged);
+}
