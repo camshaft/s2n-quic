@@ -101,7 +101,12 @@ impl Socket {
                 local_address: Default::default(),
                 remote_address: SocketAddress::from(addr).into(),
             };
-            let packet = super::network::Packet { path, ecn, payload };
+            let packet = super::network::Packet {
+                path,
+                ecn,
+                payload,
+                receive_wait: None,
+            };
             queue.send_packet(packet);
         })?;
 
@@ -136,7 +141,12 @@ impl Socket {
 
         match packet {
             Poll::Ready(packet) => {
-                let super::network::Packet { path, ecn, payload } = packet;
+                let super::network::Packet {
+                    path,
+                    ecn,
+                    payload,
+                    ..
+                } = packet;
                 let remote_address = path.remote_address.0.into();
                 Ok(Some((remote_address, ecn, payload)))
             }
@@ -166,7 +176,12 @@ impl Socket {
 
         match packet {
             Poll::Ready(packet) => {
-                let super::network::Packet { path, ecn, payload } = packet;
+                let super::network::Packet {
+                    path,
+                    ecn,
+                    payload,
+                    ..
+                } = packet;
                 let remote_address = path.remote_address.0.into();
                 Ok((remote_address, ecn, payload)).into()
             }

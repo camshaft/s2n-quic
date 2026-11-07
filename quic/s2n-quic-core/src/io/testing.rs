@@ -68,6 +68,7 @@ impl Default for Message {
                     local_address: Default::default(),
                     remote_address: Default::default(),
                 },
+                receive_wait: None,
             },
             payload: Default::default(),
         }

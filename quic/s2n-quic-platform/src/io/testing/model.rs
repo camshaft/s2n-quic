@@ -183,6 +183,26 @@ impl Model {
             .store(value, Ordering::SeqCst);
         self
     }
+
+    pub fn receive_wait(&self) -> Option<Duration> {
+        let value = self.0.receive_wait.load(Ordering::SeqCst);
+        if value == u64::MAX {
+            None
+        } else {
+            Some(Duration::from_nanos(value))
+        }
+    }
+
+    /// Sets the time each packet reports it waited between the receiving socket's receive and
+    /// the endpoint's read of it
+    ///
+    /// By default, packets don't report a wait, as with a socket that doesn't report receive
+    /// times.
+    pub fn set_receive_wait(&self, value: Option<Duration>) -> &Self {
+        let value = value.map_or(u64::MAX, |value| value.as_nanos() as _);
+        self.0.receive_wait.store(value, Ordering::SeqCst);
+        self
+    }
 }
 
 fn rate_to_u64(rate: f64) -> u64 {
@@ -204,6 +224,7 @@ struct State {
     inflight_delay: AtomicU64,
     inflight_delay_threshold: AtomicU64,
     current_inflight: AtomicU64,
+    receive_wait: AtomicU64,
 }
 
 impl Default for State {
@@ -221,6 +242,7 @@ impl Default for State {
             inflight_delay: AtomicU64::new(0),
             inflight_delay_threshold: AtomicU64::new(u64::MAX),
             current_inflight: AtomicU64::new(0),
+            receive_wait: AtomicU64::new(u64::MAX),
         }
     }
 }
@@ -236,6 +258,7 @@ impl Network for Model {
         let max_udp_payload = self.max_udp_payload() as usize;
         let inflight_delay = self.inflight_delay();
         let inflight_delay_threshold = self.inflight_delay_threshold();
+        let receive_wait = self.receive_wait();
 
         let now = super::time::now();
         let mut transmit_time = now + self.delay();
@@ -306,6 +329,8 @@ impl Network for Model {
 
             // reverse the addresses so the dst/src are correct for the receiver
             packet.switch();
+            // report the receive wait the model sets, as a socket with receive times does
+            packet.receive_wait = receive_wait;
 
             let buffers = buffers.clone();
 

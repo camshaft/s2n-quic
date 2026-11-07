@@ -17,6 +17,7 @@ pub struct Builder {
     pub(super) mtu_config_builder: mtu::Builder,
     pub(super) max_segments: gso::MaxSegments,
     pub(super) gro_enabled: Option<bool>,
+    pub(super) rx_timestamps_enabled: bool,
     pub(super) reuse_address: bool,
     pub(super) reuse_port: bool,
     pub(super) only_v6: bool,
@@ -217,6 +218,16 @@ impl Builder {
         } else {
             self.with_gro_disabled()
         }
+    }
+
+    /// Configures the socket to report the time it received each datagram (SO_TIMESTAMPNS)
+    ///
+    /// When enabled on a platform that supports it, connections publish to their event
+    /// subscribers how long each received datagram waited between the socket's receive and the
+    /// endpoint's read. This is disabled by default.
+    pub fn with_rx_timestamps(mut self, enabled: bool) -> io::Result<Self> {
+        self.rx_timestamps_enabled = enabled;
+        Ok(self)
     }
 
     /// Enables the address reuse (SO_REUSEADDR) socket option

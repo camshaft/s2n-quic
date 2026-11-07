@@ -31,8 +31,8 @@ const fn const_max(a: usize, b: usize) -> usize {
 
 /// The maximum number of bytes allocated for cmsg data
 ///
-/// This should be enough for UDP_SEGMENT + IP_TOS + IP_PKTINFO. It may need to be increased
-/// to allow for future control messages.
+/// This should be enough for UDP_SEGMENT + IP_TOS + IP_PKTINFO + SCM_TIMESTAMPNS. It may need to
+/// be increased to allow for future control messages.
 pub const MAX_LEN: usize = {
     let tos_v4_size = features::tos_v4::CMSG_SPACE;
     let tos_v6_size = features::tos_v6::CMSG_SPACE;
@@ -47,12 +47,14 @@ pub const MAX_LEN: usize = {
     // rather than taking the max, we add these in case the OS gives us both
     let pktinfo_size = features::pktinfo_v4::CMSG_SPACE + features::pktinfo_v6::CMSG_SPACE;
 
+    let rx_timestamps_size = features::rx_timestamps::CMSG_SPACE;
+
     // This is currently needed due to how we detect if CMSG data has been written or not.
     //
     // TODO remove this once we split the `reset` traits into TX and RX types
     let padding = size_of::<cmsghdr>();
 
-    tos_size + segment_offload_size + pktinfo_size + padding
+    tos_size + segment_offload_size + pktinfo_size + rx_timestamps_size + padding
 };
 
 #[cfg(test)]

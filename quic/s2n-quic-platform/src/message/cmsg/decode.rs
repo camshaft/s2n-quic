@@ -29,20 +29,44 @@ pub unsafe fn value_from_bytes<T: Copy>(value: &[u8]) -> Option<T> {
 /// Decodes all recognized control messages in the given `iter` into `AncillaryData`
 #[inline]
 pub fn collect(iter: Iter) -> AncillaryData {
+    collect_with_clock(iter, features::rx_timestamps::now)
+}
+
+/// Decodes all recognized control messages in the given `iter` into `AncillaryData`, and reads
+/// `now` for the time of the read where a message holds the time the socket received the
+/// datagram
+#[inline]
+fn collect_with_clock<Now>(iter: Iter, now: Now) -> AncillaryData
+where
+    Now: FnOnce() -> Option<core::time::Duration>,
+{
     let mut data = AncillaryData::default();
+    let mut received = None;
 
     for (cmsg, value) in iter {
         unsafe {
             // SAFETY: `Iter` ensures values are aligned
-            collect_item(&mut data, cmsg, value);
+            collect_item(&mut data, &mut received, cmsg, value);
         }
     }
+
+    // The socket's receive time and `now` are both read on `CLOCK_REALTIME`, which can move back
+    // between the two reads, so `saturating_sub` reports a wait of zero in that case
+    data.receive_wait_nanos = received.and_then(|time| {
+        let wait = now()?.saturating_sub(time);
+        Some(u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX))
+    });
 
     data
 }
 
 #[inline]
-unsafe fn collect_item(data: &mut AncillaryData, cmsg: &cmsghdr, value: &[u8]) {
+unsafe fn collect_item(
+    data: &mut AncillaryData,
+    received: &mut Option<core::time::Duration>,
+    cmsg: &cmsghdr,
+    value: &[u8],
+) {
     macro_rules! decode_error {
         ($error:expr) => {
             #[cfg(all(test, feature = "tracing", not(any(kani, miri, fuzz))))]
@@ -93,6 +117,13 @@ unsafe fn collect_item(data: &mut AncillaryData, cmsg: &cmsghdr, value: &[u8]) {
                 data.segment_size = segment_size as _;
             } else {
                 decode_error!("invalid gro value");
+            }
+        }
+        (level, ty) if features::rx_timestamps::is_match(level, ty) => {
+            if let Some(time) = features::rx_timestamps::decode(value) {
+                *received = Some(time);
+            } else {
+                decode_error!("invalid rx timestamp value");
             }
         }
         _ => {
@@ -218,5 +249,75 @@ impl<'a> Iterator for Iter<'a> {
 
             Some((cmsg, data))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::cmsg::Encoder as _;
+    use core::{cell::Cell, time::Duration};
+
+    /// Decodes `iter` on a clock that answers `now`, and counts the clock's reads in `reads`
+    fn collect_at(iter: Iter, now: Duration, reads: &Cell<usize>) -> AncillaryData {
+        collect_with_clock(iter, || {
+            reads.set(reads.get() + 1);
+            Some(now)
+        })
+    }
+
+    /// Encodes an `SCM_TIMESTAMPNS` message that holds `received`, and decodes it on a clock
+    /// that answers `now`
+    #[cfg(target_os = "linux")]
+    fn collect_with_receive_time(received: Duration, now: Duration) -> (AncillaryData, usize) {
+        let mut storage = Storage::<128>::default();
+        let mut encoder = storage.encoder();
+        let mut time: libc::timespec = unsafe { core::mem::zeroed() };
+        time.tv_sec = received.as_secs() as _;
+        time.tv_nsec = received.subsec_nanos() as _;
+        let (level, ty) = (libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS);
+        assert!(encoder.encode_cmsg(level, ty, time).is_ok());
+
+        let reads = Cell::new(0);
+        let data = collect_at(encoder.iter(), now, &reads);
+        (data, reads.get())
+    }
+
+    /// A message without a receive time doesn't hold a wait, and the decode doesn't read the clock
+    #[test]
+    fn without_receive_time() {
+        let mut storage = Storage::<128>::default();
+        let mut encoder = storage.encoder();
+        assert!(encoder.encode_cmsg(0, 0, 1u32).is_ok());
+
+        let reads = Cell::new(0);
+        let data = collect_at(encoder.iter(), Duration::from_secs(10), &reads);
+
+        assert_eq!(data.receive_wait_nanos, None);
+        assert_eq!(reads.get(), 0);
+    }
+
+    /// A message with a receive time holds the time from the socket's receive to the read
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn with_receive_time() {
+        let received = Duration::new(10, 500);
+        let now = Duration::new(10, 2_000_500);
+        let (data, reads) = collect_with_receive_time(received, now);
+
+        assert_eq!(data.receive_wait_nanos, Some(2_000_000));
+        assert_eq!(reads, 1);
+    }
+
+    /// A receive time after the read, as where the clock moved back, holds a wait of zero
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn with_receive_time_after_the_read() {
+        let received = Duration::from_secs(10);
+        let now = Duration::from_secs(9);
+        let (data, reads) = collect_with_receive_time(received, now);
+
+        assert_eq!(data.receive_wait_nanos, Some(0));
+        assert_eq!(reads, 1);
     }
 }

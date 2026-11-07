@@ -57,6 +57,7 @@ impl Io {
             mtu_config_builder,
             max_segments,
             gro_enabled,
+            rx_timestamps_enabled,
             reuse_address,
             reuse_port,
             only_v6,
@@ -157,6 +158,12 @@ impl Io {
                 enabled: gro_enabled,
             },
         });
+
+        // Configure the socket to report the time it received each datagram, where the
+        // application enabled it
+        if rx_timestamps_enabled {
+            syscall::configure_rx_timestamps(&rx_socket);
+        }
 
         // Configure packet info CMSG
         syscall::configure_pktinfo(&rx_socket);

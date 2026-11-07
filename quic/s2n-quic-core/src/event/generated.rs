@@ -2768,6 +2768,24 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
+    #[doc = " The time a datagram waited between the socket's receive and the endpoint's read of it,"]
+    #[doc = " published only for a datagram whose receive time the IO provider reports"]
+    pub struct DatagramReceiveWait {
+        pub wait: Duration,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for DatagramReceiveWait {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("DatagramReceiveWait");
+            fmt.field("wait", &self.wait);
+            fmt.finish()
+        }
+    }
+    impl Event for DatagramReceiveWait {
+        const NAME: &'static str = "transport:datagram_receive_wait";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
     #[doc = " Connection closed"]
     pub struct ConnectionClosed {
         pub error: crate::connection::Error,
@@ -4359,6 +4377,17 @@ pub mod tracing {
             let id = context.id();
             let api::DcPathCreated { path } = event;
             tracing :: event ! (target : "dc_path_created" , parent : id , tracing :: Level :: DEBUG , { path = tracing :: field :: debug (path) });
+        }
+        #[inline]
+        fn on_datagram_receive_wait(
+            &mut self,
+            context: &mut Self::ConnectionContext,
+            _meta: &api::ConnectionMeta,
+            event: &api::DatagramReceiveWait,
+        ) {
+            let id = context.id();
+            let api::DatagramReceiveWait { wait } = event;
+            tracing :: event ! (target : "datagram_receive_wait" , parent : id , tracing :: Level :: DEBUG , { wait = tracing :: field :: debug (wait) });
         }
         #[inline]
         fn on_connection_closed(
@@ -6638,6 +6667,21 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
+    #[doc = " The time a datagram waited between the socket's receive and the endpoint's read of it,"]
+    #[doc = " published only for a datagram whose receive time the IO provider reports"]
+    pub struct DatagramReceiveWait {
+        pub wait: Duration,
+    }
+    impl IntoEvent<api::DatagramReceiveWait> for DatagramReceiveWait {
+        #[inline]
+        fn into_event(self) -> api::DatagramReceiveWait {
+            let DatagramReceiveWait { wait } = self;
+            api::DatagramReceiveWait {
+                wait: wait.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
     #[doc = " Connection closed"]
     pub struct ConnectionClosed {
         pub error: crate::connection::Error,
@@ -7722,6 +7766,18 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `DatagramReceiveWait` event is triggered"]
+        #[inline]
+        fn on_datagram_receive_wait(
+            &mut self,
+            context: &mut Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::DatagramReceiveWait,
+        ) {
+            let _ = context;
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = "Called when the `ConnectionClosed` event is triggered"]
         #[inline]
         fn on_connection_closed(
@@ -8458,6 +8514,16 @@ mod traits {
             (self.1).on_dc_path_created(&mut context.1, meta, event);
         }
         #[inline]
+        fn on_datagram_receive_wait(
+            &mut self,
+            context: &mut Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::DatagramReceiveWait,
+        ) {
+            (self.0).on_datagram_receive_wait(&mut context.0, meta, event);
+            (self.1).on_datagram_receive_wait(&mut context.1, meta, event);
+        }
+        #[inline]
         fn on_connection_closed(
             &mut self,
             context: &mut Self::ConnectionContext,
@@ -8924,6 +8990,8 @@ mod traits {
         fn on_dc_state_changed(&mut self, event: builder::DcStateChanged);
         #[doc = "Publishes a `DcPathCreated` event to the publisher's subscriber"]
         fn on_dc_path_created(&mut self, event: builder::DcPathCreated);
+        #[doc = "Publishes a `DatagramReceiveWait` event to the publisher's subscriber"]
+        fn on_datagram_receive_wait(&mut self, event: builder::DatagramReceiveWait);
         #[doc = "Publishes a `ConnectionClosed` event to the publisher's subscriber"]
         fn on_connection_closed(&mut self, event: builder::ConnectionClosed);
         #[doc = r" Returns the QUIC version negotiated for the current connection, if any"]
@@ -9411,6 +9479,15 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_datagram_receive_wait(&mut self, event: builder::DatagramReceiveWait) {
+            let event = event.into_event();
+            self.subscriber
+                .on_datagram_receive_wait(self.context, &self.meta, &event);
+            self.subscriber
+                .on_connection_event(self.context, &self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn on_connection_closed(&mut self, event: builder::ConnectionClosed) {
             let event = event.into_event();
             self.subscriber
@@ -9734,6 +9811,7 @@ pub mod testing {
         pub bbr_state_changed: u64,
         pub dc_state_changed: u64,
         pub dc_path_created: u64,
+        pub datagram_receive_wait: u64,
         pub connection_closed: u64,
         pub version_information: u64,
         pub endpoint_packet_sent: u64,
@@ -9830,6 +9908,7 @@ pub mod testing {
                 bbr_state_changed: 0,
                 dc_state_changed: 0,
                 dc_path_created: 0,
+                datagram_receive_wait: 0,
                 connection_closed: 0,
                 version_information: 0,
                 endpoint_packet_sent: 0,
@@ -10531,6 +10610,20 @@ pub mod testing {
                 self.output.push(out);
             }
         }
+        fn on_datagram_receive_wait(
+            &mut self,
+            _context: &mut Self::ConnectionContext,
+            meta: &api::ConnectionMeta,
+            event: &api::DatagramReceiveWait,
+        ) {
+            self.datagram_receive_wait += 1;
+            if self.location.is_some() {
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.push(out);
+            }
+        }
         fn on_connection_closed(
             &mut self,
             _context: &mut Self::ConnectionContext,
@@ -10758,6 +10851,7 @@ pub mod testing {
         pub bbr_state_changed: u64,
         pub dc_state_changed: u64,
         pub dc_path_created: u64,
+        pub datagram_receive_wait: u64,
         pub connection_closed: u64,
         pub version_information: u64,
         pub endpoint_packet_sent: u64,
@@ -10844,6 +10938,7 @@ pub mod testing {
                 bbr_state_changed: 0,
                 dc_state_changed: 0,
                 dc_path_created: 0,
+                datagram_receive_wait: 0,
                 connection_closed: 0,
                 version_information: 0,
                 endpoint_packet_sent: 0,
@@ -11426,6 +11521,15 @@ pub mod testing {
         }
         fn on_dc_path_created(&mut self, event: builder::DcPathCreated) {
             self.dc_path_created += 1;
+            let event = event.into_event();
+            if self.location.is_some() {
+                let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+                let out = format!("{event:?}");
+                self.output.push(out);
+            }
+        }
+        fn on_datagram_receive_wait(&mut self, event: builder::DatagramReceiveWait) {
+            self.datagram_receive_wait += 1;
             let event = event.into_event();
             if self.location.is_some() {
                 let event = crate::event::snapshot::Fmt::to_snapshot(&event);
