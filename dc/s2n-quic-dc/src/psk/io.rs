@@ -1314,7 +1314,7 @@ mod tests {
         // flight went out. A later packet doesn't change that part.
         context.on_sent(ms(10));
         context.on_received(ms(12), pass(9, 11));
-        context.on_received(ms(14), pass(12, 13));
+        context.on_received(ms(14), pass(12, 14));
         let first = context.round_trips().unwrap();
         assert_eq!(first.flights, [ms(1), ms(1)]);
         assert_eq!(first.flight_passes, [Duration::ZERO; 2]);
@@ -1326,6 +1326,60 @@ mod tests {
         context.on_sent(ms(15));
         context.on_complete(ms(21), pass(14, 20));
         context.on_complete(ms(25), pass(21, 24));
+        let round_trips = context.round_trips().unwrap();
+        assert_eq!(round_trips.flights, [ms(2), ms(6)]);
+        assert_eq!(round_trips.flight_passes, [ms(1), ms(5)]);
+    }
+
+    /// Verifies that the connection's subscriber reads the endpoint's last pass for each of the
+    /// handshake's two round trips: at the first packet it receives, and at dc.complete.
+    #[test]
+    fn a_connection_reads_the_endpoints_last_pass_as_each_round_trip_ends() {
+        let start = clock::now();
+        let mut path_rtt = PathRtt::default();
+        let mut context = PathRttContext {
+            min_rtt: Some(ms(1)),
+            ..Default::default()
+        };
+        let meta = |at: u64| -> events::ConnectionMeta {
+            builder::ConnectionMeta {
+                endpoint_type: endpoint::Type::Client,
+                id: 0,
+                timestamp: start + ms(at),
+            }
+            .into_event()
+        };
+        let sent = builder::PacketSent {
+            packet_header: builder::PacketHeader::OneRtt { number: 0 },
+            packet_len: 1200,
+        }
+        .into_event();
+        let received = builder::PacketReceived {
+            packet_header: builder::PacketHeader::OneRtt { number: 0 },
+        }
+        .into_event();
+
+        // The first flight goes out at 10 ms, and its reply is read at 12 ms, in the pass after
+        // one that woke at 9 ms and slept at 11 ms.
+        CoreSub::on_packet_sent(&mut path_rtt, &mut context, &meta(10), &sent);
+        sleep(&mut path_rtt, start, 9, 11);
+        CoreSub::on_packet_received(&mut path_rtt, &mut context, &meta(12), &received);
+
+        // The second flight goes out at 15 ms, and dc.complete comes at 21 ms, in the pass after
+        // one that woke at 14 ms and slept at 20 ms.
+        let ready = builder::DcStateChanged {
+            state: builder::DcState::PathSecretsReady,
+        }
+        .into_event();
+        CoreSub::on_dc_state_changed(&mut path_rtt, &mut context, &meta(13), &ready);
+        CoreSub::on_packet_sent(&mut path_rtt, &mut context, &meta(15), &sent);
+        sleep(&mut path_rtt, start, 14, 20);
+        let complete = builder::DcStateChanged {
+            state: builder::DcState::Complete,
+        }
+        .into_event();
+        CoreSub::on_dc_state_changed(&mut path_rtt, &mut context, &meta(21), &complete);
+
         let round_trips = context.round_trips().unwrap();
         assert_eq!(round_trips.flights, [ms(2), ms(6)]);
         assert_eq!(round_trips.flight_passes, [ms(1), ms(5)]);
