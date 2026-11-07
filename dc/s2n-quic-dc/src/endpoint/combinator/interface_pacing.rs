@@ -158,6 +158,22 @@ impl SendPacing {
         self.socket_interfaces.get(socket).copied().unwrap_or(0)
     }
 
+    /// Returns the place of the send socket at `socket` among the paced interfaces, as
+    /// [`interface::Table::send_places`] places it for the send workers: the position of its
+    /// interface, which ranks the interfaces that hold a send socket by their ids, and its
+    /// position among the send sockets of that interface.
+    pub(super) fn send_place(&self, socket: usize) -> interface::SendPlace {
+        let rank = self.interface_of(socket);
+        let index = (0..socket)
+            .filter(|&earlier| self.interface_of(earlier) == rank)
+            .count();
+        interface::SendPlace {
+            rank,
+            count: self.interface_count(),
+            index,
+        }
+    }
+
     /// Returns the position of the interface that carries the highest-priority traffic, where
     /// the endpoint chooses one.
     pub fn highest_priority(&self) -> Option<usize> {
@@ -255,6 +271,9 @@ where
     pacers: Vec<Pacer<T, Clk::Timer>>,
     /// The position in `pacers` of each sender's interface.
     sender_interfaces: IdMap<LocalSenderId, usize>,
+    /// The place of each sender's send socket among the endpoint's interfaces, which pairs the
+    /// sender with the peer interface it sends to.
+    sender_places: IdMap<LocalSenderId, interface::SendPlace>,
     /// The position in `pacers` of the interface that carries the highest-priority traffic,
     /// where the [`SendPacing`] has one that holds a sender.
     highest_priority: Option<usize>,
@@ -290,6 +309,8 @@ where
     /// The lost mark of each sender of the batch being routed, read once for each batch so that
     /// each pass over the senders sees the same marks. Where a sender has an acknowledgement
     /// after the lost pairs stopped delivering, every sender without one counts as lost.
+    /// Where no sender has one, a sender that shares an interface with a pair marked lost counts
+    /// as lost too, as `counts_as_lost` in the combinator module says.
     lost_marks: Vec<bool>,
     pick_counters: IdMap<LocalSenderId, crate::counter::Counter>,
     rejected_counters: IdMap<LocalSenderId, crate::counter::Summary>,
@@ -322,6 +343,10 @@ where
         let sender_interfaces = senders
             .iter()
             .map(|(id, _)| (id, pacing.interface_of(id.as_usize())))
+            .collect();
+        let sender_places = senders
+            .iter()
+            .map(|(id, _)| (id, pacing.send_place(id.as_usize())))
             .collect();
         let pick_counters = senders
             .iter()
@@ -358,6 +383,7 @@ where
             clock,
             pacers,
             sender_interfaces,
+            sender_places,
             highest_priority,
             round_robin_idx: 0,
             closed: false,
@@ -412,18 +438,35 @@ where
     /// Where a sender has an acknowledgement after the lost pairs stopped delivering, a sender
     /// without one counts as lost too, since it may be on the same down interface and not be
     /// marked yet.
+    /// Where no sender has one, a sender that shares the local interface or the peer interface
+    /// of a pair marked lost counts as lost too, as `counts_as_lost` in the combinator module
+    /// says.
     fn read_lost_marks(&mut self, entry: &PathSecretEntry) {
         let prefer_delivered = entry.has_sender_delivering_since_lost();
+        // Counting the senders that share a marked pair's interfaces reads every sender's
+        // interfaces, so the router counts them only while a pair is marked lost.
+        let counted_lost = if !prefer_delivered && entry.has_lost_sender() {
+            super::counts_as_lost(
+                entry,
+                self.senders.len(),
+                |sender| Some(self.sender_interfaces[LocalSenderId::from_index(sender)]),
+                |sender| Some(self.sender_places[LocalSenderId::from_index(sender)]),
+            )
+        } else {
+            Vec::new()
+        };
         self.lost_marks.clear();
-        self.lost_marks
-            .extend((0..self.senders.len()).map(|sender| {
-                let sender = LocalSenderId::from_index(sender);
-                if prefer_delivered {
-                    !entry.delivers_since_lost(sender)
-                } else {
-                    entry.is_sender_lost(sender)
-                }
-            }));
+        self.lost_marks.extend((0..self.senders.len()).map(|idx| {
+            let sender = LocalSenderId::from_index(idx);
+            if prefer_delivered {
+                !entry.delivers_since_lost(sender)
+            } else {
+                counted_lost
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_else(|| entry.is_sender_lost(sender))
+            }
+        }));
     }
 
     /// Returns whether a sender on the interface for the highest-priority traffic delivers to
