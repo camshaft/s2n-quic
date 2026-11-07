@@ -326,6 +326,7 @@ fn try_send_pick_two_with_rr(
         rejected_counters.into();
     let mut senders_map: crate::endpoint::id::IdMap<crate::endpoint::id::LocalSenderId, _> =
         std::mem::take(senders).into();
+    let counted_lost_recorder = CountedLostRecorder::new(&senders_map, &registry);
     let result = PickTwo::<TestItem, TestReceiver<TestItem>, TestSender>::try_send_pick_two(
         value,
         &mut senders_map,
@@ -334,6 +335,7 @@ fn try_send_pick_two_with_rr(
         &pick_counters_map,
         &rejected_counters_map,
         &score_delta,
+        &counted_lost_recorder,
     );
     *senders = senders_map.into_iter().map(|(_, v)| v).collect();
     result
@@ -2146,11 +2148,20 @@ fn priority_items(
 /// interface and 2 and 3 on the second, which carries the highest-priority traffic. Returns, for
 /// each sender, how many highest-priority items and how many other items it got.
 fn route_by_interface(values: VecDeque<TestItem>) -> [[usize; 2]; 4] {
+    route_by_interface_recording(values, &crate::counter::Registry::default(), None)
+}
+
+/// Routes `values` as `route_by_interface` does, with the router's counters in `registry` and
+/// its events published through `path_secret_map`, where it is set.
+fn route_by_interface_recording(
+    values: VecDeque<TestItem>,
+    registry: &crate::counter::Registry,
+    path_secret_map: Option<crate::path::secret::Map>,
+) -> [[usize; 2]; 4] {
     let rate = Rate::new(100.0);
     let clock = test_clock();
     let sends: [Sends; 4] = Default::default();
     let pacing = SendPacing::new(vec![rate, rate], vec![0, 0, 1, 1]).with_highest_priority(1);
-    let registry = crate::counter::Registry::default();
     let mut router = InterfacePacedPickTwo::new(
         TestReceiver {
             values,
@@ -2160,9 +2171,10 @@ fn route_by_interface(values: VecDeque<TestItem>) -> [[usize; 2]; 4] {
         crate::xorshift::Rng::new(),
         clock.clone(),
         &pacing,
-        &registry,
+        registry,
         test_pool(),
-    );
+    )
+    .with_path_secret_map(path_secret_map);
 
     assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
 
@@ -5331,6 +5343,7 @@ fn pick_two_records_its_counters_while_a_pair_is_lost() {
         })
         .collect::<Vec<_>>()
         .into();
+    let counted_lost_recorder = CountedLostRecorder::new(&senders, &registry);
     let mut rng = crate::xorshift::Rng::with_seed(7);
     let mut rr = 0;
     for _ in 0..10 {
@@ -5343,6 +5356,7 @@ fn pick_two_records_its_counters_while_a_pair_is_lost() {
             &pick_counters,
             &rejected_counters,
             &score_delta,
+            &counted_lost_recorder,
         );
         assert!(result.is_ok());
     }
@@ -5549,4 +5563,168 @@ fn send_pacing_places_each_send_socket_as_the_interface_table_does() {
         .map(|socket| pacing.send_place(socket))
         .collect();
     assert_eq!(table.send_places(), Some(places));
+}
+
+/// Builds a path secret map that publishes its events to a testing subscriber, which counts
+/// each event.
+fn map_with_subscriber() -> (
+    crate::path::secret::Map,
+    Arc<crate::event::testing::Subscriber>,
+) {
+    let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+    let map = crate::path::secret::Map::builder()
+        .with_signer(crate::path::secret::stateless_reset::Signer::random())
+        .with_capacity(4)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber(subscriber.clone())
+        .build()
+        .unwrap();
+    (map, subscriber)
+}
+
+/// Returns how many times `subscriber` saw a router start and end its count of a sender as
+/// lost for sharing an interface with a lost pair.
+fn counted_lost_events(subscriber: &crate::event::testing::Subscriber) -> (u64, u64) {
+    (
+        subscriber
+            .path_secret_map_sender_counted_lost
+            .load(Ordering::Relaxed),
+        subscriber
+            .path_secret_map_sender_counted_lost_cleared
+            .load(Ordering::Relaxed),
+    )
+}
+
+/// While a pair is lost and no sender delivers since, pick-two counts sender 2, which sends to
+/// the lost pair's peer interface, as lost, and records the start of that count once, on its
+/// counters and as a path secret map event, though it routes every item. Once senders 1 to 3
+/// deliver since the loss, it records the end of that count once. A later loss counts sender 2
+/// again, and once no pair is marked lost, it records a second end.
+#[test]
+fn pick_two_records_the_senders_it_counts_as_lost_for_a_lost_pairs_interface() {
+    let peer = |last: u8| std::net::SocketAddr::from(([10, 0, 0, last], 4000));
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .peer_data_addrs(vec![peer(1), peer(2)])
+        .peer_data_interfaces(vec![Some(1), Some(2)])
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let (map, subscriber) = map_with_subscriber();
+    let registry = crate::counter::Registry::default();
+    let senders: crate::endpoint::id::IdMap<LocalSenderId, _> = (0..4)
+        .map(|_| TestSender {
+            accept: true,
+            calls: 0,
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let mut pick_two = PickTwo::new(
+        TestReceiver {
+            values: VecDeque::<TestItem>::new(),
+            consumed: 0,
+        },
+        senders,
+        crate::xorshift::Rng::new(),
+        &registry,
+        test_pool(),
+    )
+    .with_path_secret_map(Some(map));
+    let mut route = || {
+        pick_two.rx.values = (0..20)
+            .map(|_| new_test_item(entry.clone(), drop_counter.clone()))
+            .collect();
+        assert_eq!(poll_until_idle(&mut pick_two), Poll::Ready(None));
+    };
+
+    // Sender i sends to the peer's address i % 2, so sender 2 shares the lost pair's peer
+    // interface.
+    assert!(entry.set_sender_lost(sender(0), true));
+    route();
+    assert_eq!(counted_lost_events(&subscriber), (1, 0));
+
+    let at = |nanos| crate::time::precision::Timestamp { nanos };
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    for idx in 1..4 {
+        entry.record_sender_delivered(sender(idx), at(300));
+    }
+    route();
+    assert_eq!(counted_lost_events(&subscriber), (1, 1));
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("the counters recorded values");
+    assert!(
+        line.contains("pick_two.counted_lost=1 Variant|send.2"),
+        "the start of sender 2's count isn't recorded: {line}"
+    );
+    assert!(
+        line.contains("pick_two.counted_lost_cleared=1 Variant|send.2"),
+        "the end of sender 2's count isn't recorded: {line}"
+    );
+
+    // A later loss counts sender 2 as lost again. Once no pair is marked lost, pick-two doesn't
+    // read the marks, and it records the end of that count.
+    entry.set_senders_lost_since(at(400));
+    route();
+    assert_eq!(counted_lost_events(&subscriber), (2, 1));
+    assert!(entry.set_sender_lost(sender(0), false));
+    route();
+    assert_eq!(counted_lost_events(&subscriber), (2, 2));
+}
+
+/// While a pair is lost and no sender delivers since, the interface-paced router counts sender
+/// 1, which shares both of the lost pair's interfaces, as lost, and records the start of that
+/// count once, on its counters and as a path secret map event. Once senders 1 to 3 deliver
+/// since the loss, a router of the same entry records the end of that count once.
+#[test]
+fn interface_paced_pick_two_records_the_senders_it_counts_as_lost_for_a_lost_pairs_interface() {
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let peer = |last: u8| std::net::SocketAddr::from(([10, 0, 0, last], 4000));
+    let sender = LocalSenderId::from_index;
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .peer_data_addrs(vec![peer(1), peer(2)])
+        .peer_data_interfaces(vec![Some(1), Some(2)])
+        .build(None);
+    let (map, subscriber) = map_with_subscriber();
+    assert!(entry.set_sender_lost(sender(0), true));
+
+    let registry = crate::counter::Registry::default();
+    let counts = route_by_interface_recording(
+        priority_items(&entry, &drop_counter, 20, 20),
+        &registry,
+        Some(map.clone()),
+    );
+    assert_eq!(counts[1], [0, 0], "sender 1 got an item: {counts:?}");
+    assert_eq!(counted_lost_events(&subscriber), (1, 0));
+    let line = registry
+        .take_current_metrics_line()
+        .expect("the counters recorded values");
+    assert!(
+        line.contains("pick_two.counted_lost=1 Variant|send.1"),
+        "the start of sender 1's count isn't recorded: {line}"
+    );
+
+    let at = |nanos| crate::time::precision::Timestamp { nanos };
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    for idx in 1..4 {
+        entry.record_sender_delivered(sender(idx), at(300));
+    }
+    let registry = crate::counter::Registry::default();
+    route_by_interface_recording(
+        priority_items(&entry, &drop_counter, 20, 20),
+        &registry,
+        Some(map),
+    );
+    assert_eq!(counted_lost_events(&subscriber), (1, 1));
+    let line = registry
+        .take_current_metrics_line()
+        .expect("the counters recorded values");
+    assert!(
+        line.contains("pick_two.counted_lost_cleared=1 Variant|send.1"),
+        "the end of sender 1's count isn't recorded: {line}"
+    );
 }

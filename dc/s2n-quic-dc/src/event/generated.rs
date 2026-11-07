@@ -1179,6 +1179,40 @@ pub mod api {
     impl<'a> Event for PathSecretMapInterfacePairPreferenceEnded<'a> {
         const NAME: &'static str = "path_secret_map:interface_pair_preference_ended";
     }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a router counts a sender as lost for sharing an interface with a lost pair"]
+    pub struct PathSecretMapSenderCountedLost<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapSenderCountedLost<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapSenderCountedLost");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapSenderCountedLost<'a> {
+        const NAME: &'static str = "path_secret_map:sender_counted_lost";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a router stops counting a sender as lost for a lost pair's interface"]
+    pub struct PathSecretMapSenderCountedLostCleared<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapSenderCountedLostCleared<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapSenderCountedLostCleared");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapSenderCountedLostCleared<'a> {
+        const NAME: &'static str = "path_secret_map:sender_counted_lost_cleared";
+    }
 }
 pub mod tracing {
     #![doc = r" This module contains event integration with [`tracing`](https://docs.rs/tracing)"]
@@ -1878,6 +1912,26 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapInterfacePairPreferenceEnded { peer_address } = event;
             tracing :: event ! (target : "path_secret_map_interface_pair_preference_ended" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapSenderCountedLost { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_sender_counted_lost" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapSenderCountedLostCleared { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_sender_counted_lost_cleared" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
         }
     }
 }
@@ -3060,6 +3114,38 @@ pub mod builder {
             }
         }
     }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a router counts a sender as lost for sharing an interface with a lost pair"]
+    pub struct PathSecretMapSenderCountedLost<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapSenderCountedLost<'a>>
+        for PathSecretMapSenderCountedLost<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapSenderCountedLost<'a> {
+            let PathSecretMapSenderCountedLost { peer_address } = self;
+            api::PathSecretMapSenderCountedLost {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a router stops counting a sender as lost for a lost pair's interface"]
+    pub struct PathSecretMapSenderCountedLostCleared<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapSenderCountedLostCleared<'a>>
+        for PathSecretMapSenderCountedLostCleared<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapSenderCountedLostCleared<'a> {
+            let PathSecretMapSenderCountedLostCleared { peer_address } = self;
+            api::PathSecretMapSenderCountedLostCleared {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
 }
 pub use traits::*;
 mod traits {
@@ -3638,6 +3724,26 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `PathSecretMapSenderCountedLost` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `PathSecretMapSenderCountedLostCleared` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = r" Called for each event that relates to the endpoint and all connections"]
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -4116,6 +4222,24 @@ mod traits {
         ) {
             self.as_ref()
                 .on_path_secret_map_interface_pair_preference_ended(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_sender_counted_lost(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_sender_counted_lost_cleared(meta, event);
         }
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -4617,6 +4741,24 @@ mod traits {
             (self.1).on_path_secret_map_interface_pair_preference_ended(meta, event);
         }
         #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            (self.0).on_path_secret_map_sender_counted_lost(meta, event);
+            (self.1).on_path_secret_map_sender_counted_lost(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            (self.0).on_path_secret_map_sender_counted_lost_cleared(meta, event);
+            (self.1).on_path_secret_map_sender_counted_lost_cleared(meta, event);
+        }
+        #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
             self.0.on_event(meta, event);
             self.1.on_event(meta, event);
@@ -4799,6 +4941,16 @@ mod traits {
         fn on_path_secret_map_interface_pair_preference_ended(
             &self,
             event: builder::PathSecretMapInterfacePairPreferenceEnded,
+        );
+        #[doc = "Publishes a `PathSecretMapSenderCountedLost` event to the publisher's subscriber"]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            event: builder::PathSecretMapSenderCountedLost,
+        );
+        #[doc = "Publishes a `PathSecretMapSenderCountedLostCleared` event to the publisher's subscriber"]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            event: builder::PathSecretMapSenderCountedLostCleared,
         );
         #[doc = r" Returns the QUIC version, if any"]
         fn quic_version(&self) -> Option<u32>;
@@ -5235,6 +5387,26 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            event: builder::PathSecretMapSenderCountedLost,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_sender_counted_lost(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            event: builder::PathSecretMapSenderCountedLostCleared,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_sender_counted_lost_cleared(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn quic_version(&self) -> Option<u32> {
             self.quic_version
         }
@@ -5370,6 +5542,8 @@ pub mod testing {
             pub creditless_window_limit_grew: AtomicU64,
             pub creditless_window_limit_halved: AtomicU64,
             pub path_secret_map_interface_pair_preference_ended: AtomicU64,
+            pub path_secret_map_sender_counted_lost: AtomicU64,
+            pub path_secret_map_sender_counted_lost_cleared: AtomicU64,
         }
         impl Drop for Subscriber {
             fn drop(&mut self) {
@@ -5451,6 +5625,8 @@ pub mod testing {
                     creditless_window_limit_grew: AtomicU64::new(0),
                     creditless_window_limit_halved: AtomicU64::new(0),
                     path_secret_map_interface_pair_preference_ended: AtomicU64::new(0),
+                    path_secret_map_sender_counted_lost: AtomicU64::new(0),
+                    path_secret_map_sender_counted_lost_cleared: AtomicU64::new(0),
                 }
             }
         }
@@ -6054,6 +6230,30 @@ pub mod testing {
                 let out = format!("{meta:?} {event:?}");
                 self.output.lock().unwrap().push(out);
             }
+            fn on_path_secret_map_sender_counted_lost(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapSenderCountedLost,
+            ) {
+                self.path_secret_map_sender_counted_lost
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_path_secret_map_sender_counted_lost_cleared(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapSenderCountedLostCleared,
+            ) {
+                self.path_secret_map_sender_counted_lost_cleared
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
         }
     }
     #[derive(Debug)]
@@ -6112,6 +6312,8 @@ pub mod testing {
         pub creditless_window_limit_grew: AtomicU64,
         pub creditless_window_limit_halved: AtomicU64,
         pub path_secret_map_interface_pair_preference_ended: AtomicU64,
+        pub path_secret_map_sender_counted_lost: AtomicU64,
+        pub path_secret_map_sender_counted_lost_cleared: AtomicU64,
     }
     impl Drop for Subscriber {
         fn drop(&mut self) {
@@ -6195,6 +6397,8 @@ pub mod testing {
                 creditless_window_limit_grew: AtomicU64::new(0),
                 creditless_window_limit_halved: AtomicU64::new(0),
                 path_secret_map_interface_pair_preference_ended: AtomicU64::new(0),
+                path_secret_map_sender_counted_lost: AtomicU64::new(0),
+                path_secret_map_sender_counted_lost_cleared: AtomicU64::new(0),
             }
         }
     }
@@ -6827,6 +7031,30 @@ pub mod testing {
             let out = format!("{meta:?} {event:?}");
             self.output.lock().unwrap().push(out);
         }
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            self.path_secret_map_sender_counted_lost
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            self.path_secret_map_sender_counted_lost_cleared
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
     }
     #[derive(Debug)]
     pub struct Publisher {
@@ -6884,6 +7112,8 @@ pub mod testing {
         pub creditless_window_limit_grew: AtomicU64,
         pub creditless_window_limit_halved: AtomicU64,
         pub path_secret_map_interface_pair_preference_ended: AtomicU64,
+        pub path_secret_map_sender_counted_lost: AtomicU64,
+        pub path_secret_map_sender_counted_lost_cleared: AtomicU64,
     }
     impl Publisher {
         #[doc = r" Creates a publisher with snapshot assertions enabled"]
@@ -6957,6 +7187,8 @@ pub mod testing {
                 creditless_window_limit_grew: AtomicU64::new(0),
                 creditless_window_limit_halved: AtomicU64::new(0),
                 path_secret_map_interface_pair_preference_ended: AtomicU64::new(0),
+                path_secret_map_sender_counted_lost: AtomicU64::new(0),
+                path_secret_map_sender_counted_lost_cleared: AtomicU64::new(0),
             }
         }
     }
@@ -7408,6 +7640,28 @@ pub mod testing {
             event: builder::PathSecretMapInterfacePairPreferenceEnded,
         ) {
             self.path_secret_map_interface_pair_preference_ended
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            event: builder::PathSecretMapSenderCountedLost,
+        ) {
+            self.path_secret_map_sender_counted_lost
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            event: builder::PathSecretMapSenderCountedLostCleared,
+        ) {
+            self.path_secret_map_sender_counted_lost_cleared
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             let event = crate::event::snapshot::Fmt::to_snapshot(&event);
