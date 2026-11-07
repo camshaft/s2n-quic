@@ -38,7 +38,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::Notify;
 
 const ACCEPTOR_ID: VarInt = VarInt::from_u32(1);
 const SLOW: Rate = Rate::new(1.0);
@@ -52,6 +51,9 @@ const LOSS_AFTER: u64 = STREAMS as u64 * STREAM_LEN / 4;
 /// and then for a round of streams in which that interface carries its share: a lost pair probes
 /// again at its next probe timeout, whose backoff grows with the outage.
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the client waits after each stream while the interface recovers, so that the sim
+/// doesn't carry one stream after another until the lost pairs probe again.
+const RECOVERY_PAUSE: Duration = Duration::from_secs(1);
 /// How long neither endpoint sends while the interface is lost: longer than the 30 s idle
 /// timeout of the sim's paths, so that the send contexts of the lost pairs expire.
 const QUIET: Duration = Duration::from_secs(45);
@@ -89,11 +91,12 @@ struct Shared {
     recording: AtomicBool,
     /// The socket writes the monitor recorded.
     writes: Mutex<Vec<Write>>,
-    /// Whether the monitor recorded a write from the client's lost interface to the server.
+    /// Whether the monitor watches for a socket write from the client's lost interface to the
+    /// server.
+    watching: AtomicBool,
+    /// Whether the client wrote from its lost interface to the server while the monitor
+    /// watched.
     wrote_on_lost: AtomicBool,
-    /// Wakes the client at the first write the monitor records from the client's lost interface
-    /// to the server. `notify_one` stores a permit where the client isn't waiting yet.
-    first_lost_write: Notify,
     /// The client's data addresses, by socket.
     client_addrs: Mutex<Vec<SocketAddr>>,
     /// The server's data addresses, by socket.
@@ -110,6 +113,24 @@ impl Shared {
             .map(|(&addr, _)| addr)
             .collect();
         *self.client_addrs.lock().unwrap() = addrs.to_vec();
+    }
+
+    /// The bytes the monitor recorded from each of the client's interfaces to the server.
+    fn client_bytes(&self) -> [u64; 2] {
+        let client_addrs = self.client_addrs.lock().unwrap();
+        let server_addrs = self.server_addrs.lock().unwrap();
+        // In the sim, send socket i is recv socket i, so the position of an address in
+        // `data_addrs` is its socket, and `CLIENT_INTERFACE` holds that socket's interface.
+        let mut bytes = [0u64; 2];
+        for write in self.writes.lock().unwrap().iter() {
+            let Some(socket) = client_addrs.iter().position(|&addr| addr == write.local) else {
+                continue;
+            };
+            if server_addrs.contains(&write.peer) {
+                bytes[CLIENT_INTERFACE[socket]] += write.bytes;
+            }
+        }
+        bytes
     }
 
     /// Counts `len` bytes the server read, and loses the client's interface once the server
@@ -133,37 +154,22 @@ impl Shared {
         lost_addrs.contains(&source) || lost_addrs.contains(&destination)
     }
 
-    /// Records a write, and wakes the client at the first one from its lost interface to the
-    /// server.
-    fn on_write(&self, write: Write) {
-        if self.is_lost_to_server(&write) && !self.wrote_on_lost.swap(true, Ordering::Relaxed) {
-            self.first_lost_write.notify_one();
+    /// Records a socket write from `local` to `peer` where the monitor watches for one from the
+    /// client's lost interface to the server.
+    fn on_write(&self, local: SocketAddr, peer: SocketAddr) {
+        if !self.watching.load(Ordering::Relaxed) {
+            return;
         }
-        self.writes.lock().unwrap().push(write);
+        let from_lost = self.lost_addrs.lock().unwrap().contains(&local);
+        if from_lost && self.server_addrs.lock().unwrap().contains(&peer) {
+            self.wrote_on_lost.store(true, Ordering::Relaxed);
+        }
     }
 
-    /// Whether `write` goes from the client's lost interface to the server.
-    fn is_lost_to_server(&self, write: &Write) -> bool {
-        self.lost_addrs.lock().unwrap().contains(&write.local)
-            && self.server_addrs.lock().unwrap().contains(&write.peer)
-    }
-
-    /// The bytes the monitor recorded from each of the client's interfaces to the server.
-    fn client_bytes(&self) -> [u64; 2] {
-        let client_addrs = self.client_addrs.lock().unwrap();
-        let server_addrs = self.server_addrs.lock().unwrap();
-        // In the sim, send socket i is recv socket i, so the position of an address in
-        // `data_addrs` is its socket, and `CLIENT_INTERFACE` holds that socket's interface.
-        let mut bytes = [0u64; 2];
-        for write in self.writes.lock().unwrap().iter() {
-            let Some(socket) = client_addrs.iter().position(|&addr| addr == write.local) else {
-                continue;
-            };
-            if server_addrs.contains(&write.peer) {
-                bytes[CLIENT_INTERFACE[socket]] += write.bytes;
-            }
-        }
-        bytes
+    /// Whether the client wrote from its lost interface to the server while the monitor
+    /// watched.
+    fn wrote_on_lost_interface(&self) -> bool {
+        self.wrote_on_lost.load(Ordering::Relaxed)
     }
 }
 
@@ -302,9 +308,10 @@ fn traffic_moves_off_a_lost_interface_and_back() {
         observe::record_into(routed_in_sim);
         let monitor = in_sim.clone();
         bach::net::monitor::on_socket_write(move |write| {
+            monitor.on_write(*write.local_addr, *write.peer_addr);
             if monitor.recording.load(Ordering::Relaxed) {
                 let bytes: usize = write.payload.iter().map(|slice| slice.len()).sum();
-                monitor.on_write(Write {
+                monitor.writes.lock().unwrap().push(Write {
                     local: *write.local_addr,
                     peer: *write.peer_addr,
                     bytes: bytes as u64,
@@ -428,16 +435,29 @@ fn traffic_moves_off_a_lost_interface_and_back() {
             .await
             .expect("a new stream finishes while an interface is lost");
 
-            // The interface delivers again, and its lost pairs probe at their next probe
-            // timeouts, whose backoff grows with the outage. The client waits, without opening
-            // a stream, until the monitor sees its first write on that interface, and then writes
-            // rounds of streams until that interface carries more than an eighth of a round's
-            // bytes.
+            // The interface delivers again, and its pairs probe at their next probe timeouts,
+            // whose backoff grows with the outage. The client opens one stream a second until it
+            // writes on that interface again, and then opens the streams whose writes the test
+            // counts.
             client_side.losing.store(false, Ordering::Relaxed);
+            client_side.watching.store(true, Ordering::Relaxed);
+            timeout(RECOVERY_TIMEOUT, async {
+                while !client_side.wrote_on_lost_interface() {
+                    timeout(
+                        ROUND_TIMEOUT,
+                        exchange(&mut client, 1, "a recovery round", &client_side),
+                    )
+                    .await
+                    .expect("a stream finishes while the interface recovers");
+                    RECOVERY_PAUSE.sleep().await;
+                }
+            })
+            .await
+            .expect("the client writes on the interface again once it delivers");
             client_side.recording.store(true, Ordering::Relaxed);
-            timeout(RECOVERY_TIMEOUT, client_side.first_lost_write.notified())
-                .await
-                .expect("the client writes on the interface again once it delivers");
+
+            // The client writes rounds of streams until that interface carries more than an
+            // eighth of a round's bytes, and the monitor keeps the writes of the last round.
             timeout(RECOVERY_TIMEOUT, async {
                 loop {
                     client_side.writes.lock().unwrap().clear();

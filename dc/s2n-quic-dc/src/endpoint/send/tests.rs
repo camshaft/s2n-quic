@@ -1342,40 +1342,6 @@ fn an_acknowledgement_ends_the_wait_of_an_acknowledgement_only_probe() {
     assert!(!ctx.has_stopped_delivering(clock.get_time()));
 }
 
-/// A context that sends acknowledgements alone probes once the peer hasn't acknowledged one
-/// of its packets for a persistent congestion period, and not while a probe waits, nor before
-/// it sent an ACK-only packet that isn't ack-eliciting since the peer's last acknowledgement.
-#[test]
-fn an_acknowledgement_only_context_probes_once_the_peer_is_quiet() {
-    let registry = Registry::default();
-    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
-    let clock = make_clock(100);
-    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
-    ctx.on_peer_acknowledged(clock.get_time());
-    clock.advance(threshold);
-    assert!(
-        !ctx.needs_delivery_probe(clock.get_time()),
-        "a context that sent nothing since the peer's acknowledgement doesn't probe"
-    );
-
-    ctx.ack_only_since_peer_ack = true;
-    assert!(ctx.needs_delivery_probe(clock.get_time()));
-
-    ctx.ack_only_probe_sent = Some(clock.get_time());
-    assert!(
-        !ctx.needs_delivery_probe(clock.get_time()),
-        "a probe waits for its acknowledgement"
-    );
-
-    ctx.on_peer_acknowledged(clock.get_time());
-    ctx.ack_only_since_peer_ack = true;
-    clock.advance(threshold - Duration::from_millis(1));
-    assert!(
-        !ctx.needs_delivery_probe(clock.get_time()),
-        "the peer acknowledged a packet less than a persistent congestion period ago"
-    );
-}
-
 /// A lost mark records when it was set, and a delivering mark clears that time.
 #[test]
 fn a_lost_mark_records_when_it_was_set() {
@@ -1683,5 +1649,95 @@ fn a_cache_without_a_map_counts_a_lost_mark() {
     assert!(
         line.contains("tx.interface_pair.lost=1 Variant|send.0"),
         "got: {line}"
+    );
+}
+
+/// A context that sends acknowledgements alone probes once the peer hasn't acknowledged one
+/// of its packets for a persistent congestion period, and not while a probe waits, nor before
+/// it sent an ACK-only packet that isn't ack-eliciting since the peer's last acknowledgement.
+#[test]
+fn an_acknowledgement_only_context_probes_once_the_peer_is_quiet() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.on_peer_acknowledged(clock.get_time());
+    clock.advance(threshold);
+    assert!(
+        !ctx.needs_delivery_probe(clock.get_time()),
+        "a context that sent nothing since the peer's acknowledgement doesn't probe"
+    );
+
+    ctx.ack_only_since_peer_ack = true;
+    assert!(ctx.needs_delivery_probe(clock.get_time()));
+
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+    assert!(
+        !ctx.needs_delivery_probe(clock.get_time()),
+        "a probe waits for its acknowledgement"
+    );
+
+    ctx.on_peer_acknowledged(clock.get_time());
+    ctx.ack_only_since_peer_ack = true;
+    clock.advance(threshold - Duration::from_millis(1));
+    assert!(
+        !ctx.needs_delivery_probe(clock.get_time()),
+        "the peer acknowledged a packet less than a persistent congestion period ago"
+    );
+}
+
+/// A context that sends acknowledgements alone marks its pair lost once its probe waited for
+/// a persistent congestion period without an acknowledgement while the context kept sending
+/// ACK-only packets.
+#[test]
+fn an_acknowledgement_only_pair_is_marked_lost_while_it_keeps_acknowledging() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.on_peer_acknowledged(clock.get_time());
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+
+    clock.advance(threshold - Duration::from_millis(1));
+    ctx.ack_only_sent = Some(clock.get_time());
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(
+        !ctx.is_path_lost(),
+        "the probe hasn't waited for a persistent congestion period yet"
+    );
+
+    clock.advance(Duration::from_millis(1));
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(ctx.is_path_lost());
+    assert!(entry.is_sender_lost(sender));
+}
+
+/// A probe that waited while the context didn't send anything for a persistent congestion
+/// period, such as a probe lost in an earlier outage, doesn't mark the pair lost: the context
+/// forgets it, and its next ACK-only packet probes again.
+#[test]
+fn a_stale_acknowledgement_only_probe_does_not_mark_the_pair_lost() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.on_peer_acknowledged(clock.get_time());
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+    ctx.ack_only_sent = Some(clock.get_time());
+    ctx.ack_only_since_peer_ack = true;
+
+    clock.advance(threshold * 2);
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(!ctx.is_path_lost());
+    assert!(!entry.is_sender_lost(sender));
+    assert!(
+        ctx.ack_only_probe_sent.is_none(),
+        "the context forgets the stale probe"
+    );
+    assert!(
+        ctx.needs_delivery_probe(clock.get_time()),
+        "the context's next ACK-only packet probes again"
     );
 }
