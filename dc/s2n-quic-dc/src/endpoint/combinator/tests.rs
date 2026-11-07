@@ -1944,8 +1944,14 @@ fn creditless_window_admits_a_frame_while_empty_and_grows_where_a_worker_could_t
     // it is.
     window.starved();
     assert_eq!(window.limit(), 100);
-    assert!(window.admit(1000), "the window refused a frame while it held nothing");
-    assert!(!window.admit(1), "the window admitted a frame past its limit of 100");
+    assert!(
+        window.admit(1000),
+        "the window refused a frame while it held nothing"
+    );
+    assert!(
+        !window.admit(1),
+        "the window admitted a frame past its limit of 100"
+    );
     assert_eq!(window.held(), 1000);
 
     // Before a worker's sender takes a batch, the limit grows by the minimum, once for the
@@ -1989,7 +1995,11 @@ fn creditless_window_halves_its_limit_once_for_the_bytes_it_held_as_a_batch_wait
     window.release(100, true);
     window.release(100, false);
     window.release(100, true);
-    assert_eq!(window.limit(), 500, "the limit halved again for the bytes it held");
+    assert_eq!(
+        window.limit(),
+        500,
+        "the limit halved again for the bytes it held"
+    );
     assert_eq!(window.held(), 0);
 
     assert!(window.admit(100));
@@ -2008,7 +2018,10 @@ fn creditless_window_starts_at_its_minimum_and_doesnt_halve_below_it() {
     let _router = window.clone();
     assert!(window.admit(600));
     assert!(window.admit(400));
-    assert!(!window.admit(1), "the window admitted a frame past its minimum");
+    assert!(
+        !window.admit(1),
+        "the window admitted a frame past its minimum"
+    );
 
     window.release(1000, true);
     assert_eq!(window.limit(), 1000);
@@ -2197,7 +2210,10 @@ impl WindowLanes {
             if !self.window.admit(item.creditless_bytes()) {
                 break;
             }
-            let item = self.staged.pop_front().expect("the lanes hold a front item");
+            let item = self
+                .staged
+                .pop_front()
+                .expect("the lanes hold a front item");
             self.moved.borrow_mut().push_back(item);
         }
     }
@@ -2424,7 +2440,11 @@ fn interface_paced_pick_two_starves_its_window_only_while_budget_is_left() {
     let mut cx = task::Context::from_waker(&noop);
     let mut exhausted = Budget::new(0);
     assert!(router.poll_recv(&mut cx, &mut exhausted).is_pending());
-    assert_eq!(window.limit(), 100, "the limit grew where the budget ran out");
+    assert_eq!(
+        window.limit(),
+        100,
+        "the limit grew where the budget ran out"
+    );
 
     let mut budget = Budget::new(1);
     assert!(router.poll_recv(&mut cx, &mut budget).is_pending());
@@ -2463,7 +2483,11 @@ fn window_reader_starves_the_window_only_while_budget_is_left() {
     let mut cx = task::Context::from_waker(&noop);
     let mut exhausted = Budget::new(0);
     assert!(reader.poll_recv(&mut cx, &mut exhausted).is_pending());
-    assert_eq!(window.limit(), 100, "the limit grew where the budget ran out");
+    assert_eq!(
+        window.limit(),
+        100,
+        "the limit grew where the budget ran out"
+    );
     assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
 
     let mut budget = Budget::new(1);
