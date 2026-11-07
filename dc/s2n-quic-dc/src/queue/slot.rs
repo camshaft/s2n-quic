@@ -15,7 +15,7 @@ use super::{
 use crate::{endpoint::msg, intrusive, tracing::*};
 use core::{
     ptr::NonNull,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use s2n_quic_core::varint::VarInt;
 
@@ -51,6 +51,10 @@ pub(crate) struct Slot {
     /// brief lag between the reader's store and a dispatch read only makes the
     /// clamp momentarily conservative, which is harmless for this bound.
     advertised_window: AtomicU64,
+    /// Set where the slot was free before a bind whose init the endpoint doesn't take, so that
+    /// the last receiver's drop of that binding doesn't record the slot as freed. See
+    /// [`Slot::leave_free_unrecorded`].
+    free_unrecorded: AtomicBool,
     pub(crate) stream: Half<msg::Stream, StreamState>,
     pub(crate) control: Half<msg::Control>,
 }
@@ -239,6 +243,7 @@ impl Slot {
             binding_id: AtomicU64::new(UNALLOCATED),
             queue_id: queue_id.as_u64(),
             advertised_window: AtomicU64::new(0),
+            free_unrecorded: AtomicBool::new(false),
             stream: Half::with_extra(StreamState {
                 msg_table: None,
                 flush_watermark: 0,
@@ -333,6 +338,25 @@ impl Slot {
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
+    }
+
+    /// Marks the slot so that the last receiver's drop of its binding doesn't record the slot
+    /// as freed. The endpoint sets it where it tears down a binding whose init it doesn't take:
+    /// the slot was free before that bind, and the client's stream of the binding may still
+    /// hold it, so a second free would let the client hand the slot to another stream while
+    /// that stream lives. It is set before the receivers drop, on the thread that drops them,
+    /// so a relaxed store is enough.
+    #[inline]
+    pub(crate) fn leave_free_unrecorded(&self) {
+        self.free_unrecorded.store(true, Ordering::Relaxed);
+    }
+
+    /// Takes the mark [`Self::leave_free_unrecorded`] set: true where the last receiver's drop
+    /// doesn't record the slot as freed. The mark is taken once, so the next binding's drop
+    /// records the slot as before.
+    #[inline]
+    pub(crate) fn take_free_unrecorded(&self) -> bool {
+        self.free_unrecorded.swap(false, Ordering::Relaxed)
     }
 
     /// Publish the reader's currently-advertised receive window so dispatch can
@@ -1283,6 +1307,15 @@ mod tests {
             7 | UNALLOCATED_BIT,
             "a later binding's tombstone stays"
         );
+    }
+
+    #[test]
+    fn take_free_unrecorded_takes_the_mark_once() {
+        let slot = Slot::with_queue_id(v(0));
+        assert!(!slot.take_free_unrecorded(), "a new slot isn't marked");
+        slot.leave_free_unrecorded();
+        assert!(slot.take_free_unrecorded(), "the mark is taken");
+        assert!(!slot.take_free_unrecorded(), "the mark is taken once");
     }
 
     #[test]

@@ -346,6 +346,16 @@ impl ServerView {
         }
     }
 
+    /// Marks the slot at `queue_id` so that the last receiver's drop of its binding doesn't
+    /// record the slot as freed, where the endpoint tears down a binding whose init it doesn't
+    /// take. See [`super::slot::Slot::leave_free_unrecorded`].
+    pub(crate) fn leave_free_unrecorded(&mut self, queue_id: VarInt) {
+        let index = queue_id.as_u64() as usize;
+        if let Some(slot) = self.view.get(index, &self.state.pages) {
+            slot.leave_free_unrecorded();
+        }
+    }
+
     #[inline]
     pub fn send_control(
         &mut self,
@@ -699,5 +709,49 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Ok(BindResult::NewBinding { .. })));
+    }
+
+    #[test]
+    fn a_free_left_unrecorded_doesnt_record_the_slot() {
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+
+        // Bindings 1 and 2 of slot 1 are marked before their receivers drop, and bindings 3
+        // and 4 aren't, each pair in both orders of the drops.
+        for (binding, marked, stream_last) in [
+            (1, true, true),
+            (2, true, false),
+            (3, false, true),
+            (4, false, false),
+        ] {
+            let result = server.bind_for_msg(v(1), v(binding), &path_entry, &mut tx);
+            let Ok(BindResult::NewBinding {
+                stream, control, ..
+            }) = result
+            else {
+                panic!("expected NewBinding for binding {binding}");
+            };
+            if marked {
+                server.leave_free_unrecorded(v(1));
+            }
+            if stream_last {
+                drop(control);
+                drop(stream);
+            } else {
+                drop(stream);
+                drop(control);
+            }
+            let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+            if marked {
+                assert!(
+                    server.state.freed.take(&mut freed).is_none(),
+                    "binding {binding}: a marked end doesn't record slot 1 as freed"
+                );
+            } else {
+                assert!(
+                    server.state.freed.take(&mut freed).is_some() && freed.contains(1),
+                    "binding {binding}: an unmarked end records slot 1 as freed"
+                );
+            }
+        }
     }
 }
