@@ -1464,6 +1464,10 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // A lost pair also marks the peer dead where the peer hasn't sent an
                 // authenticated packet on any interface since the pair was marked lost, with or
                 // without unacknowledged packets and whatever the marks of the peer's other pairs.
+                // Silence doesn't renew a dead mark the entry holds already: the peer has been
+                // silent since that mark too, and a renewal at each lost context's expiry
+                // would keep the peer in the dead-peer cooldown, so a connect would never find
+                // the entry dead and silent and replace it.
                 let peer_silent_since_lost =
                     lost_at.is_some_and(|since| path_secret_entry.last_activity() < since);
                 let unacknowledged = has_inflight
@@ -1471,7 +1475,8 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     && !send_caches[local_id]
                         .borrow()
                         .skips_dead_mark(path_lost, &path_secret_entry);
-                let marked_dead = (unacknowledged || peer_silent_since_lost)
+                let silence_marks = peer_silent_since_lost && !path_secret_entry.is_marked_dead();
+                let marked_dead = (unacknowledged || silence_marks)
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
 
                 let result = send_caches[local_id].borrow_mut().invalidate(
