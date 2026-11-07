@@ -1949,6 +1949,29 @@ where
     }
 }
 
+impl<Tx> Drop for FrameReceiver<Tx> {
+    /// Releases the slot that each reset waiting here holds for its rejected init, as the
+    /// priority router ends: such a reset doesn't leave for its lane, which would release the
+    /// slot, so the slot would stay held, and the client wouldn't learn that it is free. The
+    /// resets that wait in the submission channel are released too.
+    fn drop(&mut self) {
+        for frame in self.staging.iter().chain(self.swapped.iter()) {
+            release_held(frame, &mut self.freed_batch_tx);
+        }
+        let waker = s2n_quic_core::task::waker::noop();
+        let mut cx = core::task::Context::from_waker(&waker);
+        loop {
+            let mut storage = PriorityStorage::default();
+            let Poll::Ready(Some(())) = self.frame_rx.poll_swap(&mut cx, &mut storage) else {
+                break;
+            };
+            for frame in storage.iter() {
+                release_held(frame, &mut self.freed_batch_tx);
+            }
+        }
+    }
+}
+
 /// Releases the server slot that a rejected init held for `frame`, where `frame` is a reset that
 /// no producer waits on, so that the slot is recorded as freed once the reset leaves for its lane.
 fn release_held(frame: &Frame, freed_batch_tx: &mut crate::queue::FreedBatchTx) {
