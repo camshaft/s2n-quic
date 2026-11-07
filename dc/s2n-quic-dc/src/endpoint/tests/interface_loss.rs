@@ -16,8 +16,12 @@
 //! once the client writes on that interface again, which waits for the next probes of its
 //! pairs, the client writes rounds of eight streams until that interface carries more than an
 //! eighth of a round's bytes.
+//!
+//! While a pair is lost, neither endpoint routes an acknowledgement or a freed batch to a
+//! sender whose interface pair is marked lost while another sender of the path delivers.
 
 use crate::{
+    endpoint::routing::observe::{self, Kind, Routed},
     socket::{interface, rate::Rate},
     stream::endpoint::testing::sim::{Client, SimEndpointConfig},
     testing::{ext::*, sim, without_snapshots, without_tracing},
@@ -235,8 +239,13 @@ fn traffic_moves_off_a_lost_interface_and_back() {
 
     let shared = Arc::new(Shared::default());
     let in_sim = shared.clone();
+    let routed = Arc::new(Mutex::new(Vec::<Routed>::new()));
+    let routed_in_sim = routed.clone();
 
     sim(move || {
+        // The endpoints route on the thread that runs the sim, which records what they route.
+        observe::record_into(routed_in_sim);
+
         let monitor = in_sim.clone();
         bach::net::monitor::on_socket_write(move |write| {
             if monitor.recording.load(Ordering::Relaxed) {
@@ -368,5 +377,26 @@ fn traffic_moves_off_a_lost_interface_and_back() {
     assert!(
         restored_share(restored_bytes),
         "the client wrote {restored_bytes:?} bytes on its interfaces in the last round",
+    );
+
+    // While a pair was lost, each acknowledgement and freed batch that either endpoint routed
+    // went to a sender whose pair delivered, where the path had one.
+    let routes = routed.lock().unwrap();
+    let mut acknowledgements = 0;
+    for route in routes
+        .iter()
+        .filter(|route| route.path_has_lost && route.path_delivers)
+    {
+        assert!(
+            !route.lost,
+            "{route:?} went to a sender marked lost while another sender delivered",
+        );
+        if route.kind == Kind::PendingAck {
+            acknowledgements += 1;
+        }
+    }
+    assert!(
+        acknowledgements > 0,
+        "no acknowledgement was routed while a pair was lost and another delivered",
     );
 }

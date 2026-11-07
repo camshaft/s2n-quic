@@ -981,7 +981,8 @@ where
     }
 
     // Build ACK sender after socket distribution so sender_id_to_worker is populated.
-    let ack_sender = routing::AckSender::new(worker_ack_txs, &sender_id_to_worker);
+    let ack_sender = routing::AckSender::new(worker_ack_txs, &sender_id_to_worker)
+        .with_priority_senders(priority_senders.clone());
 
     // ── Recv dispatch queues ─────────────────────────────────────────────────
     // One dispatch queue per recv_dispatch worker. Recv IO tasks fan out to all of these
@@ -1793,11 +1794,13 @@ where
                         bg.freed_batch_rx,
                         move |mut entry: crate::intrusive::Entry<msg::Sender>| {
                             // Pick-two LB using sender_load_score atomics, among the senders of
-                            // the interface for the highest-priority traffic where there is one.
+                            // the interface for the highest-priority traffic where there is one,
+                            // leaving out the senders marked lost while another sender delivers.
                             let chosen = routing::freed_batch_sender_id(
                                 priority_senders.as_deref(),
                                 socket_count,
                                 &mut rng,
+                                |sender| entry.path_secret_entry().is_sender_lost(sender),
                                 |sender| entry.path_secret_entry().sender_load_score(sender),
                             );
 

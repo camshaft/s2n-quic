@@ -119,6 +119,9 @@ impl SenderRoute for ModuloRoute {
 #[derive(Clone)]
 pub(crate) struct AckSender<T> {
     senders: IdMap<LocalSenderId, T>,
+    /// The senders of the endpoint's highest-priority traffic, which a peer's acknowledgements
+    /// move to first where the sender they're routed to is marked lost.
+    priority_senders: Option<Vec<LocalSenderId>>,
 }
 
 impl<T: Clone> AckSender<T> {
@@ -135,7 +138,17 @@ impl<T: Clone> AckSender<T> {
             .iter()
             .map(|(sender_id, &worker_idx)| (sender_id, worker_senders[worker_idx].clone()))
             .collect();
-        Self { senders }
+        Self {
+            senders,
+            priority_senders: None,
+        }
+    }
+
+    /// Sets the senders of the endpoint's highest-priority traffic, which a peer's
+    /// acknowledgements move to first where the sender they're routed to is marked lost.
+    pub fn with_priority_senders(mut self, priority_senders: Option<Vec<LocalSenderId>>) -> Self {
+        self.priority_senders = priority_senders;
+        self
     }
 }
 
@@ -143,9 +156,22 @@ impl<T> UnboundedSender<Entry<msg::Sender>> for AckSender<T>
 where
     T: UnboundedSender<Entry<msg::Sender>>,
 {
-    fn send(&mut self, msg: Entry<msg::Sender>) -> Result<(), Entry<msg::Sender>> {
+    fn send(&mut self, mut msg: Entry<msg::Sender>) -> Result<(), Entry<msg::Sender>> {
+        // A peer's acknowledgements leave a sender whose interface pair is marked lost, while
+        // another sender of the path delivers.
+        if let msg::Sender::PendingAck(ref mut submission) = *msg {
+            let path = &submission.path_secret_entry;
+            let chosen = delivering_ack_sender_id(
+                submission.local_sender_id,
+                submission.remote_sender_id,
+                self.priority_senders.as_deref(),
+                self.senders.len(),
+                |sender| path.is_sender_lost(sender),
+            );
+            submission.local_sender_id = chosen;
+        }
         #[cfg(test)]
-        observe::record(&msg);
+        observe::record(&msg, self.senders.len());
         let sender_idx = msg.sender_idx();
         debug_assert!(
             sender_idx.as_usize() < self.senders.len(),
@@ -246,19 +272,81 @@ pub(crate) fn ack_sender_id(
     senders[position as usize]
 }
 
+/// Returns the senders that the routes choose from while some of a path's interface pairs are
+/// marked lost: of the first `socket_count` senders, the ones that `is_lost` doesn't mark. Where
+/// `priority_senders`, the senders of the endpoint's highest-priority traffic, holds some of
+/// them, it returns those alone. It returns `None` where `is_lost` marks none of the first
+/// `socket_count` senders, or every one of them, so that the routes keep the choice they make
+/// without the marks.
+pub(crate) fn delivering_senders(
+    priority_senders: Option<&[LocalSenderId]>,
+    socket_count: usize,
+    is_lost: impl Fn(LocalSenderId) -> bool,
+) -> Option<Vec<LocalSenderId>> {
+    let senders = || (0..socket_count).map(LocalSenderId::from_index);
+    // A path whose pairs all deliver, the usual case, doesn't allocate.
+    if !senders().any(&is_lost) {
+        return None;
+    }
+    let delivering: Vec<LocalSenderId> = senders().filter(|&sender| !is_lost(sender)).collect();
+    if delivering.is_empty() {
+        return None;
+    }
+    let priority: Vec<LocalSenderId> = priority_senders
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .filter(|sender| delivering.contains(sender))
+        .collect();
+    if priority.is_empty() {
+        Some(delivering)
+    } else {
+        Some(priority)
+    }
+}
+
+/// Returns the sender that a peer sender's acknowledgements go to while some of the path's
+/// interface pairs are marked lost: `routed`, the sender that `ack_sender_id` picked, where
+/// `is_lost` doesn't mark it, and otherwise one of the `delivering_senders`, picked by
+/// `source_sender_id` as `ack_sender_id` picks one. Where `is_lost` marks every sender, it
+/// returns `routed`.
+pub(crate) fn delivering_ack_sender_id(
+    routed: LocalSenderId,
+    source_sender_id: RemoteSenderId,
+    priority_senders: Option<&[LocalSenderId]>,
+    socket_count: usize,
+    is_lost: impl Fn(LocalSenderId) -> bool,
+) -> LocalSenderId {
+    if !is_lost(routed) {
+        return routed;
+    }
+    let Some(senders) = delivering_senders(priority_senders, socket_count, is_lost) else {
+        return routed;
+    };
+    let position = source_sender_id.as_varint().as_u64() % senders.len() as u64;
+    senders[position as usize]
+}
+
 /// Returns the sender that a freed batch goes to: of two different senders drawn at random, the
 /// one with the lower `score`, or the first where the scores are equal.
 ///
 /// The senders are `priority_senders`, the senders of the endpoint's highest-priority traffic,
-/// where it has some, and otherwise the first `socket_count` senders. Where there is one sender,
-/// or none, it returns the first without a draw.
+/// where it has some, and otherwise the first `socket_count` senders. While `is_lost` marks
+/// some of the first `socket_count` senders and not all of them, they are the
+/// `delivering_senders` instead. Where there is one sender, or none, it returns the first
+/// without a draw.
 pub(crate) fn freed_batch_sender_id<S: PartialOrd>(
     priority_senders: Option<&[LocalSenderId]>,
     socket_count: usize,
     rng: &mut crate::xorshift::Rng,
+    is_lost: impl Fn(LocalSenderId) -> bool,
     mut score: impl FnMut(LocalSenderId) -> S,
 ) -> LocalSenderId {
-    let priority_senders = priority_senders.filter(|senders| !senders.is_empty());
+    let delivering = delivering_senders(priority_senders, socket_count, is_lost);
+    let priority_senders = delivering
+        .as_deref()
+        .or(priority_senders)
+        .filter(|senders| !senders.is_empty());
     let count = priority_senders.map_or(socket_count, |senders| senders.len());
     let sender = |position: usize| match priority_senders {
         Some(senders) => senders[position],
@@ -284,7 +372,7 @@ pub(crate) fn freed_batch_sender_id<S: PartialOrd>(
 /// the tests that check which sender each goes to.
 #[cfg(test)]
 pub(crate) mod observe {
-    use super::{msg, LocalSenderId};
+    use super::{msg, Id, LocalSenderId};
     use core::cell::RefCell;
     use std::{
         net::SocketAddr,
@@ -300,12 +388,19 @@ pub(crate) mod observe {
         PendingFreed,
     }
 
-    /// One message routed to a send worker: what it carries, its sender and its path's peer.
+    /// One message routed to a send worker: what it carries, its sender, its path's peer, and
+    /// the marks of the path's senders when it was routed.
     #[derive(Clone, Copy, Debug)]
     pub(crate) struct Routed {
         pub(crate) kind: Kind,
         pub(crate) sender: LocalSenderId,
         pub(crate) peer: SocketAddr,
+        /// Whether the sender's interface pair was marked lost.
+        pub(crate) lost: bool,
+        /// Whether a sender of the path was marked lost.
+        pub(crate) path_has_lost: bool,
+        /// Whether a sender of the path wasn't marked lost.
+        pub(crate) path_delivers: bool,
     }
 
     thread_local! {
@@ -317,8 +412,9 @@ pub(crate) mod observe {
         SINK.with(|current| *current.borrow_mut() = Some(sink));
     }
 
-    /// Records `message`, where this thread records the messages it routes.
-    pub(crate) fn record(message: &msg::Sender) {
+    /// Records `message`, which the endpoint routed among its first `senders` senders, where this
+    /// thread records the messages it routes.
+    pub(crate) fn record(message: &msg::Sender, senders: usize) {
         let kind = match message {
             msg::Sender::PendingAck(_) => Kind::PendingAck,
             msg::Sender::PendingFreed { .. } => Kind::PendingFreed,
@@ -326,10 +422,15 @@ pub(crate) mod observe {
         };
         SINK.with(|sink| {
             if let Some(sink) = sink.borrow().as_ref() {
+                let path = message.path_secret_entry();
+                let lost = |index: usize| path.is_sender_lost(LocalSenderId::from_index(index));
                 sink.lock().unwrap().push(Routed {
                     kind,
                     sender: message.sender_idx(),
-                    peer: *message.path_secret_entry().peer(),
+                    peer: *path.peer(),
+                    lost: path.is_sender_lost(message.sender_idx()),
+                    path_has_lost: (0..senders).any(&lost),
+                    path_delivers: !(0..senders).all(&lost),
                 });
             }
         });
@@ -382,7 +483,7 @@ mod tests {
         let mut rng = Rng::with_seed(7);
         // Scored by index, the higher of two different senders never wins, so sender 7 doesn't.
         for _ in 0..256 {
-            let chosen = freed_batch_sender_id(None, 8, &mut rng, |id| id.as_usize());
+            let chosen = freed_batch_sender_id(None, 8, &mut rng, |_| false, |id| id.as_usize());
             assert!(
                 chosen.as_usize() < 7,
                 "{chosen} won over a sender of a lower score"
@@ -390,13 +491,13 @@ mod tests {
         }
         // One sender, or none, takes every freed batch.
         for socket_count in [0, 1] {
-            let chosen = freed_batch_sender_id(None, socket_count, &mut rng, |_| 0);
+            let chosen = freed_batch_sender_id(None, socket_count, &mut rng, |_| false, |_| 0);
             assert_eq!(chosen, sender(0));
         }
         // Where the two scores are equal, the first draw wins.
         for _ in 0..256 {
             let first = sender(rng.clone().next_usize(8));
-            let chosen = freed_batch_sender_id(None, 8, &mut rng, |_| 0);
+            let chosen = freed_batch_sender_id(None, 8, &mut rng, |_| false, |_| 0);
             assert_eq!(chosen, first);
         }
     }
@@ -407,15 +508,90 @@ mod tests {
         let priority = [sender(1), sender(3)];
         for _ in 0..256 {
             // Both draws are of the interface's senders, and sender 3 scores lower.
-            let chosen = freed_batch_sender_id(Some(&priority[..]), 8, &mut rng, |id| {
-                usize::MAX - id.as_usize()
-            });
+            let chosen = freed_batch_sender_id(
+                Some(&priority[..]),
+                8,
+                &mut rng,
+                |_| false,
+                |id| usize::MAX - id.as_usize(),
+            );
             assert_eq!(chosen, sender(3));
         }
-        let chosen = freed_batch_sender_id(Some(&[sender(5)][..]), 8, &mut rng, |_| 0);
+        let chosen = freed_batch_sender_id(Some(&[sender(5)][..]), 8, &mut rng, |_| false, |_| 0);
         assert_eq!(chosen, sender(5));
         // An empty list keeps the choice among every sender.
-        let chosen = freed_batch_sender_id(Some(&[][..]), 1, &mut rng, |_| 0);
+        let chosen = freed_batch_sender_id(Some(&[][..]), 1, &mut rng, |_| false, |_| 0);
         assert_eq!(chosen, sender(0));
+    }
+
+    #[test]
+    fn acknowledgements_leave_a_sender_marked_lost() {
+        let priority = [sender(1), sender(3)];
+        let three = |id: LocalSenderId| id == sender(3);
+        let odd = |id: LocalSenderId| id.as_usize() % 2 == 1;
+        // A sender that isn't marked keeps the peer's acknowledgements.
+        assert_eq!(
+            delivering_ack_sender_id(sender(2), remote(5), Some(&priority[..]), 8, three),
+            sender(2)
+        );
+        // Otherwise they go to a priority sender that delivers.
+        assert_eq!(
+            delivering_ack_sender_id(sender(3), remote(4), Some(&priority[..]), 8, three),
+            sender(1)
+        );
+        assert_eq!(
+            delivering_ack_sender_id(sender(3), remote(5), Some(&priority[..]), 8, three),
+            sender(1)
+        );
+        // Where each priority sender is marked, the peer's sender picks one of the senders that
+        // deliver.
+        assert_eq!(
+            delivering_ack_sender_id(sender(3), remote(4), Some(&priority[..]), 8, odd),
+            sender(0)
+        );
+        assert_eq!(
+            delivering_ack_sender_id(sender(3), remote(5), Some(&priority[..]), 8, odd),
+            sender(2)
+        );
+        assert_eq!(
+            delivering_ack_sender_id(sender(7), remote(5), None, 8, odd),
+            sender(2)
+        );
+        // Where every sender is marked, the route's sender keeps them.
+        assert_eq!(
+            delivering_ack_sender_id(sender(3), remote(5), Some(&priority[..]), 8, |_| true),
+            sender(3)
+        );
+    }
+
+    #[test]
+    fn freed_batches_leave_senders_marked_lost() {
+        let mut rng = Rng::with_seed(7);
+        let priority = [sender(1), sender(3)];
+        let three = |id: LocalSenderId| id == sender(3);
+        let odd = |id: LocalSenderId| id.as_usize() % 2 == 1;
+        let seven = |id: LocalSenderId| id == sender(7);
+        for _ in 0..256 {
+            // The priority sender that delivers takes each batch, though sender 3 scores lower.
+            let chosen = freed_batch_sender_id(Some(&priority[..]), 8, &mut rng, three, |id| {
+                usize::MAX - id.as_usize()
+            });
+            assert_eq!(chosen, sender(1));
+            // Where each priority sender is marked, the batches go to the senders that deliver.
+            let chosen = freed_batch_sender_id(Some(&priority[..]), 8, &mut rng, odd, |_| 0);
+            assert_eq!(chosen.as_usize() % 2, 0, "{chosen} is marked lost");
+            // Without priority senders, sender 7 scores lowest, but its mark keeps it from a
+            // batch.
+            let chosen = freed_batch_sender_id(None, 8, &mut rng, seven, |id| 7 - id.as_usize());
+            assert_ne!(chosen, sender(7));
+        }
+        // Where every sender is marked, the draws are the ones without marks.
+        let (mut marked, mut unmarked) = (Rng::with_seed(11), Rng::with_seed(11));
+        for _ in 0..64 {
+            assert_eq!(
+                freed_batch_sender_id(None, 8, &mut marked, |_| true, |id| id.as_usize()),
+                freed_batch_sender_id(None, 8, &mut unmarked, |_| false, |id| id.as_usize())
+            );
+        }
     }
 }
