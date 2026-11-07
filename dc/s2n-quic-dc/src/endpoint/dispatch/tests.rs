@@ -195,6 +195,7 @@ fn bound_server_view(queue_id: VarInt, binding_id: VarInt) -> recv::QueueView {
 struct FastPathHarness {
     acceptor_registry: acceptor::LocalRegistry<Stream>,
     frame_tx: SubmissionSender,
+    frame_rx: crate::endpoint::frame::SubmissionReceiver,
     freed_batch_tx: crate::queue::FreedBatchTx,
     counters: Arc<counters::Dispatch>,
     stream_clock: crate::time::DefaultClock,
@@ -209,11 +210,12 @@ struct FastPathHarness {
 impl FastPathHarness {
     fn new() -> Self {
         let registry = crate::counter::Registry::default();
-        let (frame_tx, _frame_rx) = crate::endpoint::frame::submission_channel(1);
+        let (frame_tx, frame_rx) = crate::endpoint::frame::submission_channel(1);
         let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
         Self {
             acceptor_registry: acceptor::Registry::<Stream>::new().local(),
             frame_tx,
+            frame_rx,
             freed_batch_tx,
             counters: counters::Dispatch::new(&registry),
             stream_clock: crate::time::DefaultClock::default(),
@@ -452,4 +454,86 @@ fn slot_diag_reports_bound_vs_unallocated_state() {
             .is_none_or(|d| d.unallocated && !d.stream_has_receiver),
         "an unbound slot must read back as unallocated with no receiver"
     );
+}
+
+/// Drains the frames the dispatch submitted to `frame_rx`, and returns each reset among them by
+/// the slot it resets and its binding id.
+fn take_resets(frame_rx: &mut crate::endpoint::frame::SubmissionReceiver) -> Vec<(u64, u64)> {
+    let waker = s2n_quic_core::task::waker::noop();
+    let mut cx = core::task::Context::from_waker(&waker);
+    let mut resets = Vec::new();
+    loop {
+        let mut storage = crate::endpoint::frame::PriorityStorage::default();
+        let core::task::Poll::Ready(Some(())) = frame_rx.poll_swap(&mut cx, &mut storage) else {
+            break;
+        };
+        for frame in storage.iter() {
+            if let Header::QueueReset {
+                queue_pair,
+                binding_id,
+                ..
+            } = frame.header
+            {
+                resets.push((queue_pair.source_queue_id.as_u64(), binding_id.as_u64()));
+            }
+        }
+    }
+    resets
+}
+
+/// The inits a peer sends while the creditless window refuses frames can't add a reset for each
+/// rejected init: each slot of the peer's queues gets the reset of its first rejected init alone,
+/// whatever the binding ids of the inits routed to it, until that reset leaves the priority router
+/// and releases the slot. A slot past the peer's queues doesn't get a reset.
+#[test]
+fn rejected_inits_leave_one_reset_for_each_slot_until_it_leaves() {
+    let (packet, opener, decrypt_len) =
+        sealed_queue_msg_packet(VarInt::from_u8(0), VarInt::from_u8(1));
+    let header = single_queue_msg_header(&packet, decrypt_len);
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let mut view = recv::QueueView::Server(state.view());
+    let mut harness = FastPathHarness::new();
+
+    let init = |harness: &mut FastPathHarness, view: &mut recv::QueueView, slot: u8, binding: u8| {
+        let mut header = header;
+        let Header::QueueMsg {
+            queue_pair,
+            binding_id,
+            dest_acceptor_id,
+            ..
+        } = &mut header
+        else {
+            unreachable!("the packet holds a QueueMsg frame");
+        };
+        queue_pair.dest_queue_id = VarInt::from_u8(slot);
+        *binding_id = VarInt::from_u8(binding);
+        // The registry doesn't hold an acceptor, so the server rejects the init.
+        *dest_acceptor_id = Some(VarInt::from_u8(9));
+        let result = harness.call(header, &opener, &packet, decrypt_len, view);
+        assert!(matches!(result, Err(FastPathError::AuthForDrop)));
+    };
+
+    // Three bindings each send an init to eight slots, and none of the resets leaves.
+    for binding in 1..=3 {
+        for slot in 0..8 {
+            init(&mut harness, &mut view, slot, binding);
+        }
+    }
+    assert_eq!(
+        take_resets(&mut harness.frame_rx),
+        vec![(0, 1), (1, 1), (2, 1), (3, 1)],
+        "each of the peer's 4 queues gets the reset of its first rejected init alone"
+    );
+
+    // Slot 2's reset leaves the priority router: slot 2 gets the reset of its next rejected init,
+    // and slot 3, whose reset still waits, doesn't.
+    state.freed.release(
+        VarInt::from_u8(2),
+        VarInt::from_u8(1),
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+    init(&mut harness, &mut view, 2, 4);
+    init(&mut harness, &mut view, 3, 4);
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(2, 4)]);
 }
