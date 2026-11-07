@@ -1904,3 +1904,76 @@ fn interface_paced_pick_two_without_a_chosen_interface_routes_the_highest_input_
     assert_eq!(sent(), 5);
     assert_eq!(drop_counter.load(Ordering::Relaxed), 5);
 }
+
+#[test]
+fn interface_paced_pick_two_reads_ahead_again_once_its_highest_priority_input_closes() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    // The bulk input holds four bulk batches, each of more bytes than a burst, a 1-byte batch of
+    // the highest priority level and a fifth bulk batch, and closes after them. The input of the
+    // highest priority level stays empty until the test closes it.
+    let rx = SharedReceiver::default();
+    rx.values.borrow_mut().extend(test_items(&entry, 4, 100_000, &drop_counter));
+    let mut highest = new_test_item(entry.clone(), drop_counter.clone());
+    highest.byte_cost = 1;
+    highest.highest_priority = true;
+    rx.values.borrow_mut().push_back(highest);
+    rx.values.borrow_mut().extend(test_items(&entry, 1, 100_000, &drop_counter));
+    rx.closed.set(true);
+    let highest_rx = SharedReceiver::default();
+    let sends: [Sends; 2] = Default::default();
+    // The second interface carries the highest-priority traffic.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx.clone(),
+        timed_senders(&clock, &[&sends[0], &sends[1]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+    let costs = |sender: usize| -> Vec<u64> {
+        sends[sender].borrow().iter().map(|&(_, cost)| cost).collect()
+    };
+    let sent = |cost: u64| {
+        sends
+            .iter()
+            .map(|sends| sends.borrow().iter().filter(|&&(_, c)| c == cost).count())
+            .sum::<usize>()
+    };
+
+    // Each interface sends one bulk batch and holds the next. While the input of the highest
+    // priority level is open, the router doesn't read the bulk input ahead, so the 1-byte batch
+    // and the fifth bulk batch wait there.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(100_000), 2);
+    assert_eq!(costs(1), [100_000]);
+    assert_eq!(rx.values.borrow().len(), 2);
+    assert_eq!(rx.consumed.get(), 4 * 100_000);
+
+    // Once that input closes, the router reads the bulk input ahead again while every interface
+    // holds a batch: the 1-byte batch goes at once to the second interface's worker, and the
+    // router keeps the fifth bulk batch.
+    highest_rx.closed.set(true);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(costs(1), [100_000, 1]);
+    assert_eq!(sent(100_000), 2);
+    assert!(rx.values.borrow().is_empty());
+    assert_eq!(rx.consumed.get(), 4 * 100_000 + 1 + 100_000);
+
+    // Once the buckets have paid, the held batches go, and the router routes the fifth bulk
+    // batch, which waits until its interface has paid again.
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(100_000), 4);
+
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(sent(100_000), 5);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 6);
+}
