@@ -144,8 +144,13 @@ impl FreedInner {
 
     /// Hold the slot `queue_id` for the rejected init of `binding_id`, so that a `record` of the
     /// slot waits until `release` ends the hold. Returns false where the slot is held already,
-    /// as for a rejected init whose reset hasn't left yet.
+    /// as for a rejected init whose reset hasn't left yet, and for a slot at or past the freed
+    /// set's capacity, which `record` doesn't record, so that each hold is of a slot that the
+    /// freed set records.
     pub fn hold(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
+        if queue_id.as_u64() >= HierarchicalBitSet::MAX_CAPACITY as u64 {
+            return false;
+        }
         let mut state = self.state.lock().unwrap();
         match state.held.entry(queue_id.as_u64()) {
             std::collections::hash_map::Entry::Occupied(_) => false,
@@ -344,6 +349,20 @@ mod tests {
             .primary()
             .spawn();
         });
+    }
+
+    #[test]
+    fn a_slot_the_freed_set_cant_record_isnt_held() {
+        let freed = FreedInner::new();
+        let capacity = HierarchicalBitSet::MAX_CAPACITY;
+
+        // The slot at the freed set's capacity, which `record` doesn't record, isn't held, and
+        // `held` doesn't take an entry for it.
+        assert!(!freed.hold(VarInt::from_u32(capacity), VarInt::from_u8(1)));
+        assert!(freed.state.lock().unwrap().held.is_empty());
+
+        // The last slot that the freed set records is held.
+        assert!(freed.hold(VarInt::from_u32(capacity - 1), VarInt::from_u8(1)));
     }
 
     #[test]
