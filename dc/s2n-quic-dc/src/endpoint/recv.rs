@@ -398,7 +398,9 @@ impl Context {
             ecn_counts: self.ecn_counts,
             largest_recv_time: largest_recv_time.into(),
             path_secret_entry: self.path_entry.clone(),
-            local_sender_id: self.local_sender_id,
+            // The acknowledgements go to this context's sender while its interface pair
+            // delivers, and to a sender whose pair delivers while it is marked lost.
+            local_sender_id: self.path_entry.delivering_sender(self.local_sender_id),
             remote_sender_id: self.remote_sender_id,
             recv_worker_id,
         })

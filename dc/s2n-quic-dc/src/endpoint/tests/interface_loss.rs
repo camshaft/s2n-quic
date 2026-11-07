@@ -156,25 +156,42 @@ fn interfaces(layout: &[usize; 8]) -> Vec<interface::Config> {
     ]
 }
 
+/// Panics with `round`, the failed `step` and its `error`, and the bytes the server read and
+/// the packets the network dropped until then.
+fn fail(round: &str, step: &str, error: impl core::fmt::Debug, shared: &Shared) -> ! {
+    panic!(
+        "{round}: {step}: {error:?}; the server read {} bytes and the network dropped {} packets",
+        shared.read.load(Ordering::Relaxed),
+        shared.dropped.load(Ordering::Relaxed),
+    )
+}
+
 /// Writes `count` streams of `STREAM_LEN` bytes to the server at once, and waits for the
-/// server's answer to each.
-async fn exchange(client: &mut Client, count: usize) {
+/// server's answer to each. A failure states `round`, and the bytes the server read and the
+/// packets the network dropped until then.
+async fn exchange(client: &mut Client, count: usize, round: &'static str, shared: &Arc<Shared>) {
     let mut handles = Vec::with_capacity(count);
     for _ in 0..count {
         let stream = client
             .connect("server:0", ACCEPTOR_ID)
             .await
-            .expect("connect");
+            .unwrap_or_else(|error| fail(round, "connect", error, shared));
+        let shared = shared.clone();
         let handle = async move {
             let (mut reader, mut writer) = stream.into_split();
             let mut request = Data::new(STREAM_LEN);
-            writer
-                .write_all_from_fin(&mut request)
-                .await
-                .expect("client write");
+            if let Err(error) = writer.write_all_from_fin(&mut request).await {
+                fail(round, "client write", error, &shared);
+            }
             let mut reply = Data::new(REPLY_LEN);
-            while reader.read_into(&mut reply).await.expect("client read") > 0 {}
-            assert!(reply.is_finished(), "a reply ended early");
+            loop {
+                match reader.read_into(&mut reply).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) => fail(round, "client read", error, &shared),
+                }
+            }
+            assert!(reply.is_finished(), "{round}: a reply ended early");
         }
         .primary()
         .spawn();
@@ -265,9 +282,12 @@ fn traffic_moves_off_a_lost_interface_and_back() {
             client_side.set_client_addrs(client.data_addrs());
 
             // The server loses the client's second interface while it reads these streams.
-            timeout(ROUND_TIMEOUT, exchange(&mut client, STREAMS))
-                .await
-                .expect("the streams finish while an interface is lost");
+            timeout(
+                ROUND_TIMEOUT,
+                exchange(&mut client, STREAMS, "the first round", &client_side),
+            )
+            .await
+            .expect("the streams finish while an interface is lost");
             assert!(
                 client_side.losing.load(Ordering::Relaxed),
                 "the interface wasn't lost",
@@ -278,9 +298,12 @@ fn traffic_moves_off_a_lost_interface_and_back() {
             // so the next connect isn't refused, and a stream the client opens while the
             // interface is lost gets its answer.
             QUIET.sleep().await;
-            timeout(ROUND_TIMEOUT, exchange(&mut client, 1))
-                .await
-                .expect("a new stream finishes while an interface is lost");
+            timeout(
+                ROUND_TIMEOUT,
+                exchange(&mut client, 1, "the quiet round", &client_side),
+            )
+            .await
+            .expect("a new stream finishes while an interface is lost");
 
             // The interface delivers again, and its pairs probe at their next probe timeouts,
             // whose backoff grows with the outage. The client opens a stream at a time until it
@@ -290,18 +313,24 @@ fn traffic_moves_off_a_lost_interface_and_back() {
             client_side.recording.store(true, Ordering::Relaxed);
             timeout(RECOVERY_TIMEOUT, async {
                 while !client_side.wrote_on_lost_interface() {
-                    timeout(ROUND_TIMEOUT, exchange(&mut client, 1))
-                        .await
-                        .expect("a stream finishes while the interface recovers");
+                    timeout(
+                        ROUND_TIMEOUT,
+                        exchange(&mut client, 1, "a recovery round", &client_side),
+                    )
+                    .await
+                    .expect("a stream finishes while the interface recovers");
                 }
             })
             .await
             .expect("the client writes on the interface again once it delivers");
             client_side.writes.lock().unwrap().clear();
 
-            timeout(ROUND_TIMEOUT, exchange(&mut client, STREAMS))
-                .await
-                .expect("the streams finish once the interface delivers again");
+            timeout(
+                ROUND_TIMEOUT,
+                exchange(&mut client, STREAMS, "the last round", &client_side),
+            )
+            .await
+            .expect("the streams finish once the interface delivers again");
             client_side.recording.store(false, Ordering::Relaxed);
         }
         .group("client")

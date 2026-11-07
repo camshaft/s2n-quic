@@ -246,3 +246,32 @@ fn a_load_score_update_keeps_the_lost_mark() {
     );
     assert!(entry.sender_load_score(sender) > score);
 }
+
+#[test]
+fn a_message_for_a_lost_sender_goes_to_the_next_sender_that_delivers() {
+    let entry = test_entry_with_senders(4);
+    let sender = crate::endpoint::id::LocalSenderId::from_index;
+    assert_eq!(entry.delivering_sender(sender(1)), sender(1));
+
+    assert!(entry.set_sender_lost(sender(1), true));
+    assert!(entry.set_sender_lost(sender(2), true));
+    assert_eq!(
+        entry.delivering_sender(sender(1)),
+        sender(3),
+        "the first sender after a lost one whose pair delivers"
+    );
+
+    assert!(entry.set_sender_lost(sender(3), true));
+    assert_eq!(
+        entry.delivering_sender(sender(2)),
+        sender(0),
+        "the search goes on from the first slot"
+    );
+
+    assert!(entry.set_sender_lost(sender(0), true));
+    assert_eq!(
+        entry.delivering_sender(sender(2)),
+        sender(2),
+        "where every pair is lost, the preferred sender keeps the message"
+    );
+}

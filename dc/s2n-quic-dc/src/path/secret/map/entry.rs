@@ -424,6 +424,27 @@ impl Entry {
             .any(|slot| slot.load(Ordering::Acquire) & Self::LOST_SENDER == 0)
     }
 
+    /// Returns `preferred` while its interface pair isn't marked lost, and otherwise the first
+    /// sender after it, by slot, whose pair isn't marked lost, so that a message bound for a
+    /// lost pair goes to a pair that delivers. Returns `preferred` where every pair is marked
+    /// lost, or where the entry doesn't keep sender slots.
+    pub fn delivering_sender(&self, preferred: LocalSenderId) -> LocalSenderId {
+        let Some(start) = self.sender_index(preferred) else {
+            return preferred;
+        };
+        let delivers = |index: usize| {
+            self.sender_load_scores[index].load(Ordering::Acquire) & Self::LOST_SENDER == 0
+        };
+        if delivers(start) {
+            return preferred;
+        }
+        let len = self.sender_load_scores.len();
+        (1..len)
+            .map(|offset| (start + offset) % len)
+            .find(|&index| delivers(index))
+            .map_or(preferred, LocalSenderId::from_index)
+    }
+
     pub fn idle_timeout(&self) -> Duration {
         self.parameters
             .max_idle_timeout

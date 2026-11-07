@@ -1794,12 +1794,22 @@ where
                         move |mut entry: crate::intrusive::Entry<msg::Sender>| {
                             // Pick-two LB using sender_load_score atomics, among the senders of
                             // the interface for the highest-priority traffic where there is one.
+                            // A sender whose interface pair is marked lost loses the draw, and
+                            // where both drawn senders' pairs are lost, the batch goes to a
+                            // sender whose pair delivers.
+                            let path_secret_entry = entry.path_secret_entry();
                             let chosen = routing::freed_batch_sender_id(
                                 priority_senders.as_deref(),
                                 socket_count,
                                 &mut rng,
-                                |sender| entry.path_secret_entry().sender_load_score(sender),
+                                |sender| {
+                                    (
+                                        path_secret_entry.is_sender_lost(sender),
+                                        path_secret_entry.sender_load_score(sender),
+                                    )
+                                },
                             );
+                            let chosen = path_secret_entry.delivering_sender(chosen);
 
                             // Set the chosen sender and forward
                             if let msg::Sender::PendingFreed {

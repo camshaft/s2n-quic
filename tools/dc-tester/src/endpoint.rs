@@ -160,6 +160,9 @@ where
         gso,
         acceptor_registry,
         overall_send_rate: Rate::new(config.bandwidth),
+        // The tester doesn't list interfaces, so every socket is on one interface whose send
+        // rate is `overall_send_rate`.
+        interfaces: Vec::new(),
         budgets: endpoint::Budgets::default(),
         submission_shards: config.submission_shards,
         ups_rate: Rate::new(0.001), // 1 Mbps — small budget; UPS is low-volume control traffic

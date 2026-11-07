@@ -8,7 +8,7 @@ use crate::{
     stream::endpoint::testing::sim::{
         insert_fake_path_pair, lookup_sim_map, SimEndpointConfig, SERVER_PORT,
     },
-    testing::{ext::*, sim},
+    testing::{ext::*, sim, without_snapshots},
 };
 use s2n_quic_core::varint::VarInt;
 
@@ -36,6 +36,7 @@ fn server_interfaces() -> Vec<interface::Config> {
 /// empty interface list.
 #[test]
 fn a_client_learns_the_interface_of_each_server_address() {
+    let _snapshots = without_snapshots();
     sim(|| {
         async move {
             let server = SimEndpointConfig::default()
