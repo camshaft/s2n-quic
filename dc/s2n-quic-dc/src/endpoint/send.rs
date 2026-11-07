@@ -608,6 +608,9 @@ pub(crate) struct Context {
     /// When this context began to wait for an acknowledgement of a packet it sent, or `None`
     /// while the peer has acknowledged every packet it sent.
     pub ack_wait_since: Option<precision::Timestamp>,
+    /// When [`Self::mark_path_lost`] marked this context's interface pair lost, or `None`
+    /// while the pair delivers or was marked lost without a time.
+    pub lost_at: Option<precision::Timestamp>,
     /// When this context sent an ack-eliciting packet that the inflight map doesn't hold, such
     /// as an ACK-only probe or a Ping, with no acknowledgement from the peer since, or `None`.
     /// [`Self::has_stopped_delivering`] reads it where the inflight map is empty.
@@ -813,6 +816,7 @@ impl Context {
             invalidated: false,
             lost_from: None,
             ack_wait_since: None,
+            lost_at: None,
             ack_only_probe_sent: None,
             ack_only_since_peer_ack: false,
             rtt_tracker: AckRttTracker::default(),
@@ -1162,15 +1166,21 @@ impl Context {
     ///
     /// Marks the context's interface pair lost where it stopped delivering, as
     /// [`Self::has_stopped_delivering`] decides, so that the routers stop choosing it and its
-    /// frames move to the pairs that still deliver.
+    /// frames move to the pairs that still deliver. While the pair is lost, it caps the probe
+    /// backoff, as `Pto::cap_lost_backoff` says, so that the first probe after the pair
+    /// delivers again doesn't wait about as long as the outage lasted.
     ///
     /// Transitions the probe state from `Idle` to `Requested` if a real probe
     /// should be sent, then computes and returns the updated `WheelInterest` for
     /// rescheduling. The caller only needs to dispatch the returned interest.
     pub fn on_pto_timeout<Clk: precision::Clock + ?Sized>(&mut self, clock: &Clk) -> WheelInterest {
         let probe = self.pto.on_timeout();
-        if !self.is_path_lost() && self.has_stopped_delivering(clock.now()) {
-            self.set_path_lost(true);
+        let now = clock.now();
+        if !self.is_path_lost() && self.has_stopped_delivering(now) {
+            self.mark_path_lost(now);
+        }
+        if self.is_path_lost() {
+            self.pto.cap_lost_backoff(&self.rtt_estimator);
         }
         if probe && (self.inflight.has_inflight() || self.has_pending() || self.is_path_lost()) {
             // The only failure case is `NoOp` — the state is already `Requested`
@@ -1299,11 +1309,21 @@ impl Context {
     ///
     /// A lost mark keeps the next packet number this context sends: an acknowledgement of
     /// that packet or a later one shows that the pair delivers again.
+    ///
+    /// It clears the mark's time, which [`Self::mark_path_lost`] sets again after this call.
     pub fn set_path_lost(&mut self, lost: bool) {
         self.lost_from = lost.then_some(self.next_packet_number);
+        self.lost_at = None;
         let _ = self
             .path_secret_entry
             .set_sender_lost(self.sender_idx, lost);
+    }
+
+    /// Marks this context's interface pair lost at `now`, as [`Self::set_path_lost`] does, and
+    /// records when, so that the idle wheel can tell whether the peer sent a packet since.
+    pub fn mark_path_lost(&mut self, now: precision::Timestamp) {
+        self.set_path_lost(true);
+        self.lost_at = Some(now);
     }
 
     /// Clears the lost mark once the peer acknowledges a packet sent after the mark was set.
@@ -1618,6 +1638,30 @@ impl Pto {
         true
     }
 
+    /// The period of one wheel firing: one probe timeout period at the initial backoff, and
+    /// at least 2 ms.
+    fn base_period(rtt_estimator: &RttEstimator) -> Duration {
+        rtt_estimator
+            .pto_period(INITIAL_PTO_BACKOFF, PacketNumberSpace::Initial)
+            .max(Duration::from_millis(2))
+    }
+
+    /// Caps the backoff of a lost pair's probes, so that the pair is probed at least once a
+    /// persistent congestion period of `rtt_estimator` (RFC 9002, section 7.6.1), rounded up to
+    /// whole wheel firings.
+    ///
+    /// A lost pair's probes go unacknowledged, so without the cap its backoff doubles up to
+    /// `Self::MAX_BACKOFF`, and the first probe after the pair delivers again can wait about
+    /// as long as the outage lasted.
+    pub fn cap_lost_backoff(&mut self, rtt_estimator: &RttEstimator) {
+        let base_period = Self::base_period(rtt_estimator).as_nanos();
+        let threshold = rtt_estimator.persistent_congestion_threshold().as_nanos();
+        let periods = threshold.div_ceil(base_period);
+        let max_backoff = periods.clamp(1, u128::from(Self::MAX_BACKOFF)) as u32;
+        self.backoff = self.backoff.min(max_backoff);
+        self.firings_remaining = self.firings_remaining.min(self.backoff - 1);
+    }
+
     /// Returns `true` if the PTO needs to fire (has remaining countdown or pending state).
     pub fn is_armed(&self) -> bool {
         self.needs_update || self.arm_base.is_some()
@@ -1633,9 +1677,7 @@ impl Pto {
         clock: &Clk,
         rtt_estimator: &RttEstimator,
     ) -> Option<precision::Timestamp> {
-        let mut base_period =
-            rtt_estimator.pto_period(INITIAL_PTO_BACKOFF, PacketNumberSpace::Initial);
-        base_period = base_period.max(Duration::from_millis(2));
+        let base_period = Self::base_period(rtt_estimator);
 
         // Anchor to arm_base if available, otherwise to last_sent_time, otherwise now.
         let base = self

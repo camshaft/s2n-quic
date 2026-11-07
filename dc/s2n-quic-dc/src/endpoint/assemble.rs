@@ -98,7 +98,7 @@ where
         && !context.is_path_lost()
         && context.has_stopped_delivering(now)
     {
-        context.set_path_lost(true);
+        context.mark_path_lost(now);
     }
     let PathInfo {
         max_datagram_size: mtu,
@@ -675,9 +675,11 @@ where
                         time_sent,
                         sent_bytes: encoded_len as u16,
                     };
-                    // Restart idle timeout when transitioning from no inflight to inflight.
+                    // Restart idle timeout, and start the wait for an acknowledgement, when
+                    // transitioning from no inflight to inflight.
                     if !context.inflight.has_inflight() {
                         context.last_peer_activity = now;
+                        context.ack_wait_since = Some(now);
                     }
 
                     let pn = PacketNumberSpace::Initial.new_packet_number(packet_number);
