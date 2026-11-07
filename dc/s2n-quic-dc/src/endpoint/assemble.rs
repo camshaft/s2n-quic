@@ -648,9 +648,11 @@ where
                         time_sent,
                         sent_bytes: encoded_len as u16,
                     };
-                    // Restart idle timeout when transitioning from no inflight to inflight.
+                    // Restart idle timeout, and start the wait for an acknowledgement, when
+                    // transitioning from no inflight to inflight.
                     if !context.inflight.has_inflight() {
                         context.last_peer_activity = now;
+                        context.ack_wait_since = Some(now);
                     }
 
                     let pn = PacketNumberSpace::Initial.new_packet_number(packet_number);

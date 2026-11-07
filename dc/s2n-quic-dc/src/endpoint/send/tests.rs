@@ -1207,3 +1207,75 @@ fn a_context_dropped_for_a_rejected_key_clears_its_lost_mark() {
     assert!(removed.is_some());
     assert!(!entry.is_sender_lost(sender));
 }
+
+/// A lost mark records when it was set, and a delivering mark clears that time.
+#[test]
+fn a_lost_mark_records_when_it_was_set() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(100);
+    let now = clock.get_time();
+    assert!(ctx.lost_at.is_none());
+
+    ctx.mark_path_lost(now);
+    assert!(ctx.is_path_lost());
+    assert!(entry.is_sender_lost(sender));
+    assert_eq!(ctx.lost_at.map(|at| at.nanos), Some(now.nanos));
+
+    ctx.set_path_lost(false);
+    assert!(ctx.lost_at.is_none(), "a delivering mark clears the time");
+    assert!(!entry.is_sender_lost(sender));
+}
+
+/// A lost pair's probe backoff stops at a cap, so that the pair is probed within one wheel
+/// firing of each persistent congestion period, and grows up to that cap.
+#[test]
+fn pto_cap_lost_backoff_probes_about_once_a_persistent_congestion_period() {
+    let rtt = make_rtt(10);
+    let base_period = Pto::base_period(&rtt).as_nanos();
+    let threshold = rtt.persistent_congestion_threshold().as_nanos();
+    // The cap lies above the initial backoff and below the largest one, so the test reads
+    // the cap and not one of those bounds.
+    assert!(u128::from(INITIAL_PTO_BACKOFF) * base_period < threshold);
+    assert!(u128::from(Pto::MAX_BACKOFF - 1) * base_period >= threshold);
+
+    let mut pto = Pto::default();
+    for _ in 0..200 {
+        pto.on_timeout();
+        pto.cap_lost_backoff(&rtt);
+        assert!(
+            u128::from(pto.backoff - 1) * base_period < threshold,
+            "a lost pair is probed within one wheel firing of a persistent congestion period"
+        );
+        assert!(pto.firings_remaining < pto.backoff);
+    }
+    assert!(
+        u128::from(pto.backoff) * base_period >= threshold,
+        "the backoff grows up to the cap"
+    );
+}
+
+/// A lost pair's probe timeout caps its probe backoff, so that the first probe after the pair
+/// delivers again doesn't wait about as long as the outage lasted.
+#[test]
+fn a_lost_pair_caps_its_probe_backoff() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(100);
+    let base_period = Pto::base_period(&ctx.rtt_estimator).as_nanos();
+    let threshold = ctx
+        .rtt_estimator
+        .persistent_congestion_threshold()
+        .as_nanos();
+    assert!(u128::from(Pto::MAX_BACKOFF - 1) * base_period >= threshold);
+
+    ctx.set_path_lost(true);
+    for _ in 0..200 {
+        let _ = ctx.on_pto_timeout(&clock);
+    }
+    assert!(
+        u128::from(ctx.pto.backoff - 1) * base_period < threshold,
+        "a lost pair's backoff stays within one wheel firing of a persistent congestion period"
+    );
+}
