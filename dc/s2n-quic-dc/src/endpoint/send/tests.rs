@@ -1144,6 +1144,95 @@ fn a_pair_with_nothing_to_acknowledge_is_not_marked_lost() {
     assert!(!ctx.is_path_lost());
 }
 
+/// Records a packet of `frame` as sent and unacknowledged, the way the assembler records a
+/// packet it sends.
+fn send_unacknowledged(ctx: &mut Context, clock: &Clock, frame: crate::intrusive::Entry<Frame>) {
+    let now = clock.get_time();
+    let time_sent: s2n_quic_core::time::Timestamp = now.into();
+    let sent_bytes = 64;
+    let rtt_estimator = ctx.rtt_estimator;
+    let cc_info = ctx
+        .cca
+        .on_packet_sent(time_sent, sent_bytes, false, &rtt_estimator);
+    if !ctx.inflight.has_inflight() {
+        ctx.last_peer_activity = now;
+    }
+    let space = s2n_quic_core::packet::number::PacketNumberSpace::Initial;
+    let packet_number = space.new_packet_number(ctx.next_packet_number);
+    ctx.next_packet_number += 1;
+    let mut frames = crate::intrusive::Queue::new();
+    frames.push_back(frame);
+    let info = crate::endpoint::inflight::TransmissionInfo {
+        cc_info,
+        time_sent,
+        sent_bytes,
+    };
+    let packet = crate::endpoint::inflight::Packet::new(frames, info);
+    ctx.inflight.insert(packet_number, packet);
+    ctx.pto.on_packet_sent(now);
+}
+
+/// A pair whose packet the peer doesn't acknowledge for a persistent congestion period has
+/// stopped delivering, and its probe timeout then marks it lost from its next packet number.
+#[test]
+fn an_unacknowledged_packet_marks_its_pair_lost_after_a_persistent_congestion_period() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(1000);
+    send_unacknowledged(&mut ctx, &clock, make_frame(64));
+    let _ = ctx.wheel_interest(&clock);
+    assert!(ctx.ack_wait_since == Some(clock.get_time()));
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    let next = ctx.next_packet_number;
+
+    clock.advance(threshold - Duration::from_nanos(1));
+    assert!(!ctx.has_stopped_delivering(clock.get_time()));
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(!ctx.is_path_lost());
+    assert!(!entry.is_sender_lost(sender));
+
+    clock.advance(Duration::from_nanos(1));
+    assert!(ctx.has_stopped_delivering(clock.get_time()));
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(ctx.is_path_lost());
+    assert_eq!(ctx.lost_from, Some(next));
+    assert!(entry.is_sender_lost(sender));
+}
+
+/// An acknowledgement of another packet restarts the period after which a pair with an
+/// unacknowledged packet has stopped delivering.
+#[test]
+fn an_acknowledgement_restarts_the_period_that_marks_a_pair_lost() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(1000);
+    send_unacknowledged(&mut ctx, &clock, make_frame(64));
+    let _ = ctx.wheel_interest(&clock);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    let half = threshold / 2;
+
+    clock.advance(half);
+    // The peer acknowledges another packet, which records its activity on the pair.
+    ctx.last_peer_activity = clock.get_time();
+
+    clock.advance(threshold - half);
+    assert!(!ctx.has_stopped_delivering(clock.get_time()));
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(
+        !ctx.is_path_lost(),
+        "the acknowledgement restarts the period"
+    );
+
+    clock.advance(half);
+    assert!(ctx.has_stopped_delivering(clock.get_time()));
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(
+        ctx.is_path_lost(),
+        "a whole period passed since the acknowledgement"
+    );
+}
+
 /// A new context of a sender slot clears the lost mark that an earlier context of the slot
 /// left on the path secret entry.
 #[test]
