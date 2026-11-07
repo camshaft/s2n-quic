@@ -337,7 +337,7 @@ pub(crate) fn route_freed_batch(
 #[cfg(test)]
 pub(crate) mod observe {
     use super::{msg, LocalSenderId, RemoteSenderId};
-    use core::cell::RefCell;
+    use core::cell::{Cell, RefCell};
     use std::{
         net::SocketAddr,
         sync::{Arc, Mutex},
@@ -352,9 +352,19 @@ pub(crate) mod observe {
         PendingFreed,
     }
 
+    /// The task that submits a pending acknowledgement to the router.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Submitter {
+        /// The `ack_burst` task, which encodes the scheduled acknowledgements of a context.
+        AckBurst,
+        /// The `ack_completion` task, which encodes the acknowledgements of a context again at
+        /// the completion of its last one, where packets arrived after that one was encoded.
+        AckCompletion,
+    }
+
     /// One message routed to a send worker: what it carries, its sender, the peer sender whose
-    /// packets an acknowledgement acknowledges, its path's peer, and the lost marks of its path
-    /// when the endpoint routed it.
+    /// packets an acknowledgement acknowledges and the task that submitted it, its path's peer,
+    /// and the lost marks of its path when the endpoint routed it.
     #[derive(Clone, Copy, Debug)]
     pub(crate) struct Routed {
         pub(crate) kind: Kind,
@@ -362,6 +372,10 @@ pub(crate) mod observe {
         /// The peer sender whose packets a pending acknowledgement acknowledges, and `None` for
         /// a freed batch.
         pub(crate) remote: Option<RemoteSenderId>,
+        /// The task that submitted a pending acknowledgement, as it records itself with
+        /// `submitting` around its send, and `None` for a freed batch or an acknowledgement sent
+        /// outside `submitting`.
+        pub(crate) submitter: Option<Submitter>,
         pub(crate) peer: SocketAddr,
         /// Whether the path marks the interface pair of `sender` lost.
         pub(crate) lost: bool,
@@ -380,6 +394,7 @@ pub(crate) mod observe {
 
     thread_local! {
         static SINK: RefCell<Option<Arc<Mutex<Vec<Routed>>>>> = const { RefCell::new(None) };
+        static SUBMITTER: Cell<Option<Submitter>> = const { Cell::new(None) };
     }
 
     /// Records each message that this thread routes from now on in `sink`.
@@ -387,13 +402,35 @@ pub(crate) mod observe {
         SINK.with(|current| *current.borrow_mut() = Some(sink));
     }
 
+    /// Records `submitter` as the task that submits each pending acknowledgement that this
+    /// thread routes, until the returned guard drops.
+    pub(crate) fn submitting(submitter: Submitter) -> Submitting {
+        let previous = SUBMITTER.with(|current| current.replace(Some(submitter)));
+        Submitting { previous }
+    }
+
+    /// The guard that `submitting` returns, which records this thread's earlier submitter again
+    /// when it drops.
+    #[must_use]
+    pub(crate) struct Submitting {
+        previous: Option<Submitter>,
+    }
+
+    impl Drop for Submitting {
+        fn drop(&mut self) {
+            SUBMITTER.with(|current| current.set(self.previous));
+        }
+    }
+
     /// Records `message`, where this thread records the messages it routes.
     pub(crate) fn record(message: &msg::Sender) {
-        let (kind, remote) = match message {
-            msg::Sender::PendingAck(submission) => {
-                (Kind::PendingAck, Some(submission.remote_sender_id))
-            }
-            msg::Sender::PendingFreed { .. } => (Kind::PendingFreed, None),
+        let (kind, remote, submitter) = match message {
+            msg::Sender::PendingAck(submission) => (
+                Kind::PendingAck,
+                Some(submission.remote_sender_id),
+                SUBMITTER.with(Cell::get),
+            ),
+            msg::Sender::PendingFreed { .. } => (Kind::PendingFreed, None, None),
             msg::Sender::ReceivedAck { .. } => return,
         };
         SINK.with(|sink| {
@@ -404,6 +441,7 @@ pub(crate) mod observe {
                     kind,
                     sender,
                     remote,
+                    submitter,
                     peer: *path.peer(),
                     lost: path.is_sender_lost(sender),
                     path_has_lost: path.has_lost_sender(),

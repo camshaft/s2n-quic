@@ -1789,6 +1789,10 @@ where
             record_ack_move(path_secret_map.as_ref(), &ctx, submission.local_sender_id);
             let mut pending_ack_entry = entry;
             *pending_ack_entry = msg::Sender::PendingAck(submission);
+            #[cfg(test)]
+            let _submitter = endpoint::routing::observe::submitting(
+                endpoint::routing::observe::Submitter::AckCompletion,
+            );
             let _ = ack_sender.send(pending_ack_entry);
         } else if ctx.ack_state.is_flushed() || ctx.ack_state.is_flushed_stale() {
             counters.rx_ack_completion_impossible.add(1);
@@ -1822,6 +1826,10 @@ where
             ctx.invariants();
             if let Some(submission) = ctx.encode_and_flush(recv_worker_id) {
                 record_ack_move(path_secret_map.as_ref(), &ctx, submission.local_sender_id);
+                #[cfg(test)]
+                let _submitter = endpoint::routing::observe::submitting(
+                    endpoint::routing::observe::Submitter::AckBurst,
+                );
                 let _ = ack_sender.send(Entry::new(msg::Sender::PendingAck(submission)));
             } else if was_scheduled {
                 counters.rx_ack_state_impossible.add(1);
