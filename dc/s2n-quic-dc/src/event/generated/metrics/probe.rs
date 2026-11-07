@@ -61,6 +61,14 @@ mod counter {
                 109usize => Self(path_secret_map_cleaner_cycled),
                 126usize => Self(path_secret_map_id_write_lock),
                 129usize => Self(path_secret_map_address_write_lock),
+                132usize => Self(path_secret_map_interface_pair_lost),
+                133usize => Self(path_secret_map_interface_pair_delivering),
+                134usize => Self(path_secret_map_interface_pair_frames_moved),
+                136usize => Self(path_secret_map_dead_mark_skipped),
+                137usize => Self(creditless_window_frame_refused),
+                141usize => Self(creditless_window_limit_grew),
+                145usize => Self(creditless_window_limit_halved),
+                149usize => Self(path_secret_map_interface_pair_preference_ended),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -160,6 +168,22 @@ mod counter {
             fn path_secret_map_id_write_lock(value: u64);
             # [link_name = s2n_quic_dc__event__counter__path_secret_map_address_write_lock]
             fn path_secret_map_address_write_lock(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__path_secret_map_interface_pair_lost]
+            fn path_secret_map_interface_pair_lost(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__path_secret_map_interface_pair_delivering]
+            fn path_secret_map_interface_pair_delivering(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__path_secret_map_interface_pair_frames_moved]
+            fn path_secret_map_interface_pair_frames_moved(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__path_secret_map_dead_mark_skipped]
+            fn path_secret_map_dead_mark_skipped(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__creditless_window_frame_refused]
+            fn creditless_window_frame_refused(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__creditless_window_limit_grew]
+            fn creditless_window_limit_grew(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__creditless_window_limit_halved]
+            fn creditless_window_limit_halved(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__path_secret_map_interface_pair_preference_ended]
+            fn path_secret_map_interface_pair_preference_ended(value: u64);
         }
     );
     pub mod bool {
@@ -517,6 +541,16 @@ mod measure {
                 128usize => Self(path_secret_map_id_write_lock__duration),
                 130usize => Self(path_secret_map_address_write_lock__acquire),
                 131usize => Self(path_secret_map_address_write_lock__duration),
+                135usize => Self(path_secret_map_interface_pair_frames_moved__frames),
+                138usize => Self(creditless_window_frame_refused__frame_bytes),
+                139usize => Self(creditless_window_frame_refused__held_bytes),
+                140usize => Self(creditless_window_frame_refused__limit_bytes),
+                142usize => Self(creditless_window_limit_grew__released_bytes),
+                143usize => Self(creditless_window_limit_grew__held_bytes),
+                144usize => Self(creditless_window_limit_grew__limit_bytes),
+                146usize => Self(creditless_window_limit_halved__held_bytes),
+                147usize => Self(creditless_window_limit_halved__previous_limit_bytes),
+                148usize => Self(creditless_window_limit_halved__limit_bytes),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -632,6 +666,26 @@ mod measure {
             fn path_secret_map_address_write_lock__acquire(value: u64);
             # [link_name = s2n_quic_dc__event__measure__path_secret_map_address_write_lock__duration]
             fn path_secret_map_address_write_lock__duration(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__path_secret_map_interface_pair_frames_moved__frames]
+            fn path_secret_map_interface_pair_frames_moved__frames(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_frame_refused__frame_bytes]
+            fn creditless_window_frame_refused__frame_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_frame_refused__held_bytes]
+            fn creditless_window_frame_refused__held_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_frame_refused__limit_bytes]
+            fn creditless_window_frame_refused__limit_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_grew__released_bytes]
+            fn creditless_window_limit_grew__released_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_grew__held_bytes]
+            fn creditless_window_limit_grew__held_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_grew__limit_bytes]
+            fn creditless_window_limit_grew__limit_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_halved__held_bytes]
+            fn creditless_window_limit_halved__held_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_halved__previous_limit_bytes]
+            fn creditless_window_limit_halved__previous_limit_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_halved__limit_bytes]
+            fn creditless_window_limit_halved__limit_bytes(value: u64);
         }
     );
 }
