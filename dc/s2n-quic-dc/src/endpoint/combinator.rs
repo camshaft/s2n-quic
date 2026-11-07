@@ -30,8 +30,10 @@ use core::task::{self, Poll};
 use s2n_quic_core::{packet::number::PacketNumber, ready};
 use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 
+mod creditless;
 mod interface_pacing;
 
+pub use creditless::{CreditlessCost, CreditlessWindow, PeerKey, WindowReader, WindowSender};
 pub use interface_pacing::{InterfacePacedPickTwo, SendPacing};
 
 #[cfg(test)]
@@ -134,6 +136,11 @@ where
 /// Conservative packet-level overhead estimate for stream frame batches.
 const MAX_FRAME_BATCH_PACKET_OVERHEAD: u64 = frame::MAX_QUEUE_DATA_HEADER_OVERHEAD as u64;
 
+/// The bytes at which [`BatchFramesByPathSecret`] counts a batch as full and hands it on.
+/// `frame_dispatch` starts its window of the frames without send credit at this size, so that
+/// the window admits a full batch.
+pub const BATCH_TARGET_BYTES: u64 = u16::MAX as u64 - 3000;
+
 /// A queue of frames grouped for a single path-secret entry, stored in per-priority buckets.
 ///
 /// Frames are routed into one of [`Priority::LEVELS`] intrusive queues at push time
@@ -155,6 +162,10 @@ pub struct FrameBatch {
     byte_cost: u64,
     /// Assigned sender index (set by PickTwo after routing).
     sender_id: LocalSenderId,
+    /// Whether the batch waited in the router for a sender, beyond the batch that each pacer
+    /// holds, which halves the limit of the window of frames without send credit as a worker's
+    /// sender takes the batch (see [`CreditlessWindow`]).
+    waited: bool,
 }
 
 impl FrameBatch {
@@ -174,6 +185,7 @@ impl FrameBatch {
             byte_costs,
             byte_cost,
             sender_id: LocalSenderId::UNSPECIFIED,
+            waited: false,
         }
     }
 
@@ -286,7 +298,7 @@ where
 {
     #[inline]
     pub fn new(inner: R, clock: &Clk, rate: Rate) -> Self {
-        let target_bytes = u16::MAX as u64 - 3000;
+        let target_bytes = BATCH_TARGET_BYTES;
         let wait_nanos = rate.nanos_for_bytes(target_bytes);
         Self {
             inner,
@@ -365,7 +377,7 @@ where
     ) -> Poll<Option<FrameBatch>> {
         use precision::Timer;
 
-        let target_bytes = u16::MAX as u64 - 3000;
+        let target_bytes = BATCH_TARGET_BYTES;
 
         // If we have a pending batch from a previous poll, try to keep filling it.
         if let Some(mut batch) = self.pending_batch.take() {
@@ -606,7 +618,14 @@ where
                 // While some of the senders' interface pairs are lost and another still
                 // delivers, choose among the senders that deliver, so that a lost pair gets
                 // only the probes of its own send worker.
-                Self::pick_delivering_sender(entry, len, rng, round_robin_idx)
+                Self::pick_delivering_sender(
+                    entry,
+                    len,
+                    rng,
+                    round_robin_idx,
+                    rejected_counters,
+                    score_delta,
+                )
             } else {
                 // First candidate: round-robin for deterministic striping across senders.
                 let rr = *round_robin_idx;
@@ -668,13 +687,41 @@ where
     /// Chooses among the senders whose interface pairs deliver as the pick-two rule chooses
     /// among every sender: the first candidate in round-robin order, the second at random, and
     /// the less loaded of the two, or the more loaded with the probability the rule sets for it.
+    ///
+    /// Where a sender that isn't marked lost has an acknowledgement after the lost pairs
+    /// stopped delivering, it chooses among those senders alone, since a sender on the same
+    /// down interface may not be marked lost yet, until a sender has an acknowledgement after
+    /// the end of that preference, which the lost marks set. It records the score gap and the
+    /// rejected candidate in the pick-two counters, as the rule does among every sender.
+    ///
+    /// Where no sender has one, or once the preference ends, a sender that sends to the peer
+    /// interface of a pair marked lost counts as lost too, as `counts_as_lost` says: every sender
+    /// here is on one local interface.
     fn pick_delivering_sender(
         entry: &PathSecretEntry,
         len: usize,
         rng: &mut crate::xorshift::Rng,
         round_robin_idx: &mut usize,
+        rejected_counters: &IdMap<LocalSenderId, crate::counter::Summary>,
+        score_delta: &crate::counter::Summary,
     ) -> LocalSenderId {
-        let delivers = |idx: usize| !entry.is_sender_lost(LocalSenderId::from_index(idx));
+        let prefer_delivered = entry.prefers_senders_delivering_since_lost();
+        // Where no sender delivers since the loss, or once the preference for such senders
+        // ends, a sender that sends to a lost pair's peer interface counts as lost too, since
+        // that interface may be down.
+        let counted_lost = if prefer_delivered {
+            Vec::new()
+        } else {
+            counts_as_lost(entry, len, |_| None, |_| None)
+        };
+        let delivers = |idx: usize| {
+            let sender = LocalSenderId::from_index(idx);
+            if prefer_delivered {
+                entry.delivers_since_lost(sender)
+            } else {
+                !counted_lost[idx]
+            }
+        };
 
         let rr = *round_robin_idx % len;
         let first_idx = (0..len)
@@ -698,17 +745,78 @@ where
 
         let score1 = entry.sender_load_score(first);
         let score2 = entry.sender_load_score(second);
+        let delta = score1.abs_diff(score2);
+        score_delta.record_value(delta);
         let (better, worse) = if score1 <= score2 {
             (first, second)
         } else {
             (second, first)
         };
-        if rng.next_f64() < pick_two_worse_probability(score1.abs_diff(score2)) {
+        if rng.next_f64() < pick_two_worse_probability(delta) {
+            rejected_counters[better].record_value(delta);
             worse
         } else {
+            rejected_counters[worse].record_value(delta);
             better
         }
     }
+}
+
+/// Returns the lost mark each of the `len` senders of `entry` counts as having where no sender
+/// delivers since a pair was lost, or once the routers' preference for such senders ends: a
+/// sender whose interface pair is marked lost, and a sender that shares more of the marked
+/// pairs' interfaces than another sender that isn't marked.
+///
+/// A down interface stops every pair it is on, and the send workers mark one pair at a time, so
+/// a sender on the local interface or the peer interface of a marked pair may be down and not
+/// be marked yet. `local_interface` returns the position of a sender's local interface, or
+/// `None` where the router doesn't tell its senders' interfaces apart, and `place` the sender's
+/// place among the endpoint's interfaces, which pairs it with the peer interface it sends to. A
+/// sender counts once for each of the two interfaces it shares with a marked pair, and the
+/// senders that aren't marked and share the fewest keep their marks clear, so that the router
+/// keeps a sender to choose.
+fn counts_as_lost(
+    entry: &PathSecretEntry,
+    len: usize,
+    local_interface: impl Fn(usize) -> Option<usize>,
+    place: impl Fn(usize) -> Option<crate::socket::interface::SendPlace>,
+) -> Vec<bool> {
+    let marked: Vec<bool> = (0..len)
+        .map(|idx| entry.is_sender_lost(LocalSenderId::from_index(idx)))
+        .collect();
+    let locals: Vec<Option<usize>> = (0..len).map(&local_interface).collect();
+    let peers: Vec<Option<u16>> = (0..len)
+        .map(|idx| {
+            crate::socket::interface::paired_peer_interface(
+                entry.peer_data_addrs(),
+                entry.peer_data_interfaces(),
+                idx,
+                place(idx),
+            )
+        })
+        .collect();
+    let lost_locals: Vec<usize> = (0..len)
+        .filter(|&idx| marked[idx])
+        .filter_map(|idx| locals[idx])
+        .collect();
+    let lost_peers: Vec<u16> = (0..len)
+        .filter(|&idx| marked[idx])
+        .filter_map(|idx| peers[idx])
+        .collect();
+    let shared: Vec<usize> = (0..len)
+        .map(|idx| {
+            usize::from(matches!(locals[idx], Some(local) if lost_locals.contains(&local)))
+                + usize::from(matches!(peers[idx], Some(peer) if lost_peers.contains(&peer)))
+        })
+        .collect();
+    let fewest = (0..len)
+        .filter(|&idx| !marked[idx])
+        .map(|idx| shared[idx])
+        .min()
+        .unwrap_or(0);
+    (0..len)
+        .map(|idx| marked[idx] || shared[idx] > fewest)
+        .collect()
 }
 
 impl<T, R, S> Receiver<()> for PickTwo<T, R, S>
@@ -781,6 +889,8 @@ pub(crate) struct Assembler<R, Clk, C, A> {
     freed_batch_tx: crate::queue::FreedBatchTx,
     pub(crate) counters: AssemblerCounters,
     send_counters: Rc<super::counters::Send>,
+    /// Publishes the lost-pair events of the contexts this assembler marks lost, where set.
+    path_secret_map: Option<crate::path::secret::Map>,
     /// Self-contained unsync descriptor reuse state for the send pipeline.
     recycle_pool: UnsyncReusePool,
     /// Endpoint-wide credit pool. The assembler releases credit on the admit path —
@@ -943,6 +1053,7 @@ impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
         freed_batch_tx: crate::queue::FreedBatchTx,
         counters: AssemblerCounters,
         send_counters: Rc<super::counters::Send>,
+        path_secret_map: Option<crate::path::secret::Map>,
         initial_tx_descriptor_allocs: usize,
         send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
     ) -> Self {
@@ -961,6 +1072,7 @@ impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
             freed_batch_tx,
             counters,
             send_counters,
+            path_secret_map,
             recycle_pool,
             send_credit_pool,
         }
@@ -1009,6 +1121,7 @@ where
                     &mut self.freed_batch_tx,
                     &self.counters,
                     &self.send_counters,
+                    self.path_secret_map.as_ref(),
                     &self.send_credit_pool,
                 )
             });
@@ -1353,20 +1466,22 @@ where
 
                 let wheel_interest = {
                     let mut ctx = ctx_rc.borrow_mut();
-                    let interest = ctx.process_ack(
-                        *largest_acknowledged,
-                        *ack_range,
-                        payload,
-                        *ecn_counts,
-                        *ack_delay,
-                        &counters,
-                        &mut self.completed_tx,
-                        &mut lost_queue,
-                        &mut self.cancelled_tx,
-                        &self.clock,
-                        &mut self.random,
-                        &mut self.deferred,
-                    );
+                    let interest = cache.borrow().track_path_lost(&mut ctx, |ctx| {
+                        ctx.process_ack(
+                            *largest_acknowledged,
+                            *ack_range,
+                            payload,
+                            *ecn_counts,
+                            *ack_delay,
+                            &counters,
+                            &mut self.completed_tx,
+                            &mut lost_queue,
+                            &mut self.cancelled_tx,
+                            &self.clock,
+                            &mut self.random,
+                            &mut self.deferred,
+                        )
+                    });
                     counters.on_rtt(ctx.rtt_estimator.smoothed_rtt());
                     interest
                 };

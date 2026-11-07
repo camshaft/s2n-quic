@@ -904,6 +904,7 @@ where
         socket_senders,
         clock: clock.clone(),
         pacing,
+        path_secret_map: path_secret_map.clone(),
         send_credit_distributor,
         recv_credit_distributor,
         send_credit_waker_sink: send_credit_distributor_waker_sink,
@@ -977,6 +978,7 @@ where
             reader_metrics: reader_metrics.clone(),
             writer_metrics: writer_metrics.clone(),
             send_credit_pool: send_credit_pool.clone(),
+            path_secret_map: path_secret_map.clone(),
         });
     }
 
@@ -1000,6 +1002,10 @@ where
         .unzip();
 
     let ack_route = RecvRoute::new(num_send);
+    // Each send socket's place among the interfaces, by sender, which the recv dispatch workers
+    // read to send the acknowledgements of a peer's packets back along the pair they came on.
+    let ack_send_places: Option<Arc<[crate::socket::interface::SendPlace]>> =
+        send_places.as_deref().map(Arc::from);
     for (recv_dispatch_id, dispatch_rx, ack_completion_rx, invalidation_rx, waker_sink) in (
         dispatch_rxs,
         ack_completion_rxs,
@@ -1027,6 +1033,7 @@ where
             stream_clock: stream_clock.clone(),
             route: ack_route,
             priority_senders: priority_senders.clone(),
+            send_places: ack_send_places.clone(),
             waker_sink,
             ups_tx: ups_tx.clone(),
             invalidation_rx,
@@ -1159,6 +1166,8 @@ struct FrameDispatchParts<Clk> {
     clock: Clk,
     /// How the pacing stage paces the send sockets of each interface.
     pacing: combinator::SendPacing,
+    /// The path secret map whose subscriber records the creditless window's events.
+    path_secret_map: crate::path::secret::Map,
     /// Send-direction credit-pool distributor. Spawned alongside the frame-dispatch
     /// task on the same worker so distribution and submission share a thread.
     send_credit_distributor: crate::credit::Distributor,
@@ -1193,6 +1202,7 @@ struct SendWorkerParts {
     reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    path_secret_map: crate::path::secret::Map,
 }
 
 /// Per-socket ingredients for the socket send task.
@@ -1243,6 +1253,9 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     /// The send sockets of the interface for the highest-priority traffic, which a peer's
     /// acknowledgements go to, where the endpoint has one.
     priority_senders: Option<Vec<LocalSenderId>>,
+    /// The place of each send socket among the endpoint's interfaces, by sender, or `None` where
+    /// the endpoint doesn't list any, which picks the sender of each peer's acknowledgements.
+    send_places: Option<Arc<[crate::socket::interface::SendPlace]>>,
     waker_sink: waker::Sink,
     ups_tx: UpsSender,
     invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
@@ -1394,6 +1407,7 @@ where
                     fd.pacing,
                     budgets,
                     counter_registry.clone(),
+                    Some(fd.path_secret_map),
                     fd.send_credit_pool,
                 );
                 tasks::spawn_credit_distributor(
@@ -1451,6 +1465,7 @@ where
                     sw.reader_metrics,
                     sw.writer_metrics,
                     sw.send_credit_pool,
+                    sw.path_secret_map,
                 );
             }
 
@@ -1537,7 +1552,8 @@ where
                 let recv_dispatch_idx = rd.recv_dispatch_idx;
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx)
-                        .with_priority_senders(rd.priority_senders),
+                        .with_priority_senders(rd.priority_senders)
+                        .with_send_places(rd.send_places),
                 ));
                 let (ack_burst_tx, ack_burst_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<
@@ -1797,19 +1813,12 @@ where
                             // A sender whose interface pair is marked lost loses the draw, and
                             // where both drawn senders' pairs are lost, the batch goes to a
                             // sender whose pair delivers.
-                            let path_secret_entry = entry.path_secret_entry();
-                            let chosen = routing::freed_batch_sender_id(
+                            let chosen = routing::path_freed_batch_sender_id(
+                                entry.path_secret_entry(),
                                 priority_senders.as_deref(),
                                 socket_count,
                                 &mut rng,
-                                |sender| {
-                                    (
-                                        path_secret_entry.is_sender_lost(sender),
-                                        path_secret_entry.sender_load_score(sender),
-                                    )
-                                },
                             );
-                            let chosen = path_secret_entry.delivering_sender(chosen);
 
                             // Set the chosen sender and forward
                             if let msg::Sender::PendingFreed {

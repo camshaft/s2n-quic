@@ -280,11 +280,31 @@ pub(crate) fn freed_batch_sender_id<S: PartialOrd>(
     }
 }
 
+/// Returns the sender that a freed batch of the path `entry` goes to: of the two senders that
+/// `freed_batch_sender_id` draws, the one whose interface pair `entry` doesn't mark lost, or,
+/// where both or neither are marked lost, the one with the lower load score on `entry`. Where
+/// `entry` marks the pair of the chosen sender lost, the batch goes to the next sender of `entry`
+/// whose pair delivers instead.
+pub(crate) fn path_freed_batch_sender_id(
+    entry: &crate::path::secret::map::Entry,
+    priority_senders: Option<&[LocalSenderId]>,
+    socket_count: usize,
+    rng: &mut crate::xorshift::Rng,
+) -> LocalSenderId {
+    let chosen = freed_batch_sender_id(priority_senders, socket_count, rng, |sender| {
+        (
+            entry.is_sender_lost(sender),
+            entry.sender_load_score(sender),
+        )
+    });
+    entry.delivering_sender(chosen)
+}
+
 /// Records each acknowledgement and freed batch that the endpoint routes to a send worker, for
 /// the tests that check which sender each goes to.
 #[cfg(test)]
 pub(crate) mod observe {
-    use super::{msg, LocalSenderId};
+    use super::{msg, LocalSenderId, RemoteSenderId};
     use core::cell::RefCell;
     use std::{
         net::SocketAddr,
@@ -300,12 +320,30 @@ pub(crate) mod observe {
         PendingFreed,
     }
 
-    /// One message routed to a send worker: what it carries, its sender and its path's peer.
+    /// One message routed to a send worker: what it carries, its sender, the peer sender whose
+    /// packets an acknowledgement acknowledges, its path's peer, and the lost marks of its path
+    /// when the endpoint routed it.
     #[derive(Clone, Copy, Debug)]
     pub(crate) struct Routed {
         pub(crate) kind: Kind,
         pub(crate) sender: LocalSenderId,
+        /// The peer sender whose packets a pending acknowledgement acknowledges, and `None` for
+        /// a freed batch.
+        pub(crate) remote: Option<RemoteSenderId>,
         pub(crate) peer: SocketAddr,
+        /// Whether the path marks the interface pair of `sender` lost.
+        pub(crate) lost: bool,
+        /// Whether the path marks the interface pair of at least one of its senders lost.
+        pub(crate) path_has_lost: bool,
+        /// Whether the interface pair of at least one sender of the path isn't marked lost.
+        pub(crate) path_delivers: bool,
+        /// Whether the routers prefer the senders the peer acknowledged after the path's lost
+        /// pairs stopped delivering: a pair is marked lost, a sender has such an acknowledgement,
+        /// and no sender has an acknowledgement after the end of that preference.
+        pub(crate) path_delivers_since_lost: bool,
+        /// Whether the pair of `sender` isn't marked lost and the peer acknowledged `sender`
+        /// after the lost pairs of the path stopped delivering.
+        pub(crate) delivers_since_lost: bool,
     }
 
     thread_local! {
@@ -319,17 +357,27 @@ pub(crate) mod observe {
 
     /// Records `message`, where this thread records the messages it routes.
     pub(crate) fn record(message: &msg::Sender) {
-        let kind = match message {
-            msg::Sender::PendingAck(_) => Kind::PendingAck,
-            msg::Sender::PendingFreed { .. } => Kind::PendingFreed,
+        let (kind, remote) = match message {
+            msg::Sender::PendingAck(submission) => {
+                (Kind::PendingAck, Some(submission.remote_sender_id))
+            }
+            msg::Sender::PendingFreed { .. } => (Kind::PendingFreed, None),
             msg::Sender::ReceivedAck { .. } => return,
         };
         SINK.with(|sink| {
             if let Some(sink) = sink.borrow().as_ref() {
+                let sender = message.sender_idx();
+                let path = message.path_secret_entry();
                 sink.lock().unwrap().push(Routed {
                     kind,
-                    sender: message.sender_idx(),
-                    peer: *message.path_secret_entry().peer(),
+                    sender,
+                    remote,
+                    peer: *path.peer(),
+                    lost: path.is_sender_lost(sender),
+                    path_has_lost: path.has_lost_sender(),
+                    path_delivers: path.has_delivering_sender(),
+                    path_delivers_since_lost: path.prefers_senders_delivering_since_lost(),
+                    delivers_since_lost: path.delivers_since_lost(sender),
                 });
             }
         });
@@ -417,5 +465,38 @@ mod tests {
         // An empty list keeps the choice among every sender.
         let chosen = freed_batch_sender_id(Some(&[][..]), 1, &mut rng, |_| 0);
         assert_eq!(chosen, sender(0));
+    }
+
+    #[test]
+    fn freed_batches_leave_a_sender_whose_pair_is_lost() {
+        use core::time::Duration;
+        use s2n_quic_core::{recovery::bandwidth::Bandwidth, time::Timestamp};
+
+        let entry = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+            .socket_sender_count(8)
+            .build(None);
+        let mut rng = Rng::with_seed(7);
+        let priority = [sender(1), sender(3)];
+        // Sender 1's load score is higher than sender 3's, so only the lost mark of sender 3
+        // makes it lose the draw.
+        entry.update_sender_load_score(
+            sender(1),
+            unsafe { Timestamp::from_duration(Duration::from_millis(1)) },
+            0,
+            Bandwidth::new(1_000, Duration::from_millis(1)),
+        );
+        assert!(entry.sender_load_score(sender(1)) > entry.sender_load_score(sender(3)));
+        assert!(entry.set_sender_lost(sender(3), true));
+        for _ in 0..256 {
+            let chosen = path_freed_batch_sender_id(&entry, Some(&priority[..]), 8, &mut rng);
+            assert_eq!(chosen, sender(1));
+        }
+        // Where the pairs of both drawn senders are marked lost, sender 3's lower score wins the
+        // draw, and the batch goes to the next sender whose pair delivers, sender 4.
+        assert!(entry.set_sender_lost(sender(1), true));
+        for _ in 0..256 {
+            let chosen = path_freed_batch_sender_id(&entry, Some(&priority[..]), 8, &mut rng);
+            assert_eq!(chosen, sender(4));
+        }
     }
 }

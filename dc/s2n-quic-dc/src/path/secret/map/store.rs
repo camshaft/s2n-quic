@@ -207,4 +207,44 @@ pub trait Store: 'static + Send + Sync + time::Clock {
     fn reset_all_senders(&self);
 
     fn on_dc_connection_timeout(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapInterfacePairLost event.
+    fn on_interface_pair_lost(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapInterfacePairDelivering event.
+    fn on_interface_pair_delivering(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapInterfacePairFramesMoved event.
+    fn on_interface_pair_frames_moved(&self, peer_address: &SocketAddr, frames: usize);
+
+    /// Publishes a PathSecretMapInterfacePairPreferenceEnded event.
+    fn on_interface_pair_preference_ended(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapDeadMarkSkipped event.
+    fn on_dead_mark_skipped(&self, peer_address: &SocketAddr);
+
+    /// Publishes a CreditlessWindowFrameRefused event.
+    fn on_creditless_window_frame_refused(
+        &self,
+        peer_address: &SocketAddr,
+        frame_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    );
+
+    /// Publishes a CreditlessWindowLimitGrew event.
+    fn on_creditless_window_limit_grew(
+        &self,
+        released_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    );
+
+    /// Publishes a CreditlessWindowLimitHalved event.
+    fn on_creditless_window_limit_halved(
+        &self,
+        held_bytes: u64,
+        previous_limit_bytes: u64,
+        limit_bytes: u64,
+    );
 }

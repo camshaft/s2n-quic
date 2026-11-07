@@ -298,3 +298,49 @@ pub fn build_send_context(
     .expect("test context should be constructible");
     std::rc::Rc::new(std::cell::RefCell::new(ctx))
 }
+
+/// Inserts one sent packet into `ctx`'s inflight map, packet number 0 with one frame of `pse`,
+/// and sets the context's next packet number past it.
+pub fn insert_inflight_packet(ctx: &mut send::Context, pse: &Arc<PathSecretEntry>, clock: &Clock) {
+    use s2n_quic_core::time::Clock as _;
+    let now = clock.get_time();
+    let rtt = ctx.rtt_estimator;
+    let cc_info = ctx.cca.on_packet_sent(now, 200, false, &rtt);
+    let mut frames = crate::intrusive::Queue::new();
+    frames.push_back(test_frame(pse));
+    let pn =
+        s2n_quic_core::packet::number::PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
+    ctx.inflight.insert(
+        pn,
+        crate::endpoint::inflight::Packet::new(
+            frames,
+            crate::endpoint::inflight::TransmissionInfo {
+                cc_info,
+                time_sent: now,
+                sent_bytes: 200,
+            },
+        ),
+    );
+    ctx.next_packet_number = VarInt::from_u8(1);
+}
+
+/// Builds a path secret map that publishes its events to a testing subscriber.
+pub fn test_map_with_subscriber() -> (
+    crate::path::secret::Map,
+    Arc<crate::event::testing::Subscriber>,
+) {
+    let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+    let map = crate::path::secret::Map::builder()
+        .with_signer(crate::path::secret::stateless_reset::Signer::random())
+        .with_capacity(4)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber(subscriber.clone())
+        .build()
+        .unwrap();
+    (map, subscriber)
+}
+
+/// The count that a testing subscriber holds for one kind of event.
+pub fn event_count(counter: &core::sync::atomic::AtomicU64) -> u64 {
+    counter.load(Ordering::Relaxed)
+}

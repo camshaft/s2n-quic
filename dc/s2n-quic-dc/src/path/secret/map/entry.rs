@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     credentials::{self, Credentials},
-    endpoint::id::LocalSenderId,
+    endpoint::id::{Id as _, LocalSenderId},
     packet::{secret_control as control, WireVersion},
     path::secret::{
         open, receiver,
@@ -86,6 +86,18 @@ pub struct Entry {
     /// The interface of each of the peer's data recv addresses, or empty where the peer
     /// doesn't tag an address.
     peer_data_interfaces: PeerDataInterfaces,
+    /// When the peer last acknowledged a packet of each socket sender, as u64 nanoseconds, so
+    /// that the routers can tell the senders that deliver since a pair was lost from the
+    /// senders on the same down interface that aren't marked lost yet.
+    sender_delivered_at: Box<[AtomicU64]>,
+    /// The latest time a lost interface pair stopped delivering, as u64 nanoseconds.
+    senders_lost_since: AtomicU64,
+    /// The end of the routers' preference for the senders that deliver since a lost pair
+    /// stopped delivering, as u64 nanoseconds.
+    senders_preferred_until: AtomicU64,
+    /// The latest end of the routers' preference that an acknowledgement after it reported, as
+    /// u64 nanoseconds, so that the entry reports each end once.
+    senders_preference_ended: AtomicU64,
     /// Per-socket-sender load scores encoded as u64 nanoseconds.
     ///
     /// A lower score means the sender is expected to drain its queue sooner and is
@@ -130,6 +142,10 @@ impl SizeOf for Entry {
             peer_data_addrs,
             peer_data_interfaces,
             sender_load_scores,
+            sender_delivered_at,
+            senders_lost_since,
+            senders_preferred_until,
+            senders_preference_ended,
             queue_state: _,
         } = self;
         creation_time.size()
@@ -149,6 +165,11 @@ impl SizeOf for Entry {
             + peer_data_interfaces.len() * std::mem::size_of::<Option<u16>>()
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + sender_load_scores.len() * std::mem::size_of::<AtomicU64>()
+            + std::mem::size_of::<Box<[AtomicU64]>>()
+            + sender_delivered_at.len() * std::mem::size_of::<AtomicU64>()
+            + senders_lost_since.size()
+            + senders_preferred_until.size()
+            + senders_preference_ended.size()
             + std::mem::size_of::<QueueState>()
     }
 }
@@ -251,6 +272,10 @@ impl Entry {
             peer_data_addrs,
             peer_data_interfaces: Arc::from([]),
             sender_load_scores: Self::init_load_scores(socket_sender_count),
+            sender_delivered_at: Self::init_load_scores(socket_sender_count),
+            senders_lost_since: AtomicU64::new(0),
+            senders_preferred_until: AtomicU64::new(0),
+            senders_preference_ended: AtomicU64::new(0),
             queue_state,
         }
     }
@@ -424,16 +449,26 @@ impl Entry {
             .any(|slot| slot.load(Ordering::Acquire) & Self::LOST_SENDER == 0)
     }
 
-    /// Returns `preferred` while its interface pair isn't marked lost, and otherwise the first
-    /// sender after it, by slot, whose pair isn't marked lost, so that a message bound for a
-    /// lost pair goes to a pair that delivers. Returns `preferred` where every pair is marked
-    /// lost, or where the entry doesn't keep sender slots.
+    /// Returns `preferred` while its interface pair delivers, and otherwise the first sender
+    /// after it, by slot, whose pair delivers, so that a message bound for a lost pair goes to a
+    /// pair that delivers. While a pair is marked lost and a sender has an acknowledgement after
+    /// the lost pairs stopped delivering, a pair delivers only where its sender has one too, as
+    /// the routers choose, since a sender on the same down interface may not be marked lost yet,
+    /// until a sender has an acknowledgement after the end of that preference, as
+    /// [`Self::prefers_senders_delivering_since_lost`] says; otherwise a pair delivers while it
+    /// isn't marked lost. Returns `preferred` where no pair delivers, or where the entry doesn't
+    /// keep sender slots.
     pub fn delivering_sender(&self, preferred: LocalSenderId) -> LocalSenderId {
         let Some(start) = self.sender_index(preferred) else {
             return preferred;
         };
+        let prefer_delivered = self.prefers_senders_delivering_since_lost();
         let delivers = |index: usize| {
-            self.sender_load_scores[index].load(Ordering::Acquire) & Self::LOST_SENDER == 0
+            if prefer_delivered {
+                self.delivers_since_lost(LocalSenderId::from_index(index))
+            } else {
+                self.sender_load_scores[index].load(Ordering::Acquire) & Self::LOST_SENDER == 0
+            }
         };
         if delivers(start) {
             return preferred;
@@ -446,6 +481,86 @@ impl Entry {
                 preferred,
                 <LocalSenderId as crate::endpoint::id::Id>::from_index,
             )
+    }
+
+    /// Records that the peer acknowledged a packet of the sender at `at`, so that the routers
+    /// can tell the senders that deliver since a pair was lost. Returns true where the
+    /// acknowledgement ends the routers' preference for those senders: it is the first after
+    /// the end of the preference while the routers prefer them. The entry reports each end
+    /// once, so that another acknowledgement after the same end returns false.
+    pub fn record_sender_delivered(
+        &self,
+        sender_idx: LocalSenderId,
+        at: crate::time::precision::Timestamp,
+    ) -> bool {
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return false;
+        };
+        let until = self.senders_preferred_until.load(Ordering::Acquire);
+        let ends_preference = at.nanos > until
+            && self.sender_delivered_at[sender_idx].load(Ordering::Acquire) <= until
+            && self.prefers_senders_delivering_since_lost();
+        self.sender_delivered_at[sender_idx].fetch_max(at.nanos, Ordering::AcqRel);
+        ends_preference && self.record_preference_end(until)
+    }
+
+    /// Records that an acknowledgement ended the routers' preference that ends at `until`, as
+    /// u64 nanoseconds. Returns true where the entry hadn't recorded that end, or a later one,
+    /// yet, so that one acknowledgement alone reports each end.
+    fn record_preference_end(&self, until: u64) -> bool {
+        let ended = self
+            .senders_preference_ended
+            .fetch_max(until, Ordering::AcqRel);
+        ended < until
+    }
+
+    /// Records the time a lost interface pair stopped delivering. The entry keeps the latest
+    /// such time, so that a sender delivers since the loss only with an acknowledgement after
+    /// every lost pair stopped.
+    pub fn set_senders_lost_since(&self, since: crate::time::precision::Timestamp) {
+        self.senders_lost_since
+            .fetch_max(since.nanos, Ordering::AcqRel);
+    }
+
+    /// True when the interface pair of the sender isn't marked lost and the peer acknowledged
+    /// one of its packets after the latest time a lost pair stopped delivering.
+    pub fn delivers_since_lost(&self, sender_idx: LocalSenderId) -> bool {
+        let Some(idx) = self.sender_index(sender_idx) else {
+            return false;
+        };
+        !self.is_sender_lost(sender_idx)
+            && self.sender_delivered_at[idx].load(Ordering::Acquire)
+                > self.senders_lost_since.load(Ordering::Acquire)
+    }
+
+    /// True when the interface pair of at least one sender is marked lost and another sender
+    /// delivers since the lost pairs stopped delivering.
+    pub fn has_sender_delivering_since_lost(&self) -> bool {
+        self.has_lost_sender()
+            && (0..self.sender_delivered_at.len())
+                .any(|idx| self.delivers_since_lost(LocalSenderId::from_index(idx)))
+    }
+
+    /// Records the end of the routers' preference for the senders that deliver since a lost
+    /// pair stopped delivering. The entry keeps the latest such end, so that a later mark
+    /// extends the preference and an earlier one doesn't move it back.
+    pub fn set_senders_preferred_until(&self, until: crate::time::precision::Timestamp) {
+        self.senders_preferred_until
+            .fetch_max(until.nanos, Ordering::AcqRel);
+    }
+
+    /// True while the routers prefer the senders that deliver since the loss: some sender does,
+    /// as [`Self::has_sender_delivering_since_lost`] says, and no sender has an acknowledgement
+    /// after the end of the preference. The routers don't read a clock, so an acknowledgement
+    /// after the end shows that it passed; from then on, a sender that was idle at the loss
+    /// gets items again.
+    pub fn prefers_senders_delivering_since_lost(&self) -> bool {
+        let until = self.senders_preferred_until.load(Ordering::Acquire);
+        self.has_sender_delivering_since_lost()
+            && self
+                .sender_delivered_at
+                .iter()
+                .all(|delivered_at| delivered_at.load(Ordering::Acquire) <= until)
     }
 
     pub fn idle_timeout(&self) -> Duration {
@@ -547,6 +662,14 @@ impl Entry {
         let cooldown_ms = Self::duration_to_millis(cooldown);
         let dead_at = self.dead_at.load(Ordering::Acquire);
         dead_at >= 0 && now_ms.saturating_sub(dead_at) < cooldown_ms
+    }
+
+    /// Returns `true` while the entry holds a dead mark, within the dead-peer cooldown or after
+    /// it. Only an authenticated packet from the peer clears the mark
+    /// ([`touch_activity`](Self::touch_activity)).
+    #[inline]
+    pub fn is_marked_dead(&self) -> bool {
+        self.dead_at.load(Ordering::Acquire) >= 0
     }
 
     /// Returns `true` when the entry is marked dead, the dead-peer `cooldown` has passed since the
