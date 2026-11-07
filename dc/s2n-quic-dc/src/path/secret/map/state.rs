@@ -1505,12 +1505,14 @@ where
 
     fn on_creditless_window_frame_refused(
         &self,
+        peer_address: &SocketAddr,
         frame_bytes: u64,
         held_bytes: u64,
         limit_bytes: u64,
     ) {
         self.subscriber().on_creditless_window_frame_refused(
             event::builder::CreditlessWindowFrameRefused {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
                 frame_bytes,
                 held_bytes,
                 limit_bytes,

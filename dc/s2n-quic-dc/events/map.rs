@@ -489,7 +489,8 @@ struct PathSecretMapDeadMarkSkipped<'a> {
 #[event("creditless_window:frame_refused")]
 #[subject(endpoint)]
 /// Emitted when the creditless window refuses a frame without send credit
-struct CreditlessWindowFrameRefused {
+struct CreditlessWindowFrameRefused<'a> {
+    peer_address: SocketAddress<'a>,
     #[measure("frame_bytes", Bytes)]
     frame_bytes: u64,
     #[measure("held_bytes", Bytes)]
