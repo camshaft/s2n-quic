@@ -608,6 +608,13 @@ pub(crate) struct Context {
     /// When this context began to wait for an acknowledgement of a packet it sent, or `None`
     /// while the peer has acknowledged every packet it sent.
     pub ack_wait_since: Option<precision::Timestamp>,
+    /// When this context sent an ack-eliciting packet that the inflight map doesn't hold, such
+    /// as an ACK-only probe or a Ping, with no acknowledgement from the peer since, or `None`.
+    /// [`Self::has_stopped_delivering`] reads it where the inflight map is empty.
+    pub ack_only_probe_sent: Option<precision::Timestamp>,
+    /// Whether this context sent an ACK-only packet that isn't ack-eliciting since the peer
+    /// last acknowledged one of its packets: it sends acknowledgements alone.
+    pub ack_only_since_peer_ack: bool,
     /// RTT sampler for ACK-only (read-heavy) sends.
     ///
     /// When `inflight` is empty we have no ack-eliciting packets in flight and
@@ -806,6 +813,8 @@ impl Context {
             invalidated: false,
             lost_from: None,
             ack_wait_since: None,
+            ack_only_probe_sent: None,
+            ack_only_since_peer_ack: false,
             rtt_tracker: AckRttTracker::default(),
         })
     }
@@ -861,7 +870,7 @@ impl Context {
         Clk: s2n_quic_core::time::Clock + precision::Clock + ?Sized,
         Rand: random::Generator,
     {
-        self.last_peer_activity = clock.now();
+        self.on_peer_acknowledged(clock.now());
         self.on_largest_acknowledged(largest_acknowledged);
 
         super::ack::process_ack(
@@ -1305,19 +1314,35 @@ impl Context {
         }
     }
 
+    /// Records an acknowledgement from the peer at `now`: the peer was active, and no packet
+    /// of this context outside the inflight map waits for an acknowledgement any longer.
+    #[inline]
+    pub fn on_peer_acknowledged(&mut self, now: precision::Timestamp) {
+        self.last_peer_activity = now;
+        self.ack_only_probe_sent = None;
+        self.ack_only_since_peer_ack = false;
+    }
+
     /// True when this context has packets that wait for an acknowledgement and the peer
     /// hasn't acknowledged any of them for a persistent congestion period of its RTT estimate
     /// (RFC 9002, section 7.6.1): `(smoothed_rtt + max(4 * rttvar, 1ms) + max_ack_delay) * 3`.
+    /// Where the inflight map is empty, the packet that waits is the ack-eliciting packet that
+    /// [`Self::ack_only_probe_sent`] records, such as the probe of a context that sends
+    /// acknowledgements alone.
     ///
     /// The period counts from the later of the last acknowledgement and the time the context
     /// began to wait for one. The PTO wheel checks it each time it fires for this
     /// context, at least once a base probe timeout period, so a pair is marked lost within
-    /// about one probe timeout of the period's end.
+    /// about one probe timeout of the period's end. A context whose inflight map is empty has
+    /// no probe timeout armed, so the assembler checks it each time it assembles a packet for
+    /// the context.
     pub fn has_stopped_delivering(&self, now: precision::Timestamp) -> bool {
-        if !self.inflight.has_inflight() {
-            return false;
-        }
-        let Some(waiting_since) = self.ack_wait_since else {
+        let waiting_since = if self.inflight.has_inflight() {
+            self.ack_wait_since
+        } else {
+            self.ack_only_probe_sent
+        };
+        let Some(waiting_since) = waiting_since else {
             return false;
         };
         let elapsed = now
@@ -1325,6 +1350,23 @@ impl Context {
             .min(now.nanos_since(self.last_peer_activity));
         let threshold = self.rtt_estimator.persistent_congestion_threshold();
         elapsed >= threshold.as_nanos() as u64
+    }
+
+    /// True when this context sends acknowledgements alone and the peer hasn't acknowledged
+    /// one of its packets for a persistent congestion period: its inflight map is empty, no
+    /// ack-eliciting packet of it waits for an acknowledgement, and it sent an ACK-only packet
+    /// that isn't ack-eliciting since the peer's last acknowledgement. The assembler then makes
+    /// its next ACK-only packet ack-eliciting, though the RTT tracker suppresses probes, and a
+    /// probe that the peer doesn't acknowledge shows that the interface pair stopped
+    /// delivering (RFC 9000, section 13.2.4). The context probes again only once it sent such
+    /// a packet since the peer acknowledged its probe, so two idle endpoints stop probing
+    /// each other.
+    pub fn needs_delivery_probe(&self, now: precision::Timestamp) -> bool {
+        let threshold = self.rtt_estimator.persistent_congestion_threshold();
+        !self.inflight.has_inflight()
+            && self.ack_only_probe_sent.is_none()
+            && self.ack_only_since_peer_ack
+            && now.nanos_since(self.last_peer_activity) >= threshold.as_nanos() as u64
     }
 
     /// True when this context's pair is lost, it holds frames to move, and another sender of
