@@ -1245,3 +1245,72 @@ fn send_idle_wheel_silence_doesnt_renew_a_dead_mark() {
         .spawn();
     });
 }
+
+/// At a send context's idle expiry, a packet that waits for an acknowledgement on a pair that
+/// isn't marked lost renews a dead mark the entry holds, once the dead-peer cooldown has passed
+/// since the mark.
+#[test]
+fn send_idle_wheel_unacknowledged_packet_renews_a_dead_mark() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+        let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+
+        // At t=0 the peer's last packet arrives, and then the peer is marked dead.
+        let pse = test_entry();
+        let now = precision::Clock::now(&clock);
+        pse.touch_activity(now);
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(pse.mark_dead_if_cooldown_elapsed(now, cooldown));
+
+        // The context's packet waits for an acknowledgement until the idle expiry, and its
+        // pair isn't marked lost.
+        {
+            let mut ctx = ctx.borrow_mut();
+            insert_inflight_packet(&mut ctx, &pse, &clock);
+            let timeout = ctx.path_secret_entry.idle_timeout();
+            // The context expires once the cooldown has passed since the dead mark.
+            ctx.idle_wheel.target_time = Some(now + timeout + 5.s());
+        }
+        let _ = idle_wheel_tx.send(ctx);
+
+        async move {
+            // At t=33s the cooldown has passed since the dead mark, and the context hasn't
+            // expired yet.
+            33.s().sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                1,
+                "the context expires at t=35s"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                !pse.is_dead_during_cooldown(now, cooldown),
+                "the cooldown has passed since the dead mark at t=0"
+            );
+            assert!(pse.is_marked_dead(), "the entry still holds its dead mark");
+
+            // At t=36s the context has expired with its packet unacknowledged.
+            3.s().sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, cooldown),
+                "the expiry with an unacknowledged packet renews the dead mark"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
