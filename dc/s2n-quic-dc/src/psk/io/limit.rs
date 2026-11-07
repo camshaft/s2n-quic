@@ -81,13 +81,15 @@ pub(super) struct RoundTrips {
     /// raises the second round trip by the growth, which isn't a longer path.
     pub(super) flight_waits: [Option<Duration>; 2],
     /// The part of each of `flights` that the endpoint's pass of its event loop before the pass
-    /// that read the server's reply ran after the client sent its flight, or zero where the round
-    /// trip isn't timed. The endpoint reads a reply that arrives while a pass runs in its next
-    /// pass, so this part is the most that the reply could have waited during the endpoint's last
-    /// pass, as `waited` bounds the wait of the lowest round trip's packet where the socket didn't
-    /// measure it. A reply that waited through more than one pass, or past the end of the last
-    /// pass, waited more. A reply that arrived after the pass began waited less, and this part
-    /// also counts the time that it was still on the path.
+    /// that read the server's reply ran after the reply could first have reached the endpoint,
+    /// once the client sent its flight and the path's least time, `RoundTrips::path`, passed, or
+    /// zero where the round trip isn't timed. The endpoint reads a reply that arrives while a pass
+    /// runs in its next pass, so this part is the most that the reply could have waited during
+    /// the endpoint's last pass, as `waited` bounds the wait of the lowest round trip's packet
+    /// where the socket didn't measure it, and the part of that pass that ran while the reply was
+    /// still on the path doesn't count. A reply that waited through more than one pass, or past
+    /// the end of the last pass, waited more, and one whose path took longer than the least
+    /// waited less.
     pub(super) flight_passes: [Duration; 2],
 }
 
@@ -934,20 +936,18 @@ mod tests {
         assert_eq!(limit.current(), 2);
 
         // Where the endpoint's last pass before the pass that read the second reply ran for 1 ms
-        // after the second flight went out, that 1 ms counts as the endpoint's time, the most that
-        // the reply could have waited, and 2 ms is left, within twice the base. Where such a pass
-        // ran for 1 ms after each flight went out, 3 ms is left: each pass counts as the
-        // endpoint's time, though a reply may still have been on the path while it ran.
-        let with_a_pass = rtt_passes(50, [(50, 0), (69, 1)]);
-        assert_eq!(
-            Answer::for_handshake(ms(120), None, with_a_pass),
-            Answer::Latency(ms(2))
-        );
-        let with_two_passes = rtt_passes(50, [(50, 1), (69, 1)]);
-        assert_eq!(
-            Answer::for_handshake(ms(120), None, with_two_passes),
-            Answer::Latency(ms(3))
-        );
+        // after the reply could first have reached the endpoint, that 1 ms counts as the
+        // endpoint's time, the most that the reply could have waited, and 2 ms is left, within
+        // twice the base: beside the near peer's handshake, the limit grows. The connection's
+        // round trips leave out a part of that pass that ran while the reply was still on the
+        // path, which isn't the endpoint's time.
+        let with_a_pass = Answer::for_handshake(ms(120), None, rtt_passes(50, [(50, 0), (69, 1)]));
+        assert_eq!(with_a_pass, Answer::Latency(ms(2)));
+        drop(permits);
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(with_a_pass);
+        permits.next().unwrap().release(near);
+        assert_eq!(limit.current(), 3);
     }
 
     #[test]
@@ -1071,7 +1071,8 @@ mod tests {
         // The endpoint's load rises during the next handshake with the peer, and the socket
         // doesn't measure the wait of any reply. The handshake's lowest round trip takes 1 ms, its
         // first round trip 1 ms, and its second 5 ms, 4 ms of which the endpoint's last pass
-        // before the one that read the second reply ran after the second flight went out. Less
+        // before the one that read the second reply ran after the reply could first have reached
+        // the endpoint. Less
         // that part, both round trips take 1 ms, so the spread is zero, and 5 ms of the
         // handshake's 7 ms is past two round trips, past twice the base, which halves the limit.
         let grown = rtt_passes(1, [(1, 0), (5, 4)]);
@@ -1083,9 +1084,10 @@ mod tests {
         permits.next().unwrap().release(late);
         assert_eq!(limit.current(), 1);
 
-        // Where the reply waited past the endpoint's last pass, which didn't run after the second
-        // flight went out, the round trips can't tell that wait from a longer path: the 4 ms
-        // counts as the spread, and the same handshake shows 1 ms, within twice the base.
+        // Where the reply waited past the endpoint's last pass, which didn't run after the reply
+        // could have reached the endpoint, the round trips can't tell that wait from a longer
+        // path: the 4 ms counts as the spread, and the same handshake shows 1 ms, within twice
+        // the base.
         let past_the_pass = rtt_passes(1, [(1, 0), (5, 0)]);
         assert_eq!(past_the_pass.unwrap().spread(), ms(4));
         assert_eq!(
