@@ -47,10 +47,11 @@
 //! point folds to nothing, so the event is never constructed. It is active under `test`, the
 //! `testing` feature, or the `queue-dbg` feature, the same builds that already speak `QueueDbg`.
 //! `slot_hold` is the one exception: a plain release build records it too where `BACKBEAT_ENABLE`
-//! arms capture, so that a release build can keep what a server does with a held slot. Where
-//! `BACKBEAT_ENABLE` doesn't arm capture, `slot_hold` returns before it records, so it doesn't
-//! build the [`backbeat::global`] recorder or spawn its dumper thread. [`slot_hold`] says what an
-//! armed release build pays.
+//! arms capture, or where an application that arms capture through backbeat's API calls
+//! [`arm_slot_holds`], so that a release build can keep what a server does with a held slot.
+//! In a plain release build where neither arms it, `slot_hold` returns before it records, so it
+//! doesn't build the [`backbeat::global`] recorder or spawn its dumper thread. [`slot_hold`] says
+//! what an armed release build pays.
 //!
 //! Dumps are self-describing `.bb` files written by `backbeat::global`'s background dumper, named by
 //! UTC timestamp under `BACKBEAT_PATH` (default `${TMPDIR}/backbeat.<pid>.bb`). Read them with the
@@ -925,16 +926,69 @@ pub(crate) fn server_bind(
     });
 }
 
-/// Whether [`slot_hold`] records, decided once a process: always in a build that compiles the
-/// diagnostic in ([`super::dbg::ENABLED`]), and in a plain release build only where
-/// `BACKBEAT_ENABLE` arms capture.
+/// Lets the endpoint record each slot hold in a plain release build whose application arms
+/// backbeat's capture through backbeat's API: by `backbeat::global::enable()`, or by a
+/// `backbeat::global::Config` built with `enable(true)` that `backbeat::global::configure` or
+/// `backbeat::global::init` stages. Call it beside that call. backbeat answers whether capture is
+/// armed only by building its global recorder, and a slot hold doesn't build that recorder where
+/// nothing armed capture, so the endpoint learns of the application's arming from this call.
+///
+/// Without this call, a plain release build records a slot hold only where `BACKBEAT_ENABLE`
+/// arms capture, and a build that compiles the endpoint's diagnostic in, under `test`, the
+/// `testing` feature or the `queue-dbg` feature, records each slot hold. The call doesn't touch
+/// backbeat, so a `Config` that the application stages after it, before the first slot hold,
+/// still takes effect. It can't be taken back; a later `backbeat::global::disable()` stops the
+/// records.
+///
+/// Once armed, unless something built the global recorder before, the first slot hold builds it
+/// on the calling dispatch or router thread: with backbeat's defaults, up to 16 rings of 16 MiB
+/// that the process keeps for its life, and the dumper thread. Where the application calls this
+/// without arming capture, that recorder is built all the same and records nothing.
+pub fn arm_slot_holds() {
+    SLOT_HOLD_ARM.arm();
+}
+
+/// What arms each slot hold in this process: [`slot_holds_armed`] reads it, and
+/// [`arm_slot_holds`] sets it.
+static SLOT_HOLD_ARM: SlotHoldArm = SlotHoldArm::new();
+
+/// Whether [`slot_hold`] records: always in a build that compiles the diagnostic in
+/// ([`super::dbg::ENABLED`]), and in a plain release build where `BACKBEAT_ENABLE` arms capture,
+/// read once a process, or once the application called [`arm_slot_holds`].
 #[inline]
 fn slot_holds_armed() -> bool {
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| {
-        let var = |name: &str| std::env::var(name).ok();
-        slot_holds_armed_in(super::dbg::ENABLED, var)
-    })
+    SLOT_HOLD_ARM.is_armed(super::dbg::ENABLED, |name| std::env::var(name).ok())
+}
+
+/// What arms a slot hold: the diagnostic or `BACKBEAT_ENABLE`, decided at the first read, or a
+/// call of [`arm_slot_holds`], read at each.
+struct SlotHoldArm {
+    /// Whether the diagnostic or `BACKBEAT_ENABLE` arms each slot hold, decided at the first read.
+    by_env: std::sync::OnceLock<bool>,
+    /// Whether the application called [`arm_slot_holds`].
+    by_call: std::sync::atomic::AtomicBool,
+}
+
+impl SlotHoldArm {
+    const fn new() -> Self {
+        Self {
+            by_env: std::sync::OnceLock::new(),
+            by_call: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Arms each later slot hold, whatever the environment holds.
+    fn arm(&self) {
+        self.by_call.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a slot hold records, in a build whose diagnostic is `diagnostic`, with `var` the
+    /// read of an environment variable, which runs at the first read alone.
+    #[inline]
+    fn is_armed(&self, diagnostic: bool, var: impl FnOnce(&str) -> Option<String>) -> bool {
+        *self.by_env.get_or_init(|| slot_holds_armed_in(diagnostic, var))
+            || self.by_call.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Whether [`slot_hold`] records in a build whose diagnostic is `diagnostic`, with `var` the read
@@ -960,12 +1014,13 @@ fn slot_holds_armed_in(diagnostic: bool, var: impl FnOnce(&str) -> Option<String
 ///
 /// Unlike the other entry points, this one isn't gated by `super::dbg::on_enabled` but by
 /// [`slot_holds_armed`]: a plain release build records each outcome too where `BACKBEAT_ENABLE`
-/// arms capture. What a plain release build pays:
+/// arms capture, or once the application called [`arm_slot_holds`]. What a plain release build
+/// pays:
 ///
-/// * Where `BACKBEAT_ENABLE` doesn't arm capture: a read of the environment at the first call and
-///   one load at each later call. The call returns before it records, so it doesn't build the
-///   global recorder or spawn its dumper thread.
-/// * Where it arms capture: unless something built the global recorder before, the first record
+/// * Unarmed: a read of the environment at the first call and two loads at each later call. The
+///   call returns before it records, so it doesn't build the global recorder or spawn its dumper
+///   thread.
+/// * Armed: unless something built the global recorder before, the first record
 ///   builds it on the calling dispatch or router thread. With backbeat's defaults, that allocates
 ///   and zeroes one 16 MiB ring a shard, a shard for each available CPU up to 16, so up to 256 MiB
 ///   that the process keeps for its life; `BACKBEAT_BYTES` sets the ring size and
@@ -1568,4 +1623,62 @@ fn backbeat_enable_arms_slot_holds_in_a_release_build() {
         slot_holds_armed_in(true, |name| panic!("a diagnostic build read {name}")),
         "a build with the diagnostic compiled in arms each slot hold"
     );
+}
+
+/// Each way of arming a slot hold in a plain release build arms it: `BACKBEAT_ENABLE` at the
+/// first read, and a call of [`arm_slot_holds`] at any read, the process's arm among them.
+/// Nothing else arms it, and the environment is read once.
+#[test]
+fn each_way_of_arming_arms_slot_holds_in_a_release_build() {
+    let no_read = |name: &str| -> Option<String> { panic!("the arm read {name}") };
+
+    // Neither `BACKBEAT_ENABLE` nor a call arms it.
+    let unarmed = SlotHoldArm::new();
+    assert!(
+        !unarmed.is_armed(false, |_| None),
+        "without BACKBEAT_ENABLE or a call, a slot hold isn't armed"
+    );
+    assert!(!unarmed.is_armed(false, no_read), "it stays unarmed");
+
+    // `BACKBEAT_ENABLE` arms it at the first read.
+    let by_env = SlotHoldArm::new();
+    assert!(
+        by_env.is_armed(false, |name| {
+            assert_eq!(name, "BACKBEAT_ENABLE", "the variable that arms capture");
+            Some("1".to_string())
+        }),
+        "a BACKBEAT_ENABLE that backbeat reads as true arms a slot hold"
+    );
+    assert!(by_env.is_armed(false, no_read), "it stays armed");
+
+    // A call arms it after an unarmed first read, without a second read of the environment.
+    let by_call = SlotHoldArm::new();
+    assert!(
+        !by_call.is_armed(false, |_| None),
+        "a slot hold isn't armed before the call"
+    );
+    by_call.arm();
+    assert!(
+        by_call.is_armed(false, no_read),
+        "the call arms each later slot hold"
+    );
+
+    // A build with the diagnostic compiled in arms it without either.
+    let diagnostic = SlotHoldArm::new();
+    assert!(
+        diagnostic.is_armed(true, no_read),
+        "a build with the diagnostic compiled in arms each slot hold"
+    );
+
+    // `endpoint::arm_slot_holds`, the public path, arms the process's slot holds. A test
+    // build arms each of them all the same, so the other tests of the process don't see the
+    // change, and the arm is put back after.
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    let before = SLOT_HOLD_ARM.by_call.load(ordering);
+    crate::endpoint::arm_slot_holds();
+    assert!(
+        SLOT_HOLD_ARM.by_call.load(ordering),
+        "endpoint::arm_slot_holds arms the process's slot holds"
+    );
+    SLOT_HOLD_ARM.by_call.store(before, ordering);
 }

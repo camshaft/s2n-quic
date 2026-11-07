@@ -47,10 +47,11 @@ aws-lc-rs = "1.12"
 # Flight recorder backing the frame/packet trace (see endpoint::frame_trace). The `capture` runtime
 # is always compiled in; emission is gated at the call sites behind `endpoint::dbg::on_enabled`,
 # except for `frame_trace::slot_hold`, which a plain release build also records where
-# `BACKBEAT_ENABLE` arms capture. Unarmed, `slot_hold` doesn't build the recorder. Armed, its
-# first record builds it on the dispatch or router thread: with backbeat's defaults, one 16 MiB ring
-# for each available CPU up to 16, so up to 256 MiB kept for the process's life, and the dumper
-# thread.
+# `BACKBEAT_ENABLE` arms capture, or where the application calls `endpoint::arm_slot_holds` beside
+# its own arming of capture through backbeat's API. Unarmed, `slot_hold` doesn't build the
+# recorder. Armed, its first record builds it on the dispatch or router thread: with backbeat's
+# defaults, one 16 MiB ring for each available CPU up to 16, so up to 256 MiB kept for the
+# process's life, and the dumper thread.
 backbeat = "0.1"
 bach = { version = "0.1.0", features = ["net", "net-monitor", "tokio-compat"], optional = true }
 bitflags = "2"
