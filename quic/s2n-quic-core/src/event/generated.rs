@@ -3154,6 +3154,12 @@ pub mod api {
         #[non_exhaustive]
         #[doc = " Emitted when the max maximum transmission unit is configured"]
         MaxMtu { mtu: u16 },
+        #[non_exhaustive]
+        #[doc = " Emitted when the socket is configured to report the time it received each datagram"]
+        #[doc = ""]
+        #[doc = " This is only emitted where the application turned on receive timestamps. `enabled` is"]
+        #[doc = " false where the platform doesn't support them or the socket refused them."]
+        RxTimestamps { enabled: bool },
     }
     impl aggregate::AsVariant for PlatformFeatureConfiguration {
         const VARIANTS: &'static [aggregate::info::Variant] = &[
@@ -3187,6 +3193,11 @@ pub mod api {
                 id: 5usize,
             }
             .build(),
+            aggregate::info::variant::Builder {
+                name: aggregate::info::Str::new("RX_TIMESTAMPS\0"),
+                id: 6usize,
+            }
+            .build(),
         ];
         #[inline]
         fn variant_idx(&self) -> usize {
@@ -3197,6 +3208,7 @@ pub mod api {
                 Self::BaseMtu { .. } => 3usize,
                 Self::InitialMtu { .. } => 4usize,
                 Self::MaxMtu { .. } => 5usize,
+                Self::RxTimestamps { .. } => 6usize,
             }
         }
     }
@@ -7022,6 +7034,11 @@ pub mod builder {
         InitialMtu { mtu: u16 },
         #[doc = " Emitted when the max maximum transmission unit is configured"]
         MaxMtu { mtu: u16 },
+        #[doc = " Emitted when the socket is configured to report the time it received each datagram"]
+        #[doc = ""]
+        #[doc = " This is only emitted where the application turned on receive timestamps. `enabled` is"]
+        #[doc = " false where the platform doesn't support them or the socket refused them."]
+        RxTimestamps { enabled: bool },
     }
     impl IntoEvent<api::PlatformFeatureConfiguration> for PlatformFeatureConfiguration {
         #[inline]
@@ -7045,6 +7062,9 @@ pub mod builder {
                 },
                 Self::MaxMtu { mtu } => MaxMtu {
                     mtu: mtu.into_event(),
+                },
+                Self::RxTimestamps { enabled } => RxTimestamps {
+                    enabled: enabled.into_event(),
                 },
             }
         }
