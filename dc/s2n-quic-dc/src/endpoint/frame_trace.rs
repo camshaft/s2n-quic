@@ -222,8 +222,9 @@ pub(crate) enum BindOutcome {
     StaleOrBound = 4,
 }
 
-/// What a server did with the slot of an init it rejected, or with the slot's hold as the hold's
-/// reset leaves the priority router. Stored in [`SlotHold::outcome`].
+/// What a server did with the slot of an init it rejected, or with the slot's hold as the hold
+/// ended: as its reset left the priority router, or where the ended router refused the reset.
+/// Stored in [`SlotHold::outcome`].
 ///
 /// Discriminants are stable dump values - append, never renumber.
 #[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,6 +239,9 @@ pub(crate) enum HoldOutcome {
     PastQueues = 2,
     /// The hold's reset left the priority router for its lane, and the hold ended.
     Released = 3,
+    /// The submission channel refused the reset of a `Held` record's init, since the priority
+    /// router had ended, so `reject_init` ended the hold before it freed the slot.
+    Unheld = 4,
 }
 
 /// Why a reader's window-growth attempt advertised no — or no new — MAX_DATA. Stored in
@@ -642,10 +646,11 @@ pub struct ServerBind {
 }
 
 /// What a server did with a slot as it rejected an init on it, or as the slot's hold ended: one
-/// record for each init that `reject_init` rejects and each hold whose reset leaves the priority
-/// router for its lane. [`queue_id`](Self::queue_id) is the server's slot, the init's
-/// `dest_queue_id` and the reset's `source_queue_id`, so a record of a rejected init joins its
-/// [`ServerBind`] through `(cred_id, binding_id)`.
+/// record for each init that `reject_init` rejects, each hold whose reset leaves the priority
+/// router for its lane, and each hold that `reject_init` ends where the ended router refuses its
+/// reset. [`queue_id`](Self::queue_id) is the server's slot, the init's `dest_queue_id` and the
+/// reset's `source_queue_id`, so a record of a rejected init joins its [`ServerBind`] through
+/// `(cred_id, binding_id)`.
 #[derive(Event, IntoBytes, Immutable, Debug)]
 #[event(namespace = "s2n_quic_dc::recv::slot_hold")]
 #[repr(C)]
@@ -1010,7 +1015,8 @@ fn slot_holds_armed_in(diagnostic: bool, var: impl FnOnce(&str) -> Option<String
 }
 
 /// Records a [`SlotHold`]: what a server did with its slot `queue_id` as it rejected an init of
-/// `binding_id`, or the end of the slot's hold as its reset leaves the priority router.
+/// `binding_id`, or the end of the slot's hold as its reset leaves the priority router or as
+/// `reject_init` ends it where the ended router refuses its reset.
 ///
 /// Unlike the other entry points, this one isn't gated by `super::dbg::on_enabled` but by
 /// [`slot_holds_armed`]: a plain release build records each outcome too where `BACKBEAT_ENABLE`
@@ -1584,6 +1590,7 @@ fn slot_hold_records_each_outcome() {
         HoldOutcome::AlreadyHeld,
         HoldOutcome::PastQueues,
         HoldOutcome::Released,
+        HoldOutcome::Unheld,
     ];
     for (slot, outcome) in (1u8..).zip(outcomes) {
         slot_hold(VarInt::from_u8(slot), VarInt::from_u8(slot + 4), outcome, cred_id);
@@ -1596,6 +1603,7 @@ fn slot_hold_records_each_outcome() {
             (2, 6, HoldOutcome::AlreadyHeld as u8),
             (3, 7, HoldOutcome::PastQueues as u8),
             (4, 8, HoldOutcome::Released as u8),
+            (5, 9, HoldOutcome::Unheld as u8),
         ],
         "each outcome is recorded with its slot and its binding"
     );
