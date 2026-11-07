@@ -750,6 +750,12 @@ mod tests {
 
     #[test]
     fn a_handshake_answers_its_time_past_two_round_trips_of_its_path() {
+        // A handshake's round trips whose second reply waited 4 ms, where the socket measured the
+        // wait of each of the two replies and not the wait of the lowest round trip's reply.
+        let unmeasured_lowest = rtt_waits(1, 0, [(1, 0), (5, 4)]).map(|rtt| RoundTrips {
+            measured: false,
+            ..rtt
+        });
         for (elapsed, earlier_rtt, rtt, expected) in [
             (ms(103), None, rtt(50), Answer::Latency(ms(3))),
             // An earlier time below this connection's lowest round trip counts as it is, and
@@ -786,6 +792,9 @@ mod tests {
             // in the time, and a far path's spread counts as before.
             (ms(7), Some(ms(1)), rtt_waits(1, 0, [(1, 0), (5, 4)]), Answer::Latency(ms(5))),
             (ms(120), None, rtt_waits(60, 10, [(60, 10), (79, 10)]), Answer::Latency(ms(1))),
+            // Where the socket didn't measure the wait of the lowest round trip's reply, the round
+            // trips count as the connection measured them, whatever the waits of the two replies.
+            (ms(7), Some(ms(1)), unmeasured_lowest, Answer::Latency(ms(1))),
             // Without a round-trip time, the rest is the whole time.
             (ms(103), None, None, Answer::Latency(ms(103))),
             // Where the round trips take the whole time, the handshake doesn't show a time to
@@ -818,6 +827,11 @@ mod tests {
             assert_eq!(over.spread(), ms(4));
             assert_eq!(over.flights_time(), ms(6));
         }
+        // Without the lowest round trip's measured wait, the 4 ms that the second reply waited
+        // counts as the spread.
+        let unmeasured_lowest = unmeasured_lowest.unwrap();
+        assert_eq!(unmeasured_lowest.spread(), ms(4));
+        assert_eq!(unmeasured_lowest.flights_time(), ms(6));
     }
 
     #[test]
