@@ -2815,6 +2815,8 @@ fn interface_paced_pick_two_returns_the_credit_of_waiting_highest_priority_batch
         CAP + 2 * CREDIT,
         "the router didn't return the credit of each waiting batch to the pool",
     );
+    // The router stays ended, and doesn't offer the batches of a peer it no longer holds.
+    assert_eq!(poll_once(&mut router), Poll::Ready(None));
 }
 
 #[test]
@@ -2889,4 +2891,62 @@ fn interface_paced_pick_two_sends_a_waiting_highest_input_batch_unpaced_once_its
     assert_eq!(costs(&first), [100_000, 100_001]);
     assert_eq!(costs(&second), [200_000, 2]);
     assert_eq!(drop_counter.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn interface_paced_pick_two_ends_when_a_waiting_highest_input_batch_finds_its_worker_gone() {
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    // The second interface carries the highest-priority traffic. The pair of its sender is lost
+    // for the peer, so the first interface's sender takes each batch of that peer, paced.
+    let entry = test_path_secret_entry();
+    let sender = LocalSenderId::from_index;
+    assert!(entry.set_sender_lost(sender(1), true));
+    let highest_rx = ClosableReceiver::default();
+    {
+        let mut values = highest_rx.values.borrow_mut();
+        values.extend(test_items(&entry, 3, 100_000, &drop_counter));
+        for value in values.iter_mut() {
+            value.highest_priority = true;
+        }
+    }
+    let rx = ClosableReceiver::default();
+    rx.closed.set(true);
+    let gone = Rc::new(std::cell::Cell::new(false));
+    let senders: Vec<_> = (0..2)
+        .map(|_| GoneSender {
+            gone: Rc::clone(&gone),
+        })
+        .collect();
+    let rate = Rate::new(1.0);
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+
+    // The first batch goes, the second waits on the first interface, and the third waits in the
+    // router. The input stays open.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(highest_rx.consumed.get(), 300_000);
+
+    // Once the pair of the second interface's sender delivers again, the waiting batch goes to
+    // that sender, whose receiver is gone: the router ends in that poll, and doesn't read the
+    // batch the input holds now.
+    let mut next = new_test_item(entry.clone(), drop_counter.clone());
+    next.highest_priority = true;
+    highest_rx.values.borrow_mut().push_back(next);
+    assert!(entry.set_sender_lost(sender(1), false));
+    gone.set(true);
+    assert_eq!(poll_once(&mut router), Poll::Ready(None));
+    assert_eq!(highest_rx.values.borrow().len(), 1);
+    assert_eq!(highest_rx.consumed.get(), 300_000);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
 }
