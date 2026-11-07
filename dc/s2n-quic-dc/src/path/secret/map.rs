@@ -170,6 +170,12 @@ impl Map {
         self.store.advertised_data_addrs()
     }
 
+    /// Tags each address of the `DcDataAddresses` payload with the interface of the local
+    /// socket it matches, where `local` holds each local socket's address and interface.
+    pub fn set_advertised_data_interfaces(&self, local: &[(SocketAddr, u16)]) {
+        self.store.set_advertised_data_interfaces(local);
+    }
+
     /// Gets the [`Peer`] entry for the given address
     ///
     /// NOTE: This function is used to track cache hit ratios so it

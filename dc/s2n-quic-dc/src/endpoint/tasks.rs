@@ -7,7 +7,8 @@ use crate::{
         self,
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
-            CompletionDispatcher, FrameBatch, PathSecretMapEntry, PickTwo,
+            CompletionDispatcher, FrameBatch, InterfacePacedPickTwo, PathSecretMapEntry, PickTwo,
+            SendPacing,
         },
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
@@ -60,8 +61,8 @@ mod tests;
 ///
 /// `frame_dispatch` is the boundary between producers that submit individual [`Frame`] values
 /// and send workers that consume [`FrameBatch`] values. It is responsible for preserving frame
-/// priority, batching work by peer/path secret, applying endpoint-wide pacing, and choosing a
-/// send worker for each batch.
+/// priority, batching work by peer/path secret, pacing the send sockets of each local interface
+/// at that interface's send rate, and choosing a send worker for each batch.
 ///
 /// # Contract
 ///
@@ -70,8 +71,10 @@ mod tests;
 /// - Frames from different priority classes are never merged into the same batch.
 /// - The spawned tasks are the only side effect; callers do not receive a handle back and must
 ///   keep the underlying executor running for progress.
-/// - `overall_send_rate` and `budgets` bound how aggressively work is drained once the tasks are
-///   spawned.
+/// - `pacing` and `budgets` bound how aggressively work is drained once the tasks are spawned.
+///   With one interface, a [`Paced`] stage paces every send socket at its rate before
+///   [`PickTwo`] chooses a worker; with more, [`InterfacePacedPickTwo`] chooses the worker first
+///   and paces each interface's sockets with a token bucket of their own.
 #[allow(clippy::too_many_arguments)]
 pub fn frame_dispatch<S, Clk>(
     spawner: &mut impl Spawner,
@@ -79,7 +82,7 @@ pub fn frame_dispatch<S, Clk>(
     worker_senders: IdMap<LocalSenderId, S>,
     rng: crate::xorshift::Rng,
     clock: Clk,
-    overall_send_rate: Rate,
+    pacing: SendPacing,
     budgets: Budgets,
     counter_registry: counter::Registry,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
@@ -140,24 +143,67 @@ pub fn frame_dispatch<S, Clk>(
                     .with_function("endpoint::tasks::frame_dispatch");
                 counter::GaugedQueueReceiver::new(rx.into_list_receiver(), receiver)
             })
-            .collect();
-        let rx = PriorityRx::new(priority_batch_rxs);
-        let rx = BatchFramesByPathSecret::new(rx, &clock, overall_send_rate);
-        let rx = Map::new(rx, Entry::new);
-        let rx = Paced::new(rx, clock, overall_send_rate);
-        let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
-        let task_counter = counter_registry
-            .register_task("task.frame_dispatch")
-            .with_registration_metadata(
-                "task.frame_dispatch",
-                "Batches, paces, and routes frame batches to worker send sockets",
-                "endpoint::tasks::frame_dispatch",
+            .collect::<Vec<_>>();
+        // Batches the frames of `lanes`, a lane for each of their priority levels, highest first.
+        let batch_frames = |lanes: Vec<_>| {
+            let rx = PriorityRx::new(lanes);
+            let rx = BatchFramesByPathSecret::new(rx, &clock, pacing.total_rate());
+            Map::new(rx, Entry::new)
+        };
+        let register_task_counter = || {
+            counter_registry
+                .register_task("task.frame_dispatch")
+                .with_registration_metadata(
+                    "task.frame_dispatch",
+                    "Batches, paces, and routes frame batches to worker send sockets",
+                    "endpoint::tasks::frame_dispatch",
+                )
+        };
+        if pacing.interface_count() == 1 {
+            // Every send socket is on one interface: pace them together at its rate, then choose
+            // a worker for each batch.
+            let rx = batch_frames(priority_batch_rxs);
+            let rx = Paced::new(rx, clock, pacing.total_rate());
+            let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
+            let task_counter = register_task_counter();
+            spawner.spawn_receiver_task(
+                rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
+                Some(budgets.frame_dispatch),
+                task_counter,
             );
-        spawner.spawn_receiver_task(
-            rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
-            Some(budgets.frame_dispatch),
-            task_counter,
-        );
+        } else {
+            // The send sockets are on several interfaces: choose a worker for each batch first,
+            // then pace the batch with the token bucket of that worker's interface.
+            // Where the endpoint chooses an interface for the highest-priority traffic, the
+            // frames of the highest level are batched apart from the others, into an input of
+            // the router's own, so that their batches go to that interface even while every
+            // interface holds a batch.
+            let mut lanes = priority_batch_rxs;
+            let highest_lane = pacing
+                .highest_priority()
+                .map(|_| lanes.remove(Priority::QueueReset.as_index()));
+            let rx = batch_frames(lanes);
+            let highest_rx = highest_lane.map(|lane| batch_frames(vec![lane]));
+            let rx = InterfacePacedPickTwo::new(
+                rx,
+                worker_senders,
+                rng,
+                clock,
+                &pacing,
+                &counter_registry,
+                send_credit_pool,
+            );
+            let rx = match highest_rx {
+                Some(highest_rx) => rx.with_highest_priority_input(highest_rx),
+                None => rx,
+            };
+            let task_counter = register_task_counter();
+            spawner.spawn_receiver_task(
+                rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
+                Some(budgets.frame_dispatch),
+                task_counter,
+            );
+        }
     }
 }
 
@@ -293,10 +339,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         .map(|(local_id, st)| {
             sender_idx_to_local[st.sender_idx] = local_id;
 
-            let cache = Rc::new(RefCell::new(send::Cache::new(
-                &counter_registry,
-                st.sender_idx,
-            )));
+            let cache = Rc::new(RefCell::new(
+                send::Cache::new(&counter_registry, st.sender_idx).with_place(st.interface_place),
+            ));
 
             (local_id, cache)
         })
@@ -586,6 +631,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             tx_pto_requested,
             send_caches.clone(),
             sender_idx_to_local.clone(),
+            frame_tx.clone(),
         );
         let task_counter = counter_registry
             .register_nominal_task("task.pto_wheel", &variant)
@@ -901,7 +947,11 @@ where
 ///
 /// For each send context emitted by the PTO wheel, this updates probe state and forwards the
 /// resulting wheel interest back to the caller-supplied scheduling channels.
-pub fn send_pto_timeout<CtxRx, Clk, ImmW, TxW, PtoW, IdleW>(
+///
+/// Where a context's interface pair is marked lost and another pair of its peer still
+/// delivers, the context's pending and unacknowledged frames go to `retransmit_tx`, so that the
+/// routers send them on the pairs that deliver.
+pub fn send_pto_timeout<CtxRx, Clk, ImmW, TxW, PtoW, IdleW, RetxW>(
     pto_context_rx: CtxRx,
     clock: Clk,
     immediate_tx: ImmW,
@@ -912,6 +962,7 @@ pub fn send_pto_timeout<CtxRx, Clk, ImmW, TxW, PtoW, IdleW>(
     tx_pto_requested: counter::Counter,
     send_caches: IdMap<LocalSendSocketId, Rc<RefCell<send::Cache>>>,
     sender_idx_to_local: IdMap<LocalSenderId, LocalSendSocketId>,
+    mut retransmit_tx: RetxW,
 ) -> impl Receiver<()>
 where
     CtxRx: Receiver<Rc<RefCell<send::Context>>>,
@@ -920,6 +971,7 @@ where
     TxW: UnboundedSender<Rc<RefCell<send::Context>>>,
     PtoW: UnboundedSender<Rc<RefCell<send::Context>>>,
     IdleW: UnboundedSender<Rc<RefCell<send::Context>>>,
+    RetxW: UnboundedSender<Entry<Frame>>,
 {
     let rx = Map::new(
         pto_context_rx,
@@ -940,6 +992,15 @@ where
                     if ctx.pto.backoff > 2 {
                         counters.on_probe_no_response();
                     }
+                }
+                if ctx.should_move_frames() {
+                    let moved = ctx.move_frames(&mut retransmit_tx);
+                    debug!(
+                        moved,
+                        sender_idx = ?ctx.sender_idx,
+                        peer = %ctx.path_secret_entry.peer(),
+                        "moved the frames of a lost interface pair to the pairs that deliver"
+                    );
                 }
                 interest
             };
@@ -1242,6 +1303,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let peer_addr = ctx.peer_addr;
                 let ever_responded = ctx.last_peer_activity.nanos != ctx.created_at.nanos;
                 let has_inflight = ctx.inflight.has_inflight();
+                let path_lost = ctx.is_path_lost();
                 let pto_backoff = ctx.pto.backoff;
                 let packets_sent = ctx.next_packet_number.as_u64();
 
@@ -1310,7 +1372,10 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // were never acknowledged — that's evidence the peer is
                 // unreachable. If there are no inflight packets, both sides
                 // simply stopped talking (natural idle) and we must not mark dead.
+                // A lost pair's probes go unacknowledged, so a lost pair marks the peer dead only
+                // once every pair of the peer is lost.
                 let marked_dead = has_inflight
+                    && !(path_lost && path_secret_entry.has_delivering_sender())
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
 
                 let result = send_caches[local_id].borrow_mut().invalidate(
