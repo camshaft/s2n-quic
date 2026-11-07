@@ -108,6 +108,19 @@ struct RejectedInit {
     stream: Option<Stream>,
 }
 
+impl Drop for RejectedInit {
+    /// Disables a stream the reject still holds, however the reject ends: settled without the
+    /// packet, or dropped where the path secret map refuses the packet after the decrypt. A
+    /// stream dropped without `disable` resets its binding as its reader drops, and that reset
+    /// would release the hold of the slot's genuine rejected init as it leaves the priority
+    /// router.
+    fn drop(&mut self) {
+        if let Some(mut stream) = self.stream.take() {
+            stream.disable();
+        }
+    }
+}
+
 /// Fast path: decrypt a single-QueueMsg-frame packet directly into the slot buffer.
 ///
 /// Handles both init (with binding setup) and non-init frames.
@@ -2016,39 +2029,31 @@ fn reject_init(
 /// they take the packet's cleartext routing fields as given, so a tampered or forged init, or a
 /// replayed copy of an authentic one, would otherwise hold the slot for its binding, and the
 /// reset of the client's genuine rejected init on that slot wouldn't be sent. For a packet the
-/// endpoint doesn't take, a slot that `bind_for_msg` bound for it is torn down, and nothing else
-/// changes: the slot isn't held, recorded as freed or reset.
+/// endpoint doesn't take, the reject's drop tears down a slot that `bind_for_msg` bound for it,
+/// and nothing else changes: the slot isn't held, recorded as freed or reset.
 fn settle_rejected_init(
-    rejected: RejectedInit,
+    mut rejected: RejectedInit,
     take: bool,
     queue_view: &mut recv::QueueView,
     path_entry: &Arc<PathSecretEntry>,
     frame_tx: &mut SubmissionSender,
     freed_batch_tx: &mut crate::queue::FreedBatchTx,
 ) {
-    let RejectedInit {
-        queue_pair,
-        binding_id,
-        error_code,
-        stream,
-    } = rejected;
-
     if !take {
-        if let Some(mut stream) = stream {
-            stream.disable();
-        }
         return;
     }
 
     let Some(server_view) = queue_view.as_server_mut() else {
         return;
     };
+    let queue_pair = rejected.queue_pair;
+    let stream = rejected.stream.take();
     reject_init(
         server_view,
         path_entry,
         queue_pair,
-        binding_id,
-        error_code,
+        rejected.binding_id,
+        rejected.error_code,
         frame_tx,
         |view| match stream {
             Some(mut stream) => stream.disable(),

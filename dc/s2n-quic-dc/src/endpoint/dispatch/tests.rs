@@ -698,3 +698,37 @@ fn a_replayed_rejected_init_leaves_the_slot_as_the_first_copy_left_it() {
     assert!(init(&mut harness, &mut view, 2, true));
     assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 2)]);
 }
+
+/// A rejected init whose slot `bind_for_msg` bound disables the bound stream as the reject drops,
+/// as where the path secret map refuses its packet after the decrypt: the stream's reader doesn't
+/// reset the binding, so a reset doesn't leave the priority router and release the hold of the
+/// slot's genuine rejected init.
+#[test]
+fn a_dropped_rejected_init_disables_its_bound_stream() {
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let mut view = recv::QueueView::Server(state.view());
+    let mut harness = FastPathHarness::new();
+    // The registry holds an acceptor whose receiver is dropped, so the server binds the slot
+    // and then rejects the init with the stream it bound.
+    let registry = acceptor::Registry::<Stream>::new();
+    let receiver = registry
+        .register(VarInt::from_u8(9), Default::default())
+        .expect("the acceptor registers");
+    drop(receiver);
+    harness.acceptor_registry = registry.local();
+
+    let (packet, opener, decrypt_len) =
+        sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(1), VarInt::from_u8(9));
+    let header = single_queue_msg_header(&packet, decrypt_len);
+    let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+    let Err(FastPathError::RejectInit(rejected)) = result else {
+        panic!("the server rejects an init whose acceptor's receiver is dropped");
+    };
+    assert!(rejected.stream.is_some(), "the reject holds the stream it bound");
+
+    drop(rejected);
+    assert!(
+        take_resets(&mut harness.frame_rx).is_empty(),
+        "a dropped reject disables its stream, so its reader doesn't send a reset"
+    );
+}
