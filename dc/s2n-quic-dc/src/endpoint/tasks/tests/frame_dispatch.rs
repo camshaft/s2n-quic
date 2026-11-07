@@ -64,6 +64,7 @@ fn setup_with_pacing(num_workers: usize, pacing: SendPacing) -> (SubmissionSende
         crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
             1_000_000,
         ))),
+        crate::queue::freed_batch_channel().0,
     );
 
     (frame_tx, rxs)
@@ -448,7 +449,13 @@ fn priority_router_with_shards(
     let gauges = core::array::from_fn(|i| {
         registry.register_queue_gauge_nominal("q.router_to_batcher", format_args!("p{i}"))
     });
-    let router = tasks::FrameReceiver::new(frame_rx, lane_txs, gauges, window);
+    let router = tasks::FrameReceiver::new(
+        frame_rx,
+        lane_txs,
+        gauges,
+        window,
+        crate::queue::freed_batch_channel().0,
+    );
     (frame_tx, router, lanes)
 }
 
@@ -814,4 +821,54 @@ fn the_waiting_resets_forget_a_reset_that_leaves_for_its_lane() {
     let reset = kept.pop_front().expect("the first reset is kept");
     resets.remove(&reset);
     assert!(resets.waiting.is_empty());
+}
+
+/// A reset that leaves for its lane releases the slot that its rejected init held, so that the
+/// slot is recorded as freed only then: while the window refuses the reset, the client doesn't
+/// learn that the slot is free, and doesn't send another init on it.
+#[test]
+fn the_priority_router_releases_the_slot_of_a_reset_that_leaves_for_its_lane() {
+    use crate::socket::channel::ByteCost as _;
+    use core::task::Poll;
+    use s2n_quic_core::varint::VarInt;
+
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(1)
+        .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+        .build(None);
+    let crate::path::secret::map::entry::QueueState::Server(state) = pse.queue_state() else {
+        unreachable!("a server entry has a server queue state");
+    };
+    let state = state.clone();
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    let holder = holding_frame(&pse);
+    let holder_cost = holder.byte_cost();
+    submit(&mut frame_tx, [holder]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(holder_cost, 0)]);
+
+    // The server rejects an init of binding 1 on slot 1, which the reset answers, and frees the
+    // slot while the reset waits at the window.
+    let (mut freed_tx, _freed_rx) = crate::queue::freed_batch_channel();
+    assert!(state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(1)));
+    state.freed.record(VarInt::from_u8(1), &pse, &mut freed_tx);
+    let reset = reset_frame(&pse, 2, 1);
+    let reset_cost = reset.byte_cost();
+    submit(&mut frame_tx, [reset]);
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    assert!(take_lanes(&mut lanes).is_empty());
+    assert!(!state.freed.has_pending_work(), "the slot waits on its reset");
+
+    // A worker's sender takes the holder's batch, and the reset leaves for its lane: the slot is
+    // recorded as freed, and a later rejected init can hold it again.
+    window.release(holder_cost, window.round());
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(reset_cost, 0)]);
+    assert!(state.freed.has_pending_work(), "the slot is recorded as freed");
+    assert!(state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)));
+
+    drop(frame_tx);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
 }
