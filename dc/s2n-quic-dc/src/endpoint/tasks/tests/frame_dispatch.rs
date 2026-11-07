@@ -1122,6 +1122,72 @@ fn the_priority_router_releases_the_slot_of_a_reset_that_leaves_for_its_lane() {
     assert_eq!(poll_router(&mut router), Poll::Ready(None));
 }
 
+/// A reset that leaves for its lane records the end of its slot's hold, once: a reset that waits at
+/// the window doesn't record it, and a reset that leaves while its slot is held for another binding
+/// doesn't end that hold or record anything.
+#[test]
+fn the_priority_router_records_each_hold_that_a_leaving_reset_releases() {
+    use crate::endpoint::frame_trace::{resident_slot_holds, HoldOutcome};
+    use core::task::Poll;
+    use s2n_quic_core::varint::VarInt;
+
+    // An address no other test uses, so that the records of its credentials in the process-wide
+    // recorder are this test's alone.
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:44702".parse().unwrap())
+        .socket_sender_count(1)
+        .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+        .build(None);
+    let crate::path::secret::map::entry::QueueState::Server(state) = pse.queue_state() else {
+        unreachable!("a server entry has a server queue state");
+    };
+    let state = state.clone();
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    let holder = ping(&pse);
+    let holder_cost = holder.byte_cost();
+    submit(&mut frame_tx, [holder]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(holder_cost, 0)]);
+
+    // Slot 1 is held for binding 1, and its reset waits at the window: the hold doesn't end. The
+    // poll that swaps the reset in returns ready, and the next poll finds the channel empty.
+    assert!(state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(1)));
+    submit(&mut frame_tx, [reset_frame(&pse, 2, 1)]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    assert!(take_lanes(&mut lanes).is_empty());
+    assert!(resident_slot_holds(*pse.id()).is_empty());
+
+    // A worker's sender takes the holder's batch, and the reset leaves for its lane and ends the
+    // hold, which is recorded once.
+    window.release_peer(Some(PeerKey::of(&pse)), holder_cost, false);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes).len(), 1);
+    let released = vec![(1, 1, HoldOutcome::Released as u8)];
+    assert_eq!(resident_slot_holds(*pse.id()), released);
+    drop(frame_tx);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
+
+    // Slot 3 is held for binding 2, and a reset of slot 3 for binding 1 leaves: the hold stays,
+    // and nothing more is recorded.
+    assert!(state.freed.hold(VarInt::from_u8(3), VarInt::from_u8(2)));
+    let (mut frame_tx, mut router, mut lanes) =
+        priority_router(crate::endpoint::combinator::CreditlessWindow::default());
+    let mut reset = reset_frame(&pse, 2, 1);
+    if let frame::Header::QueueReset { queue_pair, .. } = &mut reset.header {
+        queue_pair.source_queue_id = VarInt::from_u8(3);
+    }
+    submit(&mut frame_tx, [reset]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes).len(), 1);
+    assert_eq!(resident_slot_holds(*pse.id()), released);
+    assert!(
+        !state.freed.hold(VarInt::from_u8(3), VarInt::from_u8(4)),
+        "the hold of binding 2 stays"
+    );
+}
+
 // -- The window in each batch router of `frame_dispatch` -----------------------------------
 
 /// Like [`setup_with_pacing`] but over `window`, the window of the frames without send credit,

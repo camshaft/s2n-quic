@@ -733,6 +733,55 @@ fn a_dropped_rejected_init_disables_its_bound_stream() {
     );
 }
 
+/// Each init that `reject_init` rejects records what it does with the slot: the first rejected init
+/// of a slot holds it, a later one finds it held, and a slot past the peer's queues isn't held.
+#[test]
+fn a_rejected_init_records_what_it_does_with_its_slot() {
+    use crate::endpoint::frame_trace::{resident_slot_holds, HoldOutcome};
+
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let view = state.view();
+    // An address no other test uses, so that the records of its credentials in the process-wide
+    // recorder are this test's alone.
+    let path_entry = PathSecretEntry::builder("127.0.0.1:44701".parse().unwrap())
+        .endpoint_type(endpoint::Type::Server)
+        .build(None);
+    let (mut frame_tx, mut frame_rx) = crate::endpoint::frame::submission_channel(1);
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    let mut reject = |slot: u8, binding: u8| {
+        let slot = VarInt::from_u8(slot);
+        reject_init(
+            &view,
+            &path_entry,
+            QueuePair {
+                source_queue_id: VarInt::from_u8(9),
+                dest_queue_id: slot,
+            },
+            VarInt::from_u8(binding),
+            error::ACCEPTOR_NOT_FOUND,
+            &mut frame_tx,
+            |server| server.record_freed(slot, &path_entry, &mut freed_batch_tx),
+        );
+    };
+    reject(1, 1);
+    reject(1, 2);
+    reject(1, 3);
+    reject(4, 1);
+
+    assert_eq!(take_resets(&mut frame_rx), vec![(1, 1)]);
+    assert_eq!(
+        resident_slot_holds(*path_entry.id()),
+        vec![
+            (1, 1, HoldOutcome::Held as u8),
+            (1, 2, HoldOutcome::AlreadyHeld as u8),
+            (1, 3, HoldOutcome::AlreadyHeld as u8),
+            (4, 1, HoldOutcome::PastQueues as u8),
+        ],
+        "the first init of slot 1 holds it, the next two find it held, and slot 4 isn't held"
+    );
+}
+
 /// Drops each value it's sent. The rejections the tests below check return from `process` before
 /// it sends anything on its channels.
 struct Discard;
