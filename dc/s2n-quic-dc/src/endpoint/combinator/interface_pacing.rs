@@ -14,7 +14,7 @@
 //! Where the endpoint chooses an interface for its highest-priority traffic, a batch that holds
 //! a frame of the highest priority level goes only to a worker of that interface.
 
-use super::{AssignSender, FlowCredits, HighestPriority, PathSecretMapEntry};
+use super::{AssignSender, CreditlessCost, FlowCredits, HighestPriority, PathSecretMapEntry};
 use crate::{
     credentials,
     endpoint::{
@@ -255,6 +255,8 @@ where
     /// of those without send credit, which stay in the window until the router delivers their
     /// batch through a [`WindowSender`](super::WindowSender). The router reads a batch only while
     /// a sender is free.
+    /// The router marks each batch that waits here as one that waited, which halves the
+    /// window's limit as a worker's sender takes the batch.
     waiting: HashMap<credentials::Id, VecDeque<T>>,
     /// The peers of `waiting`, which the router offers to the free senders in turn.
     waiting_order: VecDeque<credentials::Id>,
@@ -271,7 +273,12 @@ where
 
 impl<T, R, S, Clk> InterfacePacedPickTwo<T, R, S, Clk>
 where
-    T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits + HighestPriority,
+    T: ByteCost
+        + PathSecretMapEntry
+        + AssignSender
+        + FlowCredits
+        + HighestPriority
+        + CreditlessCost,
     R: Receiver<T>,
     S: UnboundedSender<T>,
     Clk: precision::Clock,
@@ -499,17 +506,20 @@ where
     /// Routes `value` as [`Self::dispatch`] does, and tells upstream that the batch was
     /// consumed once the router sent it or holds it. A batch of a peer whose batches wait in the
     /// router waits behind them, so that each peer's batches go in the order the router read
-    /// them. Returns `false` where the sender's receiver is gone.
-    fn route(&mut self, cx: &mut task::Context<'_>, value: T) -> bool {
+    /// them, and the router marks each batch that waits as one that waited. Returns `false` where
+    /// the sender's receiver is gone.
+    fn route(&mut self, cx: &mut task::Context<'_>, mut value: T) -> bool {
         let byte_cost = value.byte_cost();
         let peer = *value.path_secret_entry().id();
         if let Some(waiting) = self.waiting.get_mut(&peer) {
+            value.set_waited();
             waiting.push_back(value);
         } else {
             match self.dispatch(cx, value) {
                 Ok(true) => {}
                 Ok(false) => return false,
-                Err(value) => {
+                Err(mut value) => {
+                    value.set_waited();
                     self.waiting.insert(peer, VecDeque::from([value]));
                     self.waiting_order.push_back(peer);
                 }
@@ -641,7 +651,12 @@ struct Candidates {
 
 impl<T, R, S, Clk> Receiver<()> for InterfacePacedPickTwo<T, R, S, Clk>
 where
-    T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits + HighestPriority,
+    T: ByteCost
+        + PathSecretMapEntry
+        + AssignSender
+        + FlowCredits
+        + HighestPriority
+        + CreditlessCost,
     R: Receiver<T>,
     S: UnboundedSender<T>,
     Clk: precision::Clock,

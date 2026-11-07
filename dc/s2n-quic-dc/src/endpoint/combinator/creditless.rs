@@ -13,15 +13,19 @@
 //!
 //! A [`CreditlessWindow`] holds the bytes of those frames from the moment the priority router
 //! moves them into their lane until a [`WindowSender`] hands their batch to a worker's sender,
-//! and the priority router moves such a frame only once the window admits its bytes. A round of
-//! the window starts each time the priority router moves frames. The window's limit comes from
-//! how fast the workers take the batches:
+//! and the priority router moves such a frame only once the window admits its bytes. The
+//! window's limit comes from how fast the workers take the batches:
 //!
 //! - It starts at a minimum, which `frame_dispatch` sets to the batch router's batch target.
-//! - It grows by the bytes of each batch that a worker takes in the round in which the batch
-//!   router read the batch, where the window refused a frame in that round.
-//! - It halves, once a round, as a worker takes a batch that the batch router read in an
-//!   earlier round, and doesn't go below the minimum.
+//! - It grows where a [`WindowReader`] finds that the batch router doesn't have a batch for a
+//!   worker that could take one while the window refuses a frame: by the bytes of the last batch
+//!   a worker's sender took, and at least by the minimum, once for each refusal. A pacer that
+//!   holds a batch until its interface may send doesn't ask for another, so the limit stops
+//!   growing once the batch router has a batch each time a pacer asks for one, however fast the
+//!   frames come.
+//! - It halves as a worker's sender takes a batch that waited in the router for a sender, beyond
+//!   the batch that each pacer holds, and doesn't go below the minimum. It halves once for the
+//!   bytes the window held then: the batches that release those bytes don't halve it again.
 //!
 //! The window admits any frame while it holds nothing, so that a frame larger than the limit
 //! still goes, and every frame once the priority router holds its only clone, since nothing
@@ -30,9 +34,12 @@
 use super::FrameBatch;
 use crate::{
     endpoint::frame::Frame,
-    socket::channel::{ByteCost, UnboundedSender},
+    socket::channel::{Budget, ByteCost, Receiver, UnboundedSender},
 };
-use core::{cell::Cell, task};
+use core::{
+    cell::Cell,
+    task::{self, Poll},
+};
 use std::rc::Rc;
 
 /// The bytes of the frames without send credit that the priority router moved into the frame
@@ -40,7 +47,7 @@ use std::rc::Rc;
 /// before it moves another such frame.
 ///
 /// Its clones share one count: the priority router holds one, and the batch router holds the
-/// others, for the round in which it reads each batch and in each [`WindowSender`].
+/// others, in its [`WindowReader`] and in each [`WindowSender`].
 #[derive(Clone, Default)]
 pub struct CreditlessWindow {
     state: Rc<State>,
@@ -52,13 +59,14 @@ struct State {
     held: Cell<u64>,
     /// The bytes past which the window refuses a frame, where it holds any.
     limit: Cell<u64>,
-    /// The least that `limit` halves to.
+    /// The least that `limit` halves to, and grows by.
     minimum: u64,
-    /// The round of the window, which starts each time the priority router moves frames.
-    round: Cell<u64>,
-    /// The round in which `limit` last halved.
-    halved_in: Cell<Option<u64>>,
-    /// Whether the window refused a frame in this round.
+    /// The bytes of the last batch that a worker's sender took.
+    last_released: Cell<u64>,
+    /// The bytes that the window held as `limit` last halved and that no worker's sender took
+    /// since: `limit` doesn't halve again until they are gone.
+    halving_held: Cell<u64>,
+    /// Whether the window refused a frame since it last admitted one.
     refused: Cell<bool>,
     /// The priority router's waker, which it registers as the window refuses a frame.
     waker: Cell<Option<task::Waker>>,
@@ -87,18 +95,6 @@ impl CreditlessWindow {
         }
     }
 
-    /// Starts a round of the window, as the priority router moves frames.
-    pub fn start_round(&self) {
-        let state = &self.state;
-        state.round.set(state.round.get() + 1);
-        state.refused.set(false);
-    }
-
-    /// Returns the round of the window.
-    pub fn round(&self) -> u64 {
-        self.state.round.get()
-    }
-
     /// Admits `bytes` of frames without send credit and returns `true` where the window holds
     /// nothing, where the bytes it holds stay within its limit with them, or where no other
     /// clone of the window is left. Otherwise it refuses them and returns `false`.
@@ -112,6 +108,7 @@ impl CreditlessWindow {
             state.refused.set(true);
             return false;
         }
+        state.refused.set(false);
         state.held.set(held.saturating_add(bytes));
         true
     }
@@ -122,31 +119,46 @@ impl CreditlessWindow {
         frame.flow_credits != 0 || self.admit(frame.byte_cost())
     }
 
-    /// Releases `bytes` of a batch that the batch router read in round `read_in`, as a worker's
-    /// sender takes the batch, and wakes the priority router.
+    /// Tells the window that a worker could take a batch and the batch router doesn't have one.
     ///
-    /// The limit halves, once a round, where the batch was read in an earlier round, and grows
-    /// by `bytes` where the batch was read in this round and the window refused a frame in it.
-    pub fn release(&self, bytes: u64, read_in: u64) {
+    /// Where the window refused a frame since it last admitted one, the limit grows by the bytes
+    /// of the last batch that a worker's sender took, and at least by the minimum, and the
+    /// window wakes the priority router. It grows once for each refusal.
+    pub fn starved(&self) {
+        let state = &self.state;
+        if !state.refused.replace(false) {
+            return;
+        }
+        let growth = state.last_released.get().max(state.minimum);
+        state.limit.set(state.limit.get().saturating_add(growth));
+        self.wake();
+    }
+
+    /// Releases `bytes` of a batch as a worker's sender takes the batch, and wakes the priority
+    /// router.
+    ///
+    /// Where the batch waited in the router for a sender, the limit halves, and doesn't go below
+    /// the minimum, unless bytes that the window held as the limit last halved are still in it.
+    pub fn release(&self, bytes: u64, waited: bool) {
         if bytes == 0 {
             return;
         }
         let state = &self.state;
-        state.held.set(state.held.get().saturating_sub(bytes));
-        let round = state.round.get();
-        if read_in < round {
-            if state.halved_in.get() != Some(round) {
-                state.halved_in.set(Some(round));
-                state.limit.set((state.limit.get() / 2).max(state.minimum));
-            }
-        } else if state.refused.get() {
-            state.limit.set(state.limit.get().saturating_add(bytes));
+        let held = state.held.get().saturating_sub(bytes);
+        state.held.set(held);
+        state.last_released.set(bytes);
+        let halving_held = state.halving_held.get();
+        if halving_held != 0 {
+            state.halving_held.set(halving_held.saturating_sub(bytes));
+        } else if waited {
+            state.limit.set((state.limit.get() / 2).max(state.minimum));
+            state.halving_held.set(held);
         }
         self.wake();
     }
 
-    /// Registers `waker`, which the window wakes as a worker's sender releases bytes or a clone
-    /// of the window drops.
+    /// Registers `waker`, which the window wakes as a worker's sender releases bytes, as its
+    /// limit grows, or as a clone of the window drops.
     pub fn register(&self, waker: &task::Waker) {
         let waker = match self.state.waker.take() {
             Some(registered) if registered.will_wake(waker) => registered,
@@ -182,14 +194,18 @@ impl Drop for CreditlessWindow {
     }
 }
 
-/// A batch's bytes of frames without send credit, and the round of the window in which the
-/// batch router read the batch.
+/// A batch's bytes of frames without send credit, and whether the batch waited in the router
+/// for a sender.
 pub trait CreditlessCost {
     /// Returns the bytes of the batch's frames without send credit.
     fn creditless_bytes(&self) -> u64;
 
-    /// Returns the round of the window in which the batch router read the batch.
-    fn window_round(&self) -> u64;
+    /// Returns whether the batch waited in the router for a sender, beyond the batch that each
+    /// pacer holds.
+    fn waited(&self) -> bool;
+
+    /// Marks the batch as one that waited in the router for a sender.
+    fn set_waited(&mut self);
 }
 
 impl CreditlessCost for FrameBatch {
@@ -202,8 +218,12 @@ impl CreditlessCost for FrameBatch {
             .sum()
     }
 
-    fn window_round(&self) -> u64 {
-        self.window_round
+    fn waited(&self) -> bool {
+        self.waited
+    }
+
+    fn set_waited(&mut self) {
+        self.waited = true;
     }
 }
 
@@ -212,15 +232,47 @@ impl<T: CreditlessCost> CreditlessCost for crate::intrusive::Entry<T> {
         (**self).creditless_bytes()
     }
 
-    fn window_round(&self) -> u64 {
-        (**self).window_round()
+    fn waited(&self) -> bool {
+        (**self).waited()
+    }
+
+    fn set_waited(&mut self) {
+        (**self).set_waited();
     }
 }
 
-impl FrameBatch {
-    /// Sets the round of the window in which the batch router read the batch.
-    pub fn set_window_round(&mut self, round: u64) {
-        self.window_round = round;
+/// The receiver of the batch router's batches, which tells a [`CreditlessWindow`] where it
+/// doesn't have a batch for a worker that could take one.
+///
+/// The router after it polls it only while a worker could take a batch: `Paced` while it
+/// doesn't hold a batch, and [`InterfacePacedPickTwo`](super::InterfacePacedPickTwo) while the
+/// pacer of an interface doesn't hold one. A poll that ends `Pending` while budget is left, and
+/// so not for want of budget, starves that worker.
+pub struct WindowReader<R> {
+    inner: R,
+    window: CreditlessWindow,
+}
+
+impl<R> WindowReader<R> {
+    pub fn new(inner: R, window: CreditlessWindow) -> Self {
+        Self { inner, window }
+    }
+}
+
+impl<T, R> Receiver<T> for WindowReader<R>
+where
+    R: Receiver<T>,
+{
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>, budget: &mut Budget) -> Poll<Option<T>> {
+        let poll = self.inner.poll_recv(cx, budget);
+        if poll.is_pending() && !budget.is_exhausted() {
+            self.window.starved();
+        }
+        poll
+    }
+
+    fn on_consumed(&mut self, bytes: u64) {
+        self.inner.on_consumed(bytes);
     }
 }
 
@@ -244,11 +296,11 @@ where
 {
     fn send(&mut self, value: T) -> Result<(), T> {
         let bytes = value.creditless_bytes();
-        let read_in = value.window_round();
+        let waited = value.waited();
         let result = self.sender.send(value);
         // A router ends once a worker's receiver is gone, so the window releases the bytes
         // whether the worker took the batch or not.
-        self.window.release(bytes, read_in);
+        self.window.release(bytes, waited);
         result
     }
 }

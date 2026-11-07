@@ -33,7 +33,7 @@ use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 mod creditless;
 mod interface_pacing;
 
-pub use creditless::{CreditlessCost, CreditlessWindow, WindowSender};
+pub use creditless::{CreditlessCost, CreditlessWindow, WindowReader, WindowSender};
 pub use interface_pacing::{InterfacePacedPickTwo, SendPacing};
 
 #[cfg(test)]
@@ -162,9 +162,10 @@ pub struct FrameBatch {
     byte_cost: u64,
     /// Assigned sender index (set by PickTwo after routing).
     sender_id: LocalSenderId,
-    /// The round of the window of frames without send credit in which the batch router read the
-    /// batch (see [`CreditlessWindow`]).
-    window_round: u64,
+    /// Whether the batch waited in the router for a sender, beyond the batch that each pacer
+    /// holds, which halves the limit of the window of frames without send credit as a worker's
+    /// sender takes the batch (see [`CreditlessWindow`]).
+    waited: bool,
 }
 
 impl FrameBatch {
@@ -184,7 +185,7 @@ impl FrameBatch {
             byte_costs,
             byte_cost,
             sender_id: LocalSenderId::UNSPECIFIED,
-            window_round: 0,
+            waited: false,
         }
     }
 
