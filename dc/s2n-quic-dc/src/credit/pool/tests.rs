@@ -1968,6 +1968,12 @@ fn oldest_wait_age_grows_while_waiting_and_reads_zero_once_empty() {
             assert_eq!(age(priority), 0, "{priority:?} has no waiter");
         }
     }
+    // The gauge reports the age under its priority's variant name.
+    let line = registry.take_current_metrics_line().unwrap_or_default();
+    assert!(
+        line.contains("credit.acquire.oldest_wait_us=2000 Variant|Low"),
+        "{line}"
+    );
 
     clock.advance(Duration::from_millis(3));
     h.distribute();
@@ -1981,6 +1987,69 @@ fn oldest_wait_age_grows_while_waiting_and_reads_zero_once_empty() {
 
     drop(h);
     unsafe {
+        free_test_slot(low);
+    }
+}
+
+#[test]
+fn oldest_wait_age_skips_abandoned_waiters_and_reads_a_tier_the_walk_left_unmerged() {
+    // A tier's age is its oldest live waiter's: an abandoned waiter ahead of it doesn't count.
+    // The walk stops at the first live head it can't afford and leaves the tiers below it in
+    // their shared lists, which the ages are then read from.
+    use crate::{counter::Registry, credit::Counters, time::testing::Clock};
+    use core::time::Duration;
+
+    // Freeing the abandoned slot increments the global `DROP_COUNT`: hold the drop tests' lock.
+    let _drop_guard = drop_count_guard();
+    let registry = Registry::default();
+    let counters = Counters::new(&registry);
+    let clock = Clock::new(Duration::from_secs(1));
+    let pool = Pool::with_manual_clock(cfg(0, 100), counters.clone(), clock.clone());
+    let pool = Arc::new(pool);
+    let dist = Distributor::new(pool.clone());
+    let mut h = Harness {
+        pool,
+        dist,
+        dist_waker: Waker::from(Arc::new(NoopWake)),
+    };
+    let waker = Waker::from(Arc::new(NoopWake));
+    let age = |priority: Priority| counters.acquire_oldest_wait_us[priority as usize].get();
+
+    let abandoned = alloc_test_slot();
+    let r = unsafe { h.poll_acquire(abandoned, 10, Priority::Low, &waker) };
+    assert!(r.is_pending());
+    clock.advance(Duration::from_millis(1));
+    let high = alloc_test_slot();
+    let r = unsafe { h.poll_acquire(high, 10, Priority::High, &waker) };
+    assert!(r.is_pending());
+    clock.advance(Duration::from_millis(1));
+    let low = alloc_test_slot();
+    let r = unsafe { h.poll_acquire(low, 10, Priority::Low, &waker) };
+    assert!(r.is_pending());
+    assert_eq!(
+        unsafe { (*abandoned.as_ptr()).abandon() },
+        AbandonResult::Abandoned
+    );
+
+    // Without credit, the walk stops at the high-priority head, so the low tier stays unmerged
+    // with its abandoned waiter ahead of the live one.
+    clock.advance(Duration::from_millis(3));
+    h.distribute();
+    assert_eq!(h.dist.merged_tiers, Priority::High as usize + 1);
+    assert_eq!(age(Priority::High), 4_000);
+    assert_eq!(age(Priority::Low), 3_000);
+
+    // Dropping the distributor closes every waiter, and each age reads 0 again.
+    drop(h);
+    for priority in Priority::ALL {
+        assert_eq!(age(priority), 0, "{priority:?} has no waiter");
+    }
+    let high_ref = unsafe { &*high.as_ptr() };
+    let low_ref = unsafe { &*low.as_ptr() };
+    assert_eq!(high_ref.poll_granted(), GrantResult::Closed);
+    assert_eq!(low_ref.poll_granted(), GrantResult::Closed);
+    unsafe {
+        free_test_slot(high);
         free_test_slot(low);
     }
 }
