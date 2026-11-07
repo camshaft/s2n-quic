@@ -2021,8 +2021,14 @@ fn reject_init(
     free: impl FnOnce(&crate::queue::ServerView, &mut crate::queue::FreedBatchTx),
 ) {
     let reset = server_view.hold_freed(incoming_pair.dest_queue_id, binding_id);
-    let sent =
-        reset && send_reset(path_secret_entry, incoming_pair, binding_id, error_code, frame_tx);
+    let sent = reset
+        && send_reset(
+            path_secret_entry,
+            incoming_pair,
+            binding_id,
+            error_code,
+            frame_tx,
+        );
     free(server_view, freed_batch_tx);
     if reset && !sent {
         server_view.release_freed(
