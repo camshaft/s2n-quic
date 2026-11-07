@@ -1331,7 +1331,7 @@ impl Context {
         self.lost_at = None;
         if lost {
             let waiting_since = self
-                .ack_wait_since
+                .ack_wait_start()
                 .map_or(self.last_peer_activity, |since| {
                     since.max(self.last_peer_activity)
                 });
@@ -1397,14 +1397,7 @@ impl Context {
     /// no probe timeout armed, so [`Self::check_acknowledgement_only_delivery`] checks it each
     /// time the assembler assembles packets for the context.
     pub fn has_stopped_delivering(&self, now: precision::Timestamp) -> bool {
-        let waiting_since = if self.inflight.has_inflight() {
-            self.ack_wait_since
-        } else if self.spreads_over_interfaces {
-            self.ack_only_probe_sent
-        } else {
-            None
-        };
-        let Some(waiting_since) = waiting_since else {
+        let Some(waiting_since) = self.ack_wait_start() else {
             return false;
         };
         let elapsed = now
@@ -1412,6 +1405,23 @@ impl Context {
             .min(now.nanos_since(self.last_peer_activity));
         let threshold = self.rtt_estimator.persistent_congestion_threshold();
         elapsed >= threshold.as_nanos() as u64
+    }
+
+    /// When this context began to wait for an acknowledgement, or `None` where no packet of it
+    /// waits for one: [`Self::ack_wait_since`] while the inflight map holds a packet, and
+    /// otherwise the time [`Self::ack_only_probe_sent`] records, such as when a context that
+    /// sends acknowledgements alone sent its probe, where the context spreads over interfaces
+    /// ([`Self::spreads_over_interfaces`]). [`Self::has_stopped_delivering`] counts its wait
+    /// from it, and [`Self::set_path_lost`] the time a lost pair stopped delivering.
+    #[inline]
+    fn ack_wait_start(&self) -> Option<precision::Timestamp> {
+        if self.inflight.has_inflight() {
+            self.ack_wait_since
+        } else if self.spreads_over_interfaces {
+            self.ack_only_probe_sent
+        } else {
+            None
+        }
     }
 
     /// True when this context sends acknowledgements alone and the peer hasn't acknowledged

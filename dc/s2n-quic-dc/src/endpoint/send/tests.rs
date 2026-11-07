@@ -1722,6 +1722,42 @@ fn an_acknowledgement_only_pair_is_marked_lost_while_it_keeps_acknowledging() {
     );
 }
 
+/// The lost mark of a context that sends acknowledgements alone records that its pair stopped
+/// delivering one smoothed RTT after its probe, which the peer didn't acknowledge, and not one
+/// smoothed RTT after the peer's last acknowledgement, which came before the probe. A sender
+/// that the peer acknowledged at that time doesn't deliver since the loss, and one it
+/// acknowledged later does.
+#[test]
+fn an_acknowledgement_only_lost_mark_records_its_stop_time_from_its_probe() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
+    let other = crate::endpoint::id::LocalSenderId::from_index(1);
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    let smoothed_rtt = ctx.rtt_estimator.smoothed_rtt();
+    ctx.on_peer_acknowledged(clock.get_time());
+    // The probe goes out two smoothed RTTs after the peer's last acknowledgement, so the stop
+    // time counted from that acknowledgement comes before the stop time counted from the probe.
+    clock.advance(smoothed_rtt * 2);
+    let probe_sent = clock.get_time();
+    ctx.ack_only_probe_sent = Some(probe_sent);
+
+    clock.advance(threshold);
+    ctx.ack_only_sent = Some(clock.get_time());
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(ctx.is_path_lost());
+
+    let stopped_at = probe_sent + smoothed_rtt;
+    entry.record_sender_delivered(other, stopped_at);
+    assert!(
+        !entry.has_sender_delivering_since_lost(),
+        "an acknowledgement one smoothed RTT after the probe doesn't count"
+    );
+    entry.record_sender_delivered(other, stopped_at + Duration::from_nanos(1));
+    assert!(entry.delivers_since_lost(other));
+}
+
 /// A probe that waited while the context didn't send anything for a persistent congestion
 /// period, such as a probe lost in an earlier outage, doesn't mark the pair lost: the context
 /// forgets it, and its next ACK-only packet probes again.
@@ -1826,6 +1862,10 @@ fn a_lost_mark_records_when_the_pair_stopped_delivering() {
     ] {
         let registry = Registry::default();
         let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+        if ack_wait_since.is_some() {
+            // The inflight map holds the packet that waits for an acknowledgement.
+            send_unacknowledged(&mut ctx, &make_clock(1), make_frame(64));
+        }
         ctx.last_peer_activity = at(last_peer_activity);
         ctx.ack_wait_since = ack_wait_since.map(at);
         let stopped_at = waiting_since + ctx.rtt_estimator.smoothed_rtt().as_nanos() as u64;
