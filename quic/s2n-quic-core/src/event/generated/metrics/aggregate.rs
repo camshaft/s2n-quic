@@ -13,7 +13,7 @@ use crate::event::{
     },
 };
 use alloc::{boxed::Box, vec::Vec};
-static INFO: &[Info; 169usize] = &[
+static INFO: &[Info; 170usize] = &[
     info::Builder {
         id: 0usize,
         name: Str::new("application_protocol_information\0"),
@@ -736,294 +736,300 @@ static INFO: &[Info; 169usize] = &[
     .build(),
     info::Builder {
         id: 120usize,
-        name: Str::new("connection_closed\0"),
+        name: Str::new("datagram_receive_wait\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
         id: 121usize,
+        name: Str::new("connection_closed\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 122usize,
         name: Str::new("connection_closed.latency\0"),
         units: Units::Duration,
     }
     .build(),
     info::Builder {
-        id: 122usize,
+        id: 123usize,
         name: Str::new("connection_closed.error\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 123usize,
+        id: 124usize,
         name: Str::new("version_information\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 124usize,
+        id: 125usize,
         name: Str::new("endpoint_packet_sent\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 125usize,
+        id: 126usize,
         name: Str::new("endpoint_packet_received\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 126usize,
+        id: 127usize,
         name: Str::new("endpoint_datagram_sent\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 127usize,
+        id: 128usize,
         name: Str::new("endpoint_datagram_sent.bytes\0"),
         units: Units::Bytes,
     }
     .build(),
     info::Builder {
-        id: 128usize,
+        id: 129usize,
         name: Str::new("endpoint_datagram_sent.bytes.total\0"),
         units: Units::Bytes,
     }
     .build(),
     info::Builder {
-        id: 129usize,
+        id: 130usize,
         name: Str::new("endpoint_datagram_sent.gso_offset\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 130usize,
+        id: 131usize,
         name: Str::new("endpoint_datagram_received\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 131usize,
+        id: 132usize,
         name: Str::new("endpoint_datagram_received.bytes\0"),
         units: Units::Bytes,
     }
     .build(),
     info::Builder {
-        id: 132usize,
+        id: 133usize,
         name: Str::new("endpoint_datagram_received.bytes.total\0"),
         units: Units::Bytes,
     }
     .build(),
     info::Builder {
-        id: 133usize,
+        id: 134usize,
         name: Str::new("endpoint_datagram_dropped\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 134usize,
+        id: 135usize,
         name: Str::new("endpoint_datagram_dropped.bytes\0"),
         units: Units::Bytes,
     }
     .build(),
     info::Builder {
-        id: 135usize,
+        id: 136usize,
         name: Str::new("endpoint_datagram_dropped.bytes.total\0"),
         units: Units::Bytes,
     }
     .build(),
     info::Builder {
-        id: 136usize,
+        id: 137usize,
         name: Str::new("endpoint_datagram_dropped.reason\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 137usize,
+        id: 138usize,
         name: Str::new("endpoint_connection_attempt_failed\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 138usize,
+        id: 139usize,
         name: Str::new("endpoint_connection_attempt_failed.error\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 139usize,
+        id: 140usize,
         name: Str::new("endpoint_connection_attempt_deduplicated\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 140usize,
+        id: 141usize,
         name: Str::new("platform_tx\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 141usize,
+        id: 142usize,
         name: Str::new("platform_tx.packets.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 142usize,
+        id: 143usize,
         name: Str::new("platform_tx.packets\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 143usize,
+        id: 144usize,
         name: Str::new("platform_tx.syscalls.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 144usize,
+        id: 145usize,
         name: Str::new("platform_tx.syscalls\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 145usize,
+        id: 146usize,
         name: Str::new("platform_tx.syscalls.blocked.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 146usize,
+        id: 147usize,
         name: Str::new("platform_tx.syscalls.blocked\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 147usize,
+        id: 148usize,
         name: Str::new("platform_tx.errors.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 148usize,
+        id: 149usize,
         name: Str::new("platform_tx.errors\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 149usize,
+        id: 150usize,
         name: Str::new("platform_tx.errors.dropped.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 150usize,
+        id: 151usize,
         name: Str::new("platform_tx.errors.dropped\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 151usize,
+        id: 152usize,
         name: Str::new("platform_tx_error\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 152usize,
+        id: 153usize,
         name: Str::new("platform_rx\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 153usize,
+        id: 154usize,
         name: Str::new("platform_rx.packets.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 154usize,
+        id: 155usize,
         name: Str::new("platform_rx.packets\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 155usize,
+        id: 156usize,
         name: Str::new("platform_rx.syscalls.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 156usize,
+        id: 157usize,
         name: Str::new("platform_rx.syscalls\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 157usize,
+        id: 158usize,
         name: Str::new("platform_rx.syscalls.blocked.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 158usize,
+        id: 159usize,
         name: Str::new("platform_rx.syscalls.blocked\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 159usize,
+        id: 160usize,
         name: Str::new("platform_rx.errors.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 160usize,
+        id: 161usize,
         name: Str::new("platform_rx.errors\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 161usize,
+        id: 162usize,
         name: Str::new("platform_rx.errors.dropped.total\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 162usize,
+        id: 163usize,
         name: Str::new("platform_rx.errors.dropped\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 163usize,
+        id: 164usize,
         name: Str::new("platform_rx_error\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 164usize,
+        id: 165usize,
         name: Str::new("platform_feature_configured\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 165usize,
+        id: 166usize,
         name: Str::new("platform_event_loop_wakeup\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 166usize,
+        id: 167usize,
         name: Str::new("platform_event_loop_sleep\0"),
         units: Units::None,
     }
     .build(),
     info::Builder {
-        id: 167usize,
+        id: 168usize,
         name: Str::new("platform_event_loop_sleep.processing_duration\0"),
         units: Units::Duration,
     }
     .build(),
     info::Builder {
-        id: 168usize,
+        id: 169usize,
         name: Str::new("platform_event_loop_started\0"),
         units: Units::None,
     }
@@ -1036,7 +1042,7 @@ pub struct ConnectionContext {
 }
 pub struct Subscriber<R: Registry> {
     #[allow(dead_code)]
-    counters: Box<[R::Counter; 81usize]>,
+    counters: Box<[R::Counter; 82usize]>,
     #[allow(dead_code)]
     bool_counters: Box<[R::BoolCounter; 3usize]>,
     #[allow(dead_code)]
@@ -1071,7 +1077,7 @@ impl<R: Registry> Subscriber<R> {
     #[allow(unused_mut)]
     #[inline]
     pub fn new(registry: R) -> Self {
-        let mut counters = Vec::with_capacity(81usize);
+        let mut counters = Vec::with_capacity(82usize);
         let mut bool_counters = Vec::with_capacity(3usize);
         let mut nominal_counters = Vec::with_capacity(30usize);
         let mut nominal_counter_offsets = Vec::with_capacity(30usize);
@@ -1135,32 +1141,33 @@ impl<R: Registry> Subscriber<R> {
         counters.push(registry.register_counter(&INFO[113usize]));
         counters.push(registry.register_counter(&INFO[119usize]));
         counters.push(registry.register_counter(&INFO[120usize]));
-        counters.push(registry.register_counter(&INFO[123usize]));
+        counters.push(registry.register_counter(&INFO[121usize]));
         counters.push(registry.register_counter(&INFO[124usize]));
         counters.push(registry.register_counter(&INFO[125usize]));
         counters.push(registry.register_counter(&INFO[126usize]));
-        counters.push(registry.register_counter(&INFO[130usize]));
-        counters.push(registry.register_counter(&INFO[133usize]));
-        counters.push(registry.register_counter(&INFO[137usize]));
-        counters.push(registry.register_counter(&INFO[139usize]));
+        counters.push(registry.register_counter(&INFO[127usize]));
+        counters.push(registry.register_counter(&INFO[131usize]));
+        counters.push(registry.register_counter(&INFO[134usize]));
+        counters.push(registry.register_counter(&INFO[138usize]));
         counters.push(registry.register_counter(&INFO[140usize]));
         counters.push(registry.register_counter(&INFO[141usize]));
-        counters.push(registry.register_counter(&INFO[143usize]));
-        counters.push(registry.register_counter(&INFO[145usize]));
-        counters.push(registry.register_counter(&INFO[147usize]));
-        counters.push(registry.register_counter(&INFO[149usize]));
-        counters.push(registry.register_counter(&INFO[151usize]));
+        counters.push(registry.register_counter(&INFO[142usize]));
+        counters.push(registry.register_counter(&INFO[144usize]));
+        counters.push(registry.register_counter(&INFO[146usize]));
+        counters.push(registry.register_counter(&INFO[148usize]));
+        counters.push(registry.register_counter(&INFO[150usize]));
         counters.push(registry.register_counter(&INFO[152usize]));
         counters.push(registry.register_counter(&INFO[153usize]));
-        counters.push(registry.register_counter(&INFO[155usize]));
-        counters.push(registry.register_counter(&INFO[157usize]));
-        counters.push(registry.register_counter(&INFO[159usize]));
-        counters.push(registry.register_counter(&INFO[161usize]));
-        counters.push(registry.register_counter(&INFO[163usize]));
+        counters.push(registry.register_counter(&INFO[154usize]));
+        counters.push(registry.register_counter(&INFO[156usize]));
+        counters.push(registry.register_counter(&INFO[158usize]));
+        counters.push(registry.register_counter(&INFO[160usize]));
+        counters.push(registry.register_counter(&INFO[162usize]));
         counters.push(registry.register_counter(&INFO[164usize]));
         counters.push(registry.register_counter(&INFO[165usize]));
         counters.push(registry.register_counter(&INFO[166usize]));
-        counters.push(registry.register_counter(&INFO[168usize]));
+        counters.push(registry.register_counter(&INFO[167usize]));
+        counters.push(registry.register_counter(&INFO[169usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[24usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[34usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[98usize]));
@@ -1469,7 +1476,7 @@ impl<R: Registry> Subscriber<R> {
                 let mut count = 0;
                 for variant in <crate::connection::Error as AsVariant>::VARIANTS.iter() {
                     nominal_counters
-                        .push(registry.register_nominal_counter(&INFO[122usize], variant));
+                        .push(registry.register_nominal_counter(&INFO[123usize], variant));
                     count += 1;
                 }
                 debug_assert_ne!(count, 0, "field type needs at least one variant");
@@ -1480,7 +1487,7 @@ impl<R: Registry> Subscriber<R> {
                 let mut count = 0;
                 for variant in <DatagramDropReason as AsVariant>::VARIANTS.iter() {
                     nominal_counters
-                        .push(registry.register_nominal_counter(&INFO[136usize], variant));
+                        .push(registry.register_nominal_counter(&INFO[137usize], variant));
                     count += 1;
                 }
                 debug_assert_ne!(count, 0, "field type needs at least one variant");
@@ -1491,7 +1498,7 @@ impl<R: Registry> Subscriber<R> {
                 let mut count = 0;
                 for variant in <crate::connection::Error as AsVariant>::VARIANTS.iter() {
                     nominal_counters
-                        .push(registry.register_nominal_counter(&INFO[138usize], variant));
+                        .push(registry.register_nominal_counter(&INFO[139usize], variant));
                     count += 1;
                 }
                 debug_assert_ne!(count, 0, "field type needs at least one variant");
@@ -1520,23 +1527,23 @@ impl<R: Registry> Subscriber<R> {
         measures.push(registry.register_measure(&INFO[108usize]));
         measures.push(registry.register_measure(&INFO[109usize]));
         measures.push(registry.register_measure(&INFO[110usize]));
-        measures.push(registry.register_measure(&INFO[127usize]));
         measures.push(registry.register_measure(&INFO[128usize]));
         measures.push(registry.register_measure(&INFO[129usize]));
-        measures.push(registry.register_measure(&INFO[131usize]));
+        measures.push(registry.register_measure(&INFO[130usize]));
         measures.push(registry.register_measure(&INFO[132usize]));
-        measures.push(registry.register_measure(&INFO[134usize]));
+        measures.push(registry.register_measure(&INFO[133usize]));
         measures.push(registry.register_measure(&INFO[135usize]));
-        measures.push(registry.register_measure(&INFO[142usize]));
-        measures.push(registry.register_measure(&INFO[144usize]));
-        measures.push(registry.register_measure(&INFO[146usize]));
-        measures.push(registry.register_measure(&INFO[148usize]));
-        measures.push(registry.register_measure(&INFO[150usize]));
-        measures.push(registry.register_measure(&INFO[154usize]));
-        measures.push(registry.register_measure(&INFO[156usize]));
-        measures.push(registry.register_measure(&INFO[158usize]));
-        measures.push(registry.register_measure(&INFO[160usize]));
-        measures.push(registry.register_measure(&INFO[162usize]));
+        measures.push(registry.register_measure(&INFO[136usize]));
+        measures.push(registry.register_measure(&INFO[143usize]));
+        measures.push(registry.register_measure(&INFO[145usize]));
+        measures.push(registry.register_measure(&INFO[147usize]));
+        measures.push(registry.register_measure(&INFO[149usize]));
+        measures.push(registry.register_measure(&INFO[151usize]));
+        measures.push(registry.register_measure(&INFO[155usize]));
+        measures.push(registry.register_measure(&INFO[157usize]));
+        measures.push(registry.register_measure(&INFO[159usize]));
+        measures.push(registry.register_measure(&INFO[161usize]));
+        measures.push(registry.register_measure(&INFO[163usize]));
         timers.push(registry.register_timer(&INFO[48usize]));
         timers.push(registry.register_timer(&INFO[49usize]));
         timers.push(registry.register_timer(&INFO[50usize]));
@@ -1550,8 +1557,8 @@ impl<R: Registry> Subscriber<R> {
         timers.push(registry.register_timer(&INFO[115usize]));
         timers.push(registry.register_timer(&INFO[116usize]));
         timers.push(registry.register_timer(&INFO[117usize]));
-        timers.push(registry.register_timer(&INFO[121usize]));
-        timers.push(registry.register_timer(&INFO[167usize]));
+        timers.push(registry.register_timer(&INFO[122usize]));
+        timers.push(registry.register_timer(&INFO[168usize]));
         {
             #[allow(unused_imports)]
             use api::*;
@@ -1651,32 +1658,33 @@ impl<R: Registry> Subscriber<R> {
                 52usize => (&INFO[113usize], entry),
                 53usize => (&INFO[119usize], entry),
                 54usize => (&INFO[120usize], entry),
-                55usize => (&INFO[123usize], entry),
+                55usize => (&INFO[121usize], entry),
                 56usize => (&INFO[124usize], entry),
                 57usize => (&INFO[125usize], entry),
                 58usize => (&INFO[126usize], entry),
-                59usize => (&INFO[130usize], entry),
-                60usize => (&INFO[133usize], entry),
-                61usize => (&INFO[137usize], entry),
-                62usize => (&INFO[139usize], entry),
+                59usize => (&INFO[127usize], entry),
+                60usize => (&INFO[131usize], entry),
+                61usize => (&INFO[134usize], entry),
+                62usize => (&INFO[138usize], entry),
                 63usize => (&INFO[140usize], entry),
                 64usize => (&INFO[141usize], entry),
-                65usize => (&INFO[143usize], entry),
-                66usize => (&INFO[145usize], entry),
-                67usize => (&INFO[147usize], entry),
-                68usize => (&INFO[149usize], entry),
-                69usize => (&INFO[151usize], entry),
+                65usize => (&INFO[142usize], entry),
+                66usize => (&INFO[144usize], entry),
+                67usize => (&INFO[146usize], entry),
+                68usize => (&INFO[148usize], entry),
+                69usize => (&INFO[150usize], entry),
                 70usize => (&INFO[152usize], entry),
                 71usize => (&INFO[153usize], entry),
-                72usize => (&INFO[155usize], entry),
-                73usize => (&INFO[157usize], entry),
-                74usize => (&INFO[159usize], entry),
-                75usize => (&INFO[161usize], entry),
-                76usize => (&INFO[163usize], entry),
+                72usize => (&INFO[154usize], entry),
+                73usize => (&INFO[156usize], entry),
+                74usize => (&INFO[158usize], entry),
+                75usize => (&INFO[160usize], entry),
+                76usize => (&INFO[162usize], entry),
                 77usize => (&INFO[164usize], entry),
                 78usize => (&INFO[165usize], entry),
                 79usize => (&INFO[166usize], entry),
-                80usize => (&INFO[168usize], entry),
+                80usize => (&INFO[167usize], entry),
+                81usize => (&INFO[169usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -1884,19 +1892,19 @@ impl<R: Registry> Subscriber<R> {
                     let offset = *entry;
                     let variants = <crate::connection::Error as AsVariant>::VARIANTS;
                     let entries = &self.nominal_counters[offset..offset + variants.len()];
-                    (&INFO[122usize], entries, variants)
+                    (&INFO[123usize], entries, variants)
                 }
                 28usize => {
                     let offset = *entry;
                     let variants = <DatagramDropReason as AsVariant>::VARIANTS;
                     let entries = &self.nominal_counters[offset..offset + variants.len()];
-                    (&INFO[136usize], entries, variants)
+                    (&INFO[137usize], entries, variants)
                 }
                 29usize => {
                     let offset = *entry;
                     let variants = <crate::connection::Error as AsVariant>::VARIANTS;
                     let entries = &self.nominal_counters[offset..offset + variants.len()];
-                    (&INFO[138usize], entries, variants)
+                    (&INFO[139usize], entries, variants)
                 }
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
@@ -1938,23 +1946,23 @@ impl<R: Registry> Subscriber<R> {
                 19usize => (&INFO[108usize], entry),
                 20usize => (&INFO[109usize], entry),
                 21usize => (&INFO[110usize], entry),
-                22usize => (&INFO[127usize], entry),
-                23usize => (&INFO[128usize], entry),
-                24usize => (&INFO[129usize], entry),
-                25usize => (&INFO[131usize], entry),
-                26usize => (&INFO[132usize], entry),
-                27usize => (&INFO[134usize], entry),
-                28usize => (&INFO[135usize], entry),
-                29usize => (&INFO[142usize], entry),
-                30usize => (&INFO[144usize], entry),
-                31usize => (&INFO[146usize], entry),
-                32usize => (&INFO[148usize], entry),
-                33usize => (&INFO[150usize], entry),
-                34usize => (&INFO[154usize], entry),
-                35usize => (&INFO[156usize], entry),
-                36usize => (&INFO[158usize], entry),
-                37usize => (&INFO[160usize], entry),
-                38usize => (&INFO[162usize], entry),
+                22usize => (&INFO[128usize], entry),
+                23usize => (&INFO[129usize], entry),
+                24usize => (&INFO[130usize], entry),
+                25usize => (&INFO[132usize], entry),
+                26usize => (&INFO[133usize], entry),
+                27usize => (&INFO[135usize], entry),
+                28usize => (&INFO[136usize], entry),
+                29usize => (&INFO[143usize], entry),
+                30usize => (&INFO[145usize], entry),
+                31usize => (&INFO[147usize], entry),
+                32usize => (&INFO[149usize], entry),
+                33usize => (&INFO[151usize], entry),
+                34usize => (&INFO[155usize], entry),
+                35usize => (&INFO[157usize], entry),
+                36usize => (&INFO[159usize], entry),
+                37usize => (&INFO[161usize], entry),
+                38usize => (&INFO[163usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -1997,8 +2005,8 @@ impl<R: Registry> Subscriber<R> {
                 10usize => (&INFO[115usize], entry),
                 11usize => (&INFO[116usize], entry),
                 12usize => (&INFO[117usize], entry),
-                13usize => (&INFO[121usize], entry),
-                14usize => (&INFO[167usize], entry),
+                13usize => (&INFO[122usize], entry),
+                14usize => (&INFO[168usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -2894,6 +2902,20 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
         let _ = event;
     }
     #[inline]
+    fn on_datagram_receive_wait(
+        &mut self,
+        context: &mut Self::ConnectionContext,
+        meta: &api::ConnectionMeta,
+        event: &api::DatagramReceiveWait,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(120usize, 54usize, 1usize);
+        let _ = context;
+        let _ = meta;
+        let _ = event;
+    }
+    #[inline]
     fn on_connection_closed(
         &mut self,
         context: &mut Self::ConnectionContext,
@@ -2902,13 +2924,13 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(120usize, 54usize, 1usize);
+        self.count(121usize, 55usize, 1usize);
         self.time(
-            121usize,
+            122usize,
             13usize,
             meta.timestamp.saturating_duration_since(context.start_time),
         );
-        self.count_nominal(122usize, 27usize, &event.error);
+        self.count_nominal(123usize, 27usize, &event.error);
         let _ = context;
         let _ = meta;
         let _ = event;
@@ -2921,7 +2943,7 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(123usize, 55usize, 1usize);
+        self.count(124usize, 56usize, 1usize);
         let _ = event;
         let _ = meta;
     }
@@ -2933,7 +2955,7 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(124usize, 56usize, 1usize);
+        self.count(125usize, 57usize, 1usize);
         let _ = event;
         let _ = meta;
     }
@@ -2945,7 +2967,7 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(125usize, 57usize, 1usize);
+        self.count(126usize, 58usize, 1usize);
         let _ = event;
         let _ = meta;
     }
@@ -2957,10 +2979,10 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(126usize, 58usize, 1usize);
-        self.measure(127usize, 22usize, event.len);
-        self.measure(128usize, 23usize, event.len);
-        self.measure(129usize, 24usize, event.gso_offset);
+        self.count(127usize, 59usize, 1usize);
+        self.measure(128usize, 22usize, event.len);
+        self.measure(129usize, 23usize, event.len);
+        self.measure(130usize, 24usize, event.gso_offset);
         let _ = event;
         let _ = meta;
     }
@@ -2972,9 +2994,9 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(130usize, 59usize, 1usize);
-        self.measure(131usize, 25usize, event.len);
-        self.measure(132usize, 26usize, event.len);
+        self.count(131usize, 60usize, 1usize);
+        self.measure(132usize, 25usize, event.len);
+        self.measure(133usize, 26usize, event.len);
         let _ = event;
         let _ = meta;
     }
@@ -2986,10 +3008,10 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(133usize, 60usize, 1usize);
-        self.measure(134usize, 27usize, event.len);
-        self.measure(135usize, 28usize, event.len);
-        self.count_nominal(136usize, 28usize, &event.reason);
+        self.count(134usize, 61usize, 1usize);
+        self.measure(135usize, 27usize, event.len);
+        self.measure(136usize, 28usize, event.len);
+        self.count_nominal(137usize, 28usize, &event.reason);
         let _ = event;
         let _ = meta;
     }
@@ -3001,8 +3023,8 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(137usize, 61usize, 1usize);
-        self.count_nominal(138usize, 29usize, &event.error);
+        self.count(138usize, 62usize, 1usize);
+        self.count_nominal(139usize, 29usize, &event.error);
         let _ = event;
         let _ = meta;
     }
@@ -3014,7 +3036,7 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(139usize, 62usize, 1usize);
+        self.count(140usize, 63usize, 1usize);
         let _ = event;
         let _ = meta;
     }
@@ -3022,17 +3044,17 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     fn on_platform_tx(&mut self, meta: &api::EndpointMeta, event: &api::PlatformTx) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(140usize, 63usize, 1usize);
-        self.count(141usize, 64usize, event.count);
-        self.measure(142usize, 29usize, event.count);
-        self.count(143usize, 65usize, event.syscalls);
-        self.measure(144usize, 30usize, event.syscalls);
-        self.count(145usize, 66usize, event.blocked_syscalls);
-        self.measure(146usize, 31usize, event.blocked_syscalls);
-        self.count(147usize, 67usize, event.total_errors);
-        self.measure(148usize, 32usize, event.total_errors);
-        self.count(149usize, 68usize, event.dropped_errors);
-        self.measure(150usize, 33usize, event.dropped_errors);
+        self.count(141usize, 64usize, 1usize);
+        self.count(142usize, 65usize, event.count);
+        self.measure(143usize, 29usize, event.count);
+        self.count(144usize, 66usize, event.syscalls);
+        self.measure(145usize, 30usize, event.syscalls);
+        self.count(146usize, 67usize, event.blocked_syscalls);
+        self.measure(147usize, 31usize, event.blocked_syscalls);
+        self.count(148usize, 68usize, event.total_errors);
+        self.measure(149usize, 32usize, event.total_errors);
+        self.count(150usize, 69usize, event.dropped_errors);
+        self.measure(151usize, 33usize, event.dropped_errors);
         let _ = event;
         let _ = meta;
     }
@@ -3040,7 +3062,7 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     fn on_platform_tx_error(&mut self, meta: &api::EndpointMeta, event: &api::PlatformTxError) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(151usize, 69usize, 1usize);
+        self.count(152usize, 70usize, 1usize);
         let _ = event;
         let _ = meta;
     }
@@ -3048,17 +3070,17 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     fn on_platform_rx(&mut self, meta: &api::EndpointMeta, event: &api::PlatformRx) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(152usize, 70usize, 1usize);
-        self.count(153usize, 71usize, event.count);
-        self.measure(154usize, 34usize, event.count);
-        self.count(155usize, 72usize, event.syscalls);
-        self.measure(156usize, 35usize, event.syscalls);
-        self.count(157usize, 73usize, event.blocked_syscalls);
-        self.measure(158usize, 36usize, event.blocked_syscalls);
-        self.count(159usize, 74usize, event.total_errors);
-        self.measure(160usize, 37usize, event.total_errors);
-        self.count(161usize, 75usize, event.dropped_errors);
-        self.measure(162usize, 38usize, event.dropped_errors);
+        self.count(153usize, 71usize, 1usize);
+        self.count(154usize, 72usize, event.count);
+        self.measure(155usize, 34usize, event.count);
+        self.count(156usize, 73usize, event.syscalls);
+        self.measure(157usize, 35usize, event.syscalls);
+        self.count(158usize, 74usize, event.blocked_syscalls);
+        self.measure(159usize, 36usize, event.blocked_syscalls);
+        self.count(160usize, 75usize, event.total_errors);
+        self.measure(161usize, 37usize, event.total_errors);
+        self.count(162usize, 76usize, event.dropped_errors);
+        self.measure(163usize, 38usize, event.dropped_errors);
         let _ = event;
         let _ = meta;
     }
@@ -3066,7 +3088,7 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     fn on_platform_rx_error(&mut self, meta: &api::EndpointMeta, event: &api::PlatformRxError) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(163usize, 76usize, 1usize);
+        self.count(164usize, 77usize, 1usize);
         let _ = event;
         let _ = meta;
     }
@@ -3078,7 +3100,7 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(164usize, 77usize, 1usize);
+        self.count(165usize, 78usize, 1usize);
         let _ = event;
         let _ = meta;
     }
@@ -3090,7 +3112,7 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(165usize, 78usize, 1usize);
+        self.count(166usize, 79usize, 1usize);
         let _ = event;
         let _ = meta;
     }
@@ -3102,8 +3124,8 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(166usize, 79usize, 1usize);
-        self.time(167usize, 14usize, event.processing_duration);
+        self.count(167usize, 80usize, 1usize);
+        self.time(168usize, 14usize, event.processing_duration);
         let _ = event;
         let _ = meta;
     }
@@ -3115,7 +3137,7 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
     ) {
         #[allow(unused_imports)]
         use api::*;
-        self.count(168usize, 80usize, 1usize);
+        self.count(169usize, 81usize, 1usize);
         let _ = event;
         let _ = meta;
     }

@@ -57,6 +57,7 @@ impl Io {
             mtu_config_builder,
             max_segments,
             gro_enabled,
+            rx_timestamps_enabled,
             reuse_address,
             reuse_port,
             only_v6,
@@ -157,6 +158,22 @@ impl Io {
                 enabled: gro_enabled,
             },
         });
+
+        // Configure the socket to report the time it received each datagram, where the
+        // application enabled it
+        let rx_timestamps_requested = rx_timestamps_enabled;
+        let rx_timestamps_enabled =
+            rx_timestamps_enabled && syscall::configure_rx_timestamps(&rx_socket);
+
+        // Publish whether the socket accepted the option only where the application enabled it,
+        // so that an endpoint with the option off doesn't publish an rx timestamps configuration
+        if rx_timestamps_requested {
+            publisher.on_platform_feature_configured(event::builder::PlatformFeatureConfigured {
+                configuration: event::builder::PlatformFeatureConfiguration::RxTimestamps {
+                    enabled: rx_timestamps_enabled,
+                },
+            });
+        }
 
         // Configure packet info CMSG
         syscall::configure_pktinfo(&rx_socket);

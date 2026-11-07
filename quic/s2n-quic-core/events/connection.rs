@@ -472,6 +472,13 @@ struct DcPathCreated<'a> {
     path: &'a (dyn core::any::Any + Send + 'static),
 }
 
+#[event("transport:datagram_receive_wait")]
+/// The time a datagram waited between the socket's receive and the endpoint's read of it,
+/// published only for a datagram whose receive time the IO provider reports
+struct DatagramReceiveWait {
+    wait: Duration,
+}
+
 // NOTE - This event MUST come last, since connection-level aggregation depends on it
 #[event("connectivity:connection_closed")]
 //= https://tools.ietf.org/id/draft-marx-qlog-event-definitions-quic-h3-02#5.1.3

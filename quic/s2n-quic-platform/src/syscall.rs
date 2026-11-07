@@ -265,3 +265,26 @@ pub fn configure_gro(rx_socket: &Socket) -> bool {
 
     success
 }
+
+/// Configures the socket to return the time it received each datagram as part of the ancillary
+/// data
+pub fn configure_rx_timestamps(rx_socket: &Socket) -> bool {
+    let mut success = false;
+
+    #[cfg(unix)]
+    if let Some((level, ty)) = crate::features::rx_timestamps::SOCKOPT {
+        use std::os::unix::io::AsRawFd;
+        let enabled: libc::c_int = 1;
+
+        success |= libc!(setsockopt(
+            rx_socket.as_raw_fd(),
+            level as _,
+            ty as _,
+            &enabled as *const _ as _,
+            core::mem::size_of_val(&enabled) as _
+        ))
+        .is_ok();
+    }
+
+    success
+}

@@ -44,6 +44,7 @@ mod no_tls;
 mod offload;
 mod platform_events;
 mod pto;
+mod receive_wait;
 mod resumption;
 mod self_test;
 mod skip_packets;

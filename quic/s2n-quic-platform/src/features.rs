@@ -9,6 +9,7 @@ pub mod gso;
 pub mod pktinfo;
 pub mod pktinfo_v4;
 pub mod pktinfo_v6;
+pub mod rx_timestamps;
 pub mod tos;
 pub mod tos_v4;
 pub mod tos_v6;

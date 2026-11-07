@@ -402,7 +402,12 @@ impl Queue {
             let path = *msg.handle();
             let ecn = msg.ecn();
             let payload = msg.payload().to_vec();
-            let packet = Packet { path, ecn, payload };
+            let packet = Packet {
+                path,
+                ecn,
+                payload,
+                receive_wait: None,
+            };
             self.send_packet(packet);
         }
 
@@ -473,6 +478,7 @@ impl Queue {
 
             *msg.handle_mut() = packet.path;
             *msg.ecn_mut() = packet.ecn;
+            *msg.receive_wait_mut() = packet.receive_wait;
             let payload = msg.payload_mut();
             let to_copy = payload.len().min(packet.payload.len());
             payload[..to_copy].copy_from_slice(&packet.payload[..to_copy]);
@@ -526,6 +532,8 @@ impl Queue {
 pub struct Packet {
     pub path: Tuple,
     pub ecn: ExplicitCongestionNotification,
+    /// The time the packet waits between the receiving socket's receive and the endpoint's read
+    pub receive_wait: Option<core::time::Duration>,
     pub payload: Vec<u8>,
 }
 

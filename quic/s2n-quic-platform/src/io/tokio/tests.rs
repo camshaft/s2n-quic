@@ -14,32 +14,48 @@ use s2n_quic_core::{
     path::{mtu, Handle as _},
     time::{Clock, Duration, Timestamp},
 };
-use std::{collections::BTreeMap, net::ToSocketAddrs};
+use std::{
+    collections::BTreeMap,
+    net::ToSocketAddrs,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+};
 
 struct TestEndpoint<const IS_SERVER: bool> {
     handle: PathHandle,
     messages: BTreeMap<u32, Option<Timestamp>>,
     now: Option<Timestamp>,
-    subscriber: NoopSubscriber,
+    subscriber: FeatureSubscriber,
+    receive_waits: Arc<AtomicUsize>,
 }
 
 impl<const IS_SERVER: bool> TestEndpoint<IS_SERVER> {
-    fn new(handle: PathHandle) -> Self {
+    fn new(
+        handle: PathHandle,
+        receive_waits: Arc<AtomicUsize>,
+        rx_timestamps: Arc<Mutex<Vec<bool>>>,
+    ) -> Self {
         let messages = if IS_SERVER { 0 } else { 30 };
         let messages = (0..messages).map(|id| (id, None)).collect();
         Self {
             handle,
             messages,
             now: None,
-            subscriber: Default::default(),
+            subscriber: FeatureSubscriber { rx_timestamps },
+            receive_waits,
         }
     }
 }
 
+/// Records the `enabled` of each rx timestamps configuration the io publishes
 #[derive(Debug, Default)]
-struct NoopSubscriber;
+struct FeatureSubscriber {
+    rx_timestamps: Arc<Mutex<Vec<bool>>>,
+}
 
-impl event::Subscriber for NoopSubscriber {
+impl event::Subscriber for FeatureSubscriber {
     type ConnectionContext = ();
 
     fn create_connection_context(
@@ -48,11 +64,23 @@ impl event::Subscriber for NoopSubscriber {
         _info: &event::api::ConnectionInfo,
     ) -> Self::ConnectionContext {
     }
+
+    fn on_platform_feature_configured(
+        &mut self,
+        _meta: &event::api::EndpointMeta,
+        event: &event::api::PlatformFeatureConfigured,
+    ) {
+        if let event::api::PlatformFeatureConfiguration::RxTimestamps { enabled, .. } =
+            &event.configuration
+        {
+            self.rx_timestamps.lock().unwrap().push(*enabled);
+        }
+    }
 }
 
 impl<const IS_SERVER: bool> Endpoint for TestEndpoint<IS_SERVER> {
     type PathHandle = PathHandle;
-    type Subscriber = NoopSubscriber;
+    type Subscriber = FeatureSubscriber;
 
     const ENDPOINT_TYPE: endpoint::Type = if IS_SERVER {
         endpoint::Type::Server
@@ -93,7 +121,12 @@ impl<const IS_SERVER: bool> Endpoint for TestEndpoint<IS_SERVER> {
         let now = clock.get_time();
         self.now = Some(now);
 
-        queue.for_each(|_header, payload| {
+        queue.for_each(|header, payload| {
+            // count each datagram that holds the time it waited after the socket received it
+            if header.receive_wait.is_some() {
+                self.receive_waits.fetch_add(1, Ordering::Relaxed);
+            }
+
             // we should only be receiving u32 values
             if payload.len() != 4 {
                 return;
@@ -141,6 +174,7 @@ impl<const IS_SERVER: bool> Endpoint for TestEndpoint<IS_SERVER> {
 async fn runtime<A: ToSocketAddrs>(
     receive_addr: A,
     send_addr: Option<A>,
+    rx_timestamps: bool,
 ) -> io::Result<(super::Io, SocketAddress)> {
     let mut io_builder = Io::builder();
 
@@ -150,6 +184,7 @@ async fn runtime<A: ToSocketAddrs>(
     let rx_addr = rx_socket.local_addr()?;
 
     io_builder = io_builder.with_rx_socket(rx_socket)?;
+    io_builder = io_builder.with_rx_timestamps(rx_timestamps)?;
 
     if let Some(tx_addr) = send_addr {
         let tx_socket = syscall::bind_udp(tx_addr, false, false, false)?;
@@ -180,19 +215,59 @@ async fn test<A: ToSocketAddrs>(
     client_rx_addr: A,
     client_tx_addr: Option<A>,
 ) -> io::Result<()> {
-    let (server_io, server_addr) = runtime(server_rx_addr, server_tx_addr).await?;
-    let (client_io, client_addr) = runtime(client_rx_addr, client_tx_addr).await?;
+    let exchanged = exchange(
+        server_rx_addr,
+        server_tx_addr,
+        client_rx_addr,
+        client_tx_addr,
+        false,
+    )
+    .await?;
+
+    // without the rx timestamps option, no received datagram holds a wait
+    assert_eq!(exchanged.receive_waits, 0);
+    // and neither endpoint's io publishes an rx timestamps configuration
+    assert!(exchanged.server_rx_timestamps.is_empty());
+    assert!(exchanged.client_rx_timestamps.is_empty());
+
+    Ok(())
+}
+
+/// What the test endpoints read in an exchange of their messages
+struct Exchanged {
+    /// How many of the datagrams the endpoints received held the time the datagram waited after
+    /// the socket received it
+    receive_waits: usize,
+    /// The `enabled` of each rx timestamps configuration the server's io published
+    server_rx_timestamps: Vec<bool>,
+    /// The `enabled` of each rx timestamps configuration the client's io published
+    client_rx_timestamps: Vec<bool>,
+}
+
+/// Exchanges the test endpoints' messages, and returns what the endpoints read
+async fn exchange<A: ToSocketAddrs>(
+    server_rx_addr: A,
+    server_tx_addr: Option<A>,
+    client_rx_addr: A,
+    client_tx_addr: Option<A>,
+    rx_timestamps: bool,
+) -> io::Result<Exchanged> {
+    let (server_io, server_addr) = runtime(server_rx_addr, server_tx_addr, rx_timestamps).await?;
+    let (client_io, client_addr) = runtime(client_rx_addr, client_tx_addr, rx_timestamps).await?;
+    let receive_waits = Arc::new(AtomicUsize::new(0));
+    let server_configured = Arc::new(Mutex::new(vec![]));
+    let client_configured = Arc::new(Mutex::new(vec![]));
 
     let server_endpoint = {
         let mut handle = PathHandle::from_remote_address(client_addr.into());
         handle.local_address = server_addr.into();
-        TestEndpoint::<true>::new(handle)
+        TestEndpoint::<true>::new(handle, receive_waits.clone(), server_configured.clone())
     };
 
     let client_endpoint = {
         let mut handle = PathHandle::from_remote_address(server_addr.into());
         handle.local_address = client_addr.into();
-        TestEndpoint::<false>::new(handle)
+        TestEndpoint::<false>::new(handle, receive_waits.clone(), client_configured.clone())
     };
 
     let (server_task, actual_server_addr) = server_io.start(server_endpoint)?;
@@ -205,7 +280,14 @@ async fn test<A: ToSocketAddrs>(
 
     server_task.abort();
 
-    Ok(())
+    let server_rx_timestamps = server_configured.lock().unwrap().clone();
+    let client_rx_timestamps = client_configured.lock().unwrap().clone();
+
+    Ok(Exchanged {
+        receive_waits: receive_waits.load(Ordering::Relaxed),
+        server_rx_timestamps,
+        client_rx_timestamps,
+    })
 }
 
 static IPV4_LOCALHOST: &str = "127.0.0.1:0";
@@ -261,6 +343,29 @@ async fn ipv6_two_socket_test() -> io::Result<()> {
         }
         other => other,
     }
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn ipv4_rx_timestamps_test() -> io::Result<()> {
+    let exchanged = exchange(IPV4_LOCALHOST, None, IPV4_LOCALHOST, None, true).await?;
+
+    let supported = crate::features::rx_timestamps::SOCKOPT.is_some();
+
+    // each endpoint's io publishes whether its socket accepted the option, which it does where
+    // the platform supports it
+    assert_eq!(exchanged.server_rx_timestamps, [supported]);
+    assert_eq!(exchanged.client_rx_timestamps, [supported]);
+
+    if supported {
+        // the socket reports the time it received each datagram, so the endpoints read waits
+        assert!(exchanged.receive_waits > 0);
+    } else {
+        // the platform doesn't report a receive time, so no received datagram holds a wait
+        assert_eq!(exchanged.receive_waits, 0);
+    }
+
+    Ok(())
 }
 
 #[cfg(unix)]

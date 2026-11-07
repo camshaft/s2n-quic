@@ -65,6 +65,8 @@ macro_rules! event_recorder {
 event_recorder!(FrameSent, FrameSent, on_frame_sent);
 event_recorder!(PacketSent, PacketSent, on_packet_sent);
 event_recorder!(MtuUpdated, MtuUpdated, on_mtu_updated);
+event_recorder!(DatagramReceiveWait, DatagramReceiveWait, on_datagram_receive_wait);
+event_recorder!(DatagramReceived, DatagramReceived, on_datagram_received);
 event_recorder!(
     PathUpdated,
     RecoveryMetrics,
