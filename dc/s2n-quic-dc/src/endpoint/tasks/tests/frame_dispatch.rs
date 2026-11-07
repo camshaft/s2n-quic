@@ -410,3 +410,131 @@ fn a_batch_that_mixes_a_ping_with_a_bulk_frame_isnt_of_the_highest_priority() {
     let bulk = FrameBatch::single(test_frame_with_payload(&pse, 1000));
     assert!(!bulk.holds_highest_priority(), "a bulk frame");
 }
+
+// -- The window of the frames without send credit ------------------------------------------
+
+type Lane = unsync::Receiver<EntryAdapter<frame::Frame>>;
+
+/// Returns the priority router of `frame_dispatch` over `window`, with the sender of its
+/// submission channel and the receiver of each of its lanes.
+fn priority_router(
+    window: crate::endpoint::combinator::CreditlessWindow,
+) -> (
+    SubmissionSender,
+    impl crate::socket::channel::Receiver<()>,
+    Vec<Lane>,
+) {
+    let (frame_tx, frame_rx) = frame::submission_channel(1);
+    let mut lanes = Vec::new();
+    let lane_txs = core::array::from_fn(|_| {
+        let (tx, rx) = unsync::new::<frame::Frame>();
+        lanes.push(rx);
+        tx.into_list_sender()
+    });
+    let registry = crate::counter::Registry::default();
+    let gauges = core::array::from_fn(|i| {
+        registry.register_queue_gauge_nominal("q.router_to_batcher", format_args!("p{i}"))
+    });
+    let router = tasks::FrameReceiver::new(frame_rx, lane_txs, gauges, window);
+    (frame_tx, router, lanes)
+}
+
+/// Polls `router` once, with a waker that does nothing.
+fn poll_router(
+    router: &mut impl crate::socket::channel::Receiver<()>,
+) -> core::task::Poll<Option<()>> {
+    let waker = s2n_quic_core::task::waker::noop();
+    let mut cx = core::task::Context::from_waker(&waker);
+    let mut budget = crate::socket::channel::Budget::new(usize::MAX);
+    router.poll_recv(&mut cx, &mut budget)
+}
+
+/// Takes the frames of `lanes`, the first lane's first, and returns each frame's byte cost and
+/// send credit.
+fn take_lanes(lanes: &mut [Lane]) -> Vec<(u64, u64)> {
+    let mut frames = crate::intrusive::Queue::<frame::Frame>::new();
+    for lane in lanes {
+        lane.drain_into(&mut frames);
+    }
+    frames
+        .iter()
+        .map(|frame| (frame.byte_cost(), frame.flow_credits))
+        .collect()
+}
+
+/// The priority router moves a frame without send credit into its lane only once the window
+/// admits its bytes, and keeps each frame after a refused frame, in its lane or a later lane.
+#[test]
+fn the_priority_router_holds_frames_without_send_credit_at_the_window() {
+    use core::task::Poll;
+
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(1)
+        .build(None);
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    // Two frames without send credit in the first lane, and a frame with send credit in the
+    // last lane.
+    let mut first = test_frame(&pse);
+    first.header = frame::Header::Ping;
+    let mut second = test_frame(&pse);
+    second.header = frame::Header::Ping;
+    let mut credited = test_frame_with_payload(&pse, 3000);
+    credited.flow_credits = 4096;
+    let costs = [&first, &second, &credited].map(|frame| frame.byte_cost());
+    let mut input = PriorityInput::default();
+    input.push(first);
+    input.push(second);
+    input.push(credited);
+    frame_tx.send_batch(input).unwrap();
+
+    // The window's limit starts at 0, so it admits the first frame alone, while it holds
+    // nothing, and holds its bytes.
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(costs[0], 0)]);
+    assert_eq!(window.held(), costs[0]);
+
+    // The second frame, and the frame with send credit in the later lane, wait at the window.
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    assert!(take_lanes(&mut lanes).is_empty());
+    assert_eq!(window.round(), 2, "each pass of the priority router starts a round");
+
+    // A worker's sender takes the first frame's batch, which releases its bytes.
+    window.release(costs[0], window.round());
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(costs[1], 0), (costs[2], 4096)]);
+    assert_eq!(window.held(), costs[1]);
+
+    drop(frame_tx);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
+}
+
+/// The priority router moves every frame once it holds the window's only clone, since no
+/// worker's sender would then release their bytes.
+#[test]
+fn the_priority_router_moves_every_frame_once_the_batch_router_is_gone() {
+    use core::task::Poll;
+
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(1)
+        .build(None);
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+    let mut input = PriorityInput::default();
+    for _ in 0..3 {
+        input.push(test_frame_with_payload(&pse, 1000));
+    }
+    frame_tx.send_batch(input).unwrap();
+    drop(frame_tx);
+
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes).len(), 1);
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+
+    // The test's clone of the window stands for the batch router's.
+    drop(window);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes).len(), 2);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
+}
