@@ -301,7 +301,7 @@ pub(crate) fn path_freed_batch_sender_id(
 /// the tests that check which sender each goes to.
 #[cfg(test)]
 pub(crate) mod observe {
-    use super::{msg, LocalSenderId};
+    use super::{msg, LocalSenderId, RemoteSenderId};
     use core::cell::RefCell;
     use std::{
         net::SocketAddr,
@@ -317,12 +317,16 @@ pub(crate) mod observe {
         PendingFreed,
     }
 
-    /// One message routed to a send worker: what it carries, its sender, its path's peer, and
-    /// the lost marks of its path when the endpoint routed it.
+    /// One message routed to a send worker: what it carries, its sender, the peer sender whose
+    /// packets an acknowledgement acknowledges, its path's peer, and the lost marks of its path
+    /// when the endpoint routed it.
     #[derive(Clone, Copy, Debug)]
     pub(crate) struct Routed {
         pub(crate) kind: Kind,
         pub(crate) sender: LocalSenderId,
+        /// The peer sender whose packets a pending acknowledgement acknowledges, and `None` for
+        /// a freed batch.
+        pub(crate) remote: Option<RemoteSenderId>,
         pub(crate) peer: SocketAddr,
         /// Whether the path marks the interface pair of `sender` lost.
         pub(crate) lost: bool,
@@ -343,9 +347,11 @@ pub(crate) mod observe {
 
     /// Records `message`, where this thread records the messages it routes.
     pub(crate) fn record(message: &msg::Sender) {
-        let kind = match message {
-            msg::Sender::PendingAck(_) => Kind::PendingAck,
-            msg::Sender::PendingFreed { .. } => Kind::PendingFreed,
+        let (kind, remote) = match message {
+            msg::Sender::PendingAck(submission) => {
+                (Kind::PendingAck, Some(submission.remote_sender_id))
+            }
+            msg::Sender::PendingFreed { .. } => (Kind::PendingFreed, None),
             msg::Sender::ReceivedAck { .. } => return,
         };
         SINK.with(|sink| {
@@ -355,6 +361,7 @@ pub(crate) mod observe {
                 sink.lock().unwrap().push(Routed {
                     kind,
                     sender,
+                    remote,
                     peer: *path.peer(),
                     lost: path.is_sender_lost(sender),
                     path_has_lost: path.has_lost_sender(),
