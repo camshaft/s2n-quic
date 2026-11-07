@@ -3534,16 +3534,28 @@ fn interface_paced_pick_two_empties_its_highest_input_lists_when_its_worker_is_g
     let clock = test_clock();
     let drop_counter = Arc::new(AtomicUsize::new(0));
     // The second interface carries the highest-priority traffic. The pair of its sender is lost
-    // for the peer, so the first interface's sender takes each batch of that peer, paced.
-    let entry = test_path_secret_entry();
-    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    // for both peers, so the first interface's sender takes each batch of theirs, paced.
+    let first_peer = test_path_secret_entry();
+    let second_peer = PathSecretEntry::builder("127.0.0.1:4434".parse().unwrap())
+        .socket_sender_count(2)
+        .build(None);
+    for entry in [&first_peer, &second_peer] {
+        assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    }
+    // The input of the highest priority level holds a batch of the first peer of more bytes than
+    // a burst, two small batches of that peer and a small batch of the second peer. It stays
+    // open.
     let highest_rx = ClosableReceiver::default();
-    {
-        let mut values = highest_rx.values.borrow_mut();
-        values.extend(test_items(&entry, 3, 100_000, &drop_counter));
-        for value in values.iter_mut() {
-            value.highest_priority = true;
-        }
+    for (entry, byte_cost) in [
+        (&first_peer, 100_000),
+        (&first_peer, 2),
+        (&first_peer, 3),
+        (&second_peer, 4),
+    ] {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = byte_cost;
+        item.highest_priority = true;
+        highest_rx.values.borrow_mut().push_back(item);
     }
     let rx = ClosableReceiver::default();
     rx.closed.set(true);
@@ -3567,17 +3579,23 @@ fn interface_paced_pick_two_empties_its_highest_input_lists_when_its_worker_is_g
     )
     .with_highest_priority_input(highest_rx.clone());
 
-    // The first batch goes, the second waits on the first interface, and the third waits in the
-    // router, which lists the peer on the waiters of the first interface and on the lost peers
-    // of the second sender.
+    // The first peer's first batch goes, its second waits on the first interface for that
+    // interface's tokens, and its third waits in the router, as does the second peer's batch.
+    // The router lists both peers on the waiters of the first interface and on the lost peers of
+    // the second sender.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(router.highest_waiter_entries(), 2);
+    assert_eq!(router.highest_waiter_entries(), 4);
 
-    // Once the pacer releases the second batch, it goes to the first interface's sender, whose
-    // receiver is gone: the router ends in that poll, and empties both lists.
-    gone.set(true);
+    // The pacer releases the first peer's second batch, which leaves tokens in the first
+    // interface's bucket.
     clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_once(&mut router), Poll::Ready(Some(())));
+
+    // The router offers the first peer's third batch to the freed first interface, whose
+    // sender's receiver is gone now: the router ends in that poll, though its input is open, and
+    // empties both lists.
+    gone.set(true);
     assert_eq!(poll_once(&mut router), Poll::Ready(None));
     assert_eq!(router.highest_waiter_entries(), 0);
-    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 4);
 }
