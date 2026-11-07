@@ -71,6 +71,8 @@ mod counter {
                 149usize => Self(path_secret_map_interface_pair_preference_ended),
                 150usize => Self(path_secret_map_sender_counted_lost),
                 151usize => Self(path_secret_map_sender_counted_lost_cleared),
+                152usize => Self(path_secret_map_acknowledgement_moved),
+                153usize => Self(path_secret_map_freed_batch_moved),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -190,6 +192,10 @@ mod counter {
             fn path_secret_map_sender_counted_lost(value: u64);
             # [link_name = s2n_quic_dc__event__counter__path_secret_map_sender_counted_lost_cleared]
             fn path_secret_map_sender_counted_lost_cleared(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__path_secret_map_acknowledgement_moved]
+            fn path_secret_map_acknowledgement_moved(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__path_secret_map_freed_batch_moved]
+            fn path_secret_map_freed_batch_moved(value: u64);
         }
     );
     pub mod bool {

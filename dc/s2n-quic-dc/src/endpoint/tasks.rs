@@ -1727,12 +1727,15 @@ pub fn waker_drain(drain: endpoint::waker::Drain) -> impl Receiver<()> {
 ///
 /// For each completed pending ACK, this task updates the corresponding recv context. If the ACK
 /// became stale while it was in flight, a replacement pending ACK is submitted through
-/// `ack_sender`; otherwise the recv context settles back to idle.
+/// `ack_sender`; otherwise the recv context settles back to idle. Where `path_secret_map` is set,
+/// each replacement that goes to another sender than its context's publishes a
+/// `PathSecretMapAcknowledgementMoved` event through it.
 pub fn ack_completion<CompRx, AckTx>(
     completion_rx: CompRx,
     recv_cache: Rc<RefCell<endpoint::recv::Cache>>,
     mut ack_sender: AckTx,
     counters: Arc<endpoint::counters::Dispatch>,
+    path_secret_map: Option<crate::path::secret::Map>,
 ) -> impl Receiver<()>
 where
     CompRx: Receiver<Entry<msg::Sender>>,
@@ -1776,6 +1779,7 @@ where
             counters.rx_ack_ranges_culled.add(ranges_culled);
         }
         if let Some(submission) = submission {
+            record_ack_move(path_secret_map.as_ref(), &ctx, submission.local_sender_id);
             let mut pending_ack_entry = entry;
             *pending_ack_entry = msg::Sender::PendingAck(submission);
             let _ = ack_sender.send(pending_ack_entry);
@@ -1790,12 +1794,14 @@ where
 /// submissions.
 ///
 /// Each emitted submission is sent through `ack_sender`. Contexts that no longer have flushable
-/// ACK work are ignored.
+/// ACK work are ignored. Where `path_secret_map` is set, each submission that goes to another
+/// sender than its context's publishes a `PathSecretMapAcknowledgementMoved` event through it.
 pub fn ack_burst<AckBurstRx, AckTx>(
     ack_burst_rx: AckBurstRx,
     mut ack_sender: AckTx,
     recv_worker_id: endpoint::id::RecvDispatchWorkerId,
     counters: Arc<endpoint::counters::Dispatch>,
+    path_secret_map: Option<crate::path::secret::Map>,
 ) -> impl Receiver<()>
 where
     AckBurstRx: Receiver<Rc<RefCell<endpoint::recv::Context>>>,
@@ -1808,6 +1814,7 @@ where
             let was_scheduled = ctx.ack_state.is_scheduled();
             ctx.invariants();
             if let Some(submission) = ctx.encode_and_flush(recv_worker_id) {
+                record_ack_move(path_secret_map.as_ref(), &ctx, submission.local_sender_id);
                 let _ = ack_sender.send(Entry::new(msg::Sender::PendingAck(submission)));
             } else if was_scheduled {
                 counters.rx_ack_state_impossible.add(1);
@@ -1815,6 +1822,22 @@ where
             ctx.invariants();
         },
     )
+}
+
+/// Publishes a `PathSecretMapAcknowledgementMoved` event through `path_secret_map`, where one is
+/// set, for a submission of `ctx` that goes to another sender than the one of `ctx`, as the lost
+/// marks of the path of `ctx` route it to a sender whose pair delivers.
+fn record_ack_move(
+    path_secret_map: Option<&crate::path::secret::Map>,
+    ctx: &endpoint::recv::Context,
+    sender: LocalSenderId,
+) {
+    let Some(path_secret_map) = path_secret_map else {
+        return;
+    };
+    if sender != ctx.local_sender_id {
+        path_secret_map.on_acknowledgement_moved(ctx.path_entry.peer());
+    }
 }
 
 fn on_packet_dispatch_error(

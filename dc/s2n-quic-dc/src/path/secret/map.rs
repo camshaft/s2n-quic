@@ -376,6 +376,16 @@ impl Map {
         self.store.on_sender_counted_lost_cleared(peer_address);
     }
 
+    /// Emits a PathSecretMapAcknowledgementMoved event via the subscriber
+    pub fn on_acknowledgement_moved(&self, peer_address: &SocketAddr) {
+        self.store.on_acknowledgement_moved(peer_address);
+    }
+
+    /// Emits a PathSecretMapFreedBatchMoved event via the subscriber
+    pub fn on_freed_batch_moved(&self, peer_address: &SocketAddr) {
+        self.store.on_freed_batch_moved(peer_address);
+    }
+
     pub fn handle_control_packet(&self, packet: &control::Packet, peer: &SocketAddr) {
         match packet {
             control::Packet::StaleKey(packet) => {

@@ -1213,6 +1213,40 @@ pub mod api {
     impl<'a> Event for PathSecretMapSenderCountedLostCleared<'a> {
         const NAME: &'static str = "path_secret_map:sender_counted_lost_cleared";
     }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when an acknowledgement moves off its context's sender to one whose pair delivers"]
+    pub struct PathSecretMapAcknowledgementMoved<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapAcknowledgementMoved<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapAcknowledgementMoved");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapAcknowledgementMoved<'a> {
+        const NAME: &'static str = "path_secret_map:acknowledgement_moved";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a freed batch moves off the drawn sender of lower load to one whose pair delivers"]
+    pub struct PathSecretMapFreedBatchMoved<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapFreedBatchMoved<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapFreedBatchMoved");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapFreedBatchMoved<'a> {
+        const NAME: &'static str = "path_secret_map:freed_batch_moved";
+    }
 }
 pub mod tracing {
     #![doc = r" This module contains event integration with [`tracing`](https://docs.rs/tracing)"]
@@ -1932,6 +1966,26 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapSenderCountedLostCleared { peer_address } = event;
             tracing :: event ! (target : "path_secret_map_sender_counted_lost_cleared" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_path_secret_map_acknowledgement_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapAcknowledgementMoved,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapAcknowledgementMoved { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_acknowledgement_moved" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_path_secret_map_freed_batch_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapFreedBatchMoved,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapFreedBatchMoved { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_freed_batch_moved" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
         }
     }
 }
@@ -3146,6 +3200,36 @@ pub mod builder {
             }
         }
     }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when an acknowledgement moves off its context's sender to one whose pair delivers"]
+    pub struct PathSecretMapAcknowledgementMoved<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapAcknowledgementMoved<'a>>
+        for PathSecretMapAcknowledgementMoved<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapAcknowledgementMoved<'a> {
+            let PathSecretMapAcknowledgementMoved { peer_address } = self;
+            api::PathSecretMapAcknowledgementMoved {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a freed batch moves off the drawn sender of lower load to one whose pair delivers"]
+    pub struct PathSecretMapFreedBatchMoved<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapFreedBatchMoved<'a>> for PathSecretMapFreedBatchMoved<'a> {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapFreedBatchMoved<'a> {
+            let PathSecretMapFreedBatchMoved { peer_address } = self;
+            api::PathSecretMapFreedBatchMoved {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
 }
 pub use traits::*;
 mod traits {
@@ -3744,6 +3828,26 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `PathSecretMapAcknowledgementMoved` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_acknowledgement_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapAcknowledgementMoved,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `PathSecretMapFreedBatchMoved` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_freed_batch_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapFreedBatchMoved,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = r" Called for each event that relates to the endpoint and all connections"]
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -4240,6 +4344,24 @@ mod traits {
         ) {
             self.as_ref()
                 .on_path_secret_map_sender_counted_lost_cleared(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_acknowledgement_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapAcknowledgementMoved,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_acknowledgement_moved(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_freed_batch_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapFreedBatchMoved,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_freed_batch_moved(meta, event);
         }
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -4759,6 +4881,24 @@ mod traits {
             (self.1).on_path_secret_map_sender_counted_lost_cleared(meta, event);
         }
         #[inline]
+        fn on_path_secret_map_acknowledgement_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapAcknowledgementMoved,
+        ) {
+            (self.0).on_path_secret_map_acknowledgement_moved(meta, event);
+            (self.1).on_path_secret_map_acknowledgement_moved(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_freed_batch_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapFreedBatchMoved,
+        ) {
+            (self.0).on_path_secret_map_freed_batch_moved(meta, event);
+            (self.1).on_path_secret_map_freed_batch_moved(meta, event);
+        }
+        #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
             self.0.on_event(meta, event);
             self.1.on_event(meta, event);
@@ -4951,6 +5091,16 @@ mod traits {
         fn on_path_secret_map_sender_counted_lost_cleared(
             &self,
             event: builder::PathSecretMapSenderCountedLostCleared,
+        );
+        #[doc = "Publishes a `PathSecretMapAcknowledgementMoved` event to the publisher's subscriber"]
+        fn on_path_secret_map_acknowledgement_moved(
+            &self,
+            event: builder::PathSecretMapAcknowledgementMoved,
+        );
+        #[doc = "Publishes a `PathSecretMapFreedBatchMoved` event to the publisher's subscriber"]
+        fn on_path_secret_map_freed_batch_moved(
+            &self,
+            event: builder::PathSecretMapFreedBatchMoved,
         );
         #[doc = r" Returns the QUIC version, if any"]
         fn quic_version(&self) -> Option<u32>;
@@ -5407,6 +5557,26 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_path_secret_map_acknowledgement_moved(
+            &self,
+            event: builder::PathSecretMapAcknowledgementMoved,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_acknowledgement_moved(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_path_secret_map_freed_batch_moved(
+            &self,
+            event: builder::PathSecretMapFreedBatchMoved,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_freed_batch_moved(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn quic_version(&self) -> Option<u32> {
             self.quic_version
         }
@@ -5544,6 +5714,8 @@ pub mod testing {
             pub path_secret_map_interface_pair_preference_ended: AtomicU64,
             pub path_secret_map_sender_counted_lost: AtomicU64,
             pub path_secret_map_sender_counted_lost_cleared: AtomicU64,
+            pub path_secret_map_acknowledgement_moved: AtomicU64,
+            pub path_secret_map_freed_batch_moved: AtomicU64,
         }
         impl Drop for Subscriber {
             fn drop(&mut self) {
@@ -5627,6 +5799,8 @@ pub mod testing {
                     path_secret_map_interface_pair_preference_ended: AtomicU64::new(0),
                     path_secret_map_sender_counted_lost: AtomicU64::new(0),
                     path_secret_map_sender_counted_lost_cleared: AtomicU64::new(0),
+                    path_secret_map_acknowledgement_moved: AtomicU64::new(0),
+                    path_secret_map_freed_batch_moved: AtomicU64::new(0),
                 }
             }
         }
@@ -6254,6 +6428,30 @@ pub mod testing {
                 let out = format!("{meta:?} {event:?}");
                 self.output.lock().unwrap().push(out);
             }
+            fn on_path_secret_map_acknowledgement_moved(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapAcknowledgementMoved,
+            ) {
+                self.path_secret_map_acknowledgement_moved
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_path_secret_map_freed_batch_moved(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapFreedBatchMoved,
+            ) {
+                self.path_secret_map_freed_batch_moved
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
         }
     }
     #[derive(Debug)]
@@ -6314,6 +6512,8 @@ pub mod testing {
         pub path_secret_map_interface_pair_preference_ended: AtomicU64,
         pub path_secret_map_sender_counted_lost: AtomicU64,
         pub path_secret_map_sender_counted_lost_cleared: AtomicU64,
+        pub path_secret_map_acknowledgement_moved: AtomicU64,
+        pub path_secret_map_freed_batch_moved: AtomicU64,
     }
     impl Drop for Subscriber {
         fn drop(&mut self) {
@@ -6399,6 +6599,8 @@ pub mod testing {
                 path_secret_map_interface_pair_preference_ended: AtomicU64::new(0),
                 path_secret_map_sender_counted_lost: AtomicU64::new(0),
                 path_secret_map_sender_counted_lost_cleared: AtomicU64::new(0),
+                path_secret_map_acknowledgement_moved: AtomicU64::new(0),
+                path_secret_map_freed_batch_moved: AtomicU64::new(0),
             }
         }
     }
@@ -7055,6 +7257,30 @@ pub mod testing {
             let out = format!("{meta:?} {event:?}");
             self.output.lock().unwrap().push(out);
         }
+        fn on_path_secret_map_acknowledgement_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapAcknowledgementMoved,
+        ) {
+            self.path_secret_map_acknowledgement_moved
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_freed_batch_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapFreedBatchMoved,
+        ) {
+            self.path_secret_map_freed_batch_moved
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
     }
     #[derive(Debug)]
     pub struct Publisher {
@@ -7114,6 +7340,8 @@ pub mod testing {
         pub path_secret_map_interface_pair_preference_ended: AtomicU64,
         pub path_secret_map_sender_counted_lost: AtomicU64,
         pub path_secret_map_sender_counted_lost_cleared: AtomicU64,
+        pub path_secret_map_acknowledgement_moved: AtomicU64,
+        pub path_secret_map_freed_batch_moved: AtomicU64,
     }
     impl Publisher {
         #[doc = r" Creates a publisher with snapshot assertions enabled"]
@@ -7189,6 +7417,8 @@ pub mod testing {
                 path_secret_map_interface_pair_preference_ended: AtomicU64::new(0),
                 path_secret_map_sender_counted_lost: AtomicU64::new(0),
                 path_secret_map_sender_counted_lost_cleared: AtomicU64::new(0),
+                path_secret_map_acknowledgement_moved: AtomicU64::new(0),
+                path_secret_map_freed_batch_moved: AtomicU64::new(0),
             }
         }
     }
@@ -7662,6 +7892,28 @@ pub mod testing {
             event: builder::PathSecretMapSenderCountedLostCleared,
         ) {
             self.path_secret_map_sender_counted_lost_cleared
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_acknowledgement_moved(
+            &self,
+            event: builder::PathSecretMapAcknowledgementMoved,
+        ) {
+            self.path_secret_map_acknowledgement_moved
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_freed_batch_moved(
+            &self,
+            event: builder::PathSecretMapFreedBatchMoved,
+        ) {
+            self.path_secret_map_freed_batch_moved
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             let event = crate::event::snapshot::Fmt::to_snapshot(&event);
