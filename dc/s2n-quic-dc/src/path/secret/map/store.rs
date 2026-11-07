@@ -247,4 +247,10 @@ pub trait Store: 'static + Send + Sync + time::Clock {
         previous_limit_bytes: u64,
         limit_bytes: u64,
     );
+
+    /// Publishes a PathSecretMapSenderCountedLost event.
+    fn on_sender_counted_lost(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapSenderCountedLostCleared event.
+    fn on_sender_counted_lost_cleared(&self, peer_address: &SocketAddr);
 }
