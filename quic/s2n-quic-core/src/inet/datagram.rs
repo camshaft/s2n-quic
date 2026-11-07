@@ -10,8 +10,8 @@ use crate::{
 pub struct Header<Path> {
     pub path: Path,
     pub ecn: ExplicitCongestionNotification,
-    /// The time the datagram waited between the socket's receive and the endpoint's read of it,
-    /// where the IO provider reports the socket's receive time
+    /// The time the datagram waited between the socket's receive and the endpoint's read of its
+    /// batch, where the IO provider reports the socket's receive time
     pub receive_wait: Option<core::time::Duration>,
 }
 
@@ -40,7 +40,7 @@ pub struct AncillaryData {
     /// Set when the packet buffer is an aggregate of multiple received packets
     pub segment_size: u16,
     /// The time in nanoseconds between the socket's receive of the datagram and the read of
-    /// its message
+    /// the batch of messages that holds it
     ///
     /// This is only set where the socket reports the time it received the datagram.
     pub receive_wait_nanos: Option<u64>,

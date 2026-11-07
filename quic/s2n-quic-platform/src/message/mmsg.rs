@@ -74,6 +74,20 @@ impl MessageTrait for mmsghdr {
     }
 
     #[inline]
+    fn rx_read_at<Now: FnMut() -> Option<core::time::Duration>>(
+        &mut self,
+        local_address: &path::LocalAddress,
+        clock: &mut super::BatchClock<Now>,
+    ) -> Option<super::RxMessage<'_, Self::Handle>> {
+        unsafe {
+            // We need to replicate the `msg_len` field to the inner type before delegating
+            // Safety: The `msg_len` is associated with the same buffer as the `msg_hdr`
+            self.msg_hdr.set_payload_len(self.msg_len as _);
+        }
+        self.msg_hdr.rx_read_at(local_address, clock)
+    }
+
+    #[inline]
     fn tx_write<M: tx::Message<Handle = Self::Handle>>(
         &mut self,
         message: M,

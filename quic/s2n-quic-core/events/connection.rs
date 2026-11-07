@@ -473,7 +473,7 @@ struct DcPathCreated<'a> {
 }
 
 #[event("transport:datagram_receive_wait")]
-/// The time a datagram waited between the socket's receive and the endpoint's read of it,
+/// The time a datagram waited between the socket's receive and the endpoint's read of its batch,
 /// published only for a datagram whose receive time the IO provider reports
 struct DatagramReceiveWait {
     wait: Duration,

@@ -206,6 +206,17 @@ impl<'a> Iter<'a> {
     pub fn collect(self) -> AncillaryData {
         collect(self)
     }
+
+    /// Decodes all recognized control messages into `AncillaryData`, as `collect` does, and
+    /// reads `now` for the time of the read where a message holds the time the socket received
+    /// the datagram
+    #[inline]
+    pub fn collect_with_clock<Now>(self, now: Now) -> AncillaryData
+    where
+        Now: FnOnce() -> Option<core::time::Duration>,
+    {
+        collect_with_clock(self, now)
+    }
 }
 
 impl<'a> Iterator for Iter<'a> {
