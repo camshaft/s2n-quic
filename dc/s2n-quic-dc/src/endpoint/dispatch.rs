@@ -639,40 +639,24 @@ where
     }
     let mut peer = peer_rc.borrow_mut();
 
-    // Packet number deduplication
-    let new_packet_number = peer.dedup_filter.on_packet_number(packet_number).is_ok();
-
-    // An init the fast path rejected holds, frees and resets its slot only for a new packet
-    // number: a replayed copy of an authentic init doesn't. See `RejectInit`.
-    let decrypt_result = match decrypt_result {
-        DecryptResult::FastPath(waker) => Ok(waker),
-        DecryptResult::SlowPath(buf) => Err(buf),
-        DecryptResult::RejectedInit(rejected) => {
-            let peer = &mut *peer;
-            settle_rejected_init(
-                rejected,
-                new_packet_number,
-                &mut peer.queue_view,
-                &peer.path_entry,
-                frame_tx,
-                freed_batch_tx,
-            );
-            Ok(AutoWake::default())
-        }
-    };
-
-    if !new_packet_number {
-        record_packet_drop(
-            packet_number,
-            source_sender_id,
-            credentials.id,
-            crate::endpoint::frame_trace::DropReason::Duplicate,
-        );
-        return Err(Error::Duplicate {
+    // Packet number deduplication. The decrypt result is settled with what the filter answers:
+    // a rejected init is settled only once the filter has read its packet number, and a repeated
+    // packet number is dropped as a duplicate.
+    let decrypt_result = {
+        let peer = &mut *peer;
+        let dedup = peer.dedup_filter.on_packet_number(packet_number);
+        settle_decrypt_result(
+            decrypt_result,
+            dedup,
             credentials,
             packet_number,
-        });
-    }
+            source_sender_id,
+            &mut peer.queue_view,
+            &peer.path_entry,
+            frame_tx,
+            freed_batch_tx,
+        )?
+    };
 
     // Update activity tracking on the shared PathSecretEntry
     peer.path_entry
@@ -2026,6 +2010,58 @@ fn reject_init(
     if reset {
         send_reset(path_secret_entry, incoming_pair, binding_id, error_code, frame_tx);
     }
+}
+
+/// Settles a packet's decrypt result once the peer's dedup filter has read its packet number:
+/// `dedup` is what the filter answered. An init the fast path rejected holds, frees and resets
+/// its slot only where the packet number is new, so a replayed copy of an authentic init doesn't
+/// (see [`settle_rejected_init`]). A packet whose number the filter refuses is then dropped as a
+/// duplicate, whatever its decrypt result. For a new packet number, the answer is the waker of
+/// the frame dispatched while the packet decrypted, or the frames still to dispatch.
+#[allow(clippy::too_many_arguments)]
+fn settle_decrypt_result(
+    decrypt_result: DecryptResult,
+    dedup: Result<(), s2n_quic_core::packet::number::SlidingWindowError>,
+    credentials: Credentials,
+    packet_number: VarInt,
+    source_sender_id: VarInt,
+    queue_view: &mut recv::QueueView,
+    path_entry: &Arc<PathSecretEntry>,
+    frame_tx: &mut SubmissionSender,
+    freed_batch_tx: &mut crate::queue::FreedBatchTx,
+) -> Result<Result<AutoWake, BytesMut>, Error> {
+    let new_packet_number = dedup.is_ok();
+
+    let decrypt_result = match decrypt_result {
+        DecryptResult::FastPath(waker) => Ok(waker),
+        DecryptResult::SlowPath(buf) => Err(buf),
+        DecryptResult::RejectedInit(rejected) => {
+            settle_rejected_init(
+                rejected,
+                new_packet_number,
+                queue_view,
+                path_entry,
+                frame_tx,
+                freed_batch_tx,
+            );
+            Ok(AutoWake::default())
+        }
+    };
+
+    if !new_packet_number {
+        record_packet_drop(
+            packet_number,
+            source_sender_id,
+            credentials.id,
+            crate::endpoint::frame_trace::DropReason::Duplicate,
+        );
+        return Err(Error::Duplicate {
+            credentials,
+            packet_number,
+        });
+    }
+
+    Ok(decrypt_result)
 }
 
 /// Settles an init that the fast path rejected before its packet authenticated. `take` is

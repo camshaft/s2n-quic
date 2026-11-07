@@ -686,6 +686,8 @@ fn a_replayed_rejected_init_leaves_the_slot_as_the_first_copy_left_it() {
         &harness.path_entry,
         &mut harness.freed_batch_tx,
     );
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the release records slot 1 as freed");
 
     // A copy of that packet comes again: it authenticates, and its packet number was taken.
     assert!(init(&mut harness, &mut view, 1, false));
@@ -693,10 +695,97 @@ fn a_replayed_rejected_init_leaves_the_slot_as_the_first_copy_left_it() {
         take_resets(&mut harness.frame_rx).is_empty(),
         "a replayed init doesn't send a reset"
     );
+    assert!(
+        state.freed.take(&mut freed).is_none(),
+        "a replayed init doesn't record its slot as freed"
+    );
 
     // Binding 2's genuine init on slot 1 then holds the slot and gets its reset.
     assert!(init(&mut harness, &mut view, 2, true));
     assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 2)]);
+}
+
+/// `process` settles an init the fast path rejected with what the peer's dedup filter answered
+/// for its packet number: the first copy of an authentic init on slot 1 holds the slot and gets
+/// its reset, and once that reset leaves, a copy with the same packet number is dropped as a
+/// duplicate, and doesn't hold the slot, record it as freed or send a reset.
+#[test]
+fn a_rejected_init_whose_packet_number_repeats_is_a_duplicate_that_leaves_the_slot() {
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let mut view = recv::QueueView::Server(state.view());
+    let mut harness = FastPathHarness::new();
+    let mut dedup_filter = recv::dedup::StreamFilter::default();
+
+    let init = |harness: &mut FastPathHarness,
+                view: &mut recv::QueueView,
+                dedup_filter: &mut recv::dedup::StreamFilter| {
+        // The registry doesn't hold an acceptor, so the server rejects the init, and the packet
+        // authenticates in place, as in the decrypt closure of `process`.
+        let (mut packet, opener, decrypt_len) =
+            sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(1), VarInt::from_u8(9));
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("the server rejects an init without an acceptor");
+        };
+        assert!(
+            packet.decrypt_in_place(&opener).is_ok(),
+            "the init is sealed with its own header, so it authenticates"
+        );
+        let packet_number = packet.packet_number();
+        let dedup = dedup_filter.on_packet_number(packet_number);
+        let settled = settle_decrypt_result(
+            DecryptResult::RejectedInit(rejected),
+            dedup,
+            *packet.credentials(),
+            packet_number,
+            VarInt::from_u8(7),
+            view,
+            &harness.path_entry,
+            &mut harness.frame_tx,
+            &mut harness.freed_batch_tx,
+        );
+        (packet_number, settled)
+    };
+
+    // The first copy's packet number is new: it holds slot 1 for binding 1 and gets its reset.
+    let (_, settled) = init(&mut harness, &mut view, &mut dedup_filter);
+    assert!(matches!(settled, Ok(Ok(_))), "a new packet number is taken");
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 1)]);
+
+    // The reset leaves the priority router, which ends the hold and records slot 1 as freed.
+    state.freed.release(
+        VarInt::from_u8(1),
+        VarInt::from_u8(1),
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the release records slot 1 as freed");
+
+    // A copy with the same packet number comes again: the dedup filter refuses its number, so
+    // it is dropped as a duplicate and leaves slot 1 as the release left it.
+    let (packet_number, settled) = init(&mut harness, &mut view, &mut dedup_filter);
+    let Err(Error::Duplicate {
+        packet_number: duplicate,
+        ..
+    }) = settled
+    else {
+        panic!("a packet number the dedup filter refuses is a duplicate");
+    };
+    assert_eq!(duplicate, packet_number);
+    assert!(
+        take_resets(&mut harness.frame_rx).is_empty(),
+        "a duplicate doesn't send a reset"
+    );
+    assert!(
+        state.freed.take(&mut freed).is_none(),
+        "a duplicate doesn't record its slot as freed"
+    );
+    assert!(
+        state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)),
+        "a duplicate doesn't hold slot 1"
+    );
 }
 
 /// A rejected init whose slot `bind_for_msg` bound disables the bound stream as the reject drops,
