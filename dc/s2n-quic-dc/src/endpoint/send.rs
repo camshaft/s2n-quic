@@ -1189,9 +1189,6 @@ impl Context {
         if !self.is_path_lost() && self.has_stopped_delivering(now) {
             self.mark_path_lost(now);
         }
-        if self.is_path_lost() {
-            self.pto.cap_lost_backoff(&self.rtt_estimator);
-        }
         if probe && (self.inflight.has_inflight() || self.has_pending() || self.is_path_lost()) {
             // The only failure case is `NoOp` — the state is already `Requested`
             // because a previous probe hasn't been consumed by the assembler yet.
