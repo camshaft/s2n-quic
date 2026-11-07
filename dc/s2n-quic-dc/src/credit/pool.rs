@@ -168,6 +168,10 @@ pub struct Pool {
     /// Observability handles. Default is a no-op `Registry` (every emit is dropped on the floor).
     /// Wire in real counters via [`Pool::with_counters`].
     counters: Counters,
+    /// Reads the time when each wait starts and when it is granted. Read once per acquire that
+    /// waits, once per grant, and once per poll cycle while waiters remain; the fast path never
+    /// reads it.
+    clock: WaitClock,
 }
 
 /// A single priority tier: the wait list plus a closed flag, both protected by the same mutex.
@@ -183,6 +187,38 @@ impl Tier {
             closed: false,
         }
     }
+}
+
+/// The clock the pool reads for its per-priority wait metrics.
+enum WaitClock {
+    System(crate::time::DefaultClock),
+    /// A clock the deterministic suite steps by hand.
+    #[cfg(all(test, not(feature = "loom")))]
+    Manual(crate::time::testing::Clock),
+}
+
+impl WaitClock {
+    #[inline]
+    fn now(&self) -> precision::Timestamp {
+        match self {
+            Self::System(clock) => clock.now(),
+            #[cfg(all(test, not(feature = "loom")))]
+            Self::Manual(clock) => clock.get_time(),
+        }
+    }
+}
+
+/// The wait start of the first live (not abandoned) slot of `list`. Each list keeps its slots
+/// in the order they were linked, which is the order they started waiting up to a race of two
+/// parkers, so this is the list's oldest live waiter.
+///
+/// The caller locks the tier mutex to read a shared tier's list; a mirror is the distributor's.
+fn oldest_live_wait_start(list: &List<SlotAdapter>) -> Option<precision::Timestamp> {
+    // SAFETY: every slot of a list is linked, and its wait start was written before it was
+    // linked and doesn't change while it stays linked.
+    list.iter()
+        .find(|slot| !slot.is_dead())
+        .map(|slot| unsafe { slot.wait_start() })
 }
 
 impl Pool {
@@ -203,6 +239,20 @@ impl Pool {
             tiers: std::array::from_fn(|_| CachePadded::new(Mutex::new(Tier::new()))),
             published_paid_demand: AtomicU64::new(0),
             counters,
+            clock: WaitClock::System(crate::time::DefaultClock::default()),
+        }
+    }
+
+    /// Construct a pool whose wait metrics read `clock`, which the test steps by hand.
+    #[cfg(all(test, not(feature = "loom")))]
+    fn with_manual_clock(
+        config: Config,
+        counters: Counters,
+        clock: crate::time::testing::Clock,
+    ) -> Self {
+        Self {
+            clock: WaitClock::Manual(clock),
+            ..Self::with_counters(config, counters)
         }
     }
 
@@ -331,6 +381,7 @@ impl Pool {
         // `-n` and thus never over-counts free credit. See `Distributor::pass`.
         let slot_ref = &*slot.as_ptr();
         slot_ref.prepare_park(n, cx.waker());
+        slot_ref.set_wait_start(self.clock.now());
 
         let mut tier = lock(&self.tiers[priority as usize]);
         // Once the distributor has marked this tier closed, the drain walk has either run or is
@@ -548,6 +599,13 @@ pub struct Distributor {
     /// Current run length of consecutive injecting ticks, for the `refill.sustained_engaged` /
     /// `refill.consecutive_ticks` signals. Reset to 0 on any tick that skipped (releases met rate).
     refill_consecutive_ticks: u64,
+    /// How many tiers, from `Highest` down, the last pass merged from their shared lists into
+    /// their mirrors. Such a tier's mirror holds its waiters ahead of any later arrival, so
+    /// publishing its oldest wait doesn't lock the tier; a tier past it is read under its lock.
+    merged_tiers: usize,
+    /// Whether the last poll cycle published a nonzero oldest-wait age, so a cycle with nothing
+    /// waiting resets the gauges once and then leaves them.
+    oldest_wait_published: bool,
 }
 
 impl Distributor {
@@ -562,6 +620,8 @@ impl Distributor {
             refill_pending: 0,
             released_since_tick: 0,
             refill_consecutive_ticks: 0,
+            merged_tiers: 0,
+            oldest_wait_published: false,
         }
     }
 
@@ -785,8 +845,47 @@ impl Distributor {
         self.pool
             .published_paid_demand
             .store(self.paid_demand, Ordering::Relaxed);
+        self.publish_oldest_wait();
 
         result
+    }
+
+    /// Publish each tier's oldest live waiter's age, in microseconds, to the
+    /// `acquire.oldest_wait_us` gauges, 0 for a tier with no live waiter. Called once per poll
+    /// cycle. A tier's mirror holds its older waiters ahead of its shared list, so the shared
+    /// list is read, under its lock, only where the mirror has no live waiter and the last pass
+    /// didn't merge the tier; a waiter that reached a merged tier after that pass counts from
+    /// the next cycle.
+    fn publish_oldest_wait(&mut self) {
+        let gauges = &self.pool.counters.acquire_oldest_wait_us;
+        if self.pool.parked_demand.load(Ordering::Acquire) == self.paid_demand {
+            // Every wait so far was granted or reaped, so no tier has a waiter.
+            if self.oldest_wait_published {
+                for gauge in gauges {
+                    gauge.set(0);
+                }
+                self.oldest_wait_published = false;
+            }
+            return;
+        }
+        let now = self.pool.clock.now();
+        let mut published = false;
+        for (priority, ((local, tier), gauge)) in self
+            .local
+            .iter()
+            .zip(&self.pool.tiers)
+            .zip(gauges)
+            .enumerate()
+        {
+            let mut start = oldest_live_wait_start(local);
+            if start.is_none() && priority >= self.merged_tiers {
+                start = oldest_live_wait_start(&lock(tier).list);
+            }
+            let age_us = start.map_or(0, |start| now.nanos_since(start) / 1_000);
+            published |= age_us > 0;
+            gauge.set(age_us as i64);
+        }
+        self.oldest_wait_published = published;
     }
 
     /// A single distribution pass. Returns whether it made progress (granted or reaped anything,
@@ -842,12 +941,14 @@ impl Distributor {
         // separate from `pull` precisely because it is unconditional; see the end-of-pass writeback.
         let mut reclaimed_avail: u64 = 0;
         let mut granted_any = false;
+        let mut merged_tiers = 0;
 
-        'walk: for ((local, tier), &min_slice) in self
+        'walk: for (priority, ((local, tier), &min_slice)) in self
             .local
             .iter_mut()
             .zip(&self.pool.tiers)
             .zip(&self.pool.config.min_grant_slice)
+            .enumerate()
         {
             // Pull the shared tier into the mirror up-front, before computing the slice. This both
             // refills a drained mirror and merges fresh arrivals that landed behind cached leftovers
@@ -861,6 +962,7 @@ impl Distributor {
                 let mut shared = lock(tier);
                 local.append(&mut shared.list);
             }
+            merged_tiers = priority + 1;
             if local.is_empty() {
                 continue;
             }
@@ -949,6 +1051,9 @@ impl Distributor {
                 // (refcount CAS) and our `grant` race, and `grant` resolves that race.
                 unsafe {
                     let slot = &*ptr.as_ptr();
+                    // Read the wait's start while the slot is still ours: a successful grant hands
+                    // it back to the application.
+                    let wait_start = slot.wait_start();
                     let res = slot.grant(grant_amount);
 
                     // Whether granted or raced, this park is now resolved — credit the FULL `req`
@@ -974,6 +1079,8 @@ impl Distributor {
                             }
                             granted_any = true;
                             self.pool.counters.distributor_granted.add(1);
+                            let waited = self.pool.clock.now().duration_since(wait_start);
+                            self.pool.counters.acquire_wait[priority].record(waited);
                             trace!(target: "credit::pool", req, grant_amount, "grant");
                             self.pending_wakers.push_back(waker);
                         }
@@ -991,6 +1098,8 @@ impl Distributor {
                 }
             }
         }
+        // Publishing the oldest waits reads how far this walk merged the shared tiers.
+        self.merged_tiers = merged_tiers;
 
         // End-of-pass writeback. We only ever apply a *delta* to `available` via `fetch_add`: the
         // fast path (`poll_acquire`) mutates `available` concurrently, so the distributor can never
@@ -1097,5 +1206,12 @@ impl Drop for Distributor {
 
         // The local mirror drops automatically with the field. Each entry there is also a
         // `SlotPtr`, so its drop closes the slot just as the shared-tier walk above does.
+
+        // With the distributor gone, no tier has a waiter left to grant: reset the ages.
+        if self.oldest_wait_published {
+            for gauge in &self.pool.counters.acquire_oldest_wait_us {
+                gauge.set(0);
+            }
+        }
     }
 }
