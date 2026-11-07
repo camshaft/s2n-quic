@@ -595,6 +595,124 @@ fn send_idle_wheel_defers_death_for_recent_inflight() {
     });
 }
 
+/// A packet that waits for an acknowledgement on the peer's only pair keeps the send worker's
+/// probe timeout armed, and the probe timeout marks the pair lost long before the context's
+/// idle expiry. The expiry then finds the peer silent since the lost mark, so it doesn't renew
+/// the dead mark the entry holds, though the dead-peer cooldown has passed since that mark.
+#[test]
+fn send_idle_wheel_probe_timeout_marks_the_pair_lost_before_the_expiry() {
+    use crate::{socket::channel::FlattenList, time::wheel::Wheel};
+
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) = setup_send();
+        let cooldown = crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN;
+
+        // The peer's only pair, so that no other pair takes its packet once it is marked lost.
+        let addr: std::net::SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let pse = crate::path::secret::map::Entry::builder(addr)
+            .socket_sender_count(1)
+            .build(None);
+
+        // At t=0 the peer's last packet arrives, and then the peer is marked dead.
+        let now = precision::Clock::now(&clock);
+        pse.touch_activity(now);
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(pse.mark_dead_if_cooldown_elapsed(now, cooldown));
+
+        // The send worker's probe timeout task over its PTO wheel, as the endpoint builds it.
+        let (mut pto_wheel_tx, pto_wheel_rx) = unsync::new_with_adapter::<send::PtoWheelAdapter>();
+        let (tx_wheel_tx, tx_wheel_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
+        let (immediate_tx, immediate_rx) = unsync::new_with_adapter::<send::TxImmediateAdapter>();
+        let socket_immediate_txs: IdMap<LocalSendSocketId, _> =
+            core::iter::once((LocalSendSocketId::new(0), immediate_tx)).collect();
+        let sender_idx_to_local = || IdMap::<LocalSenderId, _>::new(1, LocalSendSocketId::new(0));
+        let immediate_tx = send::ImmediateSender::new(socket_immediate_txs, sender_idx_to_local());
+        let (retransmit_tx, retransmit_rx) = unsync::new::<Frame>();
+        let wheel: Wheel<_, _, _, 128> =
+            Wheel::new(pto_wheel_rx.into_list_receiver(), precision::Clock::timer(&clock));
+        let pto_timeout = tasks::send_pto_timeout(
+            FlattenList::new(wheel),
+            clock.clone(),
+            immediate_tx,
+            tx_wheel_tx,
+            pto_wheel_tx.clone(),
+            idle_wheel_tx.clone(),
+            registry.register("tx.pto_check"),
+            registry.register("tx.pto_requested"),
+            send_caches.clone(),
+            sender_idx_to_local(),
+            retransmit_tx,
+        );
+        async move { pto_timeout.drain_budgeted(Some(32)).await }.spawn();
+
+        async move {
+            // The queues of the probe timeout's other outputs stay open for the whole test.
+            let _outputs = (tx_wheel_rx, immediate_rx, retransmit_rx);
+
+            // At t=5s the context sends a packet that the peer never acknowledges. Its wheel
+            // interest arms the probe timeout, and the idle expiry one idle timeout later,
+            // after the cooldown has passed since the dead mark.
+            5.s().sleep().await;
+            let interest = {
+                let mut ctx = ctx.borrow_mut();
+                let now = precision::Clock::now(&clock);
+                ctx.last_peer_activity = now;
+                ctx.ack_wait_since = Some(now);
+                insert_inflight_packet(&mut ctx, &pse, &clock);
+                ctx.wheel_interest(&clock)
+            };
+            assert!(interest.pto && interest.idle_timeout);
+            let timeout = pse.idle_timeout();
+            assert!(5.s() + timeout > cooldown, "the context expires after the cooldown");
+            let _ = pto_wheel_tx.send(ctx.clone());
+            let _ = idle_wheel_tx.send(ctx.clone());
+
+            // Two seconds before the expiry, the probe timeout has marked the pair lost after
+            // the peer's last packet, and the packet still waits for an acknowledgement.
+            (timeout - 2.s()).sleep().await;
+            {
+                let ctx = ctx.borrow();
+                assert!(ctx.is_path_lost(), "the probe timeout marks the silent pair lost");
+                assert!(
+                    ctx.lost_at.is_some_and(|at| pse.last_activity() < at),
+                    "the pair is marked lost after the peer's last packet"
+                );
+                assert!(ctx.inflight.has_inflight(), "no other pair takes the packet");
+            }
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                1,
+                "the context expires one idle timeout after its packet"
+            );
+
+            // Three seconds later the context has expired, and the peer stayed silent since
+            // the lost mark.
+            3.s().sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+            let now = precision::Clock::now(&clock);
+            assert!(
+                !pse.is_dead_during_cooldown(now, cooldown),
+                "the expiry of a pair the probe timeout marked lost doesn't renew the dead mark"
+            );
+            assert!(pse.is_marked_dead(), "the mark stays until the peer is heard from");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// Gossip heartbeats arrive on the recv path and update PathSecretEntry::last_activity.
 /// The send idle wheel must treat this as evidence the peer is alive and reschedule
 /// rather than expiring the send context.
