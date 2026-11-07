@@ -88,7 +88,8 @@ impl CoreSub for DcPathCapture {
 /// round trip waited in the endpoint's receive queue: the wait that the socket measured, where the
 /// packet's datagram holds one, or else the most that the packet could have waited during the
 /// endpoint's last pass. It also records the handshake's two round trips as the client timed them
-/// from its own packets.
+/// from its own packets, and the part of each that the server's reply waited in the endpoint's
+/// receive queue, as the socket measured it.
 #[derive(Default)]
 struct PathRtt {
     /// The endpoint's last pass of its event loop.
@@ -130,6 +131,9 @@ struct PathRttContext {
     /// The handshake's first round trip, from the first packet the connection sent to the first
     /// packet it received, which the server sends only once the client's first flight arrives.
     first_flight: Option<Duration>,
+    /// The part of `first_flight` that the reply waited in the endpoint's receive queue: the
+    /// `receive_wait` of the reply's datagram.
+    first_wait: Option<Duration>,
     /// Whether the connection's path secrets are ready, after which a client sends its
     /// `DC_STATELESS_RESET_TOKENS` frame.
     secrets_ready: bool,
@@ -139,6 +143,9 @@ struct PathRttContext {
     /// `DC_STATELESS_RESET_TOKENS` frame arrived, which the server sends only once it has the
     /// client's.
     second_flight: Option<Duration>,
+    /// The part of `second_flight` that the reply waited in the endpoint's receive queue: the
+    /// `receive_wait` of the datagram that the connection reads at dc.complete.
+    second_wait: Option<Duration>,
 }
 
 impl PathRttContext {
@@ -168,10 +175,13 @@ impl PathRttContext {
         }
     }
 
-    /// Records a packet the connection received at `now`: the first ends the first round trip.
+    /// Records a packet the connection received at `now`: the first ends the first round trip,
+    /// and the wait of its datagram, where the socket measured one, is the part of it that the
+    /// reply waited.
     fn on_received(&mut self, now: Duration) {
         if let (None, Some(sent)) = (self.first_flight, self.first_sent) {
             self.first_flight = Some(now.saturating_sub(sent));
+            self.first_wait = self.receive_wait;
         }
     }
 
@@ -180,27 +190,35 @@ impl PathRttContext {
         self.secrets_ready = true;
     }
 
-    /// Records dc.complete at `now`, which ends the second round trip.
+    /// Records dc.complete at `now`, which ends the second round trip, with the wait of the
+    /// datagram that the connection reads then, where the socket measured one, as the part of it
+    /// that the reply waited.
     fn on_complete(&mut self, now: Duration) {
         if let (None, Some(sent)) = (self.second_flight, self.second_sent) {
             self.second_flight = Some(now.saturating_sub(sent));
+            self.second_wait = self.receive_wait;
         }
     }
 
     /// The connection's round trips, or `None` before its first recovery metrics. Until both of
-    /// the handshake's round trips are timed, as before dc.complete, each reads as the lowest,
-    /// which leaves the spread out.
+    /// the handshake's round trips are timed, as before dc.complete, each reads as the lowest
+    /// without a wait, which leaves the spread out.
     fn round_trips(&self) -> Option<limit::RoundTrips> {
         let lowest = self.min_rtt?;
         let flights = match (self.first_flight, self.second_flight) {
             (Some(first), Some(second)) => [first, second],
             _ => [lowest, lowest],
         };
+        let flight_waits = match (self.first_flight, self.second_flight) {
+            (Some(_), Some(_)) => [self.first_wait, self.second_wait],
+            _ => [None, None],
+        };
         Some(limit::RoundTrips {
             lowest,
             waited: self.waited,
             measured: self.measured,
             flights,
+            flight_waits,
         })
     }
 }
@@ -1204,12 +1222,64 @@ mod tests {
                 waited: Duration::ZERO,
                 measured: false,
                 flights: [ms(50), ms(69)],
+                flight_waits: [None, None],
             })
         );
 
         // Without recovery metrics, the connection doesn't show its round trips.
         context.min_rtt = None;
         assert_eq!(context.round_trips(), None);
+    }
+
+    /// Verifies that a connection keeps, with each of its handshake's two round trips, the wait
+    /// that the socket measured for the datagram that ended it, once, and that a round trip whose
+    /// datagram didn't hold a measured wait reads `None`.
+    #[test]
+    fn a_connection_keeps_the_wait_of_the_reply_that_ended_each_round_trip() {
+        let start = clock::now();
+        let mut path_rtt = PathRtt::default();
+        let mut context = PathRttContext {
+            min_rtt: Some(ms(1)),
+            ..Default::default()
+        };
+        // The client's first flight goes out at 10 ms, and the server's reply arrives at 11 ms,
+        // with a wait of 0 ms that the socket measured. A later datagram that waited 3 ms doesn't
+        // change the first round trip's wait.
+        context.on_sent(ms(10));
+        receive(&mut path_rtt, &mut context, start, 11, Some(0));
+        context.on_received(ms(11));
+        receive(&mut path_rtt, &mut context, start, 12, Some(3));
+        context.on_received(ms(12));
+
+        // The second flight goes out at 13 ms, and the reply that completes the handshake is
+        // read at 18 ms, after it waited 4 ms in the endpoint's receive queue.
+        context.on_secrets_ready();
+        context.on_sent(ms(13));
+        receive(&mut path_rtt, &mut context, start, 18, Some(4));
+        context.on_complete(ms(18));
+        receive(&mut path_rtt, &mut context, start, 20, Some(9));
+        context.on_complete(ms(20));
+        let round_trips = context.round_trips().unwrap();
+        assert_eq!(round_trips.flights, [ms(1), ms(5)]);
+        assert_eq!(round_trips.flight_waits, [Some(ms(0)), Some(ms(4))]);
+
+        // Where the reply that ends a round trip doesn't hold a measured wait, that round trip
+        // reads `None`.
+        let mut context = PathRttContext {
+            min_rtt: Some(ms(1)),
+            ..Default::default()
+        };
+        context.on_sent(ms(10));
+        receive(&mut path_rtt, &mut context, start, 11, None);
+        context.on_received(ms(11));
+        context.on_secrets_ready();
+        context.on_sent(ms(13));
+        receive(&mut path_rtt, &mut context, start, 18, Some(4));
+        context.on_complete(ms(18));
+        assert_eq!(
+            context.round_trips().unwrap().flight_waits,
+            [None, Some(ms(4))]
+        );
     }
 
     /// Verifies that a client's connection has measured its path's round trips and timed its
@@ -1432,6 +1502,7 @@ mod tests {
                 waited: ms(waited),
                 measured: false,
                 flights: [ms(lowest), ms(lowest)],
+                flight_waits: [None, None],
             })
         }
 
@@ -1482,6 +1553,7 @@ mod tests {
                 waited: ms(waited),
                 measured,
                 flights: [ms(lowest), ms(lowest)],
+                flight_waits: [None, None],
             })
         }
 
