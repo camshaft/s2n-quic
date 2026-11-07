@@ -140,6 +140,7 @@ pub struct RecvContextBuilder {
     peer: SocketAddr,
     remote_sender_id: crate::endpoint::id::RemoteSenderId,
     local_sender_id: crate::endpoint::id::LocalSenderId,
+    socket_sender_count: usize,
 }
 
 impl Default for RecvContextBuilder {
@@ -148,6 +149,7 @@ impl Default for RecvContextBuilder {
             peer: "127.0.0.1:4433".parse().unwrap(),
             remote_sender_id: crate::endpoint::id::RemoteSenderId::new(VarInt::from_u8(0)),
             local_sender_id: crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1)),
+            socket_sender_count: 0,
         }
     }
 }
@@ -170,9 +172,17 @@ impl RecvContextBuilder {
         self
     }
 
+    /// Builds the context's path entry with `count` senders, so that a test can mark the
+    /// interface pairs of its senders lost.
+    pub fn socket_sender_count(mut self, count: usize) -> Self {
+        self.socket_sender_count = count;
+        self
+    }
+
     pub fn build(self) -> Rc<RefCell<recv::Context>> {
         let entry = PathSecretEntry::builder(self.peer)
             .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+            .socket_sender_count(self.socket_sender_count)
             .build(None);
         let opener = entry.secret().application_opener(VarInt::ZERO);
         let clock = crate::time::bach::Clock::default();
@@ -297,4 +307,50 @@ pub fn build_send_context(
     )
     .expect("test context should be constructible");
     std::rc::Rc::new(std::cell::RefCell::new(ctx))
+}
+
+/// Inserts one sent packet into `ctx`'s inflight map, packet number 0 with one frame of `pse`,
+/// and sets the context's next packet number past it.
+pub fn insert_inflight_packet(ctx: &mut send::Context, pse: &Arc<PathSecretEntry>, clock: &Clock) {
+    use s2n_quic_core::time::Clock as _;
+    let now = clock.get_time();
+    let rtt = ctx.rtt_estimator;
+    let cc_info = ctx.cca.on_packet_sent(now, 200, false, &rtt);
+    let mut frames = crate::intrusive::Queue::new();
+    frames.push_back(test_frame(pse));
+    let pn =
+        s2n_quic_core::packet::number::PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
+    ctx.inflight.insert(
+        pn,
+        crate::endpoint::inflight::Packet::new(
+            frames,
+            crate::endpoint::inflight::TransmissionInfo {
+                cc_info,
+                time_sent: now,
+                sent_bytes: 200,
+            },
+        ),
+    );
+    ctx.next_packet_number = VarInt::from_u8(1);
+}
+
+/// Builds a path secret map that publishes its events to a testing subscriber.
+pub fn test_map_with_subscriber() -> (
+    crate::path::secret::Map,
+    Arc<crate::event::testing::Subscriber>,
+) {
+    let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+    let map = crate::path::secret::Map::builder()
+        .with_signer(crate::path::secret::stateless_reset::Signer::random())
+        .with_capacity(4)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber(subscriber.clone())
+        .build()
+        .unwrap();
+    (map, subscriber)
+}
+
+/// The count that a testing subscriber holds for one kind of event.
+pub fn event_count(counter: &core::sync::atomic::AtomicU64) -> u64 {
+    counter.load(Ordering::Relaxed)
 }

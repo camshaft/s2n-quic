@@ -29,7 +29,7 @@ use crate::{
 };
 use s2n_quic_core::varint::VarInt;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -67,6 +67,16 @@ struct FreedState {
     /// The assembler drains this first, retransmitting with the original request_id
     /// and encoding so the client deduplicates via seen_requests.
     retry_queue: VecDeque<RetryEntry>,
+    /// The slots held for a rejected init whose reset hasn't left the priority router yet, by
+    /// queue id. A slot freed while it is held is recorded once `release` ends its hold.
+    held: HashMap<u64, Held>,
+}
+
+/// The hold of a slot for the rejected init of `binding_id`.
+struct Held {
+    binding_id: u64,
+    /// Whether the slot was freed while it was held.
+    freed: bool,
 }
 
 impl Default for FreedInner {
@@ -83,12 +93,19 @@ impl FreedInner {
                 next_request_id: VarInt::from_u8(0),
                 in_flight: false,
                 retry_queue: VecDeque::new(),
+                held: HashMap::new(),
             }),
         }
     }
 
     /// Record that `queue_id` has been freed and, if no token is in-flight,
     /// allocate an entry and submit it to the freed channel.
+    ///
+    /// Where `hold` holds the slot, the record waits until `release` ends the hold.
+    ///
+    /// A queue id at or past the freed set's capacity, `HierarchicalBitSet::MAX_CAPACITY`, isn't
+    /// recorded. The check reads the whole queue id, so that a queue id of 2^32 or more isn't
+    /// recorded as the slot of its low 32 bits.
     pub fn record(
         &self,
         queue_id: VarInt,
@@ -97,10 +114,15 @@ impl FreedInner {
     ) {
         let mut state = self.state.lock().unwrap();
 
-        let id = queue_id.as_u64() as u32;
-        if id as u64 >= HierarchicalBitSet::MAX_CAPACITY as u64 {
+        if let Some(held) = state.held.get_mut(&queue_id.as_u64()) {
+            held.freed = true;
             return;
         }
+
+        if queue_id.as_u64() >= HierarchicalBitSet::MAX_CAPACITY as u64 {
+            return;
+        }
+        let id = queue_id.as_u64() as u32;
         let needed = id + 1;
         if needed > state.freed.capacity() {
             state.freed.grow(needed);
@@ -122,6 +144,52 @@ impl FreedInner {
         if endpoint_tx.send(entry).is_err() {
             self.state.lock().unwrap().in_flight = false;
         }
+    }
+
+    /// Hold the slot `queue_id` for the rejected init of `binding_id`, so that a `record` of the
+    /// slot waits until `release` ends the hold. Returns false where the slot is held already,
+    /// as for a rejected init whose reset hasn't left yet, and for a slot at or past the freed
+    /// set's capacity, which `record` doesn't record, so that each hold is of a slot that the
+    /// freed set records.
+    pub fn hold(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
+        if queue_id.as_u64() >= HierarchicalBitSet::MAX_CAPACITY as u64 {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        match state.held.entry(queue_id.as_u64()) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Held {
+                    binding_id: binding_id.as_u64(),
+                    freed: false,
+                });
+                true
+            }
+        }
+    }
+
+    /// End the hold of `queue_id` for `binding_id` once its reset leaves, and record the slot as
+    /// freed where a `record` waited on the hold. A hold for another binding stays. Returns
+    /// whether a hold ended.
+    pub fn release(
+        &self,
+        queue_id: VarInt,
+        binding_id: VarInt,
+        path_entry: &Arc<PathSecretEntry>,
+        endpoint_tx: &mut FreedBatchTx,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let freed = match state.held.get(&queue_id.as_u64()) {
+            Some(held) if held.binding_id == binding_id.as_u64() => held.freed,
+            _ => return false,
+        };
+        state.held.remove(&queue_id.as_u64());
+        drop(state);
+
+        if freed {
+            self.record(queue_id, path_entry, endpoint_tx);
+        }
+        true
     }
 
     /// Drain the accumulated freed IDs into `dest`, returning a request_id.
@@ -222,6 +290,7 @@ impl core::fmt::Debug for FreedInner {
                 .debug_struct("FreedInner")
                 .field("freed_count", &s.freed.len())
                 .field("in_flight", &s.in_flight)
+                .field("held", &s.held.len())
                 .finish(),
             Err(_) => write!(f, "FreedInner(<locked>)"),
         }
@@ -252,6 +321,82 @@ mod tests {
         let path_entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap()).build(None);
         let freed = FreedInner::new();
         (path_entry, freed, tx, rx)
+    }
+
+    #[test]
+    fn a_held_slot_is_recorded_once_its_reset_leaves() {
+        sim(|| {
+            let (path_entry, freed, mut tx, rx) = test_setup();
+
+            async move {
+                let _rx = rx;
+                let slot = VarInt::from_u8(5);
+                assert!(freed.hold(slot, VarInt::from_u8(1)));
+                // A second rejected init of the held slot doesn't get a hold of its own.
+                assert!(!freed.hold(slot, VarInt::from_u8(2)));
+
+                // The slot is freed while its reset waits: the record waits on the hold.
+                freed.record(slot, &path_entry, &mut tx);
+                assert!(!freed.has_pending_work());
+
+                // A release for another binding leaves the hold as it is.
+                assert!(!freed.release(slot, VarInt::from_u8(2), &path_entry, &mut tx));
+                assert!(!freed.has_pending_work());
+
+                // The held binding's reset leaves: the slot is recorded as freed.
+                assert!(freed.release(slot, VarInt::from_u8(1), &path_entry, &mut tx));
+                let mut dest = HierarchicalBitSet::new(1);
+                freed.take(&mut dest).unwrap();
+                assert!(dest.contains(5));
+
+                // The slot can be held again for its next rejected init.
+                assert!(freed.hold(slot, VarInt::from_u8(3)));
+            }
+            .primary()
+            .spawn();
+        });
+    }
+
+    #[test]
+    fn a_slot_the_freed_set_cant_record_isnt_held() {
+        let freed = FreedInner::new();
+        let capacity = HierarchicalBitSet::MAX_CAPACITY;
+
+        // The slot at the freed set's capacity, which `record` doesn't record, isn't held, and
+        // `held` doesn't take an entry for it.
+        assert!(!freed.hold(VarInt::from_u32(capacity), VarInt::from_u8(1)));
+        assert!(freed.state.lock().unwrap().held.is_empty());
+
+        // The last slot that the freed set records is held.
+        assert!(freed.hold(VarInt::from_u32(capacity - 1), VarInt::from_u8(1)));
+    }
+
+    #[test]
+    fn a_queue_id_past_the_freed_set_isnt_recorded() {
+        sim(|| {
+            let (path_entry, freed, mut tx, rx) = test_setup();
+
+            async move {
+                let _rx = rx;
+                let capacity = HierarchicalBitSet::MAX_CAPACITY;
+
+                // A queue id of 2^32 + 5 isn't recorded as slot 5, its low 32 bits, and
+                // the slot at the freed set's capacity isn't recorded.
+                freed.record(VarInt::new((1u64 << 32) + 5).unwrap(), &path_entry, &mut tx);
+                freed.record(VarInt::from_u32(capacity), &path_entry, &mut tx);
+                assert!(!freed.has_pending_work());
+
+                // The last slot that the freed set records is recorded.
+                freed.record(VarInt::from_u32(capacity - 1), &path_entry, &mut tx);
+                let mut dest = HierarchicalBitSet::new(1);
+                freed.take(&mut dest).unwrap();
+                assert!(dest.contains(capacity - 1));
+                assert!(!dest.contains(5));
+                assert_eq!(dest.len(), 1);
+            }
+            .primary()
+            .spawn();
+        });
     }
 
     #[test]
