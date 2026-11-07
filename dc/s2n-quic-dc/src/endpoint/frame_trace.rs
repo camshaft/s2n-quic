@@ -1664,14 +1664,15 @@ fn each_way_of_arming_arms_slot_holds_in_a_release_build() {
         "a build with the diagnostic compiled in arms each slot hold"
     );
 
-    // `arm_slot_holds` arms the process's slot holds. A test build arms each of them all the same,
-    // so the other tests of the process don't see the change, and the arm is put back after.
+    // `endpoint::arm_slot_holds`, the public path, arms the process's slot holds. A test
+    // build arms each of them all the same, so the other tests of the process don't see the
+    // change, and the arm is put back after.
     let ordering = std::sync::atomic::Ordering::Relaxed;
     let before = SLOT_HOLD_ARM.by_call.load(ordering);
-    arm_slot_holds();
+    crate::endpoint::arm_slot_holds();
     assert!(
         SLOT_HOLD_ARM.by_call.load(ordering),
-        "arm_slot_holds arms the process's slot holds"
+        "endpoint::arm_slot_holds arms the process's slot holds"
     );
     SLOT_HOLD_ARM.by_call.store(before, ordering);
 }
