@@ -71,9 +71,9 @@ mod tests;
 /// - Frames from different priority classes are never merged into the same batch.
 /// - The spawned tasks are the only side effect; callers do not receive a handle back and must
 ///   keep the underlying executor running for progress.
-/// - A reset that leaves the priority router for its lane releases the slot that a rejected init
-///   held for it, and `freed_batch_tx` takes the slot's freed record where the slot was freed
-///   while the reset waited.
+/// - A reset that leaves the priority router for its lane releases the slot that a rejected init,
+///   or the stream that sent the reset, held for it, and `freed_batch_tx` takes the slot's freed
+///   record where the slot was freed while the reset waited.
 /// - `pacing` and `budgets` bound how aggressively work is drained once the tasks are spawned.
 ///   With one interface, a [`Paced`] stage paces every send socket at its rate before
 ///   [`PickTwo`] chooses a worker; with more, [`InterfacePacedPickTwo`] chooses the worker first
@@ -1847,11 +1847,15 @@ where
 /// send credit pool bounds it, but it waits behind a refused frame of its lane or of a lane
 /// before it.
 ///
-/// A reset that leaves for its lane releases the slot that its rejected init held, and the slot
-/// is recorded as freed then, so that the client sends another init on the slot only once the
-/// reset is on its way. This bounds the resets of a peer's rejected inits that wait here to one
-/// for each of the peer's queues, whatever the queue and binding ids of its frames, and
-/// `WaitingResets` drops the copies of a reset that wait here already.
+/// A reset that leaves for its lane releases the slot that its rejected init, or the stream that
+/// sent it, held for it, and the slot is recorded as freed then, so that the client sends another
+/// init on the slot only once the reset is on its way. A stream's reset isn't sent while its slot
+/// is held for another binding's reset, as where a client sends inits on a slot before it learns
+/// that the slot is free, each of them evicting the stream before it from a full acceptor. This
+/// bounds the resets that a peer's frames add here by the peer's queues, whatever the queue and
+/// binding ids of its frames: while a reset of the binding that holds a queue's slot waits here,
+/// a reset of another binding on that queue isn't sent, and `WaitingResets` drops the copies of a
+/// reset that wait here already.
 struct FrameReceiver<Tx> {
     frame_rx: SubmissionReceiver,
     /// The frames the window didn't admit yet, each lane's in the order the swaps brought them.
@@ -1949,18 +1953,11 @@ where
     }
 }
 
-/// Releases the server slot that a rejected init held for `frame`, where `frame` is a reset that
-/// no producer waits on, so that the slot is recorded as freed once the reset leaves for its lane.
+/// Releases the server slot that a rejected init, or the stream that sent `frame`, held for
+/// `frame`, where `frame` is a reset that no producer waits on, so that the slot is recorded as
+/// freed once the reset leaves for its lane.
 fn release_held(frame: &Frame, freed_batch_tx: &mut crate::queue::FreedBatchTx) {
-    if WaitingResets::key(frame).is_none() {
-        return;
-    }
-    let frame::Header::QueueReset {
-        queue_pair,
-        binding_id,
-        ..
-    } = frame.header
-    else {
+    let Some((queue_pair, binding_id)) = frame.unawaited_reset() else {
         return;
     };
     if let crate::path::secret::map::entry::QueueState::Server(ref state) =
@@ -1990,17 +1987,7 @@ impl WaitingResets {
     /// Returns the key of `frame` where it is a reset without a completion sender or send
     /// credit, which no producer waits on.
     fn key(frame: &Frame) -> Option<ResetKey> {
-        let frame::Header::QueueReset {
-            queue_pair,
-            binding_id,
-            ..
-        } = frame.header
-        else {
-            return None;
-        };
-        if frame.completion.is_some() || frame.flow_credits != 0 {
-            return None;
-        }
+        let (queue_pair, binding_id) = frame.unawaited_reset()?;
         Some((
             *frame.path_secret_entry.id(),
             queue_pair.source_queue_id.as_u64(),

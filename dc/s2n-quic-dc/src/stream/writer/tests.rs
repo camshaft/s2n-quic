@@ -3843,3 +3843,126 @@ impl crate::credit::WakerSink for TestWakerSink {
         }
     }
 }
+
+/// A server writer of the stream on `entry`'s slot 1 for `binding`, with the stream's half.
+fn server_writer(
+    entry: &Arc<PathSecretEntry>,
+    freed_batch_tx: &mut crate::queue::FreedBatchTx,
+    frame_tx: frame::SubmissionSender,
+    binding: u8,
+) -> (Writer, crate::queue::StreamReceiver) {
+    let crate::path::secret::map::entry::QueueState::Server(state) = entry.queue_state() else {
+        panic!("a server entry has a server queue state");
+    };
+    let result = state.view().bind_for_msg(
+        VarInt::from_u8(1),
+        VarInt::from_u8(binding),
+        entry,
+        freed_batch_tx,
+    );
+    let crate::queue::BindResult::NewBinding {
+        stream, control, ..
+    } = result.expect("the slot binds")
+    else {
+        panic!("a free slot binds a new binding");
+    };
+    let writer = Writer::new_server(
+        frame_tx,
+        entry.clone(),
+        VarInt::from_u8(7),
+        VarInt::from_u8(9),
+        control,
+        crate::time::DefaultClock::default(),
+        test_writer_metrics(),
+        crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::default())),
+        crate::credit::Priority::default(),
+    );
+    (writer, stream)
+}
+
+/// Drains the frames `frame_rx` holds, and returns each reset among them by the queue it resets
+/// and its binding id.
+fn take_server_resets(frame_rx: &mut SubmissionReceiver) -> Vec<(u64, u64)> {
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
+    let mut storage = PriorityStorage::default();
+    let mut resets = Vec::new();
+    while let Poll::Ready(Some(())) = frame_rx.poll_swap(&mut cx, &mut storage) {
+        for (_priority, queue) in storage.drain() {
+            for mut frame in queue {
+                frame.status = frame::TransmissionStatus::Acknowledged;
+                if let Header::QueueReset {
+                    queue_pair,
+                    binding_id,
+                    ..
+                } = frame.header
+                {
+                    resets.push((queue_pair.source_queue_id.as_u64(), binding_id.as_u64()));
+                }
+            }
+        }
+    }
+    resets
+}
+
+/// A server writer's reset that no producer waits on holds its slot until it leaves the priority
+/// router, and isn't sent while the slot is held for another binding's reset. A reset that the
+/// submission channel refuses doesn't hold the slot.
+#[test]
+fn a_server_writer_reset_holds_its_slot_until_it_leaves() {
+    use crate::queue::freed::ResetHold;
+
+    let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let entry = PathSecretEntry::builder(peer)
+        .endpoint_type(endpoint::Type::Server)
+        .build(None);
+    let crate::path::secret::map::entry::QueueState::Server(state) = entry.queue_state() else {
+        panic!("a server entry has a server queue state");
+    };
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+    let (frame_tx, mut frame_rx) = frame::submission_channel(1);
+    let (slot, b2, b3) = (VarInt::from_u8(1), VarInt::from_u8(2), VarInt::from_u8(3));
+    let error_code = error::SENDER_CANCELLED;
+
+    // Binding 2's reset holds the slot, so the slot's record waits on it once the stream drops.
+    let (mut writer, stream) = server_writer(&entry, &mut freed_batch_tx, frame_tx.clone(), 2);
+    let sent = writer.0.send_reset_frame(error_code, ResetTarget::Both);
+    assert!(sent.is_ok(), "the submission channel takes the reset");
+    drop((writer, stream));
+    assert_eq!(take_server_resets(&mut frame_rx), vec![(1, 2)]);
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    assert!(state.freed.take(&mut freed).is_none(), "the slot waits on its reset");
+
+    // Binding 3's reset isn't sent while binding 2's reset holds the slot.
+    let (mut writer, stream) = server_writer(&entry, &mut freed_batch_tx, frame_tx.clone(), 3);
+    let sent = writer.0.send_reset_frame(error_code, ResetTarget::Both);
+    assert!(sent.is_ok(), "a reset that isn't sent doesn't fail the writer");
+    assert!(take_server_resets(&mut frame_rx).is_empty());
+
+    // Binding 2's reset leaves: the slot is recorded as freed, and binding 3's reset is sent.
+    state.freed.release(slot, b2, &entry, &mut freed_batch_tx);
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the release records the slot as freed");
+    assert!(freed.contains(1));
+    let sent = writer.0.send_reset_frame(error_code, ResetTarget::Both);
+    assert!(sent.is_ok(), "the submission channel takes the reset");
+    assert_eq!(take_server_resets(&mut frame_rx), vec![(1, 3)]);
+
+    // Binding 3's reset leaves before its stream drops, so the slot is recorded as freed then.
+    state.freed.release(slot, b3, &entry, &mut freed_batch_tx);
+    drop((writer, stream));
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the slot is recorded as freed as its stream drops");
+    assert!(freed.contains(1));
+
+    // A reset that the submission channel refuses doesn't hold the slot.
+    drop(frame_rx);
+    let (mut writer, stream) = server_writer(&entry, &mut freed_batch_tx, frame_tx, 4);
+    let sent = writer.0.send_reset_frame(error_code, ResetTarget::Both);
+    assert!(sent.is_err(), "the submission channel is closed");
+    assert_eq!(
+        state.freed.hold_reset(slot, VarInt::from_u8(5)),
+        ResetHold::Held
+    );
+    drop((writer, stream));
+}

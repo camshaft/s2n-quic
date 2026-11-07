@@ -139,6 +139,7 @@ use crate::{
     intrusive,
     packet::datagram::{QueuePair, ResetTarget},
     path::secret::map::Entry as PathSecretEntry,
+    queue::freed::ResetHold,
     stream::metrics::ReaderMetrics,
     tracing::{debug, trace},
 };
@@ -2037,7 +2038,26 @@ impl Inner {
             flow_credits: 0,
         };
 
-        self.send_frame(frame)?;
+        // A reset that no producer waits on holds a server slot until it leaves the priority
+        // router, so that the slot is recorded as freed only then. It isn't sent while the slot
+        // is held for another binding's reset.
+        let hold = self.stream_rx.hold_reset(&frame);
+        if hold == ResetHold::Refused {
+            debug!(
+                binding_id = self.stream_rx.binding_id().as_u64(),
+                error_code = error_code.as_u64(),
+                ?reset_target,
+                "QueueReset not sent: the slot is held for another binding's reset"
+            );
+            return Ok(());
+        }
+        if let Err(err) = self.send_frame(frame) {
+            if hold == ResetHold::Held {
+                // The reset doesn't reach the priority router, so it doesn't hold the slot.
+                self.stream_rx.release_reset();
+            }
+            return Err(err);
+        }
 
         debug!(
             binding_id = self.stream_rx.binding_id().as_u64(),

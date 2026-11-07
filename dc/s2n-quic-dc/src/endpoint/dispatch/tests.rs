@@ -732,3 +732,188 @@ fn a_dropped_rejected_init_disables_its_bound_stream() {
         "a dropped reject disables its stream, so its reader doesn't send a reset"
     );
 }
+
+/// The server queue state of `harness`'s path secret entry, which holds the slots of the streams
+/// that the dispatch binds and the holds of their resets, and a view of it.
+fn entry_state(harness: &FastPathHarness) -> (Arc<crate::queue::ServerState>, recv::QueueView) {
+    let crate::path::secret::map::entry::QueueState::Server(state) =
+        harness.path_entry.queue_state()
+    else {
+        unreachable!("a server entry has a server queue state");
+    };
+    (state.clone(), recv::QueueView::Server(state.view()))
+}
+
+/// Registers acceptor 9 in `harness`'s registry with room for one stream, so that each stream the
+/// dispatch accepts after the first evicts the stream before it.
+fn one_stream_acceptor(harness: &mut FastPathHarness) -> acceptor::channel::Receiver<Stream> {
+    let registry = acceptor::Registry::<Stream>::new();
+    let mut receiver = registry
+        .register(VarInt::from_u8(9), acceptor::channel::Config::from(1usize))
+        .expect("the acceptor registers");
+    receiver.register();
+    harness.acceptor_registry = registry.local();
+    receiver
+}
+
+/// Sends `harness` an init of `binding` on `slot` for acceptor 9, which accepts its stream.
+fn accept_init(harness: &mut FastPathHarness, view: &mut recv::QueueView, slot: u8, binding: u8) {
+    let (packet, opener, decrypt_len) = sealed_queue_init_packet(
+        VarInt::from_u8(slot),
+        VarInt::from_u8(binding),
+        VarInt::from_u8(9),
+    );
+    let header = single_queue_msg_header(&packet, decrypt_len);
+    let result = harness.call(header, &opener, &packet, decrypt_len, view);
+    assert!(result.is_ok(), "acceptor 9 takes the init");
+}
+
+/// A reset of slot 1 for binding 2, with `completion` and `flow_credits`.
+fn slot_reset(
+    entry: &Arc<PathSecretEntry>,
+    completion: Option<crate::endpoint::frame::CompletionSender>,
+    flow_credits: u64,
+) -> Frame {
+    Frame {
+        header: Header::QueueReset {
+            queue_pair: QueuePair {
+                source_queue_id: VarInt::from_u8(1),
+                dest_queue_id: VarInt::from_u8(7),
+            },
+            binding_id: VarInt::from_u8(2),
+            reset_target: ResetTarget::Both,
+            error_code: VarInt::from_u8(1),
+            init: None,
+        },
+        payload: ByteVec::new(),
+        path_secret_entry: entry.clone(),
+        completion,
+        status: crate::endpoint::frame::TransmissionStatus::default(),
+        ttl: DEFAULT_TTL,
+        enqueued_at: None,
+        flow_credits,
+    }
+}
+
+/// The streams that a peer's inits make the acceptor evict while the creditless window refuses
+/// frames can't add a reset for each evicted stream: each slot gets the reset of its first evicted
+/// stream alone, whatever the binding ids of the streams bound to it later, until that reset
+/// leaves the priority router and releases the slot.
+#[test]
+fn evicted_streams_leave_one_reset_for_each_slot_until_it_leaves() {
+    let mut harness = FastPathHarness::new();
+    let (state, mut view) = entry_state(&harness);
+    let _receiver = one_stream_acceptor(&mut harness);
+
+    // Three bindings each send an init to four slots, and each init the acceptor takes evicts the
+    // stream before it, whose reader sends a reset. None of the resets leaves.
+    for binding in 1..=3 {
+        for slot in 0..4 {
+            accept_init(&mut harness, &mut view, slot, binding);
+        }
+    }
+    assert_eq!(
+        take_resets(&mut harness.frame_rx),
+        vec![(0, 1), (1, 1), (2, 1), (3, 1)],
+        "each slot gets the reset of its first evicted stream alone"
+    );
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    assert!(
+        state.freed.take(&mut freed).is_none(),
+        "each slot waits on its reset or holds a stream"
+    );
+
+    // Slot 2's reset leaves the priority router: slot 2 is recorded as freed and gets the reset of
+    // its next evicted stream, and slot 3, whose reset still waits, doesn't.
+    state.freed.release(
+        VarInt::from_u8(2),
+        VarInt::from_u8(1),
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+    state.freed.take(&mut freed).expect("the release records slot 2 as freed");
+    assert!(freed.contains(2) && !freed.contains(3));
+    accept_init(&mut harness, &mut view, 2, 4);
+    accept_init(&mut harness, &mut view, 0, 4);
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(2, 4)]);
+}
+
+/// A reset that a producer waits on, or that holds send credit, is sent while the slot is held
+/// for another binding's reset and doesn't hold the slot. A reset that no producer waits on holds
+/// it, and the reset of the binding that holds the slot is sent without a hold of its own.
+#[test]
+fn a_reset_that_a_producer_waits_on_is_sent_while_the_slot_is_held() {
+    use crate::queue::freed::ResetHold;
+
+    let mut harness = FastPathHarness::new();
+    let (state, _) = entry_state(&harness);
+    let (slot, other) = (VarInt::from_u8(1), VarInt::from_u8(1));
+    let result = state.view().bind_for_msg(
+        slot,
+        VarInt::from_u8(2),
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+    let crate::queue::BindResult::NewBinding {
+        mut stream,
+        mut control,
+        ..
+    } = result.expect("slot 1 binds")
+    else {
+        panic!("a free slot binds a new binding");
+    };
+    let unawaited = slot_reset(&harness.path_entry, None, 0);
+    // The completion's receiver drops at once, so the frame doesn't owe it a disposition.
+    let awaited = slot_reset(
+        &harness.path_entry,
+        Some(crate::endpoint::frame::failure_completion_channel().sender()),
+        0,
+    );
+    let credited = slot_reset(&harness.path_entry, None, 1);
+
+    // Another binding's reset holds the slot.
+    assert_eq!(state.freed.hold_reset(slot, other), ResetHold::Held);
+    assert_eq!(stream.hold_reset(&unawaited), ResetHold::Refused);
+    assert_eq!(control.hold_reset(&unawaited), ResetHold::Refused);
+    assert_eq!(stream.hold_reset(&awaited), ResetHold::Unheld);
+    assert_eq!(control.hold_reset(&credited), ResetHold::Unheld);
+
+    // That reset leaves: the stream's reset holds the slot, and the other half's reset of the
+    // same binding is sent without a hold of its own.
+    state.freed.release(
+        slot,
+        other,
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+    assert_eq!(stream.hold_reset(&unawaited), ResetHold::Held);
+    assert_eq!(control.hold_reset(&unawaited), ResetHold::Unheld);
+
+    // A reset that isn't sent ends its hold, so the other half's reset can hold the slot.
+    stream.release_reset();
+    assert_eq!(control.hold_reset(&unawaited), ResetHold::Held);
+    control.release_reset();
+
+    // The stream's halves drop: no hold is left, so the slot is recorded as freed.
+    drop((stream, control));
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the slot is recorded as freed");
+    assert!(freed.contains(1));
+}
+
+/// A reset that the submission channel refuses doesn't hold its slot: the evicted stream's slot is
+/// recorded as freed once its halves drop.
+#[test]
+fn an_evicted_stream_whose_reset_isnt_sent_releases_its_slot() {
+    let mut harness = FastPathHarness::new();
+    let (state, mut view) = entry_state(&harness);
+    let _receiver = one_stream_acceptor(&mut harness);
+    // The submission channel's receiver drops, so the channel refuses every frame.
+    harness.frame_rx = crate::endpoint::frame::submission_channel(1).1;
+
+    accept_init(&mut harness, &mut view, 0, 1);
+    accept_init(&mut harness, &mut view, 1, 1);
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the evicted stream's slot is recorded as freed");
+    assert!(freed.contains(0));
+}

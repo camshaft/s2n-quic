@@ -1286,6 +1286,24 @@ impl Frame {
     pub fn should_transmit(&self) -> bool {
         self.completion.as_ref().is_none_or(|c| c.should_transmit())
     }
+
+    /// Returns the queue pair and the binding id of this frame where it is a reset without a
+    /// completion sender or send credit, which no producer waits on.
+    #[inline]
+    pub fn unawaited_reset(&self) -> Option<(QueuePair, VarInt)> {
+        let Header::QueueReset {
+            queue_pair,
+            binding_id,
+            ..
+        } = self.header
+        else {
+            return None;
+        };
+        if self.completion.is_some() || self.flow_credits != 0 {
+            return None;
+        }
+        Some((queue_pair, binding_id))
+    }
 }
 
 impl Drop for Frame {

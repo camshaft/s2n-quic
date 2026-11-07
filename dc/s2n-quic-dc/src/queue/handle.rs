@@ -10,10 +10,14 @@
 //!   also keeps the underlying page table alive.
 
 use super::{
+    freed::ResetHold,
     half::{self, Closed},
     slot::Slot,
 };
-use crate::{endpoint::msg, intrusive};
+use crate::{
+    endpoint::{frame::Frame, msg},
+    intrusive,
+};
 use core::{
     ptr::NonNull,
     task::{Context, Poll},
@@ -44,6 +48,47 @@ pub(crate) enum OnFree {
     },
 }
 
+impl OnFree {
+    /// Holds this server slot for `reset` where it is a reset of the slot's stream that no
+    /// producer waits on, as `FreedInner::hold_reset` does. Any other reset is sent without a
+    /// hold.
+    fn hold_reset(&self, reset: &Frame) -> ResetHold {
+        let OnFree::Server { path_entry, .. } = self else {
+            return ResetHold::Unheld;
+        };
+        let Some((queue_pair, binding_id)) = reset.unawaited_reset() else {
+            return ResetHold::Unheld;
+        };
+        let crate::path::secret::map::entry::QueueState::Server(ref server_state) =
+            *path_entry.queue_state()
+        else {
+            debug_assert!(false, "OnFree::Server on non-server entry");
+            return ResetHold::Unheld;
+        };
+        let freed = &server_state.freed;
+        freed.hold_reset(queue_pair.source_queue_id, binding_id)
+    }
+
+    /// Ends the hold of this server slot for a reset of `binding_id` that wasn't sent.
+    fn release_reset(&mut self, queue_id: VarInt, binding_id: VarInt) {
+        let OnFree::Server {
+            path_entry,
+            endpoint_tx,
+        } = self
+        else {
+            return;
+        };
+        let crate::path::secret::map::entry::QueueState::Server(ref server_state) =
+            *path_entry.queue_state()
+        else {
+            debug_assert!(false, "OnFree::Server on non-server entry");
+            return;
+        };
+        let freed = &server_state.freed;
+        freed.release(queue_id, binding_id, path_entry, endpoint_tx);
+    }
+}
+
 // ── StreamReceiver ────────────────────────────────────────────────────────────
 
 pub struct StreamReceiver {
@@ -67,6 +112,20 @@ impl StreamReceiver {
     #[inline]
     pub fn binding_id(&self) -> VarInt {
         self.slot().binding_id()
+    }
+
+    /// Holds this slot for `reset` before it is sent, where `reset` is a reset of a server slot's
+    /// stream that no producer waits on. See [`ResetHold`] for what it returns.
+    #[inline]
+    pub(crate) fn hold_reset(&self, reset: &Frame) -> ResetHold {
+        self.on_free.hold_reset(reset)
+    }
+
+    /// Ends the hold of this slot for a reset that [`Self::hold_reset`] held and that wasn't sent.
+    #[inline]
+    pub(crate) fn release_reset(&mut self) {
+        let (queue_id, binding_id) = (self.queue_id(), self.binding_id());
+        self.on_free.release_reset(queue_id, binding_id);
     }
 
     #[inline]
@@ -172,6 +231,20 @@ impl ControlReceiver {
     #[inline]
     pub fn binding_id(&self) -> VarInt {
         self.slot().binding_id()
+    }
+
+    /// Holds this slot for `reset` before it is sent, where `reset` is a reset of a server slot's
+    /// stream that no producer waits on. See [`ResetHold`] for what it returns.
+    #[inline]
+    pub(crate) fn hold_reset(&self, reset: &Frame) -> ResetHold {
+        self.on_free.hold_reset(reset)
+    }
+
+    /// Ends the hold of this slot for a reset that [`Self::hold_reset`] held and that wasn't sent.
+    #[inline]
+    pub(crate) fn release_reset(&mut self) {
+        let (queue_id, binding_id) = (self.queue_id(), self.binding_id());
+        self.on_free.release_reset(queue_id, binding_id);
     }
 
     #[inline]
