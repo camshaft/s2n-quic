@@ -13,11 +13,14 @@ the image for benchmarks.
 - `prepare_image(image_path, work_dir)` creates a previously absent image and
   returns `preparation_seconds`, `compressed_bytes`, `compression`,
   `source_evidence`, and `guest_evidence`. Preserve the last three fields in the
-  run's result record; the image also contains its source evidence.
+  run's result record; the image also contains its source evidence. Returned
+  guest evidence contains only declared fields, excluding extra guest text and
+  the per-run protocol nonce.
 - `verify_image(image_path, work_dir)` returns `None` only after authenticated SSH,
   the guest's shutdown event, QEMU exit, and temporary-file cleanup.
 - Failures raise `GuestError` with `stage` and `code`; these fields contain neither
-  subprocess output nor credentials. Keyboard interruption propagates after cleanup.
+  subprocess output nor credentials. If cleanup also fails, `cleanup` preserves
+  its closed error codes beside the original stage and code.
 
 The caller first validates cache metadata, including the image digest. This
 backend does not replace provenance validation and never prints `bench: ok`.
@@ -36,7 +39,10 @@ requires free space for two virtual-disk lengths for installation plus conversio
 it checks that space again after downloading and inspecting the media. Memory and free disk are read before starting the guest.
 Choose a job deadline that allows the operation and its cleanup allowance.
 The integrating caller must run these synchronous APIs on the main thread so
-SIGINT and SIGTERM can trigger cleanup.
+SIGINT and SIGTERM can be recorded for cleanup. They end the operation as
+`GuestError` stage `interrupted`, code `signal`, at the next safe checkpoint;
+a running dependency may finish or reach its configured timeout first.
+Signals never raise during resource acquisition or cleanup.
 
 `work_dir` must be owned by the caller, mode 0700, and outside both the image
 cache and uploaded result directories. A new work directory is created with

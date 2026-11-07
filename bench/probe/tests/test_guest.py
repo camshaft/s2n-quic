@@ -92,6 +92,12 @@ class SimulatedRunner:
         self.kvm_calls = 0
         self.ssh_reply = b"BENCH_SSH_OK\r\n"
         self.shutdown_disconnect = False
+        self.ssl_verify_result = 0
+        self.size_download = len(ISO)
+        self.disk_after_download = None
+        self.private_modes = {}
+        self.signal_after_popen = False
+        self.reap_timeout = False
 
     def clock(self):
         return self.now
@@ -108,6 +114,8 @@ class SimulatedRunner:
 
     def kvm(self):
         self.kvm_calls += 1
+        if self.failure == "kvm":
+            raise guest.GuestError("kvm", "no-kvm")
         self.inject("kvm")
 
     def memory_bytes(self):
@@ -122,8 +130,10 @@ class SimulatedRunner:
         self.inject(command[0])
         if command[0] == "curl":
             pathlib.Path(command[command.index("--output") + 1]).write_bytes(ISO)
-            return json.dumps({"url_effective": self.final_url, "ssl_verify_result": 0,
-                               "size_download": len(ISO)}).encode()
+            if self.disk_after_download is not None:
+                self.available_disk = self.disk_after_download
+            return json.dumps({"url_effective": self.final_url, "ssl_verify_result": self.ssl_verify_result,
+                               "size_download": self.size_download}).encode()
         if command[0] == "7z":
             pathlib.Path(command[3][2:], "install.wim").write_bytes(b"WIM")
         elif command[0] == "wimlib-imagex":
@@ -143,9 +153,10 @@ class SimulatedRunner:
         elif command[0] == "ssh-keygen":
             path = pathlib.Path(command[command.index("-f") + 1])
             if "-y" in command:
-                return b" ".join(PUBLIC.split()[:2]) + b"\n"
+                return PUBLIC
             path.write_bytes(b"PRIVATE-" + path.name.encode())
             path.with_suffix(".pub").write_bytes(PUBLIC)
+            path.with_suffix(".pub").chmod(0o644)
         elif command[0] == "ssh":
             self.inject("shutdown" if command[-1].endswith("shutdown.ps1") else "verify-command")
             key = pathlib.Path(command[command.index("-i") + 1])
@@ -161,8 +172,13 @@ class SimulatedRunner:
         self.now += 1
         self.commands.append((command, None))
         self.inject("popen")
+        directory = self.channels[-1].path.parent
+        self.private_modes = {str(p.relative_to(directory)): stat.S_IMODE(p.stat().st_mode)
+                              for p in directory.rglob("*")}
         process = Process(self)
         self.processes.append(process)
+        if self.signal_after_popen:
+            signal.raise_signal(signal.SIGTERM)
         return process
 
     def channel(self, directory):
@@ -173,6 +189,9 @@ class SimulatedRunner:
     def reap(self, process, timeout):
         self.reaped.append((process, timeout))
         process.ended = True
+        if self.reap_timeout:
+            raise subprocess.TimeoutExpired(["qemu"], timeout, output=b"SECRET")
+        self.inject("reap")
 
 
 class BackendTests(unittest.TestCase):
@@ -229,16 +248,24 @@ class BackendTests(unittest.TestCase):
         self.assertIn("-c", convert)
         self.assertIn("compression_type=zlib", convert)
         self.assertEqual(runner.kvm_calls, 1)
+        curl, timeout = next((c, t) for c, t in runner.commands if c[0] == "curl")
+        self.assertEqual(curl[curl.index("--proto") + 1], "=https")
+        self.assertEqual(curl[curl.index("--proto-redir") + 1], "=https")
+        self.assertEqual(float(curl[curl.index("--max-time") + 1]), timeout)
+        self.assertEqual(timeout, self.settings.timeout_seconds)
         self.assert_clean(runner)
 
     def test_prepare_failure_and_interruptions_do_not_publish(self):
-        for failure in ("curl", "7z", "wimlib-imagex", "genisoimage", "qemu-img", "popen", "attach", "event", "wait", "convert", "timeout-event", "interrupt-event", "term-event"):
+        for failure in ("kvm", "curl", "7z", "wimlib-imagex", "genisoimage", "qemu-img", "popen", "attach", "event", "wait", "convert", "timeout-event", "interrupt-event", "term-event"):
             with self.subTest(failure=failure):
                 runner = SimulatedRunner(["prepared"])
                 runner.failure = failure
                 with self.assertRaises((guest.GuestError, KeyboardInterrupt)) as error:
                     self.prepare(runner)
                 self.assertNotIn("SECRET", str(error.exception))
+                if failure == "kvm":
+                    self.assertEqual(runner.commands, [])
+                    self.assertEqual(error.exception.code, "no-kvm")
                 self.assertFalse(self.image.exists())
                 self.assert_clean(runner)
 
@@ -272,7 +299,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(qemu[qemu.index("-accel") + 1], "kvm")
         self.assertTrue(any("overlay.qcow2" in item for item in qemu))
         create = next(c for c, _ in runner.commands if c[:2] == ["qemu-img", "create"])
-        self.assertEqual(create[create.index("-b") + 1], str(self.image))
+        self.assertEqual(create[create.index("-b") + 1], str(self.image.resolve()))
         self.assertEqual(create[create.index("-F") + 1], "qcow2")
         ssh = [c for c, _ in runner.commands if c[0] == "ssh"]
         self.assertEqual(len(ssh), 2)
@@ -284,21 +311,31 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(command[command.index("-F") + 1], "/dev/null")
             self.assertIn("benchprobe@127.0.0.1", command)
         nonce = runner.seeds[0]["metadata"]["nonce"]
-        self.assertTrue(runner.hosts.startswith("bench-" + nonce + " ssh-ed25519 "))
+        self.assertEqual(runner.hosts, "bench-" + nonce + " " + b" ".join(PUBLIC.split()[:2]).decode() + "\n")
         seed = runner.seeds[0]
         self.assertEqual(set(seed["files"]), {"seed.json", "benchrun.tag", "host_key", "client.pub"})
         self.assertEqual(seed["files"]["host_key"], b"PRIVATE-host")
+        self.assertEqual(seed["mode"], 0o700)
+        self.assertEqual(runner.private_modes["seed"], 0o700)
+        for path in ("client", "client.pub", "host", "host.pub", "known_hosts", "seed.iso",
+                     "seed/host_key", "seed/client.pub", "seed/seed.json"):
+            self.assertEqual(runner.private_modes[path], 0o600, path)
+        self.assertEqual(runner.kvm_calls, 1)
         self.assertNotIn(b"PRIVATE-client", b"".join(seed["files"].values()))
         self.assert_clean(runner)
 
     def test_verify_failures_always_reap_and_remove_secrets_without_changing_base(self):
-        for failure in ("ssh-keygen", "genisoimage", "qemu-img", "popen", "attach", "event", "ssh", "verify-command", "shutdown", "wait", "interrupt-event", "term-verify-command"):
+        for failure in ("kvm", "ssh-keygen", "genisoimage", "qemu-img", "popen", "attach", "event", "ssh", "verify-command", "shutdown", "wait", "interrupt-event", "term-verify-command"):
             with self.subTest(failure=failure):
                 runner = SimulatedRunner(["ready", "stopping"])
                 runner.failure = failure
                 with self.assertRaises((guest.GuestError, KeyboardInterrupt)) as error:
                     self.verify(runner)
                 self.assertNotIn("SECRET", str(error.exception))
+                if failure == "kvm":
+                    self.assertEqual(runner.commands, [])
+                    self.assertEqual(error.exception.code, "no-kvm")
+                self.assertEqual(runner.kvm_calls, 1)
                 self.assertEqual(self.image.read_bytes(), IMAGE)
                 self.assert_clean(runner)
 
@@ -318,6 +355,55 @@ class BackendTests(unittest.TestCase):
         runner.shutdown_disconnect = True
         with self.assertRaisesRegex(guest.GuestError, "unexpected-phase"):
             self.verify(runner)
+        self.assert_clean(runner)
+
+    def test_serial_evidence_exports_only_declared_fields(self):
+        runner = SimulatedRunner(["prepared"])
+        runner.event_changes = {"extra_secret": "SECRET"}
+        evidence = self.prepare(runner)["guest_evidence"]
+        self.assertEqual(set(evidence), {"schema", "phase", "setup_complete", "password_invalidated",
+                                      "base_accounts_disabled", "base_host_keys_absent", "edition",
+                                      "license_status", "grace_minutes"})
+        self.assertNotIn("SECRET", json.dumps(evidence))
+        self.assertNotIn("nonce", evidence)
+        self.assert_clean(runner)
+
+    def test_certificate_and_download_length_fail_closed(self):
+        for field, value, code in (("ssl_verify_result", 1, "untrusted-download"),
+                                   ("size_download", len(ISO) + 1, "download-size")):
+            with self.subTest(field=field):
+                runner = SimulatedRunner(["prepared"])
+                setattr(runner, field, value)
+                with self.assertRaisesRegex(guest.GuestError, code):
+                    self.prepare(runner)
+                self.assertFalse(self.image.exists())
+                self.assert_clean(runner)
+
+    def test_capacity_is_checked_after_the_download(self):
+        runner = SimulatedRunner(["prepared"])
+        runner.disk_after_download = 2 * self.settings.disk_gib * 1024 ** 3 - 1
+        with self.assertRaisesRegex(guest.GuestError, "no-room"):
+            self.prepare(runner)
+        self.assertEqual(runner.processes, [])
+        self.assertFalse(self.image.exists())
+        self.assert_clean(runner)
+
+    def test_cleanup_failure_is_an_error_in_both_phases(self):
+        for operation, phases in ((self.prepare, ["prepared"]), (self.verify, ["ready", "stopping"])):
+            runner = SimulatedRunner(phases)
+            runner.failure = "reap"
+            with self.assertRaises(guest.GuestError) as error:
+                operation(runner)
+            self.assertEqual(error.exception.stage, "cleanup")
+            self.assertNotIn("SECRET", str(error.exception))
+            self.assert_clean(runner)
+
+    def test_verification_requires_a_clean_qemu_exit(self):
+        runner = SimulatedRunner(["ready", "stopping"])
+        runner.exit_code = 1
+        with self.assertRaisesRegex(guest.GuestError, "qemu-failed"):
+            self.verify(runner)
+        self.assertEqual(self.image.read_bytes(), IMAGE)
         self.assert_clean(runner)
 
     def test_publisher_hash_must_match_when_supplied(self):
@@ -392,6 +478,8 @@ class BackendTests(unittest.TestCase):
                                   ({"grace_minutes": "1"}, False),
                                   ({"license_status": 5}, False),
                                   ({"schema": 2}, False),
+                                  ({"schema": True}, False),
+                                  ({"edition": None}, False),
                                   ({"setup_complete": 1}, False)):
             runner = SimulatedRunner(["ready"])
             runner.seeds = [{"metadata": {"nonce": "n"}}]
@@ -410,6 +498,47 @@ class BackendTests(unittest.TestCase):
             with guest.cancellation():
                 signal.raise_signal(signal.SIGTERM)
         self.assertEqual(before, {s: signal.getsignal(s) for s in before})
+
+    def test_signal_after_process_creation_still_reaps(self):
+        runner = SimulatedRunner(["prepared"])
+        runner.signal_after_popen = True
+        with self.assertRaisesRegex(guest.GuestError, "interrupted"):
+            self.prepare(runner)
+        self.assertEqual(len(runner.processes), 1)
+        self.assertFalse(self.image.exists())
+        self.assert_clean(runner)
+
+    def test_signal_during_directory_removal_does_not_stop_cleanup(self):
+        runner = SimulatedRunner(["ready", "stopping"])
+        remove = guest.shutil.rmtree
+        signalled = []
+
+        def removal(*args, **kwargs):
+            signalled.append(True)
+            signal.raise_signal(signal.SIGTERM)
+            return remove(*args, **kwargs)
+
+        with mock.patch("guest.shutil.rmtree", side_effect=removal):
+            with self.assertRaisesRegex(guest.GuestError, "interrupted"):
+                self.verify(runner)
+        self.assertTrue(signalled)
+        self.assert_clean(runner)
+        self.assertEqual(self.image.read_bytes(), IMAGE)
+
+    def test_cleanup_failure_keeps_the_primary_failure(self):
+        for operation, phases, failure, expected_stage in (
+                (self.prepare, ["prepared"], "wait", "prepare"),
+                (self.verify, ["ready", "stopping"], "ssh", "ssh")):
+            runner = SimulatedRunner(phases)
+            runner.failure = failure
+            runner.reap_timeout = True
+            with self.assertRaises(guest.GuestError) as error:
+                operation(runner)
+            self.assertEqual(error.exception.stage, expected_stage)
+            self.assertEqual(error.exception.code, "command-failed")
+            self.assertEqual(error.exception.cleanup, ("timeout",))
+            self.assertNotIn("SECRET", str(error.exception))
+            self.assert_clean(runner)
 
     def test_real_reaper_kills_process_group_and_waits(self):
         process = mock.Mock(pid=123)
@@ -436,6 +565,27 @@ class BackendTests(unittest.TestCase):
                                 with self.assertRaisesRegex(guest.GuestError, "invalid-json") as error:
                                     channel.receive(deadline)
                                 self.assertNotIn("SECRET", str(error.exception))
+                    finally:
+                        os.close(write_fd)
+                self.assertFalse(channel.path.exists())
+
+    def test_serial_exit_before_a_record_and_deadline(self):
+        for process_exited in (True, False):
+            with self.subTest(process_exited=process_exited):
+                with guest.Channel(self.root) as channel:
+                    read_fd, write_fd = os.pipe()
+                    channel.pidfd = read_fd
+                    deadline = guest.Deadline(10, lambda: 0)
+                    try:
+                        if process_exited:
+                            os.write(write_fd, b"exit")
+                            with self.assertRaisesRegex(guest.GuestError, "process-exited-before-record"):
+                                channel.receive(deadline)
+                        else:
+                            with mock.patch("guest.select.select", return_value=([], [], [])) as wait:
+                                with self.assertRaisesRegex(guest.GuestError, "deadline"):
+                                    channel.receive(deadline)
+                                self.assertEqual(wait.call_args.args[-1], 10)
                     finally:
                         os.close(write_fd)
                 self.assertFalse(channel.path.exists())

@@ -15,6 +15,7 @@ that Windows installed or booted. See windows/README.md for the live checks.
 """
 
 import contextlib
+import contextvars
 import dataclasses
 import hashlib
 import json
@@ -36,14 +37,16 @@ from xml.sax.saxutils import escape
 
 ROOT = pathlib.Path(__file__).resolve().parent
 WINDOWS = ROOT / "windows"
+_CANCELLATION = contextvars.ContextVar("bench_cancellation", default=None)
 
 
 class GuestError(RuntimeError):
     """A stage and a closed error code; never subprocess output or credentials."""
 
-    def __init__(self, stage, code):
+    def __init__(self, stage, code, cleanup=()):
         self.stage = stage
         self.code = code
+        self.cleanup = tuple(cleanup)
         super().__init__(f"{stage}: {code}")
 
 
@@ -87,6 +90,7 @@ class Deadline:
         self.end = clock() + seconds
 
     def remaining(self):
+        check_cancellation()
         left = self.end - self.clock()
         if left <= 0 or not math.isfinite(left):
             raise GuestError("deadline", "expired")
@@ -177,6 +181,7 @@ class Runner:
     def run(self, command, timeout):
         result = subprocess.run(command, check=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, timeout=timeout)
+        check_cancellation()
         return result.stdout
 
     def popen(self, command):
@@ -201,32 +206,69 @@ def stage(name):
         yield
     except GuestError:
         raise
-    except subprocess.TimeoutExpired:
-        raise GuestError(name, "timeout") from None
-    except subprocess.CalledProcessError:
-        raise GuestError(name, "command-failed") from None
-    except (OSError, ValueError, KeyError, ET.ParseError):
-        raise GuestError(name, "dependency-failed") from None
+    except subprocess.TimeoutExpired as error:
+        raise GuestError(name, "timeout", getattr(error, "cleanup", ())) from None
+    except subprocess.CalledProcessError as error:
+        raise GuestError(name, "command-failed", getattr(error, "cleanup", ())) from None
+    except (OSError, ValueError, KeyError, ET.ParseError) as error:
+        raise GuestError(name, "dependency-failed", getattr(error, "cleanup", ())) from None
+
+
+def check_cancellation():
+    state = _CANCELLATION.get()
+    if state is not None and state["requested"]:
+        raise GuestError("interrupted", "signal")
 
 
 @contextlib.contextmanager
 def cancellation():
-    """The synchronous CLI runs on its main thread; cancellation still cleans up."""
+    """Remember signals; raise only at checkpoints outside acquisition and cleanup.
+
+    A running dependency can finish or reach its configured timeout before the
+    next checkpoint. A signal during cleanup is reported after cleanup finishes.
+    """
     previous = {}
+    state = {"requested": False}
+    token = _CANCELLATION.set(state)
 
     def interrupted(signum, frame):
-        # A second cancellation must not interrupt process reaping or key removal.
-        for cancelling_signal in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(cancelling_signal, signal.SIG_IGN)
-        raise GuestError("interrupted", "signal")
+        state["requested"] = True
 
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous[signum] = signal.signal(signum, interrupted)
         yield
+        check_cancellation()
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+        _CANCELLATION.reset(token)
+
+
+@contextlib.contextmanager
+def cleanup_scope(clean):
+    """Preserve a primary failure and append only closed cleanup error codes."""
+    failure = None
+    try:
+        yield
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            clean()
+        except BaseException as error:
+            if isinstance(error, subprocess.TimeoutExpired):
+                code = "timeout"
+            elif isinstance(error, subprocess.CalledProcessError):
+                code = "command-failed"
+            elif isinstance(error, KeyboardInterrupt):
+                code = "interrupted"
+            else:
+                code = "dependency-failed"
+            if failure is None:
+                raise GuestError("cleanup", code) from None
+            failure.cleanup = (*getattr(failure, "cleanup", ()), code)
 
 
 def private_write(path, value):
@@ -246,8 +288,9 @@ def scratch(work_dir, image_path):
     info = work.stat()
     if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
         raise GuestError("configuration", "work-not-private")
-    with tempfile.TemporaryDirectory(prefix="guest-", dir=work) as directory:
-        yield pathlib.Path(directory)
+    temporary = tempfile.TemporaryDirectory(prefix="guest-", dir=work)
+    with cleanup_scope(temporary.cleanup):
+        yield pathlib.Path(temporary.name)
 
 
 def check_capacity(runner, settings, directory):
@@ -340,19 +383,25 @@ def qemu_command(settings, disk, seed, serial_path, iso=None, port=None):
 
 @contextlib.contextmanager
 def virtual_machine(runner, deadline, settings, directory, disk, seed, iso=None, port=None):
-    with runner.channel(directory) as channel:
-        process = runner.popen(qemu_command(settings, disk, seed, channel.path, iso, port))
-        try:
+    channel = runner.channel(directory)
+    with cleanup_scope(lambda: channel.__exit__(None, None, None)):
+        channel.__enter__()
+        process = None
+
+        def reap():
+            if process is not None:
+                runner.reap(process, settings.cleanup_seconds)
+
+        with cleanup_scope(reap):
+            process = runner.popen(qemu_command(settings, disk, seed, channel.path, iso, port))
+            deadline.remaining()
             channel.attach(process)
             yield process, channel
-        finally:
-            with stage("cleanup"):
-                runner.reap(process, settings.cleanup_seconds)
 
 
 def event(channel, deadline, phase, nonce, edition=None):
     record = channel.receive(deadline)
-    if record.get("schema") != 1 or record.get("nonce") != nonce:
+    if type(record.get("schema")) is not int or record["schema"] != 1 or record.get("nonce") != nonce:
         raise GuestError("event", "wrong-identity")
     if record.get("phase") != phase:
         raise GuestError("event", "unexpected-phase")
@@ -360,18 +409,25 @@ def event(channel, deadline, phase, nonce, edition=None):
         required = ("setup_complete", "password_invalidated", "base_accounts_disabled", "base_host_keys_absent")
         if any(record.get(key) is not True for key in required):
             raise GuestError("event", "missing-attestation")
+        if not isinstance(record.get("edition"), str) or not record["edition"]:
+            raise GuestError("event", "wrong-edition")
         if edition is not None and record.get("edition") != edition:
             raise GuestError("event", "wrong-edition")
         status, grace = record.get("license_status"), record.get("grace_minutes")
         if (type(status) is not int or type(grace) is not int or grace < 0
                 or not (status == 1 or (status == 2 and grace > 0))):
             raise GuestError("license", "not-usable")
-    return record
+        # Export declared evidence only, not arbitrary guest text or protocol tokens.
+        return {key: record[key] for key in (
+            "schema", "phase", *required, "edition", "license_status", "grace_minutes"
+        )}
+    return {"schema": 1, "phase": phase}
 
 
 def clean_exit(process, deadline):
     if process.wait(timeout=deadline.remaining()) != 0:
         raise GuestError("shutdown", "qemu-failed")
+    check_cancellation()
 
 
 def prepare_image(image_path, work_dir, *, settings=None, runner=None):
@@ -455,12 +511,14 @@ def verify_image(image_path, work_dir, *, settings=None, runner=None):
             client, host = directory / "client", directory / "host"
             for key in (client, host):
                 runner.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "bench", "-f", str(key)], deadline.remaining())
-                os.chmod(key, 0o600)
+                for key_file in (key, key.with_suffix(".pub")):
+                    os.chmod(key_file, 0o600)
             public = runner.run(["ssh-keygen", "-y", "-f", str(host)], deadline.remaining()).decode("ascii").strip()
-            if len(public.split()) != 2 or public.split()[0] != "ssh-ed25519":
+            fields = public.split()
+            if len(fields) < 2 or fields[0] != "ssh-ed25519":
                 raise GuestError("keys", "host-public-key")
             hosts = directory / "known_hosts"
-            private_write(hosts, "bench-" + nonce + " " + public + "\n")
+            private_write(hosts, "bench-" + nonce + " " + " ".join(fields[:2]) + "\n")
             metadata = {"schema": 1, "nonce": nonce}
             seed = make_seed(runner, deadline, directory, "BENCHRUN", metadata,
                              {"host_key": host.read_bytes(), "client.pub": client.with_suffix(".pub").read_bytes()})
