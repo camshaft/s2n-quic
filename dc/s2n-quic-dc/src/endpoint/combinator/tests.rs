@@ -55,6 +55,7 @@ struct TestItem {
     byte_cost: u64,
     flow_credits: u64,
     highest_priority: bool,
+    waited: bool,
     drop_counter: Arc<AtomicUsize>,
 }
 
@@ -163,6 +164,7 @@ fn new_test_item(
         byte_cost: 123,
         flow_credits: 0,
         highest_priority: false,
+        waited: false,
         drop_counter,
     }
 }
@@ -4340,76 +4342,91 @@ impl CreditlessCost for TestItem {
         }
     }
 
-    fn window_round(&self) -> u64 {
-        0
+    fn waited(&self) -> bool {
+        self.waited
     }
 
-    fn creditless_peer(&self) -> Option<PeerKey> {
-        (self.flow_credits == 0).then(|| PeerKey::of(&self.path_secret_entry))
+    fn set_waited(&mut self) {
+        self.waited = true;
     }
 }
 
 /// The window admits a frame while it holds nothing, refuses one past its limit, and grows its
-/// limit by a batch's bytes where it refused a frame in the round in which the batch was read.
+/// limit, once for each refusal, where a worker could take a batch that the batch router doesn't
+/// have.
 #[test]
-fn creditless_window_admits_a_frame_while_empty_and_grows_by_its_releases() {
-    let window = CreditlessWindow::default();
+fn creditless_window_admits_a_frame_while_empty_and_grows_where_a_worker_could_take_a_batch() {
+    let window = CreditlessWindow::new(100);
     // A clone stands for the batch router's, so that the window counts the frames.
     let _router = window.clone();
-    window.start_round();
+    // A worker that could take a batch while the window didn't refuse a frame leaves the limit as
+    // it is.
+    window.starved();
+    assert_eq!(window.limit(), 100);
     assert!(
         window.admit(1000),
         "the window refused a frame while it held nothing"
     );
     assert!(
         !window.admit(1),
-        "the window admitted a frame past its limit of 0"
+        "the window admitted a frame past its limit of 100"
     );
     assert_eq!(window.held(), 1000);
 
-    window.release(1000, window.round());
-    assert_eq!(window.held(), 0);
-    assert_eq!(window.limit(), 1000);
-    assert!(window.admit(600));
-    assert!(window.admit(400));
-    assert!(
-        !window.admit(1),
-        "the window admitted a frame past its limit of 1000"
-    );
+    // Before a worker's sender takes a batch, the limit grows by the minimum, once for the
+    // refusal.
+    window.starved();
+    assert_eq!(window.limit(), 200);
+    window.starved();
+    assert_eq!(window.limit(), 200, "the limit grew twice for one refusal");
 
-    // A batch released in a round in which the window didn't refuse a frame leaves the limit
-    // as it is.
-    window.start_round();
-    window.release(1000, window.round());
-    assert_eq!(window.limit(), 1000);
+    // A batch that didn't wait leaves the limit as it is.
+    window.release(1000, false);
     assert_eq!(window.held(), 0);
+    assert_eq!(window.limit(), 200);
+    assert!(window.admit(1000));
+    assert!(!window.admit(1));
+
+    // After that, the limit grows by the bytes of the last batch a worker's sender took.
+    window.starved();
+    assert_eq!(window.limit(), 1200);
+    // A frame the window admits ends the refusal.
+    assert!(window.admit(200));
+    window.starved();
+    assert_eq!(window.limit(), 1200);
+    assert_eq!(window.held(), 1200);
 }
 
-/// The window halves its limit once a round as a worker takes a batch that was read in an
-/// earlier round.
+/// The window halves its limit as a worker's sender takes a batch that waited for a sender, once
+/// for the bytes the window held then.
 #[test]
-fn creditless_window_halves_its_limit_once_a_round_for_a_batch_that_waited() {
+fn creditless_window_halves_its_limit_once_for_the_bytes_it_held_as_a_batch_waited() {
     let window = CreditlessWindow::with_limit(1000);
     let _router = window.clone();
-    let read_in = window.round();
-    for _ in 0..3 {
+    for _ in 0..4 {
         assert!(window.admit(100));
     }
 
-    window.start_round();
-    window.release(100, read_in);
+    window.release(100, true);
     assert_eq!(window.limit(), 500);
-    window.release(100, read_in);
-    assert_eq!(window.limit(), 500, "the limit halved twice in a round");
-
-    window.start_round();
-    window.release(100, read_in);
-    assert_eq!(window.limit(), 250);
+    // The window held 300 bytes as its limit halved: the batches that release them don't halve
+    // it again, whether they waited or not.
+    window.release(100, true);
+    window.release(100, false);
+    window.release(100, true);
+    assert_eq!(
+        window.limit(),
+        500,
+        "the limit halved again for the bytes it held"
+    );
     assert_eq!(window.held(), 0);
 
+    assert!(window.admit(100));
+    window.release(100, true);
+    assert_eq!(window.limit(), 250);
+
     // A release of no bytes leaves the limit as it is.
-    window.start_round();
-    window.release(0, read_in);
+    window.release(0, true);
     assert_eq!(window.limit(), 250);
 }
 
@@ -4418,7 +4435,6 @@ fn creditless_window_halves_its_limit_once_a_round_for_a_batch_that_waited() {
 fn creditless_window_starts_at_its_minimum_and_doesnt_halve_below_it() {
     let window = CreditlessWindow::new(1000);
     let _router = window.clone();
-    let read_in = window.round();
     assert!(window.admit(600));
     assert!(window.admit(400));
     assert!(
@@ -4426,8 +4442,7 @@ fn creditless_window_starts_at_its_minimum_and_doesnt_halve_below_it() {
         "the window admitted a frame past its minimum"
     );
 
-    window.start_round();
-    window.release(1000, read_in);
+    window.release(1000, true);
     assert_eq!(window.limit(), 1000);
 }
 
@@ -4508,7 +4523,9 @@ fn creditless_window_releases_a_batch_that_the_workers_receiver_refuses() {
 }
 
 /// The bytes of a waiting peer's batches without send credit stay in the window while the
-/// batches wait in the router, and leave it as each batch goes to a worker's sender.
+/// batches wait in the router, and leave it as each batch goes to a worker's sender. The first
+/// batch that waited halves the window's limit as it goes, once for the bytes the window holds
+/// then.
 #[test]
 fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window() {
     let rate = Rate::new(1.0);
@@ -4521,9 +4538,17 @@ fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window
     let window = CreditlessWindow::with_limit(400_000);
     let delivers = Sends::default();
     let lost = Sends::default();
+    // Whether each batch waited in the router, in the order the senders took them.
+    let waited = Rc::new(RefCell::new(Vec::new()));
     let senders: IdMap<LocalSenderId, _> = timed_senders(&clock, &[&delivers, &lost])
         .into_iter()
-        .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
+        .map(|(id, sender)| {
+            let sender = WaitedSender {
+                sender,
+                waited: Rc::clone(&waited),
+            };
+            (id, WindowSender::new(sender, window.clone()))
+        })
         .collect();
     // The priority router admitted each batch's frames, none of which borrows send credit.
     let values = test_items(&entry, 4, 100_000, &drop_counter);
@@ -4560,25 +4585,35 @@ fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window
     assert_eq!(window.held(), 300_000);
     assert!(!window.admit(100_001));
 
-    // Each batch's bytes leave the window as the batch goes.
-    for (delivered, held) in [(2, 200_000), (3, 100_000)] {
+    // Each batch's bytes leave the window as the batch goes. The second batch waited on its
+    // interface's pacer, which leaves the limit as it is, and the third in the router, which
+    // halves it.
+    for (delivered, held, limit) in [(2, 200_000, 400_000), (3, 100_000, 200_000)] {
         clock.advance(std::time::Duration::from_millis(1));
         assert_eq!(poll_until_idle(&mut router), Poll::Pending);
         assert_eq!(delivers.borrow().len(), delivered);
         assert_eq!(window.held(), held);
+        assert_eq!(window.limit(), limit);
     }
+    // The fourth batch waited in the router too, but the window held its bytes as the limit
+    // halved.
     clock.advance(std::time::Duration::from_millis(1));
     assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
     assert_eq!(delivers.borrow().len(), 4);
     assert_eq!(window.held(), 0);
+    assert_eq!(window.limit(), 200_000);
     assert!(lost.borrow().is_empty());
+    assert_eq!(
+        *waited.borrow(),
+        [false, false, true, true],
+        "the router marks the batches that waited in it",
+    );
     assert_eq!(drop_counter.load(Ordering::Relaxed), 4);
 }
 
 #[test]
 fn frame_batch_counts_the_bytes_of_its_frames_without_send_credit() {
     let path = test_path_secret_entry();
-    let peer = PeerKey::of(&path);
     let first = new_test_frame(path.clone(), 16);
     let first_cost = first.byte_cost();
     let mut batch = FrameBatch::new(first);
@@ -4590,45 +4625,333 @@ fn frame_batch_counts_the_bytes_of_its_frames_without_send_credit() {
     batch.push_with_cost(credited, credited_cost);
     assert_eq!(batch.creditless_bytes(), first_cost);
 
-    // A batch keeps the round in which the batch router read it, 0 until the router sets it.
-    assert_eq!(batch.window_round(), 0);
-    batch.set_window_round(7);
-    assert_eq!(batch.window_round(), 7);
+    // A new batch hasn't waited in the router.
+    assert!(!batch.waited());
 
-    // A worker's sender reads them through the batch's entry.
-    let entry = Entry::new(batch);
+    // A worker's sender reads them through the batch's entry, and the router marks the batch
+    // through it.
+    let mut entry = Entry::new(batch);
     assert_eq!(entry.creditless_bytes(), first_cost);
-    assert_eq!(entry.window_round(), 7);
-    // The batch holds one peer's frames, whose bytes the window counts for that peer.
-    assert_eq!(entry.creditless_peer(), Some(peer));
-    // A batch of frames with send credit alone has no peer for the window.
-    let mut credited_only = new_test_frame(test_path_secret_entry(), 8);
-    credited_only.flow_credits = 1;
-    assert_eq!(FrameBatch::new(credited_only).creditless_peer(), None);
+    assert!(!entry.waited());
+    entry.set_waited();
+    assert!(entry.waited());
 }
 
-/// A worker's sender releases a batch's bytes for the batch's peer.
-#[test]
-fn window_sender_releases_a_batchs_bytes_for_its_peer() {
-    let entry = test_path_secret_entry();
-    let peer = PeerKey::of(&entry);
-    let window = CreditlessWindow::default();
-    let mut sender = WindowSender::new(
-        TestSender {
-            accept: true,
-            calls: 0,
-        },
-        window.clone(),
-    );
-    let mut item = new_test_item(entry, Arc::new(AtomicUsize::new(0)));
-    item.byte_cost = 1000;
-    assert_eq!(item.creditless_peer(), Some(peer));
+/// The priority router of the window's pacing tests: it moves its items into the batch router's
+/// lane, in order, while the window admits their bytes, and stops at the first item the window
+/// refuses.
+struct WindowLanes {
+    window: CreditlessWindow,
+    staged: VecDeque<TestItem>,
+    moved: Rc<RefCell<VecDeque<TestItem>>>,
+}
 
-    assert!(window.admit_peer(Some(peer), item.creditless_bytes()));
-    assert_eq!(window.peer_held(peer), 1000);
-    assert!(sender.send(item).is_ok());
-    assert_eq!(window.held(), 0);
-    assert_eq!(window.peer_held(peer), 0);
+impl WindowLanes {
+    fn new(window: CreditlessWindow, staged: VecDeque<TestItem>) -> Self {
+        Self {
+            window,
+            staged,
+            moved: Rc::default(),
+        }
+    }
+
+    /// Returns the receiver of the lane, which is `Pending` while the lane is empty.
+    fn receiver(&self) -> LaneReceiver {
+        LaneReceiver {
+            moved: Rc::clone(&self.moved),
+        }
+    }
+
+    /// Moves the staged items into the lane while the window admits their bytes.
+    fn pass(&mut self) {
+        while let Some(item) = self.staged.front() {
+            if !self.window.admit(item.creditless_bytes()) {
+                break;
+            }
+            let item = self
+                .staged
+                .pop_front()
+                .expect("the lanes hold a front item");
+            self.moved.borrow_mut().push_back(item);
+        }
+    }
+}
+
+/// The receiver of the lane of a [`WindowLanes`].
+struct LaneReceiver {
+    moved: Rc<RefCell<VecDeque<TestItem>>>,
+}
+
+impl Receiver<TestItem> for LaneReceiver {
+    fn poll_recv(
+        &mut self,
+        _cx: &mut task::Context<'_>,
+        _budget: &mut Budget,
+    ) -> Poll<Option<TestItem>> {
+        match self.moved.borrow_mut().pop_front() {
+            Some(item) => Poll::Ready(Some(item)),
+            None => Poll::Pending,
+        }
+    }
+
+    fn on_consumed(&mut self, _bytes: u64) {}
+}
+
+/// Runs `router` over 20 ms of `clock`, in steps of 10 us: in each step `lanes` moves the items
+/// that the window admits, and `router` sends what it may. Returns the window's limit after each
+/// step, and the bytes it holds then.
+fn run_with_window<R: Receiver<()>>(
+    lanes: &mut WindowLanes,
+    router: &mut R,
+    clock: &test_clock_mod::Clock,
+) -> (Vec<u64>, Vec<u64>) {
+    let mut limits = Vec::new();
+    let mut held = Vec::new();
+    for _ in 0..2_000 {
+        lanes.pass();
+        assert_eq!(poll_until_idle(router), Poll::Pending);
+        clock.advance(std::time::Duration::from_micros(10));
+        limits.push(lanes.window.limit());
+        held.push(lanes.window.held());
+    }
+    (limits, held)
+}
+
+/// Under one paced interface, the window's limit grows where the pacer finds the batch router
+/// without a batch while the window refuses one, and settles above its minimum once the batch
+/// router has the next batch each time the pacer asks for one: at about the batch the pacer
+/// holds and the next one.
+#[test]
+fn creditless_window_settles_at_the_batches_one_paced_interface_holds() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let window = CreditlessWindow::new(10_000);
+    let mut lanes = WindowLanes::new(
+        window.clone(),
+        test_items(&test_path_secret_entry(), 200, 100_000, &drop_counter),
+    );
+    let sends = Sends::default();
+    let senders: IdMap<LocalSenderId, _> = timed_senders(&clock, &[&sends, &sends])
+        .into_iter()
+        .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
+        .collect();
+    let rx = WindowReader::new(lanes.receiver(), window.clone());
+    let rx: crate::socket::channel::Paced<_, _, TestItem> =
+        crate::socket::channel::Paced::new(rx, clock.clone(), rate);
+    let registry = crate::counter::Registry::default();
+    let mut router = PickTwo::new(
+        rx,
+        senders,
+        crate::xorshift::Rng::new(),
+        &registry,
+        test_pool(),
+    );
+
+    let (limits, _) = run_with_window(&mut lanes, &mut router, &clock);
+
+    // A batch of 100,000 bytes takes 800 us at 1 Gbps, so the interface sends about 25 in 20 ms.
+    let sent = sends.borrow().len();
+    assert!(sent >= 20, "{sent} batches");
+    // The pacer holds a batch and the lane the next one, beside the minimum, and a pacer that
+    // holds a batch doesn't ask for another: the limit stays there.
+    let settled = *limits.last().expect("the run has steps");
+    assert!(
+        (200_000..=310_000).contains(&settled),
+        "the limit settled at {settled}",
+    );
+    assert!(
+        limits[1_000..].iter().all(|&limit| limit == settled),
+        "the limit changed in the last 10 ms",
+    );
+    // Nothing marks a batch as one that waited under one interface, so the limit doesn't halve.
+    assert!(
+        limits.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the limit halved",
+    );
+}
+
+/// Under two paced interfaces, the window's limit settles above its minimum at about the
+/// batches that the two pacers hold and the next ones, and each interface sends at its rate.
+#[test]
+fn creditless_window_settles_at_the_batches_two_paced_interfaces_hold() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let start = crate::time::precision::Clock::now(&clock);
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let window = CreditlessWindow::new(10_000);
+    let mut lanes = WindowLanes::new(
+        window.clone(),
+        test_items(&test_path_secret_entry(), 200, 100_000, &drop_counter),
+    );
+    let first = Sends::default();
+    let second = Sends::default();
+    let senders: IdMap<LocalSenderId, _> = timed_senders(&clock, &[&first, &second])
+        .into_iter()
+        .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
+        .collect();
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::<TestItem, _, _, _>::new(
+        lanes.receiver(),
+        senders,
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &SendPacing::new(vec![rate, rate], vec![0, 1]),
+        &registry,
+        test_pool(),
+    )
+    .with_window(window);
+
+    let (limits, _) = run_with_window(&mut lanes, &mut router, &clock);
+
+    // A batch of 100,000 bytes takes 800 us at 1 Gbps, so each interface sends about 25 in 20 ms.
+    for sends in [&first, &second] {
+        let sends = sends.borrow();
+        assert_within_rate(&sends, rate, start);
+        assert!(sends.len() >= 20, "{} batches", sends.len());
+    }
+    // Each pacer holds a batch and the lane the next one: the limit grows past them. A pacer
+    // that holds a batch doesn't ask for another, so the limit doesn't grow past a batch of each
+    // pacer, a next batch for each and the minimum, though the frames keep coming.
+    let settled = *limits.last().expect("the run has steps");
+    assert!(settled >= 300_000, "the limit settled at {settled}");
+    let most = limits.iter().copied().max().unwrap_or_default();
+    assert!(most <= 410_000, "the limit grew to {most}");
+}
+
+/// Under two paced interfaces, where the pair of the second interface's sender is lost for the
+/// peer, the first interface's sender takes each of the peer's batches, and those its pacer
+/// doesn't hold wait in the router. The free sender of the second interface can't take them, so
+/// the window's limit doesn't grow for them while they wait: the limit and the bytes that wait in
+/// the router stay bounded, though the frames keep coming.
+#[test]
+fn creditless_window_stays_bounded_while_a_peers_batches_wait_for_one_interface() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    let window = CreditlessWindow::new(10_000);
+    let mut lanes = WindowLanes::new(
+        window.clone(),
+        test_items(&entry, 200, 100_000, &drop_counter),
+    );
+    let delivers = Sends::default();
+    let lost = Sends::default();
+    let senders: IdMap<LocalSenderId, _> = timed_senders(&clock, &[&delivers, &lost])
+        .into_iter()
+        .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
+        .collect();
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::<TestItem, _, _, _>::new(
+        lanes.receiver(),
+        senders,
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &SendPacing::new(vec![rate, rate], vec![0, 1]),
+        &registry,
+        test_pool(),
+    )
+    .with_window(window);
+
+    let (limits, held) = run_with_window(&mut lanes, &mut router, &clock);
+
+    // A batch of 100,000 bytes takes 800 us at 1 Gbps, so the first interface sends about 25 in
+    // 20 ms, and the second doesn't send any.
+    let sent = delivers.borrow().len();
+    assert!(sent >= 20, "{sent} batches");
+    assert!(lost.borrow().is_empty());
+    // The first interface's pacer holds a batch, and at most two more wait in the router: the
+    // limit grows only once no batch waits, and halves as a batch that waited goes.
+    let most_held = held.iter().copied().max().unwrap_or_default();
+    assert!(most_held <= 310_000, "the window held {most_held}");
+    let most = limits.iter().copied().max().unwrap_or_default();
+    assert!(most <= 410_000, "the limit grew to {most}");
+}
+
+/// The interface-paced router tells its window that a sender could take a batch where its
+/// receiver is `Pending` while budget is left and no batch waits in it, which grows the limit of
+/// a window that refused a frame, and doesn't tell it where the budget ran out.
+#[test]
+fn interface_paced_pick_two_starves_its_window_only_while_budget_is_left() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let window = CreditlessWindow::new(100);
+    let lanes = WindowLanes::new(window.clone(), VecDeque::new());
+    let first = Sends::default();
+    let second = Sends::default();
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::<TestItem, _, _, _>::new(
+        lanes.receiver(),
+        timed_senders(&clock, &[&first, &second]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &SendPacing::new(vec![rate, rate], vec![0, 1]),
+        &registry,
+        test_pool(),
+    )
+    .with_window(window.clone());
+    assert!(window.admit(1000));
+    assert!(!window.admit(1));
+
+    let noop = s2n_quic_core::task::waker::noop();
+    let mut cx = task::Context::from_waker(&noop);
+    let mut exhausted = Budget::new(0);
+    assert!(router.poll_recv(&mut cx, &mut exhausted).is_pending());
+    assert_eq!(
+        window.limit(),
+        100,
+        "the limit grew where the budget ran out"
+    );
+
+    let mut budget = Budget::new(1);
+    assert!(router.poll_recv(&mut cx, &mut budget).is_pending());
+    assert_eq!(window.limit(), 200);
+}
+
+/// A worker's sender that records whether each batch waited in the router before it hands the
+/// batch on.
+struct WaitedSender<S> {
+    sender: S,
+    waited: Rc<RefCell<Vec<bool>>>,
+}
+
+impl<S: UnboundedSender<TestItem>> UnboundedSender<TestItem> for WaitedSender<S> {
+    fn send(&mut self, value: TestItem) -> Result<(), TestItem> {
+        self.waited.borrow_mut().push(value.waited);
+        self.sender.send(value)
+    }
+}
+
+/// A reader tells the window that a worker could take a batch where its receiver is `Pending`
+/// while budget is left, which grows the limit of a window that refused a frame and wakes the
+/// priority router, and doesn't tell it where the budget ran out.
+#[test]
+fn window_reader_starves_the_window_only_while_budget_is_left() {
+    let wakes = Arc::new(CountWaker(AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(wakes.clone());
+    let window = CreditlessWindow::new(100);
+    let lanes = WindowLanes::new(window.clone(), VecDeque::new());
+    let mut reader = WindowReader::new(lanes.receiver(), window.clone());
+    assert!(window.admit(1000));
+    assert!(!window.admit(1));
+    window.register(&waker);
+
+    let noop = s2n_quic_core::task::waker::noop();
+    let mut cx = task::Context::from_waker(&noop);
+    let mut exhausted = Budget::new(0);
+    assert!(reader.poll_recv(&mut cx, &mut exhausted).is_pending());
+    assert_eq!(
+        window.limit(),
+        100,
+        "the limit grew where the budget ran out"
+    );
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+
+    let mut budget = Budget::new(1);
+    assert!(reader.poll_recv(&mut cx, &mut budget).is_pending());
+    assert_eq!(window.limit(), 200);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
 }
 
 /// Records the creditless window's events, each as its kind and its three byte fields in the
@@ -4723,9 +5046,9 @@ fn creditless_window_with_events(
 }
 
 /// The window records each frame it refuses, with the frame's peer, each growth of its limit and
-/// each halving, with the bytes it holds and its limit. It records a halving once a round, also
-/// where its minimum keeps the limit where it is, and doesn't record an event where nothing
-/// changes or where it refuses bytes given without their frame.
+/// each halving, with the bytes it holds and its limit. It records each halving, also where its
+/// minimum keeps the limit where it is, and doesn't record an event where nothing changes or
+/// where it refuses bytes given without their frame.
 #[test]
 fn creditless_window_records_its_refusals_and_limit_changes_as_events() {
     let events = std::sync::Arc::new(WindowEvents::default());
@@ -4733,14 +5056,11 @@ fn creditless_window_records_its_refusals_and_limit_changes_as_events() {
     // A clone stands for the batch router's, so that the window counts the frames.
     let _router = window.clone();
 
-    // A frame while the window holds nothing doesn't record an event. It is of the same peer as
-    // the next frame, so the window doesn't admit that frame as the first of its peer.
-    window.start_round();
-    let path_secret_entry = test_path_secret_entry();
-    let peer_key = PeerKey::of(&path_secret_entry);
-    assert!(window.admit_peer(Some(peer_key), 100));
+    // A frame while the window holds nothing doesn't record an event.
+    assert!(window.admit(100));
     assert!(events.take().is_empty());
     // A refused frame records its peer, its bytes, the bytes the window holds and the limit.
+    let path_secret_entry = test_path_secret_entry();
     let peer = *path_secret_entry.peer();
     let frame = new_test_frame(path_secret_entry, 1);
     let frame_bytes = frame.byte_cost();
@@ -4752,46 +5072,48 @@ fn creditless_window_records_its_refusals_and_limit_changes_as_events() {
     assert!(!window.admit(1));
     assert!(events.take().is_empty());
 
-    // A release in the round in which the window refused a frame grows the limit by its bytes.
-    window.release_peer(Some(peer_key), 100, window.round());
-    assert_eq!(window.peer_held(peer_key), 0);
-    assert_eq!(window.limit(), 164);
-    assert_eq!(events.take(), [("limit_grew", 100, 0, 164)]);
+    // A worker that could take a batch that the batch router doesn't have, while the window
+    // refuses a frame, grows the limit by the minimum before a worker's sender takes a batch,
+    // and the event holds the bytes of that last batch, none yet.
+    window.starved();
+    assert_eq!(window.limit(), 128);
+    assert_eq!(events.take(), [("limit_grew", 0, 100, 128)]);
 
-    // A frame within the limit, a release in a round without a refusal and a release of no
-    // bytes leave the limit as it is and don't record an event.
-    window.start_round();
-    assert!(window.admit(100));
-    assert!(window.admit(64));
-    window.release(164, window.round());
-    window.release(0, 0);
-    assert_eq!(window.limit(), 164);
+    // A batch that didn't wait, a worker that could take a batch without a refusal and a release
+    // of no bytes leave the limit as it is and don't record an event.
+    window.release(100, false);
+    window.starved();
+    window.release(0, true);
+    assert_eq!(window.limit(), 128);
     assert!(events.take().is_empty());
 
-    // A batch read in an earlier round halves the limit, which the window records once a round.
-    let read_in = window.round();
+    // After that, the limit grows by the bytes of the last batch a worker's sender took.
     assert!(window.admit(100));
-    window.start_round();
-    window.release(60, read_in);
-    window.release(40, read_in);
-    assert_eq!(window.limit(), 82);
-    assert_eq!(events.take(), [("limit_halved", 40, 164, 82)]);
+    assert!(!window.admit(100));
+    window.starved();
+    assert_eq!(window.limit(), 228);
+    assert_eq!(events.take(), [("limit_grew", 100, 100, 228)]);
 
-    // The minimum bounds a halving and then keeps the limit where it is, and each round still
+    // A batch that waited halves the limit, once for the bytes the window held then.
+    assert!(window.admit(60));
+    window.release(100, true);
+    assert_eq!(window.limit(), 114);
+    assert_eq!(events.take(), [("limit_halved", 60, 228, 114)]);
+    window.release(60, true);
+    assert_eq!(window.limit(), 114);
+    assert!(events.take().is_empty());
+
+    // The minimum bounds a halving and then keeps the limit where it is, and each halving still
     // records the event.
-    let read_in = window.round();
     assert!(window.admit(30));
-    window.start_round();
-    window.release(30, read_in);
+    window.release(30, true);
     assert_eq!(window.limit(), 64);
-    let read_in = window.round();
     assert!(window.admit(10));
-    window.start_round();
-    window.release(10, read_in);
+    window.release(10, true);
     assert_eq!(window.limit(), 64);
     assert_eq!(
         events.take(),
-        [("limit_halved", 0, 82, 64), ("limit_halved", 0, 64, 64)]
+        [("limit_halved", 0, 114, 64), ("limit_halved", 0, 64, 64)]
     );
     assert_eq!(window.held(), 0);
 }

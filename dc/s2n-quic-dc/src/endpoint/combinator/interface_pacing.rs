@@ -16,7 +16,7 @@
 //! Frame dispatch then batches the frames of that level apart from the others, and passes
 //! [`InterfacePacedPickTwo`] an input of its own for them.
 
-use super::{AssignSender, FlowCredits, HighestPriority, PathSecretMapEntry};
+use super::{AssignSender, CreditlessCost, FlowCredits, HighestPriority, PathSecretMapEntry};
 use crate::{
     credentials,
     endpoint::{
@@ -296,7 +296,8 @@ where
     /// delivered the batches it holds.
     closed: bool,
     /// A batch of `rx` that the router read while every interface held a batch, which it keeps
-    /// until an interface may take it. The router doesn't read `rx` while it keeps one.
+    /// until an interface may take it, as a batch that waited. The router doesn't read `rx` while
+    /// it keeps one.
     pending: Option<T>,
     /// The batches of `rx` that no sender may take yet, since each sender that delivers to their
     /// peer is on an interface that holds a batch, by the path secret of their peer, each peer's
@@ -305,7 +306,9 @@ where
     /// send credit pool bounds the credit they hold, and a
     /// [`CreditlessWindow`](super::CreditlessWindow) bounds the bytes of those without send
     /// credit, which stay in the window until the router delivers their batch through a
-    /// [`WindowSender`](super::WindowSender).
+    /// [`WindowSender`](super::WindowSender). The router marks each batch that waits here as one
+    /// that waited, which halves the window's limit as a worker's sender takes the batch, and
+    /// doesn't let the window's limit grow while a batch waits here.
     waiting: HashMap<credentials::Id, WaitingPeer<T>>,
     /// The peers of `waiting` that wait on each interface, by the interface's position in
     /// `pacers`, in the order they began to wait on it: a peer waits on each interface whose
@@ -323,7 +326,8 @@ where
     /// such a batch waits while every sender of that interface is marked lost for its peer and
     /// each other sender that delivers is on an interface that holds a batch. Meanwhile the router
     /// reads and routes the batches of other peers. Their count isn't bounded, and their frames
-    /// are bounded in `frame_dispatch` as those of `waiting` are.
+    /// are bounded in `frame_dispatch` as those of `waiting` are. The router marks them, and
+    /// treats the window's limit while they wait, as it does those of `waiting`.
     highest_waiting: HashMap<credentials::Id, HighestWaitingPeer<T>>,
     /// The peers of `highest_waiting` that wait on each interface, by the interface's position:
     /// the router offers their batches again once that interface frees. The list holds each
@@ -357,6 +361,10 @@ where
     /// Send credit pool. Where a batch can't be delivered, since its worker's receiver is gone,
     /// the credit its frames borrowed returns here, with the credit of each batch held then.
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    /// The window of the frames without send credit, where [`Self::with_window`] set one, which
+    /// the router tells where a sender is free, no batch waits in `waiting` or `highest_waiting`,
+    /// and `rx` doesn't have the next batch.
+    window: Option<super::CreditlessWindow>,
     /// How many times the router offered a batch to the senders with `dispatch`, for the
     /// tests.
     #[cfg(test)]
@@ -365,7 +373,12 @@ where
 
 impl<T, R, S, Clk> InterfacePacedPickTwo<T, R, S, Clk>
 where
-    T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits + HighestPriority,
+    T: ByteCost
+        + PathSecretMapEntry
+        + AssignSender
+        + FlowCredits
+        + HighestPriority
+        + CreditlessCost,
     R: Receiver<T>,
     S: UnboundedSender<T>,
     Clk: precision::Clock,
@@ -450,6 +463,7 @@ where
             rejected_counters,
             score_delta,
             send_credit_pool,
+            window: None,
             #[cfg(test)]
             dispatches: 0,
         }
@@ -464,6 +478,15 @@ where
     /// other, while an interface doesn't hold a batch.
     pub fn with_highest_priority_input(mut self, highest_rx: R) -> Self {
         self.highest_rx = Some(highest_rx);
+        self
+    }
+
+    /// Returns the router with `window`, the window of the frames without send credit of its
+    /// batches. Where a sender is free and `rx` doesn't have the next batch, the router tells the
+    /// window that a worker could take a batch, while no batch waits in the router: a free sender
+    /// can't take a waiting batch, and the next frames may be of its peer.
+    pub fn with_window(mut self, window: super::CreditlessWindow) -> Self {
+        self.window = Some(window);
         self
     }
 
@@ -661,29 +684,39 @@ where
     /// sender may take it. A batch whose peer has batches of the same input that wait in the
     /// router waits behind them, so that each peer's batches of an input go in the order the
     /// router read them. `highest` is true where `value` goes only to the interface for the
-    /// highest-priority traffic. Returns `false` where the sender's receiver is gone.
-    fn route(&mut self, cx: &mut task::Context<'_>, value: T, highest: bool, input: Input) -> bool {
+    /// highest-priority traffic. The router marks each batch that waits as one that waited.
+    /// Returns `false` where the sender's receiver is gone.
+    fn route(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        mut value: T,
+        highest: bool,
+        input: Input,
+    ) -> bool {
         let peer = *value.path_secret_entry().id();
         match input {
             Input::Highest => {
                 if let Some(waiting) = self.highest_waiting.get_mut(&peer) {
+                    value.set_waited();
                     waiting.batches.push_back(value);
                     return true;
                 }
             }
             Input::Other => {
                 if let Some(waiting) = self.waiting.get_mut(&peer) {
+                    value.set_waited();
                     waiting.batches.push_back(value);
                     return true;
                 }
             }
         }
-        let value = match self.dispatch(cx, value, highest) {
+        let mut value = match self.dispatch(cx, value, highest) {
             Ok(routed) => return routed,
             Err(value) => value,
         };
         // Each sender that delivers to the batch's peer is on an interface that holds a batch: the
-        // batch waits in the router until one of them is free.
+        // batch waits in the router until one of them is free, as a batch that waited.
+        value.set_waited();
         match input {
             Input::Highest => {
                 let wait = self.highest_new_wait();
@@ -1199,7 +1232,12 @@ where
 
 impl<T, R, S, Clk> Receiver<()> for InterfacePacedPickTwo<T, R, S, Clk>
 where
-    T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits + HighestPriority,
+    T: ByteCost
+        + PathSecretMapEntry
+        + AssignSender
+        + FlowCredits
+        + HighestPriority
+        + CreditlessCost,
     R: Receiver<T>,
     S: UnboundedSender<T>,
     Clk: precision::Clock,
@@ -1294,7 +1332,7 @@ where
                 || (self.highest_priority.is_some() && self.highest_rx.is_none()))
         {
             match self.rx.poll_recv(cx, budget) {
-                Poll::Ready(Some(value)) => {
+                Poll::Ready(Some(mut value)) => {
                     let byte_cost = value.byte_cost();
                     let highest = self.is_highest(&value);
                     if self.has_free_sender() || highest {
@@ -1303,7 +1341,8 @@ where
                         }
                     } else {
                         // Every interface holds a batch: keep this one until an interface may
-                        // take it.
+                        // take it, as a batch that waited.
+                        value.set_waited();
                         self.pending = Some(value);
                     }
                     // Tell upstream that the batch was consumed, as `PickTwo` does once it sends
@@ -1312,7 +1351,20 @@ where
                     return Poll::Ready(Some(()));
                 }
                 Poll::Ready(None) => self.closed = true,
-                Poll::Pending => {}
+                Poll::Pending => {
+                    // A free sender could take a batch that the router doesn't have. While a
+                    // batch waits in the router, the window's limit doesn't grow: the free
+                    // senders can't take that batch, and the next frames may be of its peer.
+                    if let Some(window) = &self.window {
+                        if self.waiting.is_empty()
+                            && self.highest_waiting.is_empty()
+                            && self.has_free_sender()
+                            && !budget.is_exhausted()
+                        {
+                            window.starved();
+                        }
+                    }
+                }
             }
         }
 

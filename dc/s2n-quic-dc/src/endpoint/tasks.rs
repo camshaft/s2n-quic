@@ -8,7 +8,8 @@ use crate::{
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
             CompletionDispatcher, CreditlessWindow, FrameBatch, InterfacePacedPickTwo,
-            PathSecretMapEntry, PeerKey, PickTwo, SendPacing, WindowSender, BATCH_TARGET_BYTES,
+            PathSecretMapEntry, PickTwo, SendPacing, WindowReader, WindowSender,
+            BATCH_TARGET_BYTES,
         },
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
@@ -98,8 +99,8 @@ pub fn frame_dispatch<S, Clk>(
     // The frames without send credit in the lanes below, and in the batch routers after them,
     // stay in this window until a worker's sender takes their batch, which bounds their bytes:
     // the send credit pool bounds the other frames. The window starts at the batch router's
-    // batch target, so that it admits a full batch, and grows and shrinks with how fast the
-    // workers take the batches.
+    // batch target, so that it admits a full batch, grows where a worker could take a batch
+    // that the batch router doesn't have, and halves where a batch waited for a sender.
     // Where the endpoint passes its path secret map, the window records each frame it refuses
     // and each change of its limit as an event of the map's subscriber.
     let window = match path_secret_map {
@@ -195,17 +196,11 @@ fn frame_dispatch_over<S, Clk>(
             })
             .collect::<Vec<_>>();
         // Batches the frames of `lanes`, a lane for each of their priority levels, highest first.
-        // Each batch router that this builds, the highest lane's among them, sets on each batch
-        // the window's round in which it reads the batch, and a worker's sender releases the
-        // batch's bytes from the window as it takes the batch.
+        // A worker's sender releases each batch's bytes from the window as it takes the batch.
         let batch_frames = |lanes: Vec<_>| {
             let rx = PriorityRx::new(lanes);
             let rx = BatchFramesByPathSecret::new(rx, &clock, pacing.total_rate());
-            let read_in = window.clone();
-            Map::new(rx, move |mut batch: FrameBatch| {
-                batch.set_window_round(read_in.round());
-                Entry::new(batch)
-            })
+            Map::new(rx, Entry::new)
         };
         let worker_senders: IdMap<LocalSenderId, WindowSender<S>> = worker_senders
             .into_iter()
@@ -222,8 +217,11 @@ fn frame_dispatch_over<S, Clk>(
         };
         if pacing.interface_count() == 1 {
             // Every send socket is on one interface: pace them together at its rate, then choose
-            // a worker for each batch.
+            // a worker for each batch. The pacer polls this reader while it doesn't hold a batch,
+            // so the window grows where the worker could take a batch that the batch router
+            // doesn't have.
             let rx = batch_frames(priority_batch_rxs);
+            let rx = WindowReader::new(rx, window.clone());
             let rx = Paced::new(rx, clock, pacing.total_rate());
             let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
             let task_counter = register_task_counter();
@@ -234,7 +232,8 @@ fn frame_dispatch_over<S, Clk>(
             );
         } else {
             // The send sockets are on several interfaces: choose a worker for each batch first,
-            // then pace the batch with the token bucket of that worker's interface.
+            // then pace the batch with the token bucket of that worker's interface. The router
+            // tells the window where a sender could take a batch that it doesn't have.
             // Where the endpoint chooses an interface for the highest-priority traffic, the
             // frames of the highest level are batched apart from the others, into an input of
             // the router's own, so that their batches go to that interface even while every
@@ -253,7 +252,8 @@ fn frame_dispatch_over<S, Clk>(
                 &pacing,
                 &counter_registry,
                 send_credit_pool,
-            );
+            )
+            .with_window(window.clone());
             let rx = match highest_rx {
                 Some(highest_rx) => rx.with_highest_priority_input(highest_rx),
                 None => rx,
@@ -1944,25 +1944,17 @@ where
 /// into per-priority lane senders.
 ///
 /// A frame without send credit goes into its lane only once `window` admits its bytes, which
-/// stay in the window until a worker's sender takes the frame's batch. A frame that the window
-/// refuses waits in `staging`, with each later frame of its peer in its lane and in the lanes
-/// after it, so that a peer's frames keep their order. The frames of other peers pass it, a
-/// frame with send credit among them, which the window doesn't count since the send credit
-/// pool bounds it. Each poll swaps in one shard of the submission channel behind the frames
-/// that wait in `staging`, and a poll that swaps returns ready, so that the next poll swaps
-/// the next shard and a new frame of a peer that the window doesn't hold back isn't delayed.
+/// stay in the window until a worker's sender takes the frame's batch. The frames the window
+/// refuses wait in `staging`, each lane's in order, and the receiver doesn't swap again until
+/// it has moved them, so the frames submitted meanwhile wait in the submission channel. A frame
+/// with send credit isn't counted, since the send credit pool bounds it, but it waits behind a
+/// refused frame of its lane or of a lane before it.
 struct FrameReceiver<Tx> {
     frame_rx: SubmissionReceiver,
-    /// The frames that the window didn't admit yet, and the frames of their peers after them.
+    /// The frames of the last swap that the window didn't admit yet.
     staging: PriorityStorage,
     /// An empty storage, which takes the frames that `move_admitted` keeps.
     swapped: PriorityStorage,
-    /// An empty storage, which takes the frames of a swap before they go behind `staging`.
-    incoming: PriorityStorage,
-    /// Whether the submission channel has closed.
-    closed: bool,
-    /// The peers with a frame that the window refused in this pass, whose later frames wait.
-    held_back: std::collections::HashSet<PeerKey>,
     priority_list_txs: [Tx; Priority::LEVELS],
     q_router_to_batcher: [QueueGauge; Priority::LEVELS],
     window: CreditlessWindow,
@@ -1982,9 +1974,6 @@ where
             frame_rx,
             staging: PriorityStorage::default(),
             swapped: PriorityStorage::default(),
-            incoming: PriorityStorage::default(),
-            closed: false,
-            held_back: Default::default(),
             priority_list_txs,
             q_router_to_batcher,
             window,
@@ -1992,13 +1981,11 @@ where
     }
 
     /// Moves the frames of `staging` into their lanes, highest priority first and each lane's
-    /// in order. A frame that the window refuses stays in `staging`, with each later frame of
-    /// its peer in its lane and in the lanes after it, and the frames of other peers pass it.
-    /// Returns whether it moved a frame.
+    /// in order, until the window refuses a frame, which stays in `staging` with every frame
+    /// after it. Returns whether it moved a frame.
     fn move_admitted(&mut self, cx: &mut core::task::Context<'_>) -> bool {
-        self.window.start_round();
-        self.held_back.clear();
         let mut moved = false;
+        let mut refused = false;
         for (i, ((priority, mut queue), tx)) in self
             .staging
             .drain()
@@ -2006,30 +1993,26 @@ where
             .enumerate()
         {
             let mut admitted = Queue::<Frame>::new();
-            let mut kept = Queue::<Frame>::new();
-            while let Some(frame) = queue.pop_front() {
-                let peer = PeerKey::of(&frame.path_secret_entry);
-                if self.held_back.contains(&peer) || !self.window.admit_frame(&frame) {
-                    self.held_back.insert(peer);
-                    kept.push_back(frame);
-                } else {
-                    admitted.push_back(frame);
+            while !refused {
+                let Some(frame) = queue.front() else {
+                    break;
+                };
+                if !self.window.admit_frame(frame) {
+                    refused = true;
+                    break;
                 }
+                admitted.push_back(queue.pop_front().expect("the queue holds a front frame"));
             }
             if !admitted.is_empty() {
                 moved = true;
                 self.q_router_to_batcher[i].enqueue(admitted.len() as u64);
                 let _ = UnboundedSender::send(tx, admitted);
             }
-            frame::HomogeneousBatch {
-                queue: kept,
-                priority,
-            }
-            .append_to(&mut self.swapped);
+            frame::HomogeneousBatch { queue, priority }.append_to(&mut self.swapped);
         }
-        // `staging` is empty now, and `swapped` holds the frames that wait.
+        // `staging` is empty now, and `swapped` holds the frames the window refused.
         core::mem::swap(&mut self.staging, &mut self.swapped);
-        if !self.held_back.is_empty() {
+        if refused {
             self.window.register(cx.waker());
         }
         moved
@@ -2050,36 +2033,24 @@ where
             return Poll::Pending;
         }
 
-        // Swap in the frames submitted since the last poll, behind the frames that wait, so
-        // that a new frame of a peer that the window doesn't hold back goes in this pass.
-        let mut swapped_in = false;
-        if !self.closed {
-            match self.frame_rx.poll_swap(cx, &mut self.incoming) {
-                Poll::Ready(None) => self.closed = true,
-                Poll::Pending => {}
-                Poll::Ready(Some(())) => {
-                    swapped_in = true;
-                    for (priority, queue) in self.incoming.drain() {
-                        frame::HomogeneousBatch { queue, priority }.append_to(&mut self.staging);
-                    }
-                }
+        // The frames the window refused go before the next swap.
+        if !self.staging.is_empty() {
+            if !self.move_admitted(cx) {
+                return Poll::Pending;
             }
+            budget.consume();
+            return Poll::Ready(Some(()));
         }
 
-        if self.staging.is_empty() {
-            return if self.closed {
-                Poll::Ready(None)
-            } else {
-                Poll::Pending
-            };
+        match self.frame_rx.poll_swap(cx, &mut self.staging) {
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(())) => {
+                budget.consume();
+                self.move_admitted(cx);
+                Poll::Ready(Some(()))
+            }
         }
-        // A swap takes one shard of the submission channel. Where it moved nothing, as where it
-        // brought in only frames of held-back peers, the next poll swaps the next shard.
-        if !self.move_admitted(cx) && !swapped_in {
-            return Poll::Pending;
-        }
-        budget.consume();
-        Poll::Ready(Some(()))
     }
 
     fn on_consumed(&mut self, _bytes: u64) {}
