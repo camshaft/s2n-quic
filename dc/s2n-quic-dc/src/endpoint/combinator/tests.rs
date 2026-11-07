@@ -1909,3 +1909,219 @@ fn interface_paced_pick_two_ends_without_consuming_a_batch_whose_worker_is_gone(
     assert_eq!(consumed.get(), 0);
     assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
 }
+
+// -- CreditlessWindow and WindowSender ------------------------------------------------------
+
+impl CreditlessCost for TestItem {
+    fn creditless_bytes(&self) -> u64 {
+        if self.flow_credits == 0 {
+            self.byte_cost
+        } else {
+            0
+        }
+    }
+
+    fn window_round(&self) -> u64 {
+        0
+    }
+}
+
+/// The window admits a frame while it holds nothing, refuses one past its limit, and grows its
+/// limit by a batch's bytes where it refused a frame in the round in which the batch was read.
+#[test]
+fn creditless_window_admits_a_frame_while_empty_and_grows_by_its_releases() {
+    let window = CreditlessWindow::default();
+    // A clone stands for the batch router's, so that the window counts the frames.
+    let _router = window.clone();
+    window.start_round();
+    assert!(window.admit(1000), "the window refused a frame while it held nothing");
+    assert!(!window.admit(1), "the window admitted a frame past its limit of 0");
+    assert_eq!(window.held(), 1000);
+
+    window.release(1000, window.round());
+    assert_eq!(window.held(), 0);
+    assert_eq!(window.limit(), 1000);
+    assert!(window.admit(600));
+    assert!(window.admit(400));
+    assert!(!window.admit(1), "the window admitted a frame past its limit of 1000");
+
+    // A batch released in a round in which the window didn't refuse a frame leaves the limit
+    // as it is.
+    window.start_round();
+    window.release(1000, window.round());
+    assert_eq!(window.limit(), 1000);
+    assert_eq!(window.held(), 0);
+}
+
+/// The window halves its limit once a round as a worker takes a batch that was read in an
+/// earlier round.
+#[test]
+fn creditless_window_halves_its_limit_once_a_round_for_a_batch_that_waited() {
+    let window = CreditlessWindow::with_limit(1000);
+    let _router = window.clone();
+    let read_in = window.round();
+    for _ in 0..3 {
+        assert!(window.admit(100));
+    }
+
+    window.start_round();
+    window.release(100, read_in);
+    assert_eq!(window.limit(), 500);
+    window.release(100, read_in);
+    assert_eq!(window.limit(), 500, "the limit halved twice in a round");
+
+    window.start_round();
+    window.release(100, read_in);
+    assert_eq!(window.limit(), 250);
+    assert_eq!(window.held(), 0);
+
+    // A release of no bytes leaves the limit as it is.
+    window.start_round();
+    window.release(0, read_in);
+    assert_eq!(window.limit(), 250);
+}
+
+/// A window made with a minimum starts its limit at the minimum and doesn't halve it below.
+#[test]
+fn creditless_window_starts_at_its_minimum_and_doesnt_halve_below_it() {
+    let window = CreditlessWindow::new(1000);
+    let _router = window.clone();
+    let read_in = window.round();
+    assert!(window.admit(600));
+    assert!(window.admit(400));
+    assert!(!window.admit(1), "the window admitted a frame past its minimum");
+
+    window.start_round();
+    window.release(1000, read_in);
+    assert_eq!(window.limit(), 1000);
+}
+
+/// A waker that counts its wakes.
+struct CountWaker(AtomicUsize);
+
+impl std::task::Wake for CountWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A window sender releases a batch's bytes as it hands the batch on, and wakes the receiver
+/// that the window refused. Once the last sender drops, the window wakes the receiver again
+/// and admits every frame.
+#[test]
+fn creditless_window_wakes_its_receiver_and_admits_every_frame_once_the_senders_are_gone() {
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let wakes = Arc::new(CountWaker(AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(wakes.clone());
+    let window = CreditlessWindow::default();
+    let mut sender = WindowSender::new(
+        TestSender {
+            accept: true,
+            calls: 0,
+        },
+        window.clone(),
+    );
+    let mut item = new_test_item(test_path_secret_entry(), drop_counter.clone());
+    item.byte_cost = 1000;
+
+    assert!(window.admit(item.creditless_bytes()));
+    assert!(!window.admit(1));
+    window.register(&waker);
+    assert!(sender.send(item).is_ok());
+    assert_eq!(window.held(), 0);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+
+    window.register(&waker);
+    drop(sender);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
+    assert!(window.admit(u64::MAX));
+    assert!(window.admit(u64::MAX));
+    assert_eq!(window.held(), 0);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
+}
+
+/// The bytes of a waiting peer's batches without send credit stay in the window while the
+/// batches wait in the router, and leave it as each batch goes to a worker's sender.
+#[test]
+fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    // The pair of the second interface's sender is lost for the peer, so the first interface's
+    // sender takes each of its batches.
+    let entry = test_path_secret_entry();
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    let window = CreditlessWindow::with_limit(400_000);
+    let delivers = Sends::default();
+    let lost = Sends::default();
+    let senders: IdMap<LocalSenderId, _> = timed_senders(&clock, &[&delivers, &lost])
+        .into_iter()
+        .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
+        .collect();
+    // The priority router admitted each batch's frames, none of which borrows send credit.
+    let values = test_items(&entry, 4, 100_000, &drop_counter);
+    for value in &values {
+        assert!(window.admit(value.creditless_bytes()));
+    }
+    assert_eq!(window.held(), 400_000);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        TestReceiver {
+            values,
+            consumed: 0,
+        },
+        senders,
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &SendPacing::new(vec![rate, rate], vec![0, 1]),
+        &registry,
+        test_pool(),
+    );
+
+    // The first batch goes at once, the second waits on the first interface, and the third and
+    // fourth wait in the router: the window holds the bytes of the three, and refuses a frame
+    // past its limit.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(delivers.borrow().len(), 1);
+    assert_eq!(window.held(), 300_000);
+    assert!(!window.admit(100_001));
+
+    // Each batch's bytes leave the window as the batch goes.
+    for (delivered, held) in [(2, 200_000), (3, 100_000)] {
+        clock.advance(std::time::Duration::from_millis(1));
+        assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+        assert_eq!(delivers.borrow().len(), delivered);
+        assert_eq!(window.held(), held);
+    }
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(delivers.borrow().len(), 4);
+    assert_eq!(window.held(), 0);
+    assert!(lost.borrow().is_empty());
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn frame_batch_counts_the_bytes_of_its_frames_without_send_credit() {
+    let path = test_path_secret_entry();
+    let first = new_test_frame(path.clone(), 16);
+    let first_cost = first.byte_cost();
+    let mut batch = FrameBatch::new(first);
+    // The send credit pool bounds a frame that borrows send credit, so the batch doesn't count
+    // its bytes.
+    let mut credited = new_test_frame(path, 24);
+    credited.flow_credits = 4096;
+    let credited_cost = credited.byte_cost();
+    batch.push_with_cost(credited, credited_cost);
+    assert_eq!(batch.creditless_bytes(), first_cost);
+
+    // A batch keeps the round in which the batch router read it, 0 until the router sets it.
+    assert_eq!(batch.window_round(), 0);
+    batch.set_window_round(7);
+    assert_eq!(batch.window_round(), 7);
+
+    // A worker's sender reads them through the batch's entry.
+    let entry = Entry::new(batch);
+    assert_eq!(entry.creditless_bytes(), first_cost);
+    assert_eq!(entry.window_round(), 7);
+}

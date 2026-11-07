@@ -30,8 +30,10 @@ use core::task::{self, Poll};
 use s2n_quic_core::{packet::number::PacketNumber, ready};
 use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 
+mod creditless;
 mod interface_pacing;
 
+pub use creditless::{CreditlessCost, CreditlessWindow, WindowSender};
 pub use interface_pacing::{InterfacePacedPickTwo, SendPacing};
 
 #[cfg(test)]
@@ -134,6 +136,11 @@ where
 /// Conservative packet-level overhead estimate for stream frame batches.
 const MAX_FRAME_BATCH_PACKET_OVERHEAD: u64 = frame::MAX_QUEUE_DATA_HEADER_OVERHEAD as u64;
 
+/// The bytes at which [`BatchFramesByPathSecret`] counts a batch as full and hands it on.
+/// `frame_dispatch` starts its window of the frames without send credit at this size, so that
+/// the window admits a full batch.
+pub const BATCH_TARGET_BYTES: u64 = u16::MAX as u64 - 3000;
+
 /// A queue of frames grouped for a single path-secret entry, stored in per-priority buckets.
 ///
 /// Frames are routed into one of [`Priority::LEVELS`] intrusive queues at push time
@@ -155,6 +162,9 @@ pub struct FrameBatch {
     byte_cost: u64,
     /// Assigned sender index (set by PickTwo after routing).
     sender_id: LocalSenderId,
+    /// The round of the window of frames without send credit in which the batch router read the
+    /// batch (see [`CreditlessWindow`]).
+    window_round: u64,
 }
 
 impl FrameBatch {
@@ -174,6 +184,7 @@ impl FrameBatch {
             byte_costs,
             byte_cost,
             sender_id: LocalSenderId::UNSPECIFIED,
+            window_round: 0,
         }
     }
 
@@ -286,7 +297,7 @@ where
 {
     #[inline]
     pub fn new(inner: R, clock: &Clk, rate: Rate) -> Self {
-        let target_bytes = u16::MAX as u64 - 3000;
+        let target_bytes = BATCH_TARGET_BYTES;
         let wait_nanos = rate.nanos_for_bytes(target_bytes);
         Self {
             inner,
@@ -365,7 +376,7 @@ where
     ) -> Poll<Option<FrameBatch>> {
         use precision::Timer;
 
-        let target_bytes = u16::MAX as u64 - 3000;
+        let target_bytes = BATCH_TARGET_BYTES;
 
         // If we have a pending batch from a previous poll, try to keep filling it.
         if let Some(mut batch) = self.pending_batch.take() {

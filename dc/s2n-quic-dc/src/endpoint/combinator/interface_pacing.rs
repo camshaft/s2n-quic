@@ -250,8 +250,11 @@ where
     /// The batches that no sender may take yet, since each sender that delivers to their peer
     /// is on an interface that holds a batch, by the path secret of their peer, each peer's in
     /// the order the router read them. Meanwhile the router reads and routes the batches of
-    /// other peers. Their count isn't bounded: the send credit pool bounds the credit their
-    /// frames hold, and the router reads a batch only while a sender is free.
+    /// other peers. In `frame_dispatch` their frames are bounded: the send credit pool bounds
+    /// the credit they hold, and a [`CreditlessWindow`](super::CreditlessWindow) bounds the bytes
+    /// of those without send credit, which stay in the window until the router delivers their
+    /// batch through a [`WindowSender`](super::WindowSender). The router reads a batch only while
+    /// a sender is free.
     waiting: HashMap<credentials::Id, VecDeque<T>>,
     /// The peers of `waiting`, which the router offers to the free senders in turn.
     waiting_order: VecDeque<credentials::Id>,
