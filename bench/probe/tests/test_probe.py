@@ -142,6 +142,7 @@ class CliTests(unittest.TestCase):
             with mock.patch.object(probe, "inputs", side_effect=AssertionError("unexpected inputs")):
                 self.assertEqual(self.invoke(command)[:2], (1, "bench: no-kvm\n"))
             self.assertEqual(self.rows()[-1]["code"], "no-kvm")
+            self.assertIsNone(self.rows()[-1]["guest_evidence"])
         self.assertFalse(self.images.exists())
         self.preparing.assert_not_called()
         self.verifying.assert_not_called()
@@ -274,10 +275,15 @@ class CliTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.write_metadata(value)
                 self.assertEqual(self.invoke("verify")[0], 1)
-                self.assertEqual(self.rows()[-1]["status"], "verify-failed")
-        for raw in ("{SECRET", '{"version":1,"version":1}', '{"version":NaN}'):
+                row = self.rows()[-1]
+                self.assertEqual((row["status"], row["stage"], row["code"]), ("verify-failed", "cache", "invalid-cache"))
+        for raw, stage, code in (("{SECRET", "host", "dependency-failed"),
+                                 ('{"version":1,"version":1}', "cache", "invalid-cache"),
+                                 ('{"version":NaN}', "cache", "invalid-cache")):
             (self.images / "prepared.json").write_text(raw)
             self.assertEqual(self.invoke("verify")[0], 1)
+            row = self.rows()[-1]
+            self.assertEqual((row["stage"], row["code"]), (stage, code))
         self.verifying.assert_not_called()
         self.assertEqual((self.images / "image.qcow2").read_bytes(), IMAGE)
 
@@ -290,12 +296,30 @@ class CliTests(unittest.TestCase):
         metadata.unlink()
         metadata.symlink_to(outside)
         self.assertEqual(self.invoke("verify")[0], 1)
+        row = self.rows()[-1]
+        self.assertEqual((row["stage"], row["code"]), ("host", "dependency-failed"))
         self.assertEqual(outside.read_bytes(), saved)
         metadata.unlink()
         metadata.write_bytes(saved)
         (self.images / "image.qcow2").write_bytes(b"different")
         self.assertEqual(self.invoke("verify")[0], 1)
         self.verifying.assert_not_called()
+
+    def test_partial_cache_entries_never_start_a_guest(self):
+        self.assertEqual(self.invoke("prepare")[0], 0)
+        for filename in ("prepared.json", "image.qcow2"):
+            with self.subTest(missing=filename):
+                path = self.images / filename
+                content = path.read_bytes()
+                path.unlink()
+                self.assertFalse(path.exists())
+                self.assertEqual(self.invoke("verify")[:2], (1, "bench: verify-failed\n"))
+                row = self.rows()[-1]
+                expected = ("host", "dependency-failed") if filename == "prepared.json" else ("cache", "invalid-cache")
+                self.assertEqual((row["stage"], row["code"]), expected)
+                self.assertIsNone(row["guest_evidence"])
+                self.verifying.assert_not_called()
+                path.write_bytes(content)
 
     def test_preparation_failure_never_publishes_metadata_or_success(self):
         def fail(image, work):
@@ -416,6 +440,80 @@ class CliTests(unittest.TestCase):
         (self.results / "probe.jsonl").symlink_to(outside)
         self.assertEqual(self.invoke("kvm"), (1, "", "bench: result-failed\n"))
         self.assertEqual(outside.read_text(), "unchanged")
+
+    def test_pending_signal_stops_real_backend_before_any_process(self):
+        self.assertEqual(self.invoke("prepare")[0], 0)
+        original = self.metadata()
+        for operation, trigger, phases in (("prepare", "inputs", ["prepared"]),
+                                            ("verify", "restored", ["ready", "stopping"])):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(operation=operation, signum=signum):
+                    self.images = self.root / (operation + "-" + str(signum))
+                    if operation == "verify":
+                        self.images.mkdir()
+                        (self.images / "image.qcow2").write_bytes(IMAGE)
+                        self.write_metadata(original)
+                    runner = SimulatedRunner(phases)
+                    self.preparing.side_effect = lambda image, work: REAL_PREPARE(image, work, runner=runner)
+                    self.verifying.side_effect = lambda image, work: REAL_VERIFY(image, work, runner=runner)
+                    self.preparing.reset_mock()
+                    self.verifying.reset_mock()
+                    real_trigger = getattr(probe, trigger)
+                    states = []
+
+                    def request_signal(*args, **kwargs):
+                        result = real_trigger(*args, **kwargs)
+                        state = guest._CANCELLATION.get()
+                        self.assertIsNotNone(state)
+                        self.assertFalse(state["requested"])
+                        self.assertFalse(state["interruptible"])
+                        signal.raise_signal(signum)
+                        self.assertTrue(state["requested"])
+                        states.append(state)
+                        return result
+
+                    before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+                    with mock.patch.object(probe, trigger, side_effect=request_signal):
+                        self.assertEqual(self.invoke(operation)[:2], (1, "bench: " + operation + "-failed\n"))
+                    self.assertEqual(len(states), 1)
+                    self.assertEqual(self.rows()[-1]["stage"], "interrupted")
+                    self.assertEqual(self.rows()[-1]["code"], "signal")
+                    (self.preparing if operation == "prepare" else self.verifying).assert_called_once()
+                    self.assertEqual(runner.kvm_calls, 0)
+                    self.assertEqual(runner.commands, [])
+                    self.assertEqual(runner.processes, [])
+                    self.assertFalse(list(self.root.glob("bench-private-*")))
+                    self.assertFalse(list(self.images.glob(".prepare-*")))
+                    self.assertEqual({s: signal.getsignal(s) for s in before}, before)
+                    self.assertIsNone(guest._CANCELLATION.get())
+                    if operation == "verify":
+                        self.assertEqual(self.metadata(), original)
+                        self.assertEqual((self.images / "image.qcow2").read_bytes(), IMAGE)
+                    else:
+                        self.assertEqual(list(self.images.iterdir()), [])
+
+    def test_nested_cancellation_reuses_state_handlers_and_exit_checkpoint(self):
+        for signum in (None, signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+                after_inner = []
+                try:
+                    with guest.cancellation():
+                        state = guest._CANCELLATION.get()
+                        handlers = {s: signal.getsignal(s) for s in before}
+                        with guest.cancellation():
+                            self.assertIs(guest._CANCELLATION.get(), state)
+                            self.assertEqual({s: signal.getsignal(s) for s in before}, handlers)
+                            if signum is not None:
+                                signal.raise_signal(signum)
+                                self.assertTrue(state["requested"])
+                        after_inner.append(True)
+                except guest.GuestError as error:
+                    self.assertIsNotNone(signum)
+                    self.assertEqual((error.stage, error.code), ("interrupted", "signal"))
+                self.assertEqual(after_inner, [True] if signum is None else [])
+                self.assertEqual({s: signal.getsignal(s) for s in before}, before)
+                self.assertIsNone(guest._CANCELLATION.get())
 
     def test_cli_uses_both_real_modules_with_simulated_processes(self):
         prepare_runner = SimulatedRunner(["prepared"])

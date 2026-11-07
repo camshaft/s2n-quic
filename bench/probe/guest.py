@@ -259,6 +259,11 @@ def interruptible_wait():
 @contextlib.contextmanager
 def cancellation():
     """Interrupt owned waits; protect acquisition, short updates and all cleanup."""
+    if _CANCELLATION.get() is not None:
+        check_cancellation()
+        yield
+        check_cancellation()
+        return
     previous = {}
     state = {"requested": False, "interruptible": False}
     token = _CANCELLATION.set(state)
