@@ -13,8 +13,12 @@
 //!
 //! Where the peer doesn't tag its addresses, the endpoint doesn't list interfaces, or either side
 //! has a single interface, a sender keeps the address it took before: `addrs[sender % len]`.
+//!
+//! A receiver sends the acknowledgements of a peer's packets back along the pair they came on,
+//! so that they cross the same interfaces as the packets: see [`paired_ack_sender`].
 
 use super::{Id, Table};
+use s2n_quic_core::inet::SocketAddress;
 use std::net::SocketAddr;
 
 /// Where a send socket sits among the endpoint's interfaces, for pairing.
@@ -102,6 +106,78 @@ pub fn paired_peer_addr(
         .map(|(addr, _)| *addr)
         .collect();
     on_paired[place.index % on_paired.len()]
+}
+
+/// Returns the sender that sends the acknowledgements of a peer's packets, so that they follow
+/// the packets' route back: a sender of the local interface paired with the peer's interface
+/// that the packets came from.
+///
+/// `addrs` and `interfaces` hold the peer's data addresses and their tags, as
+/// [`paired_peer_addr`] reads them, `places` the place of each of the endpoint's send sockets,
+/// by sender, `source` the address the packets came from, and `remote_sender` the peer's sender
+/// that sent them. Where `source` is one of `addrs`, the sender's position among the senders of
+/// the paired interface is the address's position among the addresses of its interface, so
+/// that each of the peer's addresses maps to one sender. Where only the IP address of `source`
+/// matches, the peer's senders map to the senders of the paired interface in turn.
+///
+/// Returns `None`, which keeps the caller's choice, where the peer doesn't tag its addresses,
+/// either side has a single interface, `source` doesn't match the addresses of exactly one of
+/// the peer's interfaces, or the endpoint doesn't hold a send socket on the paired interface.
+pub fn paired_ack_sender(
+    addrs: &[SocketAddr],
+    interfaces: &[Option<u16>],
+    places: &[SendPlace],
+    source: SocketAddress,
+    remote_sender: usize,
+) -> Option<usize> {
+    if interfaces.len() != addrs.len() {
+        return None;
+    }
+
+    let mut remote: Vec<u16> = interfaces.iter().flatten().copied().collect();
+    remote.sort_unstable();
+    remote.dedup();
+    if remote.len() <= 1 {
+        return None;
+    }
+
+    let exact = addrs
+        .iter()
+        .position(|addr| SocketAddress::from(*addr).unmapped_eq(&source));
+    let (tag, position) = match exact {
+        Some(at) => {
+            let tag = interfaces[at]?;
+            let position = interfaces[..at]
+                .iter()
+                .filter(|other| **other == Some(tag))
+                .count();
+            (tag, Some(position))
+        }
+        None => {
+            let mut tags = addrs
+                .iter()
+                .zip(interfaces)
+                .filter(|(addr, _)| SocketAddress::from(**addr).ip().unmapped_eq(&source.ip()))
+                .map(|(_, tag)| *tag);
+            let tag = tags.next().flatten()?;
+            if tags.any(|other| other != Some(tag)) {
+                return None;
+            }
+            (tag, None)
+        }
+    };
+
+    let rank = remote.binary_search(&tag).ok()?;
+    let on_rank: Vec<usize> = places
+        .iter()
+        .enumerate()
+        .filter(|(_, place)| place.count > 1 && place.rank == rank)
+        .map(|(sender, _)| sender)
+        .collect();
+    if on_rank.is_empty() {
+        return None;
+    }
+    Some(on_rank[position.unwrap_or(remote_sender) % on_rank.len()])
 }
 
 /// Returns the interface tag of the peer's address that a sender sends to, as
@@ -317,5 +393,102 @@ mod tests {
         assert_eq!(paired_peer_interface(&peer, &gap, 1, None), None);
         assert_eq!(paired_peer_interface(&peer, &[], 1, None), None);
         assert_eq!(paired_peer_interface(&[], &[], 1, None), None);
+    }
+
+    /// The places of the four send sockets of an endpoint with two interfaces: sockets 0 and 2
+    /// on the first, 1 and 3 on the second.
+    fn two_interfaces() -> [SendPlace; 4] {
+        let two = |rank, index| SendPlace {
+            rank,
+            count: 2,
+            index,
+        };
+        [two(0, 0), two(1, 0), two(0, 1), two(1, 1)]
+    }
+
+    #[test]
+    fn an_acknowledgement_goes_back_along_the_pair_its_packet_came_on() {
+        let peer = addrs(4);
+        let tags = [Some(1), Some(1), Some(2), Some(2)];
+        let places = two_interfaces();
+        for (at, &source) in peer.iter().enumerate() {
+            let sender = paired_ack_sender(&peer, &tags, &places, source.into(), 7)
+                .expect("a packet from a tagged address is paired");
+            // The sender is on the local interface paired with the source's interface, and
+            // sends back to the source.
+            assert_eq!(places[sender].rank, at / 2);
+            assert_eq!(
+                paired_peer_addr(&peer, &tags, sender, Some(places[sender])),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn an_acknowledgement_of_a_packet_from_another_port_stays_on_its_pair() {
+        let peer = [
+            SocketAddr::from(([10, 0, 0, 1], 4000)),
+            SocketAddr::from(([10, 0, 0, 1], 4001)),
+            SocketAddr::from(([10, 0, 0, 2], 4000)),
+            SocketAddr::from(([10, 0, 0, 2], 4001)),
+        ];
+        let tags = [Some(1), Some(1), Some(2), Some(2)];
+        let places = two_interfaces();
+        // A packet from a port that isn't one of the peer's data addresses goes back on a
+        // sender of the paired interface, the peer's senders in turn.
+        let source = SocketAddress::from(SocketAddr::from(([10, 0, 0, 2], 5555)));
+        assert_eq!(paired_ack_sender(&peer, &tags, &places, source, 4), Some(1));
+        assert_eq!(paired_ack_sender(&peer, &tags, &places, source, 5), Some(3));
+
+        // An IPv4 address mapped into IPv6 matches the address it maps.
+        let peer = addrs(4);
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:4001".parse().unwrap();
+        assert_eq!(
+            paired_ack_sender(&peer, &tags, &places, mapped.into(), 7),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn an_acknowledgement_keeps_the_callers_sender_where_the_pair_isnt_known() {
+        let peer = addrs(4);
+        let tags = [Some(1), Some(1), Some(2), Some(2)];
+        let places = two_interfaces();
+        let source = SocketAddress::from(peer[1]);
+
+        // The peer doesn't tag its addresses.
+        assert_eq!(paired_ack_sender(&peer, &[], &places, source, 7), None);
+        assert_eq!(paired_ack_sender(&peer, &[None; 4], &places, source, 7), None);
+        // The tags don't match the addresses.
+        assert_eq!(paired_ack_sender(&peer, &tags[..3], &places, source, 7), None);
+        // The source's address doesn't have a tag.
+        let gap = [Some(1), None, Some(2), Some(2)];
+        assert_eq!(paired_ack_sender(&peer, &gap, &places, source, 7), None);
+        // The peer has one interface.
+        assert_eq!(paired_ack_sender(&peer, &[Some(1); 4], &places, source, 7), None);
+        // The endpoint has one interface that holds a send socket.
+        let one = [SendPlace {
+            rank: 0,
+            count: 1,
+            index: 0,
+        }];
+        assert_eq!(paired_ack_sender(&peer, &tags, &one, source, 7), None);
+        // The source's IP address isn't one of the peer's.
+        let elsewhere = SocketAddress::from(SocketAddr::from(([10, 0, 0, 9], 4001)));
+        assert_eq!(paired_ack_sender(&peer, &tags, &places, elsewhere, 7), None);
+        // The source's port isn't a data address, and its IP address is on both of the peer's
+        // interfaces.
+        let other_port = SocketAddress::from(SocketAddr::from(([10, 0, 0, 1], 5555)));
+        assert_eq!(paired_ack_sender(&peer, &tags, &places, other_port, 7), None);
+        // The source is on the peer's third interface, which no local interface sends to.
+        let three = [Some(1), Some(1), Some(2), Some(3)];
+        let on_third = SocketAddress::from(peer[3]);
+        assert_eq!(paired_ack_sender(&peer, &three, &places, on_third, 7), None);
+        // A source on the peer's second interface still has a pair.
+        let on_second = SocketAddress::from(peer[2]);
+        assert_eq!(
+            paired_ack_sender(&peer, &three, &places, on_second, 7),
+            Some(1)
+        );
     }
 }

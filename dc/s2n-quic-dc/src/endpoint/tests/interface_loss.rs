@@ -23,11 +23,18 @@
 //! The endpoints record each acknowledgement and freed batch they route to a send worker. None
 //! may go to a sender whose interface pair its path marks lost while another sender of that path
 //! delivers, and the endpoints must route at least one of each while a pair of its path is lost.
+//!
+//! Once the first streams finish, no pair whose routes avoid the lost interface may be marked
+//! lost: each endpoint sends the acknowledgements of a pair's packets back along that pair, so
+//! they don't cross the lost interface.
 
 use crate::{
-    endpoint::routing::observe::{self, Kind, Routed},
+    endpoint::{
+        id::LocalSenderId,
+        routing::observe::{self, Kind, Routed},
+    },
     socket::{interface, rate::Rate},
-    stream::endpoint::testing::sim::{Client, SimEndpointConfig},
+    stream::endpoint::testing::sim::{lookup_sim_map, Client, SimEndpointConfig},
     testing::{ext::*, sim, without_snapshots, without_tracing},
 };
 use bach::time::timeout;
@@ -306,6 +313,49 @@ async fn reset_round_trip(client: &mut Client) {
     );
 }
 
+/// The local sender id of the send socket at `socket`.
+fn sender(socket: usize) -> LocalSenderId {
+    LocalSenderId::new(VarInt::from_u32(socket as u32))
+}
+
+/// The path secret entry of the endpoint at `local` for the peer at `peer`.
+fn path_entry(
+    local: &[SocketAddr],
+    peer: &[SocketAddr],
+) -> Arc<crate::path::secret::map::Entry> {
+    let map = lookup_sim_map(local[0]).expect("the endpoint registered its path secret map");
+    peer.iter()
+        .find_map(|&addr| map.get_raw(addr))
+        .expect("the endpoint holds a path secret for the peer")
+}
+
+/// Asserts that neither endpoint marks a pair lost whose routes avoid the client's lost
+/// interface, and that the client marks a pair on that interface lost. The server's second
+/// interface is paired with the client's second, the lost one.
+fn assert_lost_marks(shared: &Shared) {
+    let client_addrs = shared.client_addrs.lock().unwrap().clone();
+    let server_addrs = shared.server_addrs.lock().unwrap().clone();
+    let client = path_entry(&client_addrs, &server_addrs);
+    let server = path_entry(&server_addrs, &client_addrs);
+    for (socket, &interface) in CLIENT_INTERFACE.iter().enumerate() {
+        assert!(
+            interface == LOST || !client.is_sender_lost(sender(socket)),
+            "the client marked the pair of its socket {socket} lost",
+        );
+    }
+    for (socket, &interface) in SERVER_INTERFACE.iter().enumerate() {
+        assert!(
+            interface == LOST || !server.is_sender_lost(sender(socket)),
+            "the server marked the pair of its socket {socket} lost",
+        );
+    }
+    let marked = CLIENT_INTERFACE
+        .iter()
+        .enumerate()
+        .any(|(socket, &interface)| interface == LOST && client.is_sender_lost(sender(socket)));
+    assert!(marked, "the client didn't mark a pair on the lost interface lost");
+}
+
 /// While one of the client's interfaces is lost, the client and the server move their traffic to
 /// the pairs that still deliver, so the streams the client opened before the loss finish, and
 /// the expiry of the lost pairs' send contexts doesn't mark the peer dead.
@@ -447,6 +497,10 @@ fn run(recover: bool) {
                 client_side.losing.load(Ordering::Relaxed),
                 "the interface wasn't lost",
             );
+
+            // The pairs whose routes avoid the lost interface still get their acknowledgements,
+            // so neither endpoint marks one of them lost.
+            assert_lost_marks(&client_side);
 
             // Each endpoint's resets are its highest-priority traffic, whose pairs cross the lost
             // interface, so they make their round trip on the pairs that still deliver.

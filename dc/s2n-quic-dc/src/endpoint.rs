@@ -1002,6 +1002,10 @@ where
         .unzip();
 
     let ack_route = RecvRoute::new(num_send);
+    // Each send socket's place among the interfaces, by sender, which the recv dispatch workers
+    // read to send the acknowledgements of a peer's packets back along the pair they came on.
+    let ack_send_places: Option<Arc<[crate::socket::interface::SendPlace]>> =
+        send_places.as_deref().map(Arc::from);
     for (recv_dispatch_id, dispatch_rx, ack_completion_rx, invalidation_rx, waker_sink) in (
         dispatch_rxs,
         ack_completion_rxs,
@@ -1029,6 +1033,7 @@ where
             stream_clock: stream_clock.clone(),
             route: ack_route,
             priority_senders: priority_senders.clone(),
+            send_places: ack_send_places.clone(),
             waker_sink,
             ups_tx: ups_tx.clone(),
             invalidation_rx,
@@ -1248,6 +1253,9 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     /// The send sockets of the interface for the highest-priority traffic, which a peer's
     /// acknowledgements go to, where the endpoint has one.
     priority_senders: Option<Vec<LocalSenderId>>,
+    /// The place of each send socket among the endpoint's interfaces, by sender, or `None` where
+    /// the endpoint doesn't list any, which picks the sender of each peer's acknowledgements.
+    send_places: Option<Arc<[crate::socket::interface::SendPlace]>>,
     waker_sink: waker::Sink,
     ups_tx: UpsSender,
     invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
@@ -1544,7 +1552,8 @@ where
                 let recv_dispatch_idx = rd.recv_dispatch_idx;
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx)
-                        .with_priority_senders(rd.priority_senders),
+                        .with_priority_senders(rd.priority_senders)
+                        .with_send_places(rd.send_places),
                 ));
                 let (ack_burst_tx, ack_burst_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<

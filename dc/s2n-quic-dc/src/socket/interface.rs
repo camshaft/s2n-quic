@@ -28,7 +28,7 @@ use std::{
 mod tests;
 
 mod pairing;
-pub use pairing::{paired_peer_addr, paired_peer_interface, SendPlace};
+pub use pairing::{paired_ack_sender, paired_peer_addr, paired_peer_interface, SendPlace};
 
 /// The identity of one of an endpoint's local interfaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
