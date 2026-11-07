@@ -545,6 +545,9 @@ pub struct PickTwo<T, R, S> {
     /// must return to the pool, since `Frame` has no `Drop` that releases it.
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
     value: PhantomData<fn() -> T>,
+    /// Records each start and each end of the router's count of a sender as lost for sharing an
+    /// interface with a lost pair.
+    counted_lost_recorder: CountedLostRecorder,
 }
 
 impl<T, R, S> PickTwo<T, R, S>
@@ -581,6 +584,7 @@ where
             .collect();
         let score_delta = counter_registry
             .register_summary("pick_two.score_delta", crate::counter::Unit::Microsecond);
+        let counted_lost_recorder = CountedLostRecorder::new(&senders, counter_registry);
         Self {
             rx,
             senders,
@@ -591,7 +595,18 @@ where
             score_delta,
             send_credit_pool,
             value: PhantomData,
+            counted_lost_recorder,
         }
+    }
+
+    /// Publishes each start and each end of the router's count of a sender as lost for sharing
+    /// an interface with a lost pair through `path_secret_map`, where it is set.
+    pub fn with_path_secret_map(
+        mut self,
+        path_secret_map: Option<crate::path::secret::Map>,
+    ) -> Self {
+        self.counted_lost_recorder.path_secret_map = path_secret_map;
+        self
     }
 
     fn try_send_pick_two(
@@ -602,6 +617,7 @@ where
         pick_counters: &IdMap<LocalSenderId, crate::counter::Counter>,
         rejected_counters: &IdMap<LocalSenderId, crate::counter::Summary>,
         score_delta: &crate::counter::Summary,
+        counted_lost_recorder: &CountedLostRecorder,
     ) -> Result<(), T> {
         debug_assert!(!senders.is_empty());
         debug_assert_eq!(senders.len(), pick_counters.len());
@@ -624,8 +640,12 @@ where
                     round_robin_idx,
                     rejected_counters,
                     score_delta,
+                    counted_lost_recorder,
                 )
             } else {
+                // Where no pair is marked lost, or every pair is, the router doesn't count a
+                // sender as lost for sharing a lost pair's interface.
+                counted_lost_recorder.record(entry, &[]);
                 // First candidate: round-robin for deterministic striping across senders.
                 let rr = *round_robin_idx;
                 let next = rr + 1;
@@ -696,6 +716,7 @@ where
     /// Where no sender has one, or once the preference ends, a sender that sends to the peer
     /// interface of a pair marked lost counts as lost too, as `counts_as_lost` says: every sender
     /// here is on one local interface.
+    /// It records each start and each end of that count through `counted_lost_recorder`.
     fn pick_delivering_sender(
         entry: &PathSecretEntry,
         len: usize,
@@ -703,22 +724,24 @@ where
         round_robin_idx: &mut usize,
         rejected_counters: &IdMap<LocalSenderId, crate::counter::Summary>,
         score_delta: &crate::counter::Summary,
+        counted_lost_recorder: &CountedLostRecorder,
     ) -> LocalSenderId {
         let prefer_delivered = entry.prefers_senders_delivering_since_lost();
         // Where no sender delivers since the loss, or once the preference for such senders
         // ends, a sender that sends to a lost pair's peer interface counts as lost too, since
         // that interface may be down.
         let counted_lost = if prefer_delivered {
-            Vec::new()
+            CountedLost::default()
         } else {
             counts_as_lost(entry, len, |_| None, |_| None)
         };
+        counted_lost_recorder.record(entry, &counted_lost.shared);
         let delivers = |idx: usize| {
             let sender = LocalSenderId::from_index(idx);
             if prefer_delivered {
                 entry.delivers_since_lost(sender)
             } else {
-                !counted_lost[idx]
+                !counted_lost.lost[idx]
             }
         };
 
@@ -774,12 +797,15 @@ where
 /// sender counts once for each of the two interfaces it shares with a marked pair, and the
 /// senders that aren't marked and share the fewest keep their marks clear, so that the router
 /// keeps a sender to choose.
+///
+/// Beside each sender's mark, it returns whether the sender counts as lost for the interfaces
+/// it shares alone, without a mark of its own.
 fn counts_as_lost(
     entry: &PathSecretEntry,
     len: usize,
     local_interface: impl Fn(usize) -> Option<usize>,
     place: impl Fn(usize) -> Option<crate::socket::interface::SendPlace>,
-) -> Vec<bool> {
+) -> CountedLost {
     let marked: Vec<bool> = (0..len)
         .map(|idx| entry.is_sender_lost(LocalSenderId::from_index(idx)))
         .collect();
@@ -813,9 +839,82 @@ fn counts_as_lost(
         .map(|idx| shared[idx])
         .min()
         .unwrap_or(0);
-    (0..len)
-        .map(|idx| marked[idx] || shared[idx] > fewest)
-        .collect()
+    CountedLost {
+        lost: (0..len)
+            .map(|idx| marked[idx] || shared[idx] > fewest)
+            .collect(),
+        shared: (0..len)
+            .map(|idx| !marked[idx] && shared[idx] > fewest)
+            .collect(),
+    }
+}
+
+/// Each sender's mark and count as lost, as `counts_as_lost` returns them.
+#[derive(Default)]
+struct CountedLost {
+    /// Whether each sender counts as lost, with its own mark or for the interfaces it shares.
+    lost: Vec<bool>,
+    /// Whether each sender counts as lost for the interfaces it shares alone, without a mark of
+    /// its own.
+    shared: Vec<bool>,
+}
+
+/// Records each start and each end of a router's count of a sender as lost for sharing an
+/// interface with a lost pair, once on the sender's counters and once as a path secret map
+/// event. The entry keeps which senders are counted, so that the routers of one entry record
+/// each start and each end once.
+struct CountedLostRecorder {
+    started: IdMap<LocalSenderId, crate::counter::Counter>,
+    ended: IdMap<LocalSenderId, crate::counter::Counter>,
+    path_secret_map: Option<crate::path::secret::Map>,
+}
+
+impl CountedLostRecorder {
+    fn new<S>(
+        senders: &IdMap<LocalSenderId, S>,
+        counter_registry: &crate::counter::Registry,
+    ) -> Self {
+        let register = |name: &'static str| -> IdMap<LocalSenderId, crate::counter::Counter> {
+            senders
+                .iter()
+                .map(|(id, _)| {
+                    let counter =
+                        counter_registry.register_nominal(name, format_args!("send.{id}"));
+                    (id, counter)
+                })
+                .collect()
+        };
+        Self {
+            started: register("pick_two.counted_lost"),
+            ended: register("pick_two.counted_lost_cleared"),
+            path_secret_map: None,
+        }
+    }
+
+    /// Records each sender whose count as lost for sharing a lost pair's interface starts or
+    /// ends, where `shared` says which senders count so now.
+    fn record(&self, entry: &PathSecretEntry, shared: &[bool]) {
+        if !shared.contains(&true) && !entry.has_sender_counted_lost() {
+            return;
+        }
+        for (id, started) in self.started.iter() {
+            let counted = shared.get(id.as_usize()).copied().unwrap_or(false);
+            if !entry.set_sender_counted_lost(id, counted) {
+                continue;
+            }
+            if counted {
+                started.add(1);
+                if let Some(map) = &self.path_secret_map {
+                    map.on_sender_counted_lost(entry.peer());
+                }
+            } else {
+                self.ended[id].add(1);
+                if let Some(map) = &self.path_secret_map {
+                    map.on_sender_counted_lost_cleared(entry.peer());
+                }
+            }
+        }
+    }
 }
 
 impl<T, R, S> Receiver<()> for PickTwo<T, R, S>
@@ -839,6 +938,7 @@ where
             &self.pick_counters,
             &self.rejected_counters,
             &self.score_delta,
+            &self.counted_lost_recorder,
         ) {
             Ok(()) => {
                 // Notify upstream (e.g. the overall Paced stage) that bytes were consumed so the

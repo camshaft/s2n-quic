@@ -354,6 +354,9 @@ where
     pick_counters: IdMap<LocalSenderId, crate::counter::Counter>,
     rejected_counters: IdMap<LocalSenderId, crate::counter::Summary>,
     score_delta: crate::counter::Summary,
+    /// Records each start and each end of the router's count of a sender as lost for sharing an
+    /// interface with a lost pair.
+    counted_lost_recorder: super::CountedLostRecorder,
     /// Send credit pool. Where a batch can't be delivered, since its worker's receiver is gone,
     /// the credit its frames borrowed returns here, with the credit of each batch held then.
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
@@ -412,6 +415,7 @@ where
             .collect();
         let score_delta = counter_registry
             .register_summary("pick_two.score_delta", crate::counter::Unit::Microsecond);
+        let counted_lost_recorder = super::CountedLostRecorder::new(&senders, counter_registry);
         // The interface for the highest-priority traffic counts only where a sender is on it.
         let highest_priority = pacing.highest_priority().filter(|&position| {
             senders
@@ -449,6 +453,7 @@ where
             pick_counters,
             rejected_counters,
             score_delta,
+            counted_lost_recorder,
             send_credit_pool,
             #[cfg(test)]
             dispatches: 0,
@@ -464,6 +469,16 @@ where
     /// other, while an interface doesn't hold a batch.
     pub fn with_highest_priority_input(mut self, highest_rx: R) -> Self {
         self.highest_rx = Some(highest_rx);
+        self
+    }
+
+    /// Publishes each start and each end of the router's count of a sender as lost for sharing
+    /// an interface with a lost pair through `path_secret_map`, where it is set.
+    pub fn with_path_secret_map(
+        mut self,
+        path_secret_map: Option<crate::path::secret::Map>,
+    ) -> Self {
+        self.counted_lost_recorder.path_secret_map = path_secret_map;
         self
     }
 
@@ -496,6 +511,7 @@ where
     /// which the lost marks set. Where no sender has one, or once the preference ends, a sender
     /// that shares the local interface or the peer interface of a pair marked lost counts as
     /// lost too, as `counts_as_lost` in the combinator module says.
+    /// It records each start and each end of that count through `counted_lost_recorder`.
     fn read_lost_marks(&mut self, entry: &PathSecretEntry) {
         let prefer_delivered = entry.prefers_senders_delivering_since_lost();
         // Counting the senders that share a marked pair's interfaces reads every sender's
@@ -508,8 +524,10 @@ where
                 |sender| Some(self.sender_places[LocalSenderId::from_index(sender)]),
             )
         } else {
-            Vec::new()
+            super::CountedLost::default()
         };
+        self.counted_lost_recorder
+            .record(entry, &counted_lost.shared);
         self.lost_marks.clear();
         self.lost_marks.extend((0..self.senders.len()).map(|idx| {
             let sender = LocalSenderId::from_index(idx);
@@ -517,6 +535,7 @@ where
                 !entry.delivers_since_lost(sender)
             } else {
                 counted_lost
+                    .lost
                     .get(idx)
                     .copied()
                     .unwrap_or_else(|| entry.is_sender_lost(sender))

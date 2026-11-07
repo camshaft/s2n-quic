@@ -1153,6 +1153,40 @@ pub mod api {
     impl Event for CreditlessWindowLimitHalved {
         const NAME: &'static str = "creditless_window:limit_halved";
     }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a router counts a sender as lost for sharing an interface with a lost pair"]
+    pub struct PathSecretMapSenderCountedLost<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapSenderCountedLost<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapSenderCountedLost");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapSenderCountedLost<'a> {
+        const NAME: &'static str = "path_secret_map:sender_counted_lost";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a router stops counting a sender as lost for a lost pair's interface"]
+    pub struct PathSecretMapSenderCountedLostCleared<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapSenderCountedLostCleared<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapSenderCountedLostCleared");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapSenderCountedLostCleared<'a> {
+        const NAME: &'static str = "path_secret_map:sender_counted_lost_cleared";
+    }
 }
 pub mod tracing {
     #![doc = r" This module contains event integration with [`tracing`](https://docs.rs/tracing)"]
@@ -1842,6 +1876,26 @@ pub mod tracing {
                 limit_bytes,
             } = event;
             tracing :: event ! (target : "creditless_window_limit_halved" , parent : parent , tracing :: Level :: DEBUG , { held_bytes = tracing :: field :: debug (held_bytes) , previous_limit_bytes = tracing :: field :: debug (previous_limit_bytes) , limit_bytes = tracing :: field :: debug (limit_bytes) });
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapSenderCountedLost { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_sender_counted_lost" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapSenderCountedLostCleared { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_sender_counted_lost_cleared" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
         }
     }
 }
@@ -2999,6 +3053,38 @@ pub mod builder {
             }
         }
     }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a router counts a sender as lost for sharing an interface with a lost pair"]
+    pub struct PathSecretMapSenderCountedLost<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapSenderCountedLost<'a>>
+        for PathSecretMapSenderCountedLost<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapSenderCountedLost<'a> {
+            let PathSecretMapSenderCountedLost { peer_address } = self;
+            api::PathSecretMapSenderCountedLost {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a router stops counting a sender as lost for a lost pair's interface"]
+    pub struct PathSecretMapSenderCountedLostCleared<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapSenderCountedLostCleared<'a>>
+        for PathSecretMapSenderCountedLostCleared<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapSenderCountedLostCleared<'a> {
+            let PathSecretMapSenderCountedLostCleared { peer_address } = self;
+            api::PathSecretMapSenderCountedLostCleared {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
 }
 pub use traits::*;
 mod traits {
@@ -3567,6 +3653,26 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `PathSecretMapSenderCountedLost` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `PathSecretMapSenderCountedLostCleared` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = r" Called for each event that relates to the endpoint and all connections"]
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -4036,6 +4142,24 @@ mod traits {
             event: &api::CreditlessWindowLimitHalved,
         ) {
             self.as_ref().on_creditless_window_limit_halved(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_sender_counted_lost(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_sender_counted_lost_cleared(meta, event);
         }
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -4528,6 +4652,24 @@ mod traits {
             (self.1).on_creditless_window_limit_halved(meta, event);
         }
         #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            (self.0).on_path_secret_map_sender_counted_lost(meta, event);
+            (self.1).on_path_secret_map_sender_counted_lost(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            (self.0).on_path_secret_map_sender_counted_lost_cleared(meta, event);
+            (self.1).on_path_secret_map_sender_counted_lost_cleared(meta, event);
+        }
+        #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
             self.0.on_event(meta, event);
             self.1.on_event(meta, event);
@@ -4706,6 +4848,16 @@ mod traits {
         fn on_creditless_window_limit_grew(&self, event: builder::CreditlessWindowLimitGrew);
         #[doc = "Publishes a `CreditlessWindowLimitHalved` event to the publisher's subscriber"]
         fn on_creditless_window_limit_halved(&self, event: builder::CreditlessWindowLimitHalved);
+        #[doc = "Publishes a `PathSecretMapSenderCountedLost` event to the publisher's subscriber"]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            event: builder::PathSecretMapSenderCountedLost,
+        );
+        #[doc = "Publishes a `PathSecretMapSenderCountedLostCleared` event to the publisher's subscriber"]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            event: builder::PathSecretMapSenderCountedLostCleared,
+        );
         #[doc = r" Returns the QUIC version, if any"]
         fn quic_version(&self) -> Option<u32>;
     }
@@ -5131,6 +5283,26 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            event: builder::PathSecretMapSenderCountedLost,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_sender_counted_lost(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            event: builder::PathSecretMapSenderCountedLostCleared,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_sender_counted_lost_cleared(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn quic_version(&self) -> Option<u32> {
             self.quic_version
         }
@@ -5265,6 +5437,8 @@ pub mod testing {
             pub creditless_window_frame_refused: AtomicU64,
             pub creditless_window_limit_grew: AtomicU64,
             pub creditless_window_limit_halved: AtomicU64,
+            pub path_secret_map_sender_counted_lost: AtomicU64,
+            pub path_secret_map_sender_counted_lost_cleared: AtomicU64,
         }
         impl Drop for Subscriber {
             fn drop(&mut self) {
@@ -5345,6 +5519,8 @@ pub mod testing {
                     creditless_window_frame_refused: AtomicU64::new(0),
                     creditless_window_limit_grew: AtomicU64::new(0),
                     creditless_window_limit_halved: AtomicU64::new(0),
+                    path_secret_map_sender_counted_lost: AtomicU64::new(0),
+                    path_secret_map_sender_counted_lost_cleared: AtomicU64::new(0),
                 }
             }
         }
@@ -5936,6 +6112,30 @@ pub mod testing {
                 let out = format!("{meta:?} {event:?}");
                 self.output.lock().unwrap().push(out);
             }
+            fn on_path_secret_map_sender_counted_lost(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapSenderCountedLost,
+            ) {
+                self.path_secret_map_sender_counted_lost
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_path_secret_map_sender_counted_lost_cleared(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapSenderCountedLostCleared,
+            ) {
+                self.path_secret_map_sender_counted_lost_cleared
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
         }
     }
     #[derive(Debug)]
@@ -5993,6 +6193,8 @@ pub mod testing {
         pub creditless_window_frame_refused: AtomicU64,
         pub creditless_window_limit_grew: AtomicU64,
         pub creditless_window_limit_halved: AtomicU64,
+        pub path_secret_map_sender_counted_lost: AtomicU64,
+        pub path_secret_map_sender_counted_lost_cleared: AtomicU64,
     }
     impl Drop for Subscriber {
         fn drop(&mut self) {
@@ -6075,6 +6277,8 @@ pub mod testing {
                 creditless_window_frame_refused: AtomicU64::new(0),
                 creditless_window_limit_grew: AtomicU64::new(0),
                 creditless_window_limit_halved: AtomicU64::new(0),
+                path_secret_map_sender_counted_lost: AtomicU64::new(0),
+                path_secret_map_sender_counted_lost_cleared: AtomicU64::new(0),
             }
         }
     }
@@ -6695,6 +6899,30 @@ pub mod testing {
             let out = format!("{meta:?} {event:?}");
             self.output.lock().unwrap().push(out);
         }
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLost,
+        ) {
+            self.path_secret_map_sender_counted_lost
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapSenderCountedLostCleared,
+        ) {
+            self.path_secret_map_sender_counted_lost_cleared
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
     }
     #[derive(Debug)]
     pub struct Publisher {
@@ -6751,6 +6979,8 @@ pub mod testing {
         pub creditless_window_frame_refused: AtomicU64,
         pub creditless_window_limit_grew: AtomicU64,
         pub creditless_window_limit_halved: AtomicU64,
+        pub path_secret_map_sender_counted_lost: AtomicU64,
+        pub path_secret_map_sender_counted_lost_cleared: AtomicU64,
     }
     impl Publisher {
         #[doc = r" Creates a publisher with snapshot assertions enabled"]
@@ -6823,6 +7053,8 @@ pub mod testing {
                 creditless_window_frame_refused: AtomicU64::new(0),
                 creditless_window_limit_grew: AtomicU64::new(0),
                 creditless_window_limit_halved: AtomicU64::new(0),
+                path_secret_map_sender_counted_lost: AtomicU64::new(0),
+                path_secret_map_sender_counted_lost_cleared: AtomicU64::new(0),
             }
         }
     }
@@ -7263,6 +7495,28 @@ pub mod testing {
         }
         fn on_creditless_window_limit_halved(&self, event: builder::CreditlessWindowLimitHalved) {
             self.creditless_window_limit_halved
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_sender_counted_lost(
+            &self,
+            event: builder::PathSecretMapSenderCountedLost,
+        ) {
+            self.path_secret_map_sender_counted_lost
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_sender_counted_lost_cleared(
+            &self,
+            event: builder::PathSecretMapSenderCountedLostCleared,
+        ) {
+            self.path_secret_map_sender_counted_lost_cleared
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             let event = crate::event::snapshot::Fmt::to_snapshot(&event);

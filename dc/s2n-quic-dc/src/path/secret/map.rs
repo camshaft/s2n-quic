@@ -361,6 +361,16 @@ impl Map {
             .on_creditless_window_limit_halved(held_bytes, previous_limit_bytes, limit_bytes);
     }
 
+    /// Emits a PathSecretMapSenderCountedLost event via the subscriber
+    pub fn on_sender_counted_lost(&self, peer_address: &SocketAddr) {
+        self.store.on_sender_counted_lost(peer_address);
+    }
+
+    /// Emits a PathSecretMapSenderCountedLostCleared event via the subscriber
+    pub fn on_sender_counted_lost_cleared(&self, peer_address: &SocketAddr) {
+        self.store.on_sender_counted_lost_cleared(peer_address);
+    }
+
     pub fn handle_control_packet(&self, packet: &control::Packet, peer: &SocketAddr) {
         match packet {
             control::Packet::StaleKey(packet) => {
