@@ -3407,3 +3407,177 @@ fn interface_paced_pick_two_lists_a_waiting_highest_input_peer_once_on_each_inte
     assert_eq!(drop_counter.load(Ordering::Relaxed), 6);
     assert_eq!(highest_rx.consumed.get(), 501_010);
 }
+
+#[test]
+fn interface_paced_pick_two_offers_a_waiting_highest_input_batch_only_on_a_free_interface() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    // Three interfaces, each with one sender, and no interface for the highest-priority traffic.
+    // The pairs of the second and third senders are lost for the first peer and for the third
+    // peer, so that the first sender takes their batches, and those of the first and third
+    // senders are lost for the second peer, so that the second sender takes its batches.
+    let waits = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(3)
+        .build(None);
+    let other = PathSecretEntry::builder("127.0.0.1:4434".parse().unwrap())
+        .socket_sender_count(3)
+        .build(None);
+    let later = PathSecretEntry::builder("127.0.0.1:4435".parse().unwrap())
+        .socket_sender_count(3)
+        .build(None);
+    for (entry, lost) in [(&waits, [1, 2]), (&other, [0, 2]), (&later, [1, 2])] {
+        for sender in lost {
+            assert!(entry.set_sender_lost(LocalSenderId::from_index(sender), true));
+        }
+    }
+    // The input of the highest priority level holds three batches of the first peer, each of
+    // more bytes than a burst and a byte more than the one before it, then two batches of the
+    // second peer, each of more bytes than a burst. The bulk input is closed and empty.
+    let highest_rx = ClosableReceiver::default();
+    for (entry, byte_cost) in [
+        (&waits, 100_000),
+        (&waits, 100_001),
+        (&waits, 100_002),
+        (&other, 200_000),
+        (&other, 200_001),
+    ] {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = byte_cost;
+        item.highest_priority = true;
+        highest_rx.values.borrow_mut().push_back(item);
+    }
+    let rx = ClosableReceiver::default();
+    rx.closed.set(true);
+    let first = Sends::default();
+    let second = Sends::default();
+    let third = Sends::default();
+    let pacing = SendPacing::new(vec![rate, rate, rate], vec![0, 1, 2]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&first, &second, &third]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+    let costs = |sends: &Sends| {
+        sends
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect::<Vec<_>>()
+    };
+
+    // The first peer's first batch goes at once to the first interface, its second waits on
+    // that interface, and its third waits in the router, which lists the peer on the waiters of
+    // the first interface and on the lost peers of the second and third senders. The second
+    // peer's first batch goes at once to the second interface, and its second waits on that
+    // interface. The third interface is free.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(costs(&first), [100_000]);
+    assert_eq!(costs(&second), [200_000]);
+    assert!(costs(&third).is_empty());
+    assert_eq!(router.highest_waiter_entries(), 3);
+
+    // The second sender's pair delivers to the first peer again, but that sender's interface
+    // holds a batch, so the router doesn't offer the first peer's batch to the senders.
+    let dispatches = router.dispatches();
+    assert!(waits.set_sender_lost(LocalSenderId::from_index(1), false));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(router.dispatches(), dispatches);
+
+    // The third sender's pair delivers to the first peer again, and its interface is free: the
+    // first peer's waiting batch goes at once to it. The router keeps the peer's entries on the
+    // waiters of the first interface and on the lost peers of the second sender.
+    assert!(waits.set_sender_lost(LocalSenderId::from_index(2), false));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(costs(&third), [100_002]);
+    assert_eq!(router.highest_waiter_entries(), 2);
+
+    // A batch of the third peer waits in the router, which lists that peer on the waiters of the
+    // first interface behind the first peer's entry, and on the lost peers of the second and
+    // third senders.
+    let mut item = new_test_item(later.clone(), drop_counter.clone());
+    item.byte_cost = 300_000;
+    item.highest_priority = true;
+    highest_rx.values.borrow_mut().push_back(item);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(router.highest_waiter_entries(), 5);
+
+    // Once the pacer releases the first peer's second batch, the router skips the first peer's
+    // entry on the first interface's waiters and offers the third peer's batch, which waits on
+    // that interface for its tokens, in the same poll.
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(costs(&first), [100_000, 100_001]);
+    assert_eq!(router.highest_waiter_entries(), 2);
+
+    // Once each bucket has paid for the batches sent before, the batch each interface holds goes,
+    // and the router ends, with each entry gone from its lists.
+    highest_rx.closed.set(true);
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(costs(&first), [100_000, 100_001, 300_000]);
+    assert_eq!(costs(&second), [200_000, 200_001]);
+    assert_eq!(costs(&third), [100_002]);
+    assert_eq!(router.highest_waiter_entries(), 0);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 6);
+    assert_eq!(highest_rx.consumed.get(), 1_000_004);
+}
+
+#[test]
+fn interface_paced_pick_two_empties_its_highest_input_lists_when_its_worker_is_gone() {
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    // The second interface carries the highest-priority traffic. The pair of its sender is lost
+    // for the peer, so the first interface's sender takes each batch of that peer, paced.
+    let entry = test_path_secret_entry();
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    let highest_rx = ClosableReceiver::default();
+    {
+        let mut values = highest_rx.values.borrow_mut();
+        values.extend(test_items(&entry, 3, 100_000, &drop_counter));
+        for value in values.iter_mut() {
+            value.highest_priority = true;
+        }
+    }
+    let rx = ClosableReceiver::default();
+    rx.closed.set(true);
+    let gone = Rc::new(std::cell::Cell::new(false));
+    let senders: Vec<_> = (0..2)
+        .map(|_| GoneSender {
+            gone: Rc::clone(&gone),
+        })
+        .collect();
+    let rate = Rate::new(1.0);
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+
+    // The first batch goes, the second waits on the first interface, and the third waits in the
+    // router, which lists the peer on the waiters of the first interface and on the lost peers
+    // of the second sender.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(router.highest_waiter_entries(), 2);
+
+    // Once the pacer releases the second batch, it goes to the first interface's sender, whose
+    // receiver is gone: the router ends in that poll, and empties both lists.
+    gone.set(true);
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_once(&mut router), Poll::Ready(None));
+    assert_eq!(router.highest_waiter_entries(), 0);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+}
