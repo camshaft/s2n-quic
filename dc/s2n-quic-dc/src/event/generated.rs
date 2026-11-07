@@ -1113,7 +1113,11 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
-    #[doc = " Emitted when the creditless window's limit grows by the bytes a worker took"]
+    #[doc = " Emitted when the creditless window's limit grows"]
+    #[doc = ""]
+    #[doc = " The limit grows where a worker could take a batch that the batch router doesn't have, while"]
+    #[doc = " a frame that the window refused waits: by the bytes of the last batch that a worker's sender"]
+    #[doc = " took, which the event holds as its released bytes, and at least by the window's minimum."]
     pub struct CreditlessWindowLimitGrew {
         pub released_bytes: u64,
         pub held_bytes: u64,
@@ -1134,7 +1138,12 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
-    #[doc = " Emitted once a round when the creditless window's limit halves or stays at its minimum"]
+    #[doc = " Emitted when the creditless window's limit halves, or stays at its minimum"]
+    #[doc = ""]
+    #[doc = " The limit halves as a worker's sender takes a batch that waited for a sender in the"]
+    #[doc = " interface-paced router, beyond the batch that each pacer holds, and doesn't go below the"]
+    #[doc = " window's minimum. It halves once for the bytes that the window held then: the batches that"]
+    #[doc = " release those bytes don't halve it again."]
     pub struct CreditlessWindowLimitHalved {
         pub held_bytes: u64,
         pub previous_limit_bytes: u64,
@@ -2983,7 +2992,11 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
-    #[doc = " Emitted when the creditless window's limit grows by the bytes a worker took"]
+    #[doc = " Emitted when the creditless window's limit grows"]
+    #[doc = ""]
+    #[doc = " The limit grows where a worker could take a batch that the batch router doesn't have, while"]
+    #[doc = " a frame that the window refused waits: by the bytes of the last batch that a worker's sender"]
+    #[doc = " took, which the event holds as its released bytes, and at least by the window's minimum."]
     pub struct CreditlessWindowLimitGrew {
         pub released_bytes: u64,
         pub held_bytes: u64,
@@ -3005,7 +3018,12 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
-    #[doc = " Emitted once a round when the creditless window's limit halves or stays at its minimum"]
+    #[doc = " Emitted when the creditless window's limit halves, or stays at its minimum"]
+    #[doc = ""]
+    #[doc = " The limit halves as a worker's sender takes a batch that waited for a sender in the"]
+    #[doc = " interface-paced router, beyond the batch that each pacer holds, and doesn't go below the"]
+    #[doc = " window's minimum. It halves once for the bytes that the window held then: the batches that"]
+    #[doc = " release those bytes don't halve it again."]
     pub struct CreditlessWindowLimitHalved {
         pub held_bytes: u64,
         pub previous_limit_bytes: u64,

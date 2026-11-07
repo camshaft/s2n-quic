@@ -501,7 +501,11 @@ struct CreditlessWindowFrameRefused<'a> {
 
 #[event("creditless_window:limit_grew")]
 #[subject(endpoint)]
-/// Emitted when the creditless window's limit grows by the bytes a worker took
+/// Emitted when the creditless window's limit grows
+///
+/// The limit grows where a worker could take a batch that the batch router doesn't have, while
+/// a frame that the window refused waits: by the bytes of the last batch that a worker's sender
+/// took, which the event holds as its released bytes, and at least by the window's minimum.
 struct CreditlessWindowLimitGrew {
     #[measure("released_bytes", Bytes)]
     released_bytes: u64,
@@ -513,7 +517,12 @@ struct CreditlessWindowLimitGrew {
 
 #[event("creditless_window:limit_halved")]
 #[subject(endpoint)]
-/// Emitted once a round when the creditless window's limit halves or stays at its minimum
+/// Emitted when the creditless window's limit halves, or stays at its minimum
+///
+/// The limit halves as a worker's sender takes a batch that waited for a sender in the
+/// interface-paced router, beyond the batch that each pacer holds, and doesn't go below the
+/// window's minimum. It halves once for the bytes that the window held then: the batches that
+/// release those bytes don't halve it again.
 struct CreditlessWindowLimitHalved {
     #[measure("held_bytes", Bytes)]
     held_bytes: u64,
