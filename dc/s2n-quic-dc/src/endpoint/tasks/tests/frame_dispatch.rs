@@ -543,9 +543,24 @@ fn the_priority_router_moves_every_frame_once_the_batch_router_is_gone() {
 /// window's limit grows where the worker could take a batch while the window refuses a frame.
 #[test]
 fn frame_dispatch_shares_its_window_among_the_routers_and_the_workers_senders() {
+    shares_its_window(SendPacing::single(Rate::new(100.0)), 1);
+}
+
+/// As `frame_dispatch_shares_its_window_among_the_routers_and_the_workers_senders`, where the
+/// workers' send sockets are on two interfaces, which `InterfacePacedPickTwo` paces.
+#[test]
+fn frame_dispatch_shares_its_window_under_two_interfaces() {
+    let rate = Rate::new(100.0);
+    shares_its_window(SendPacing::new(vec![rate, rate], vec![0, 1]), 2);
+}
+
+/// Runs `frame_dispatch` with `pacing` and a worker for each of `workers` send sockets over a
+/// window of the test's, and checks the bytes the window holds and its limit as each batch
+/// reaches its worker.
+fn shares_its_window(pacing: SendPacing, workers: usize) {
     const FRAMES: usize = 10;
     let _snapshots = crate::testing::without_snapshots();
-    // The bytes the window holds and its limit as each batch reaches the worker.
+    // The bytes the window holds and its limit as each batch reaches a worker.
     let arrivals = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
     let arrivals_in_sim = arrivals.clone();
 
@@ -554,16 +569,17 @@ fn frame_dispatch_shares_its_window_among_the_routers_and_the_workers_senders() 
             crate::endpoint::combinator::BATCH_TARGET_BYTES,
         );
         let (mut frame_tx, frame_rx) = frame::submission_channel(1);
-        let (worker_tx, mut worker_rx) = unsync::new::<FrameBatch>();
+        let (worker_txs, worker_rxs): (Vec<_>, Vec<_>) =
+            (0..workers).map(|_| unsync::new::<FrameBatch>()).unzip();
         let mut spawner = Local::new(0);
         tasks::frame_dispatch_over(
             window.clone(),
             &mut spawner,
             frame_rx,
-            vec![worker_tx].into(),
+            worker_txs.into(),
             crate::xorshift::Rng::new(),
             Clock::default(),
-            SendPacing::single(Rate::new(100.0)),
+            pacing.clone(),
             Budgets::default(),
             crate::counter::Registry::default(),
             crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
@@ -575,7 +591,7 @@ fn frame_dispatch_shares_its_window_among_the_routers_and_the_workers_senders() 
         // doesn't borrow send credit.
         async move {
             let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
-                .socket_sender_count(1)
+                .socket_sender_count(workers)
                 .build(None);
             let mut input = PriorityInput::default();
             for _ in 0..FRAMES {
@@ -586,17 +602,20 @@ fn frame_dispatch_shares_its_window_among_the_routers_and_the_workers_senders() 
         .primary()
         .spawn();
 
-        let arrivals = arrivals_in_sim.clone();
-        async move {
-            while let Some(_batch) = worker_rx.recv().await {
-                arrivals
-                    .lock()
-                    .unwrap()
-                    .push((window.held(), window.limit()));
+        for mut worker_rx in worker_rxs {
+            let arrivals = arrivals_in_sim.clone();
+            let window = window.clone();
+            async move {
+                while let Some(_batch) = worker_rx.recv().await {
+                    arrivals
+                        .lock()
+                        .unwrap()
+                        .push((window.held(), window.limit()));
+                }
             }
+            .primary()
+            .spawn();
         }
-        .primary()
-        .spawn();
     });
 
     let arrivals = arrivals.lock().unwrap();

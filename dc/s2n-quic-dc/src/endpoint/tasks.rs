@@ -184,10 +184,7 @@ fn frame_dispatch_over<S, Clk>(
         let rx = PriorityRx::new(priority_batch_rxs);
         let rx = BatchFramesByPathSecret::new(rx, &clock, pacing.total_rate());
         let rx = Map::new(rx, Entry::new);
-        // The router after this reader polls it while a worker could take a batch, so the window
-        // grows where the batch router doesn't have one, and a worker's sender releases each
-        // batch's bytes from the window as it takes the batch.
-        let rx = WindowReader::new(rx, window.clone());
+        // A worker's sender releases each batch's bytes from the window as it takes the batch.
         let worker_senders: IdMap<LocalSenderId, WindowSender<S>> = worker_senders
             .into_iter()
             .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
@@ -203,7 +200,10 @@ fn frame_dispatch_over<S, Clk>(
         };
         if pacing.interface_count() == 1 {
             // Every send socket is on one interface: pace them together at its rate, then choose
-            // a worker for each batch.
+            // a worker for each batch. The pacer polls this reader while it doesn't hold a batch,
+            // so the window grows where the worker could take a batch that the batch router
+            // doesn't have.
+            let rx = WindowReader::new(rx, window.clone());
             let rx = Paced::new(rx, clock, pacing.total_rate());
             let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
             let task_counter = register_task_counter();
@@ -214,7 +214,8 @@ fn frame_dispatch_over<S, Clk>(
             );
         } else {
             // The send sockets are on several interfaces: choose a worker for each batch first,
-            // then pace the batch with the token bucket of that worker's interface.
+            // then pace the batch with the token bucket of that worker's interface. The router
+            // tells the window where a sender could take a batch that it doesn't have.
             let rx = InterfacePacedPickTwo::new(
                 rx,
                 worker_senders,
@@ -223,7 +224,8 @@ fn frame_dispatch_over<S, Clk>(
                 &pacing,
                 &counter_registry,
                 send_credit_pool,
-            );
+            )
+            .with_window(window.clone());
             let task_counter = register_task_counter();
             spawner.spawn_receiver_task(
                 rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),

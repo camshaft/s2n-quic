@@ -2225,20 +2225,22 @@ impl Receiver<TestItem> for LaneReceiver {
 
 /// Runs `router` over 20 ms of `clock`, in steps of 10 us: in each step `lanes` moves the items
 /// that the window admits, and `router` sends what it may. Returns the window's limit after each
-/// step.
+/// step, and the bytes it holds then.
 fn run_with_window<R: Receiver<()>>(
     lanes: &mut WindowLanes,
     router: &mut R,
     clock: &test_clock_mod::Clock,
-) -> Vec<u64> {
+) -> (Vec<u64>, Vec<u64>) {
     let mut limits = Vec::new();
+    let mut held = Vec::new();
     for _ in 0..2_000 {
         lanes.pass();
         assert_eq!(poll_until_idle(router), Poll::Pending);
         clock.advance(std::time::Duration::from_micros(10));
         limits.push(lanes.window.limit());
+        held.push(lanes.window.held());
     }
-    limits
+    (limits, held)
 }
 
 /// Under one paced interface, the window's limit grows where the pacer finds the batch router
@@ -2272,7 +2274,7 @@ fn creditless_window_settles_at_the_batches_one_paced_interface_holds() {
         test_pool(),
     );
 
-    let limits = run_with_window(&mut lanes, &mut router, &clock);
+    let (limits, _) = run_with_window(&mut lanes, &mut router, &clock);
 
     // A batch of 100,000 bytes takes 800 us at 1 Gbps, so the interface sends about 25 in 20 ms.
     let sent = sends.borrow().len();
@@ -2287,6 +2289,11 @@ fn creditless_window_settles_at_the_batches_one_paced_interface_holds() {
     assert!(
         limits[1_000..].iter().all(|&limit| limit == settled),
         "the limit changed in the last 10 ms",
+    );
+    // Nothing marks a batch as one that waited under one interface, so the limit doesn't halve.
+    assert!(
+        limits.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the limit halved",
     );
 }
 
@@ -2311,16 +2318,17 @@ fn creditless_window_settles_at_the_batches_two_paced_interfaces_hold() {
         .collect();
     let registry = crate::counter::Registry::default();
     let mut router = InterfacePacedPickTwo::<TestItem, _, _, _>::new(
-        WindowReader::new(lanes.receiver(), window.clone()),
+        lanes.receiver(),
         senders,
         crate::xorshift::Rng::new(),
         clock.clone(),
         &SendPacing::new(vec![rate, rate], vec![0, 1]),
         &registry,
         test_pool(),
-    );
+    )
+    .with_window(window);
 
-    let limits = run_with_window(&mut lanes, &mut router, &clock);
+    let (limits, _) = run_with_window(&mut lanes, &mut router, &clock);
 
     // A batch of 100,000 bytes takes 800 us at 1 Gbps, so each interface sends about 25 in 20 ms.
     for sends in [&first, &second] {
@@ -2333,6 +2341,56 @@ fn creditless_window_settles_at_the_batches_two_paced_interfaces_hold() {
     // pacer, a next batch for each and the minimum, though the frames keep coming.
     let settled = *limits.last().expect("the run has steps");
     assert!(settled >= 300_000, "the limit settled at {settled}");
+    let most = limits.iter().copied().max().unwrap_or_default();
+    assert!(most <= 410_000, "the limit grew to {most}");
+}
+
+/// Under two paced interfaces, where the pair of the second interface's sender is lost for the
+/// peer, the first interface's sender takes each of the peer's batches, and those its pacer
+/// doesn't hold wait in the router. The free sender of the second interface can't take them, so
+/// the window's limit doesn't grow for them while they wait: the limit and the bytes that wait in
+/// the router stay bounded, though the frames keep coming.
+#[test]
+fn creditless_window_stays_bounded_while_a_peers_batches_wait_for_one_interface() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    let window = CreditlessWindow::new(10_000);
+    let mut lanes = WindowLanes::new(
+        window.clone(),
+        test_items(&entry, 200, 100_000, &drop_counter),
+    );
+    let delivers = Sends::default();
+    let lost = Sends::default();
+    let senders: IdMap<LocalSenderId, _> = timed_senders(&clock, &[&delivers, &lost])
+        .into_iter()
+        .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
+        .collect();
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::<TestItem, _, _, _>::new(
+        lanes.receiver(),
+        senders,
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &SendPacing::new(vec![rate, rate], vec![0, 1]),
+        &registry,
+        test_pool(),
+    )
+    .with_window(window);
+
+    let (limits, held) = run_with_window(&mut lanes, &mut router, &clock);
+
+    // A batch of 100,000 bytes takes 800 us at 1 Gbps, so the first interface sends about 25 in
+    // 20 ms, and the second doesn't send any.
+    let sent = delivers.borrow().len();
+    assert!(sent >= 20, "{sent} batches");
+    assert!(lost.borrow().is_empty());
+    // The first interface's pacer holds a batch, and at most two more wait in the router: the
+    // limit grows only once no batch waits, and halves as a batch that waited goes.
+    let most_held = held.iter().copied().max().unwrap_or_default();
+    assert!(most_held <= 310_000, "the window held {most_held}");
     let most = limits.iter().copied().max().unwrap_or_default();
     assert!(most <= 410_000, "the limit grew to {most}");
 }

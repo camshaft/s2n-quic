@@ -17,12 +17,13 @@
 //! window's limit comes from how fast the workers take the batches:
 //!
 //! - It starts at a minimum, which `frame_dispatch` sets to the batch router's batch target.
-//! - It grows where a [`WindowReader`] finds that the batch router doesn't have a batch for a
-//!   worker that could take one while the window refuses a frame: by the bytes of the last batch
-//!   a worker's sender took, and at least by the minimum, once for each refusal. A pacer that
-//!   holds a batch until its interface may send doesn't ask for another, so the limit stops
-//!   growing once the batch router has a batch each time a pacer asks for one, however fast the
-//!   frames come.
+//! - It grows where a worker could take a batch that the batch router doesn't have while the
+//!   window refuses a frame: by the bytes of the last batch a worker's sender took, and at least
+//!   by the minimum, once for each refusal. A [`WindowReader`] tells the window so under one
+//!   paced interface, and [`InterfacePacedPickTwo`](super::InterfacePacedPickTwo) itself under
+//!   several, only while no batch waits in it for a sender. A pacer that holds a batch until its
+//!   interface may send doesn't ask for another, and the limit doesn't grow while a peer's
+//!   batches wait for its busy senders, so the limit doesn't grow at the pace of the frames.
 //! - It halves as a worker's sender takes a batch that waited in the router for a sender, beyond
 //!   the batch that each pacer holds, and doesn't go below the minimum. It halves once for the
 //!   bytes the window held then: the batches that release those bytes don't halve it again.
@@ -244,10 +245,11 @@ impl<T: CreditlessCost> CreditlessCost for crate::intrusive::Entry<T> {
 /// The receiver of the batch router's batches, which tells a [`CreditlessWindow`] where it
 /// doesn't have a batch for a worker that could take one.
 ///
-/// The router after it polls it only while a worker could take a batch: `Paced` while it
-/// doesn't hold a batch, and [`InterfacePacedPickTwo`](super::InterfacePacedPickTwo) while the
-/// pacer of an interface doesn't hold one. A poll that ends `Pending` while budget is left, and
-/// so not for want of budget, starves that worker.
+/// The router after it polls it only while a worker could take a batch, as `Paced` does while it
+/// doesn't hold a batch. A poll that ends `Pending` while budget is left, and so not for want of
+/// budget, starves that worker. [`InterfacePacedPickTwo`](super::InterfacePacedPickTwo) tells
+/// its window itself instead, since a free sender of one interface can't take the batches that
+/// wait in it for the senders of another.
 pub struct WindowReader<R> {
     inner: R,
     window: CreditlessWindow,
