@@ -1605,7 +1605,7 @@ where
                     recv_cache.clone(),
                     ack_burst_tx,
                     recv_idle_wheel_tx,
-                    rd.path_secret_map,
+                    rd.path_secret_map.clone(),
                     rd.acceptor_registry,
                     rd.frame_tx,
                     rd.ack_sender.clone(),
@@ -1639,6 +1639,7 @@ where
                     rd.ack_sender.clone(),
                     recv_dispatch_idx,
                     rd.counters.clone(),
+                    Some(rd.path_secret_map.clone()),
                 );
                 let task_counter = counter_registry
                     .register_nominal_task("task.ack_burst", &variant)
@@ -1665,6 +1666,7 @@ where
                     recv_cache.clone(),
                     rd.ack_sender,
                     rd.counters.clone(),
+                    Some(rd.path_secret_map),
                 );
                 let task_counter = counter_registry
                     .register_nominal_task("task.ack_completion", &variant)
@@ -1753,7 +1755,7 @@ where
                 );
                 // A client path the idle wheel marks dead asks the handshake client registered
                 // on the map, where one is, for a new handshake with the peer in the background.
-                let path_secret_map = bg.path_secret_map;
+                let path_secret_map = bg.path_secret_map.clone();
                 let request_rehandshake = move |peer| {
                     let reason = crate::psk::io::HandshakeReason::Remote;
                     let _ = path_secret_map.request_handshake(peer, reason);
@@ -1804,6 +1806,7 @@ where
                     let mut ack_sender = bg.ack_sender;
                     let socket_count = total_sender_ids;
                     let priority_senders = bg.priority_senders;
+                    let path_secret_map = bg.path_secret_map;
                     let mut rng = crate::xorshift::Rng::new();
                     let rx = crate::socket::channel::Map::new(
                         bg.freed_batch_rx,
@@ -1812,22 +1815,16 @@ where
                             // the interface for the highest-priority traffic where there is one.
                             // A sender whose interface pair is marked lost loses the draw, and
                             // where both drawn senders' pairs are lost, the batch goes to a
-                            // sender whose pair delivers.
-                            let chosen = routing::path_freed_batch_sender_id(
-                                entry.path_secret_entry(),
+                            // sender whose pair delivers. Each batch that the lost marks move
+                            // off the sender the load scores choose publishes an event through
+                            // the path secret map.
+                            routing::route_freed_batch(
+                                &mut entry,
                                 priority_senders.as_deref(),
                                 socket_count,
                                 &mut rng,
+                                Some(&path_secret_map),
                             );
-
-                            // Set the chosen sender and forward
-                            if let msg::Sender::PendingFreed {
-                                ref mut local_sender_id,
-                                ..
-                            } = *entry
-                            {
-                                *local_sender_id = chosen;
-                            }
                             let _ = ack_sender.send(entry);
                         },
                     );

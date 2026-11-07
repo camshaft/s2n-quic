@@ -552,3 +552,17 @@ struct PathSecretMapSenderCountedLost<'a> {
 struct PathSecretMapSenderCountedLostCleared<'a> {
     peer_address: SocketAddress<'a>,
 }
+
+#[event("path_secret_map:acknowledgement_moved")]
+#[subject(endpoint)]
+/// Emitted when an acknowledgement moves off its context's sender to one whose pair delivers
+struct PathSecretMapAcknowledgementMoved<'a> {
+    peer_address: SocketAddress<'a>,
+}
+
+#[event("path_secret_map:freed_batch_moved")]
+#[subject(endpoint)]
+/// Emitted when a freed batch moves off the drawn sender of lower load to one whose pair delivers
+struct PathSecretMapFreedBatchMoved<'a> {
+    peer_address: SocketAddress<'a>,
+}

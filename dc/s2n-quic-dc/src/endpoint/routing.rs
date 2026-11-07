@@ -284,20 +284,52 @@ pub(crate) fn freed_batch_sender_id<S: PartialOrd>(
 /// `freed_batch_sender_id` draws, the one whose interface pair `entry` doesn't mark lost, or,
 /// where both or neither are marked lost, the one with the lower load score on `entry`. Where
 /// `entry` marks the pair of the chosen sender lost, the batch goes to the next sender of `entry`
-/// whose pair delivers instead.
+/// whose pair delivers instead. It also returns whether the lost marks move the batch off the
+/// sender that the load scores alone choose.
 pub(crate) fn path_freed_batch_sender_id(
     entry: &crate::path::secret::map::Entry,
     priority_senders: Option<&[LocalSenderId]>,
     socket_count: usize,
     rng: &mut crate::xorshift::Rng,
-) -> LocalSenderId {
+) -> (LocalSenderId, bool) {
+    // The drawn sender of the lower load score, the first where the two are equal, as
+    // `freed_batch_sender_id` chooses it without the lost marks.
+    let mut by_load: Option<(LocalSenderId, u64)> = None;
     let chosen = freed_batch_sender_id(priority_senders, socket_count, rng, |sender| {
-        (
-            entry.is_sender_lost(sender),
-            entry.sender_load_score(sender),
-        )
+        let load = entry.sender_load_score(sender);
+        if !by_load.is_some_and(|(_, lower)| lower <= load) {
+            by_load = Some((sender, load));
+        }
+        (entry.is_sender_lost(sender), load)
     });
-    entry.delivering_sender(chosen)
+    let delivering = entry.delivering_sender(chosen);
+    let by_load = by_load.map_or(chosen, |(sender, _)| sender);
+    (delivering, delivering != by_load)
+}
+
+/// Sets the sender of the freed batch `message` to the one `path_freed_batch_sender_id` returns
+/// for its path. Where the lost marks move the batch off the sender that the load scores alone
+/// choose, it publishes a `PathSecretMapFreedBatchMoved` event through `path_secret_map`, where
+/// one is set. A message of another kind keeps its sender.
+pub(crate) fn route_freed_batch(
+    message: &mut msg::Sender,
+    priority_senders: Option<&[LocalSenderId]>,
+    socket_count: usize,
+    rng: &mut crate::xorshift::Rng,
+    path_secret_map: Option<&crate::path::secret::Map>,
+) {
+    if let msg::Sender::PendingFreed {
+        ref path_secret_entry,
+        ref mut local_sender_id,
+    } = *message
+    {
+        let (chosen, moved) =
+            path_freed_batch_sender_id(path_secret_entry, priority_senders, socket_count, rng);
+        *local_sender_id = chosen;
+        if let Some(path_secret_map) = path_secret_map.filter(|_| moved) {
+            path_secret_map.on_freed_batch_moved(path_secret_entry.peer());
+        }
+    }
 }
 
 /// Records each acknowledgement and freed batch that the endpoint routes to a send worker, for
@@ -487,16 +519,95 @@ mod tests {
         );
         assert!(entry.sender_load_score(sender(1)) > entry.sender_load_score(sender(3)));
         assert!(entry.set_sender_lost(sender(3), true));
+        // The load scores alone choose sender 3, so the lost mark moves each batch off it.
         for _ in 0..256 {
-            let chosen = path_freed_batch_sender_id(&entry, Some(&priority[..]), 8, &mut rng);
+            let (chosen, moved) =
+                path_freed_batch_sender_id(&entry, Some(&priority[..]), 8, &mut rng);
             assert_eq!(chosen, sender(1));
+            assert!(moved);
         }
         // Where the pairs of both drawn senders are marked lost, sender 3's lower score wins the
         // draw, and the batch goes to the next sender whose pair delivers, sender 4.
         assert!(entry.set_sender_lost(sender(1), true));
         for _ in 0..256 {
-            let chosen = path_freed_batch_sender_id(&entry, Some(&priority[..]), 8, &mut rng);
+            let (chosen, moved) =
+                path_freed_batch_sender_id(&entry, Some(&priority[..]), 8, &mut rng);
             assert_eq!(chosen, sender(4));
+            assert!(moved);
         }
+    }
+
+    #[test]
+    fn freed_batches_that_keep_the_sender_the_load_scores_choose_are_not_moved() {
+        use core::time::Duration;
+        use s2n_quic_core::{recovery::bandwidth::Bandwidth, time::Timestamp};
+
+        let peer = "127.0.0.1:4433".parse().unwrap();
+        let entry = crate::path::secret::map::Entry::builder(peer)
+            .socket_sender_count(8)
+            .build(None);
+        let mut rng = Rng::with_seed(7);
+        let priority = [sender(1), sender(3)];
+        // Without a lost mark, each batch stays on the sender the load scores choose.
+        for _ in 0..256 {
+            let (_, moved) = path_freed_batch_sender_id(&entry, Some(&priority[..]), 8, &mut rng);
+            assert!(!moved);
+        }
+        // The lost mark of sender 1, whose load score is the higher, keeps each batch on sender
+        // 3, which the load scores choose too.
+        entry.update_sender_load_score(
+            sender(1),
+            unsafe { Timestamp::from_duration(Duration::from_millis(1)) },
+            0,
+            Bandwidth::new(1_000, Duration::from_millis(1)),
+        );
+        assert!(entry.sender_load_score(sender(1)) > entry.sender_load_score(sender(3)));
+        assert!(entry.set_sender_lost(sender(1), true));
+        for _ in 0..256 {
+            let (chosen, moved) =
+                path_freed_batch_sender_id(&entry, Some(&priority[..]), 8, &mut rng);
+            assert_eq!(chosen, sender(3));
+            assert!(!moved);
+        }
+    }
+
+    #[test]
+    fn a_freed_batch_moved_off_a_lost_sender_publishes_an_event() {
+        use core::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+        let map = crate::path::secret::Map::builder()
+            .with_signer(crate::path::secret::stateless_reset::Signer::random())
+            .with_capacity(4)
+            .with_clock(s2n_quic_core::time::NoopClock)
+            .with_subscriber(subscriber.clone())
+            .build()
+            .unwrap();
+        let moves = &subscriber.path_secret_map_freed_batch_moved;
+        let peer = "127.0.0.1:4433".parse().unwrap();
+        let entry = crate::path::secret::map::Entry::builder(peer)
+            .socket_sender_count(4)
+            .build(None);
+        let mut message = msg::Sender::PendingFreed {
+            path_secret_entry: entry.clone(),
+            local_sender_id: sender(0),
+        };
+        let mut rng = Rng::with_seed(7);
+        let priority = [sender(1)];
+        // A batch that stays on the sender the load scores choose doesn't publish an event.
+        route_freed_batch(&mut message, Some(&priority[..]), 4, &mut rng, Some(&map));
+        assert_eq!(message.sender_idx(), sender(1));
+        assert_eq!(moves.load(Ordering::Relaxed), 0);
+        // With the pair of sender 1 marked lost, the batch moves to sender 2, and the map
+        // publishes the move.
+        assert!(entry.set_sender_lost(sender(1), true));
+        route_freed_batch(&mut message, Some(&priority[..]), 4, &mut rng, Some(&map));
+        assert_eq!(message.sender_idx(), sender(2));
+        assert_eq!(moves.load(Ordering::Relaxed), 1);
+        // Without a map, the batch moves all the same, and no event is published.
+        route_freed_batch(&mut message, Some(&priority[..]), 4, &mut rng, None);
+        assert_eq!(message.sender_idx(), sender(2));
+        assert_eq!(moves.load(Ordering::Relaxed), 1);
     }
 }

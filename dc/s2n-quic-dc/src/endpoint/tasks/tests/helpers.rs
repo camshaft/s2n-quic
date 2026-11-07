@@ -140,6 +140,7 @@ pub struct RecvContextBuilder {
     peer: SocketAddr,
     remote_sender_id: crate::endpoint::id::RemoteSenderId,
     local_sender_id: crate::endpoint::id::LocalSenderId,
+    socket_sender_count: usize,
 }
 
 impl Default for RecvContextBuilder {
@@ -148,6 +149,7 @@ impl Default for RecvContextBuilder {
             peer: "127.0.0.1:4433".parse().unwrap(),
             remote_sender_id: crate::endpoint::id::RemoteSenderId::new(VarInt::from_u8(0)),
             local_sender_id: crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1)),
+            socket_sender_count: 0,
         }
     }
 }
@@ -170,9 +172,17 @@ impl RecvContextBuilder {
         self
     }
 
+    /// Builds the context's path entry with `count` senders, so that a test can mark the
+    /// interface pairs of its senders lost.
+    pub fn socket_sender_count(mut self, count: usize) -> Self {
+        self.socket_sender_count = count;
+        self
+    }
+
     pub fn build(self) -> Rc<RefCell<recv::Context>> {
         let entry = PathSecretEntry::builder(self.peer)
             .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+            .socket_sender_count(self.socket_sender_count)
             .build(None);
         let opener = entry.secret().application_opener(VarInt::ZERO);
         let clock = crate::time::bach::Clock::default();

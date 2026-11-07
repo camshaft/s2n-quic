@@ -253,4 +253,10 @@ pub trait Store: 'static + Send + Sync + time::Clock {
 
     /// Publishes a PathSecretMapSenderCountedLostCleared event.
     fn on_sender_counted_lost_cleared(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapAcknowledgementMoved event.
+    fn on_acknowledgement_moved(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapFreedBatchMoved event.
+    fn on_freed_batch_moved(&self, peer_address: &SocketAddr);
 }

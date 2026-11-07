@@ -1575,6 +1575,22 @@ where
                 },
             );
     }
+
+    fn on_acknowledgement_moved(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_acknowledgement_moved(
+            event::builder::PathSecretMapAcknowledgementMoved {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
+
+    fn on_freed_batch_moved(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_freed_batch_moved(
+            event::builder::PathSecretMapFreedBatchMoved {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
 }
 
 impl<C, S> Drop for State<C, S>
