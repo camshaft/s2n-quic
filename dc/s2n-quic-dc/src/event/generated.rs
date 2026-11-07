@@ -1018,6 +1018,141 @@ pub mod api {
     impl Event for PathSecretMapAddressWriteLock {
         const NAME: &'static str = "path_secret_map:address_cache_write_lock";
     }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a send context marks its interface pair lost"]
+    pub struct PathSecretMapInterfacePairLost<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapInterfacePairLost<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapInterfacePairLost");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapInterfacePairLost<'a> {
+        const NAME: &'static str = "path_secret_map:interface_pair_lost";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a lost interface pair delivers again"]
+    pub struct PathSecretMapInterfacePairDelivering<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapInterfacePairDelivering<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapInterfacePairDelivering");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapInterfacePairDelivering<'a> {
+        const NAME: &'static str = "path_secret_map:interface_pair_delivering";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a lost interface pair moves its frames to the pairs that deliver"]
+    pub struct PathSecretMapInterfacePairFramesMoved<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub frames: usize,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapInterfacePairFramesMoved<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapInterfacePairFramesMoved");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("frames", &self.frames);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapInterfacePairFramesMoved<'a> {
+        const NAME: &'static str = "path_secret_map:interface_pair_frames_moved";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when the idle wheel doesn't mark a peer dead because another pair delivers"]
+    pub struct PathSecretMapDeadMarkSkipped<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapDeadMarkSkipped<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapDeadMarkSkipped");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapDeadMarkSkipped<'a> {
+        const NAME: &'static str = "path_secret_map:dead_mark_skipped";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when the creditless window refuses a frame without send credit"]
+    pub struct CreditlessWindowFrameRefused<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub frame_bytes: u64,
+        pub held_bytes: u64,
+        pub limit_bytes: u64,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for CreditlessWindowFrameRefused<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("CreditlessWindowFrameRefused");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("frame_bytes", &self.frame_bytes);
+            fmt.field("held_bytes", &self.held_bytes);
+            fmt.field("limit_bytes", &self.limit_bytes);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for CreditlessWindowFrameRefused<'a> {
+        const NAME: &'static str = "creditless_window:frame_refused";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when the creditless window's limit grows by the bytes a worker took"]
+    pub struct CreditlessWindowLimitGrew {
+        pub released_bytes: u64,
+        pub held_bytes: u64,
+        pub limit_bytes: u64,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for CreditlessWindowLimitGrew {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("CreditlessWindowLimitGrew");
+            fmt.field("released_bytes", &self.released_bytes);
+            fmt.field("held_bytes", &self.held_bytes);
+            fmt.field("limit_bytes", &self.limit_bytes);
+            fmt.finish()
+        }
+    }
+    impl Event for CreditlessWindowLimitGrew {
+        const NAME: &'static str = "creditless_window:limit_grew";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted once a round when the creditless window's limit halves or stays at its minimum"]
+    pub struct CreditlessWindowLimitHalved {
+        pub held_bytes: u64,
+        pub previous_limit_bytes: u64,
+        pub limit_bytes: u64,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl crate::event::snapshot::Fmt for CreditlessWindowLimitHalved {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("CreditlessWindowLimitHalved");
+            fmt.field("held_bytes", &self.held_bytes);
+            fmt.field("previous_limit_bytes", &self.previous_limit_bytes);
+            fmt.field("limit_bytes", &self.limit_bytes);
+            fmt.finish()
+        }
+    }
+    impl Event for CreditlessWindowLimitHalved {
+        const NAME: &'static str = "creditless_window:limit_halved";
+    }
 }
 pub mod tracing {
     #![doc = r" This module contains event integration with [`tracing`](https://docs.rs/tracing)"]
@@ -1621,6 +1756,89 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapAddressWriteLock { acquire, duration } = event;
             tracing :: event ! (target : "path_secret_map_address_write_lock" , parent : parent , tracing :: Level :: DEBUG , { acquire = tracing :: field :: debug (acquire) , duration = tracing :: field :: debug (duration) });
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapInterfacePairLost { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_interface_pair_lost" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapInterfacePairDelivering { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_interface_pair_delivering" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapInterfacePairFramesMoved { peer_address, frames } = event;
+            tracing :: event ! (target : "path_secret_map_interface_pair_frames_moved" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , frames = tracing :: field :: debug (frames) });
+        }
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapDeadMarkSkipped { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_dead_mark_skipped" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_creditless_window_frame_refused(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowFrameRefused,
+        ) {
+            let parent = self.parent(meta);
+            let api::CreditlessWindowFrameRefused {
+                peer_address,
+                frame_bytes,
+                held_bytes,
+                limit_bytes,
+            } = event;
+            tracing :: event ! (target : "creditless_window_frame_refused" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , frame_bytes = tracing :: field :: debug (frame_bytes) , held_bytes = tracing :: field :: debug (held_bytes) , limit_bytes = tracing :: field :: debug (limit_bytes) });
+        }
+        #[inline]
+        fn on_creditless_window_limit_grew(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitGrew,
+        ) {
+            let parent = self.parent(meta);
+            let api::CreditlessWindowLimitGrew {
+                released_bytes,
+                held_bytes,
+                limit_bytes,
+            } = event;
+            tracing :: event ! (target : "creditless_window_limit_grew" , parent : parent , tracing :: Level :: DEBUG , { released_bytes = tracing :: field :: debug (released_bytes) , held_bytes = tracing :: field :: debug (held_bytes) , limit_bytes = tracing :: field :: debug (limit_bytes) });
+        }
+        #[inline]
+        fn on_creditless_window_limit_halved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitHalved,
+        ) {
+            let parent = self.parent(meta);
+            let api::CreditlessWindowLimitHalved {
+                held_bytes,
+                previous_limit_bytes,
+                limit_bytes,
+            } = event;
+            tracing :: event ! (target : "creditless_window_limit_halved" , parent : parent , tracing :: Level :: DEBUG , { held_bytes = tracing :: field :: debug (held_bytes) , previous_limit_bytes = tracing :: field :: debug (previous_limit_bytes) , limit_bytes = tracing :: field :: debug (limit_bytes) });
         }
     }
 }
@@ -2644,6 +2862,139 @@ pub mod builder {
             }
         }
     }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a send context marks its interface pair lost"]
+    pub struct PathSecretMapInterfacePairLost<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapInterfacePairLost<'a>>
+        for PathSecretMapInterfacePairLost<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapInterfacePairLost<'a> {
+            let PathSecretMapInterfacePairLost { peer_address } = self;
+            api::PathSecretMapInterfacePairLost {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a lost interface pair delivers again"]
+    pub struct PathSecretMapInterfacePairDelivering<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapInterfacePairDelivering<'a>>
+        for PathSecretMapInterfacePairDelivering<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapInterfacePairDelivering<'a> {
+            let PathSecretMapInterfacePairDelivering { peer_address } = self;
+            api::PathSecretMapInterfacePairDelivering {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a lost interface pair moves its frames to the pairs that deliver"]
+    pub struct PathSecretMapInterfacePairFramesMoved<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub frames: usize,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapInterfacePairFramesMoved<'a>>
+        for PathSecretMapInterfacePairFramesMoved<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapInterfacePairFramesMoved<'a> {
+            let PathSecretMapInterfacePairFramesMoved { peer_address, frames } = self;
+            api::PathSecretMapInterfacePairFramesMoved {
+                peer_address: peer_address.into_event(),
+                frames: frames.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when the idle wheel doesn't mark a peer dead because another pair delivers"]
+    pub struct PathSecretMapDeadMarkSkipped<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapDeadMarkSkipped<'a>> for PathSecretMapDeadMarkSkipped<'a> {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapDeadMarkSkipped<'a> {
+            let PathSecretMapDeadMarkSkipped { peer_address } = self;
+            api::PathSecretMapDeadMarkSkipped {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when the creditless window refuses a frame without send credit"]
+    pub struct CreditlessWindowFrameRefused<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub frame_bytes: u64,
+        pub held_bytes: u64,
+        pub limit_bytes: u64,
+    }
+    impl<'a> IntoEvent<api::CreditlessWindowFrameRefused<'a>> for CreditlessWindowFrameRefused<'a> {
+        #[inline]
+        fn into_event(self) -> api::CreditlessWindowFrameRefused<'a> {
+            let CreditlessWindowFrameRefused {
+                peer_address,
+                frame_bytes,
+                held_bytes,
+                limit_bytes,
+            } = self;
+            api::CreditlessWindowFrameRefused {
+                peer_address: peer_address.into_event(),
+                frame_bytes: frame_bytes.into_event(),
+                held_bytes: held_bytes.into_event(),
+                limit_bytes: limit_bytes.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when the creditless window's limit grows by the bytes a worker took"]
+    pub struct CreditlessWindowLimitGrew {
+        pub released_bytes: u64,
+        pub held_bytes: u64,
+        pub limit_bytes: u64,
+    }
+    impl IntoEvent<api::CreditlessWindowLimitGrew> for CreditlessWindowLimitGrew {
+        #[inline]
+        fn into_event(self) -> api::CreditlessWindowLimitGrew {
+            let CreditlessWindowLimitGrew {
+                released_bytes,
+                held_bytes,
+                limit_bytes,
+            } = self;
+            api::CreditlessWindowLimitGrew {
+                released_bytes: released_bytes.into_event(),
+                held_bytes: held_bytes.into_event(),
+                limit_bytes: limit_bytes.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted once a round when the creditless window's limit halves or stays at its minimum"]
+    pub struct CreditlessWindowLimitHalved {
+        pub held_bytes: u64,
+        pub previous_limit_bytes: u64,
+        pub limit_bytes: u64,
+    }
+    impl IntoEvent<api::CreditlessWindowLimitHalved> for CreditlessWindowLimitHalved {
+        #[inline]
+        fn into_event(self) -> api::CreditlessWindowLimitHalved {
+            let CreditlessWindowLimitHalved {
+                held_bytes,
+                previous_limit_bytes,
+                limit_bytes,
+            } = self;
+            api::CreditlessWindowLimitHalved {
+                held_bytes: held_bytes.into_event(),
+                previous_limit_bytes: previous_limit_bytes.into_event(),
+                limit_bytes: limit_bytes.into_event(),
+            }
+        }
+    }
 }
 pub use traits::*;
 mod traits {
@@ -3142,6 +3493,76 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `PathSecretMapInterfacePairLost` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `PathSecretMapInterfacePairDelivering` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `PathSecretMapInterfacePairFramesMoved` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `PathSecretMapDeadMarkSkipped` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `CreditlessWindowFrameRefused` event is triggered"]
+        #[inline]
+        fn on_creditless_window_frame_refused(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowFrameRefused,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `CreditlessWindowLimitGrew` event is triggered"]
+        #[inline]
+        fn on_creditless_window_limit_grew(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitGrew,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `CreditlessWindowLimitHalved` event is triggered"]
+        #[inline]
+        fn on_creditless_window_limit_halved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitHalved,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = r" Called for each event that relates to the endpoint and all connections"]
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -3550,6 +3971,67 @@ mod traits {
         ) {
             self.as_ref()
                 .on_path_secret_map_address_write_lock(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_interface_pair_lost(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_interface_pair_delivering(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_interface_pair_frames_moved(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_dead_mark_skipped(meta, event);
+        }
+        #[inline]
+        fn on_creditless_window_frame_refused(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowFrameRefused,
+        ) {
+            self.as_ref()
+                .on_creditless_window_frame_refused(meta, event);
+        }
+        #[inline]
+        fn on_creditless_window_limit_grew(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitGrew,
+        ) {
+            self.as_ref().on_creditless_window_limit_grew(meta, event);
+        }
+        #[inline]
+        fn on_creditless_window_limit_halved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitHalved,
+        ) {
+            self.as_ref().on_creditless_window_limit_halved(meta, event);
         }
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -3979,6 +4461,69 @@ mod traits {
             (self.1).on_path_secret_map_address_write_lock(meta, event);
         }
         #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            (self.0).on_path_secret_map_interface_pair_lost(meta, event);
+            (self.1).on_path_secret_map_interface_pair_lost(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            (self.0).on_path_secret_map_interface_pair_delivering(meta, event);
+            (self.1).on_path_secret_map_interface_pair_delivering(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            (self.0).on_path_secret_map_interface_pair_frames_moved(meta, event);
+            (self.1).on_path_secret_map_interface_pair_frames_moved(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            (self.0).on_path_secret_map_dead_mark_skipped(meta, event);
+            (self.1).on_path_secret_map_dead_mark_skipped(meta, event);
+        }
+        #[inline]
+        fn on_creditless_window_frame_refused(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowFrameRefused,
+        ) {
+            (self.0).on_creditless_window_frame_refused(meta, event);
+            (self.1).on_creditless_window_frame_refused(meta, event);
+        }
+        #[inline]
+        fn on_creditless_window_limit_grew(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitGrew,
+        ) {
+            (self.0).on_creditless_window_limit_grew(meta, event);
+            (self.1).on_creditless_window_limit_grew(meta, event);
+        }
+        #[inline]
+        fn on_creditless_window_limit_halved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitHalved,
+        ) {
+            (self.0).on_creditless_window_limit_halved(meta, event);
+            (self.1).on_creditless_window_limit_halved(meta, event);
+        }
+        #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
             self.0.on_event(meta, event);
             self.1.on_event(meta, event);
@@ -4131,6 +4676,32 @@ mod traits {
             &self,
             event: builder::PathSecretMapAddressWriteLock,
         );
+        #[doc = "Publishes a `PathSecretMapInterfacePairLost` event to the publisher's subscriber"]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            event: builder::PathSecretMapInterfacePairLost,
+        );
+        #[doc = "Publishes a `PathSecretMapInterfacePairDelivering` event to the publisher's subscriber"]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            event: builder::PathSecretMapInterfacePairDelivering,
+        );
+        #[doc = "Publishes a `PathSecretMapInterfacePairFramesMoved` event to the publisher's subscriber"]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            event: builder::PathSecretMapInterfacePairFramesMoved,
+        );
+        #[doc = "Publishes a `PathSecretMapDeadMarkSkipped` event to the publisher's subscriber"]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            event: builder::PathSecretMapDeadMarkSkipped,
+        );
+        #[doc = "Publishes a `CreditlessWindowFrameRefused` event to the publisher's subscriber"]
+        fn on_creditless_window_frame_refused(&self, event: builder::CreditlessWindowFrameRefused);
+        #[doc = "Publishes a `CreditlessWindowLimitGrew` event to the publisher's subscriber"]
+        fn on_creditless_window_limit_grew(&self, event: builder::CreditlessWindowLimitGrew);
+        #[doc = "Publishes a `CreditlessWindowLimitHalved` event to the publisher's subscriber"]
+        fn on_creditless_window_limit_halved(&self, event: builder::CreditlessWindowLimitHalved);
         #[doc = r" Returns the QUIC version, if any"]
         fn quic_version(&self) -> Option<u32>;
     }
@@ -4495,6 +5066,67 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            event: builder::PathSecretMapInterfacePairLost,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_interface_pair_lost(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            event: builder::PathSecretMapInterfacePairDelivering,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_interface_pair_delivering(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            event: builder::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_interface_pair_frames_moved(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            event: builder::PathSecretMapDeadMarkSkipped,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_dead_mark_skipped(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_creditless_window_frame_refused(&self, event: builder::CreditlessWindowFrameRefused) {
+            let event = event.into_event();
+            self.subscriber
+                .on_creditless_window_frame_refused(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_creditless_window_limit_grew(&self, event: builder::CreditlessWindowLimitGrew) {
+            let event = event.into_event();
+            self.subscriber
+                .on_creditless_window_limit_grew(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_creditless_window_limit_halved(&self, event: builder::CreditlessWindowLimitHalved) {
+            let event = event.into_event();
+            self.subscriber
+                .on_creditless_window_limit_halved(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn quic_version(&self) -> Option<u32> {
             self.quic_version
         }
@@ -4622,6 +5254,13 @@ pub mod testing {
             pub path_secret_map_cleaner_cycled: AtomicU64,
             pub path_secret_map_id_write_lock: AtomicU64,
             pub path_secret_map_address_write_lock: AtomicU64,
+            pub path_secret_map_interface_pair_lost: AtomicU64,
+            pub path_secret_map_interface_pair_delivering: AtomicU64,
+            pub path_secret_map_interface_pair_frames_moved: AtomicU64,
+            pub path_secret_map_dead_mark_skipped: AtomicU64,
+            pub creditless_window_frame_refused: AtomicU64,
+            pub creditless_window_limit_grew: AtomicU64,
+            pub creditless_window_limit_halved: AtomicU64,
         }
         impl Drop for Subscriber {
             fn drop(&mut self) {
@@ -4695,6 +5334,13 @@ pub mod testing {
                     path_secret_map_cleaner_cycled: AtomicU64::new(0),
                     path_secret_map_id_write_lock: AtomicU64::new(0),
                     path_secret_map_address_write_lock: AtomicU64::new(0),
+                    path_secret_map_interface_pair_lost: AtomicU64::new(0),
+                    path_secret_map_interface_pair_delivering: AtomicU64::new(0),
+                    path_secret_map_interface_pair_frames_moved: AtomicU64::new(0),
+                    path_secret_map_dead_mark_skipped: AtomicU64::new(0),
+                    creditless_window_frame_refused: AtomicU64::new(0),
+                    creditless_window_limit_grew: AtomicU64::new(0),
+                    creditless_window_limit_halved: AtomicU64::new(0),
                 }
             }
         }
@@ -5202,6 +5848,90 @@ pub mod testing {
                 let out = format!("{meta:?} {event:?}");
                 self.output.lock().unwrap().push(out);
             }
+            fn on_path_secret_map_interface_pair_lost(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapInterfacePairLost,
+            ) {
+                self.path_secret_map_interface_pair_lost
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_path_secret_map_interface_pair_delivering(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapInterfacePairDelivering,
+            ) {
+                self.path_secret_map_interface_pair_delivering
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_path_secret_map_interface_pair_frames_moved(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapInterfacePairFramesMoved,
+            ) {
+                self.path_secret_map_interface_pair_frames_moved
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_path_secret_map_dead_mark_skipped(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapDeadMarkSkipped,
+            ) {
+                self.path_secret_map_dead_mark_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_creditless_window_frame_refused(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::CreditlessWindowFrameRefused,
+            ) {
+                self.creditless_window_frame_refused
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_creditless_window_limit_grew(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::CreditlessWindowLimitGrew,
+            ) {
+                self.creditless_window_limit_grew
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_creditless_window_limit_halved(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::CreditlessWindowLimitHalved,
+            ) {
+                self.creditless_window_limit_halved
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
         }
     }
     #[derive(Debug)]
@@ -5252,6 +5982,13 @@ pub mod testing {
         pub path_secret_map_cleaner_cycled: AtomicU64,
         pub path_secret_map_id_write_lock: AtomicU64,
         pub path_secret_map_address_write_lock: AtomicU64,
+        pub path_secret_map_interface_pair_lost: AtomicU64,
+        pub path_secret_map_interface_pair_delivering: AtomicU64,
+        pub path_secret_map_interface_pair_frames_moved: AtomicU64,
+        pub path_secret_map_dead_mark_skipped: AtomicU64,
+        pub creditless_window_frame_refused: AtomicU64,
+        pub creditless_window_limit_grew: AtomicU64,
+        pub creditless_window_limit_halved: AtomicU64,
     }
     impl Drop for Subscriber {
         fn drop(&mut self) {
@@ -5327,6 +6064,13 @@ pub mod testing {
                 path_secret_map_cleaner_cycled: AtomicU64::new(0),
                 path_secret_map_id_write_lock: AtomicU64::new(0),
                 path_secret_map_address_write_lock: AtomicU64::new(0),
+                path_secret_map_interface_pair_lost: AtomicU64::new(0),
+                path_secret_map_interface_pair_delivering: AtomicU64::new(0),
+                path_secret_map_interface_pair_frames_moved: AtomicU64::new(0),
+                path_secret_map_dead_mark_skipped: AtomicU64::new(0),
+                creditless_window_frame_refused: AtomicU64::new(0),
+                creditless_window_limit_grew: AtomicU64::new(0),
+                creditless_window_limit_halved: AtomicU64::new(0),
             }
         }
     }
@@ -5863,6 +6607,90 @@ pub mod testing {
             let out = format!("{meta:?} {event:?}");
             self.output.lock().unwrap().push(out);
         }
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            self.path_secret_map_interface_pair_lost
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            self.path_secret_map_interface_pair_delivering
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            self.path_secret_map_interface_pair_frames_moved
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            self.path_secret_map_dead_mark_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_creditless_window_frame_refused(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowFrameRefused,
+        ) {
+            self.creditless_window_frame_refused
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_creditless_window_limit_grew(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitGrew,
+        ) {
+            self.creditless_window_limit_grew
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_creditless_window_limit_halved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::CreditlessWindowLimitHalved,
+        ) {
+            self.creditless_window_limit_halved
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
     }
     #[derive(Debug)]
     pub struct Publisher {
@@ -5912,6 +6740,13 @@ pub mod testing {
         pub path_secret_map_cleaner_cycled: AtomicU64,
         pub path_secret_map_id_write_lock: AtomicU64,
         pub path_secret_map_address_write_lock: AtomicU64,
+        pub path_secret_map_interface_pair_lost: AtomicU64,
+        pub path_secret_map_interface_pair_delivering: AtomicU64,
+        pub path_secret_map_interface_pair_frames_moved: AtomicU64,
+        pub path_secret_map_dead_mark_skipped: AtomicU64,
+        pub creditless_window_frame_refused: AtomicU64,
+        pub creditless_window_limit_grew: AtomicU64,
+        pub creditless_window_limit_halved: AtomicU64,
     }
     impl Publisher {
         #[doc = r" Creates a publisher with snapshot assertions enabled"]
@@ -5977,6 +6812,13 @@ pub mod testing {
                 path_secret_map_cleaner_cycled: AtomicU64::new(0),
                 path_secret_map_id_write_lock: AtomicU64::new(0),
                 path_secret_map_address_write_lock: AtomicU64::new(0),
+                path_secret_map_interface_pair_lost: AtomicU64::new(0),
+                path_secret_map_interface_pair_delivering: AtomicU64::new(0),
+                path_secret_map_interface_pair_frames_moved: AtomicU64::new(0),
+                path_secret_map_dead_mark_skipped: AtomicU64::new(0),
+                creditless_window_frame_refused: AtomicU64::new(0),
+                creditless_window_limit_grew: AtomicU64::new(0),
+                creditless_window_limit_halved: AtomicU64::new(0),
             }
         }
     }
@@ -6349,6 +7191,74 @@ pub mod testing {
             event: builder::PathSecretMapAddressWriteLock,
         ) {
             self.path_secret_map_address_write_lock
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            event: builder::PathSecretMapInterfacePairLost,
+        ) {
+            self.path_secret_map_interface_pair_lost
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            event: builder::PathSecretMapInterfacePairDelivering,
+        ) {
+            self.path_secret_map_interface_pair_delivering
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            event: builder::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            self.path_secret_map_interface_pair_frames_moved
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            event: builder::PathSecretMapDeadMarkSkipped,
+        ) {
+            self.path_secret_map_dead_mark_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_creditless_window_frame_refused(&self, event: builder::CreditlessWindowFrameRefused) {
+            self.creditless_window_frame_refused
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_creditless_window_limit_grew(&self, event: builder::CreditlessWindowLimitGrew) {
+            self.creditless_window_limit_grew
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_creditless_window_limit_halved(&self, event: builder::CreditlessWindowLimitHalved) {
+            self.creditless_window_limit_halved
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             let event = crate::event::snapshot::Fmt::to_snapshot(&event);
