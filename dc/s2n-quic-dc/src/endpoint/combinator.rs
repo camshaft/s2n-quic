@@ -33,7 +33,7 @@ use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 mod creditless;
 mod interface_pacing;
 
-pub use creditless::{CreditlessCost, CreditlessWindow, WindowSender};
+pub use creditless::{CreditlessCost, CreditlessWindow, PeerKey, WindowSender};
 pub use interface_pacing::{InterfacePacedPickTwo, SendPacing};
 
 #[cfg(test)]

@@ -591,7 +591,7 @@ fn the_priority_router_holds_frames_without_send_credit_at_the_window() {
     );
 
     // A worker's sender takes the first frame's batch, which releases its bytes.
-    window.release(costs[0], window.round());
+    window.release_peer(Some(PeerKey::of(&pse)), costs[0], window.round());
     assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
     assert_eq!(take_lanes(&mut lanes), [(costs[1], 0), (costs[2], 4096)]);
     assert_eq!(window.held(), costs[1]);
@@ -627,6 +627,224 @@ fn the_priority_router_moves_every_frame_once_the_batch_router_is_gone() {
     assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
     assert_eq!(take_lanes(&mut lanes).len(), 2);
     assert_eq!(poll_router(&mut router), Poll::Ready(None));
+}
+
+// -- Frames that pass a refused frame -------------------------------------------------------
+
+use crate::endpoint::combinator::PeerKey;
+
+/// Takes the frames of `lanes`, the first lane's first, and returns each frame's peer and send
+/// credit.
+fn take_peers(lanes: &mut [Lane]) -> Vec<(PeerKey, u64)> {
+    let mut frames = crate::intrusive::Queue::<frame::Frame>::new();
+    for lane in lanes {
+        lane.drain_into(&mut frames);
+    }
+    frames
+        .iter()
+        .map(|frame| (PeerKey::of(&frame.path_secret_entry), frame.flow_credits))
+        .collect()
+}
+
+/// Returns a path secret entry of a peer at `addr`.
+fn peer_entry(addr: &str) -> std::sync::Arc<crate::path::secret::map::Entry> {
+    crate::path::secret::map::Entry::builder(addr.parse().unwrap())
+        .socket_sender_count(1)
+        .build(None)
+}
+
+/// Returns a ping of `pse`, a frame without send credit of the highest priority level.
+fn ping(
+    pse: &std::sync::Arc<crate::path::secret::map::Entry>,
+) -> crate::intrusive::Entry<frame::Frame> {
+    let mut frame = test_frame(pse);
+    frame.header = frame::Header::Ping;
+    frame
+}
+
+/// Returns a control frame of `pse` with `payload_size` zero bytes of payload: a frame without
+/// send credit of the control level, whose byte cost grows with its payload.
+fn control_frame(
+    pse: &std::sync::Arc<crate::path::secret::map::Entry>,
+    payload_size: usize,
+) -> crate::intrusive::Entry<frame::Frame> {
+    let mut frame = test_frame_with_payload(pse, payload_size);
+    frame.header = frame::Header::QueueControl {
+        queue_pair: crate::packet::datagram::QueuePair {
+            source_queue_id: s2n_quic_core::varint::VarInt::from_u8(1),
+            dest_queue_id: s2n_quic_core::varint::VarInt::from_u8(2),
+        },
+        binding_id: s2n_quic_core::varint::VarInt::from_u8(1),
+    };
+    frame
+}
+
+/// A frame that the window refuses holds back the later frames of its peer, in its lane and in
+/// the later lanes, in their order, and the frames of another peer pass it, with send credit
+/// and without.
+#[test]
+fn the_priority_router_moves_other_peers_frames_past_a_refused_frame() {
+    use core::task::Poll;
+
+    let (a, b) = (peer_entry("127.0.0.1:4433"), peer_entry("127.0.0.2:4433"));
+    let (peer_a, peer_b) = (PeerKey::of(&a), PeerKey::of(&b));
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    // The control lane holds three frames of the first peer, each of its own byte cost, with a
+    // frame of the second peer after the first two, and the last lane holds a frame with send
+    // credit of each peer.
+    let [a1, a2, a3] = [10, 20, 30].map(|payload| control_frame(&a, payload));
+    let costs = [&a1, &a2, &a3].map(|frame| frame.byte_cost());
+    let b1 = control_frame(&b, 0);
+    let b_cost = b1.byte_cost();
+    let mut input = PriorityInput::default();
+    input.push(a1);
+    input.push(a2);
+    input.push(b1);
+    input.push(a3);
+    for (pse, credits) in [(&a, 4096), (&b, 2048)] {
+        let mut credited = test_frame_with_payload(pse, 3000);
+        credited.flow_credits = credits;
+        input.push(credited);
+    }
+    frame_tx.send_batch(input).unwrap();
+
+    // The window's limit is 0. It admits the first peer's first frame while it holds nothing,
+    // and the second peer's frame while it holds none of that peer's bytes, and refuses the
+    // first peer's second frame, which holds back the first peer's later frames.
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(
+        take_peers(&mut lanes),
+        [(peer_a, 0), (peer_b, 0), (peer_b, 2048)]
+    );
+    assert_eq!(window.held(), costs[0] + b_cost);
+    assert_eq!(window.peer_held(peer_a), costs[0]);
+    assert_eq!(window.peer_held(peer_b), b_cost);
+
+    // Nothing moves while the window holds the first peer's bytes.
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    assert!(take_peers(&mut lanes).is_empty());
+
+    // A worker's sender takes the first peer's batch in the round that refused its second
+    // frame, which raises the limit to the bytes it releases. The window holds the second
+    // peer's bytes and none of the first peer's, so it admits the first peer's second frame
+    // past the limit, and refuses its third, which still holds back its frame with send credit.
+    window.release_peer(Some(peer_a), costs[0], window.round());
+    assert_eq!(window.peer_held(peer_a), 0);
+    assert_eq!(window.limit(), costs[0]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(costs[1], 0)]);
+    assert_eq!(window.held(), b_cost + costs[1]);
+}
+
+/// The priority router swaps in the frames submitted while a refused frame waits, behind it in
+/// its peer's order, and moves a new frame of another peer past it in the same pass. Once the
+/// submission channel closes, it moves the frames that wait before it ends.
+#[test]
+fn the_priority_router_swaps_in_new_frames_behind_a_refused_frame() {
+    use core::task::Poll;
+
+    let (a, b) = (peer_entry("127.0.0.1:4433"), peer_entry("127.0.0.2:4433"));
+    let (peer_a, peer_b) = (PeerKey::of(&a), PeerKey::of(&b));
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    let [a1, a2, a3] = [10, 20, 30].map(|payload| control_frame(&a, payload));
+    let costs = [&a1, &a2, &a3].map(|frame| frame.byte_cost());
+    let mut input = PriorityInput::default();
+    input.push(a1);
+    input.push(a2);
+    frame_tx.send_batch(input).unwrap();
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_peers(&mut lanes), [(peer_a, 0)]);
+
+    // The first peer's second frame waits at the window. A frame of each peer comes: the
+    // second peer's ping goes in the next pass, and the first peer's third frame waits behind
+    // the first peer's refused frame.
+    let mut input = PriorityInput::default();
+    input.push(a3);
+    input.push(ping(&b));
+    frame_tx.send_batch(input).unwrap();
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_peers(&mut lanes), [(peer_b, 0)]);
+
+    // The test's clone of the window stands for the batch router's: once it drops and the
+    // submission channel closes, the router moves the two frames that wait, in their order,
+    // and then ends.
+    drop(frame_tx);
+    drop(window);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(costs[1], 0), (costs[2], 0)]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
+}
+
+/// Returns a priority router over a submission channel of `shards` shards, as `priority_router`
+/// does over one.
+fn sharded_priority_router(
+    window: crate::endpoint::combinator::CreditlessWindow,
+    shards: usize,
+) -> (
+    SubmissionSender,
+    impl crate::socket::channel::Receiver<()>,
+    Vec<Lane>,
+) {
+    let (frame_tx, frame_rx) = frame::submission_channel(shards);
+    let mut lanes = Vec::new();
+    let lane_txs = core::array::from_fn(|_| {
+        let (tx, rx) = unsync::new::<frame::Frame>();
+        lanes.push(rx);
+        tx.into_list_sender()
+    });
+    let registry = crate::counter::Registry::default();
+    let gauges = core::array::from_fn(|i| {
+        registry.register_queue_gauge_nominal("q.router_to_batcher", format_args!("p{i}"))
+    });
+    let router = tasks::FrameReceiver::new(frame_rx, lane_txs, gauges, window);
+    (frame_tx, router, lanes)
+}
+
+/// A swap takes one shard of the submission channel. Where a swap brings in only frames of a
+/// peer that the window holds back, the router returns ready, and its next poll swaps the next
+/// shard, so that another peer's frame there goes while the window holds the first peer's bytes.
+#[test]
+fn the_priority_router_swaps_the_next_shard_after_a_swap_of_held_back_frames() {
+    use core::task::Poll;
+
+    let (a, b) = (peer_entry("127.0.0.1:4433"), peer_entry("127.0.0.2:4433"));
+    let (peer_a, peer_b) = (PeerKey::of(&a), PeerKey::of(&b));
+    let ping_cost = ping(&a).byte_cost();
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = sharded_priority_router(window.clone(), 2);
+
+    let mut input = PriorityInput::default();
+    input.push(ping(&a));
+    frame_tx.send_batch(input).unwrap();
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_peers(&mut lanes), [(peer_a, 0)]);
+    assert_eq!(window.peer_held(peer_a), ping_cost);
+
+    // The sender takes the two shards in turn, so the first peer's second ping goes to the
+    // shard after the one the router swapped, and the second peer's ping to the other.
+    for pse in [&a, &b] {
+        let mut input = PriorityInput::default();
+        input.push(ping(pse));
+        frame_tx.send_batch(input).unwrap();
+    }
+
+    // The next swap brings in the first peer's second ping alone, which the window refuses. The
+    // router returns ready, and its next poll swaps the other shard and moves the second peer's
+    // ping while the window still holds the first peer's bytes.
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert!(take_peers(&mut lanes).is_empty());
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_peers(&mut lanes), [(peer_b, 0)]);
+    assert_eq!(window.peer_held(peer_a), ping_cost);
+    assert_eq!(window.peer_held(peer_b), ping_cost);
+
+    // Both shards are empty now, and the first peer's second ping waits at the window.
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    assert!(take_peers(&mut lanes).is_empty());
 }
 
 // -- The window's round in each batch router of `frame_dispatch` ---------------------------
