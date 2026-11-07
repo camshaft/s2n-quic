@@ -13,6 +13,7 @@ use crate::{
         secret::map::{entry::QueueState, Entry as PathSecretEntry},
     },
     queue,
+    socket::interface::{paired_ack_sender, SendPlace},
     stream::endpoint::ack::state as ack_state,
     tracing::*,
 };
@@ -452,6 +453,10 @@ pub(crate) struct Cache {
     /// The senders of the interface that carries the endpoint's highest-priority traffic, which
     /// a peer's acknowledgements go to, where the endpoint has one.
     pub priority_senders: Option<Vec<LocalSenderId>>,
+    /// The place of each of the endpoint's send sockets among its interfaces, by sender, or
+    /// `None` where the endpoint doesn't list interfaces. It picks the sender of the
+    /// acknowledgements of each new context, ahead of `priority_senders`.
+    send_places: Option<Arc<[SendPlace]>>,
 }
 
 impl Cache {
@@ -460,6 +465,7 @@ impl Cache {
             senders: FxHashMap::default(),
             worker_id,
             priority_senders: None,
+            send_places: None,
         }
     }
 
@@ -467,6 +473,13 @@ impl Cache {
     /// acknowledgements go to.
     pub fn with_priority_senders(mut self, priority_senders: Option<Vec<LocalSenderId>>) -> Self {
         self.priority_senders = priority_senders;
+        self
+    }
+
+    /// Sets the place of each of the endpoint's send sockets, so that each new context sends its
+    /// acknowledgements back along the interface pair the peer's packets came on.
+    pub fn with_send_places(mut self, send_places: Option<Arc<[SendPlace]>>) -> Self {
+        self.send_places = send_places;
         self
     }
 
@@ -589,10 +602,13 @@ impl Cache {
                     "recv cache key_id advanced — replacing entry"
                 );
 
-                let dest_sender_id = super::routing::ack_sender_id(
-                    route.sender_id_for_ack(remote_sender_id),
-                    remote_sender_id,
+                let dest_sender_id = ack_sender_id(
+                    self.send_places.as_deref(),
                     self.priority_senders.as_deref(),
+                    &path_entry,
+                    peer_addr,
+                    remote_sender_id,
+                    route,
                 );
 
                 // Take queue_view from old context — it was already used by decrypt
@@ -662,10 +678,13 @@ impl Cache {
                     )
                     .map_err(|_| CacheError::ReplayDetected)?;
 
-                let dest_sender_id = super::routing::ack_sender_id(
-                    route.sender_id_for_ack(remote_sender_id),
-                    remote_sender_id,
+                let dest_sender_id = ack_sender_id(
+                    self.send_places.as_deref(),
                     self.priority_senders.as_deref(),
+                    &path_entry,
+                    peer_addr,
+                    remote_sender_id,
+                    route,
                 );
 
                 let ctx = Rc::new(RefCell::new(Context::new(
@@ -694,6 +713,44 @@ impl Cache {
         let removed = before - self.senders.len();
         debug!(%id, removed, worker_id = %self.worker_id, "invalidating recv contexts");
     }
+}
+
+/// Returns the sender that sends the acknowledgements of the peer's sender `remote_sender_id`,
+/// whose packets come from `peer_addr`.
+///
+/// Where the endpoint lists interfaces and the peer tags its data addresses, the sender is on
+/// the interface paired with the one the packets came from, so that the acknowledgements go
+/// back along the pair the packets came on and don't cross another interface, which can be
+/// lost while that pair delivers. Otherwise it is the sender that `routing::ack_sender_id`
+/// picks from the one `route` chooses: a sender of the interface for the endpoint's
+/// highest-priority traffic, where `priority_senders` lists that interface's senders.
+fn ack_sender_id<Route: super::routing::SenderRoute>(
+    send_places: Option<&[SendPlace]>,
+    priority_senders: Option<&[LocalSenderId]>,
+    path_entry: &PathSecretEntry,
+    peer_addr: SocketAddress,
+    remote_sender_id: RemoteSenderId,
+    route: &Route,
+) -> LocalSenderId {
+    send_places
+        .and_then(|places| {
+            paired_ack_sender(
+                path_entry.peer_data_addrs(),
+                path_entry.peer_data_interfaces(),
+                places,
+                peer_addr,
+                remote_sender_id.as_varint().as_u64() as usize,
+            )
+        })
+        .and_then(|sender| VarInt::new(sender as u64).ok())
+        .map(LocalSenderId::new)
+        .unwrap_or_else(|| {
+            super::routing::ack_sender_id(
+                route.sender_id_for_ack(remote_sender_id),
+                remote_sender_id,
+                priority_senders,
+            )
+        })
 }
 
 crate::context_wheel_adapter!(IdleWheelAdapter, Context, idle_wheel);

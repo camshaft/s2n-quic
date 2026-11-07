@@ -4,11 +4,12 @@
 //! Tests that a peer's acknowledgements and the freed batches go to a send socket of the
 //! interface that carries the endpoint's highest-priority traffic.
 //!
-//! The client and the server each put their eight sockets on two interfaces, four on each: the
-//! client's in two runs of four, the server's in turn. The client writes many short streams to
-//! the server, which acknowledges the client's packets and frees each stream's queue as the
-//! stream ends. The test records each acknowledgement and freed batch that the server routes to
-//! a send worker, with the sender it goes to.
+//! The server puts its eight sockets on two interfaces, four on each, in turn. The client doesn't
+//! list interfaces, so its data addresses go untagged, and the server can't pair its interfaces
+//! with the client's: the flagged-interface rule chooses each acknowledgement's sender. The
+//! client writes many short streams to the server, which acknowledges the client's packets and
+//! frees each stream's queue as the stream ends. The test records each acknowledgement and freed
+//! batch that the server routes to a send worker, with the sender it goes to.
 
 use crate::{
     endpoint::routing::observe::{self, Kind, Routed},
@@ -32,8 +33,6 @@ const STREAM_LEN: u64 = 64 * 1024;
 /// highest-priority traffic, so that the test catches a router that picks among every sender
 /// unless each of those picks falls on the fast interface.
 const FREED_BATCHES: usize = 8;
-/// The interface of each client socket: sockets 0 to 3 on the slow one, 4 to 7 on the fast one.
-const CLIENT_INTERFACE: [usize; 8] = [0, 0, 0, 0, 1, 1, 1, 1];
 /// The interface of each server socket: the even sockets on the slow one, the odd ones on the
 /// fast one.
 const SERVER_INTERFACE: [usize; 8] = [0, 1, 0, 1, 0, 1, 0, 1];
@@ -97,9 +96,7 @@ fn server_routes(server_highest_priority: bool) -> Vec<Routed> {
         .spawn();
 
         async move {
-            let mut client = SimEndpointConfig::default()
-                .interfaces(interfaces(&CLIENT_INTERFACE, false))
-                .client();
+            let mut client = SimEndpointConfig::default().client();
             *client_addrs_in_sim.lock().unwrap() = client.data_addrs().to_vec();
             for _ in 0..STREAMS {
                 let stream = client
