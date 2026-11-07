@@ -16,6 +16,7 @@
 
 use super::{AssignSender, FlowCredits, HighestPriority, PathSecretMapEntry};
 use crate::{
+    credentials,
     endpoint::{
         edt::pick_two_worse_probability,
         id::{IdMap, LocalSenderId},
@@ -32,6 +33,7 @@ use core::{
     task::{self, Poll},
     time::Duration,
 };
+use std::collections::{HashMap, VecDeque};
 
 /// How frame dispatch paces the send sockets: the send rate of each interface that holds a send
 /// socket, and the interface of each send socket.
@@ -221,7 +223,8 @@ impl<T, Tm: precision::Timer> Pacer<T, Tm> {
 /// While the interface pair of a worker is marked lost and another worker of the batch's peer
 /// delivers, the router doesn't choose the lost worker, and a highest-priority batch whose
 /// interface's workers are all lost goes, paced, to a worker that delivers. A batch that no
-/// worker may take now waits in the router, which doesn't read the next one meanwhile.
+/// worker may take now waits in the router, behind the waiting batches of its peer, while the
+/// router routes the batches of other peers.
 ///
 /// Implements `Receiver<()>` so it can be drained via `ReceiverExt::drain_budgeted`.
 pub struct InterfacePacedPickTwo<T, R, S, Clk>
@@ -244,10 +247,14 @@ where
     /// Whether `rx` closed. The router then doesn't read another batch, and ends once it has
     /// delivered the batches it holds.
     closed: bool,
-    /// A batch that no sender may take yet, since each sender that delivers to its peer is on
-    /// an interface that holds a batch. The router doesn't read another batch while it holds
-    /// one.
-    waiting_batch: Option<T>,
+    /// The batches that no sender may take yet, since each sender that delivers to their peer
+    /// is on an interface that holds a batch, by the path secret of their peer, each peer's in
+    /// the order the router read them. Meanwhile the router reads and routes the batches of
+    /// other peers. Their count isn't bounded: the send credit pool bounds the credit their
+    /// frames hold, and the router reads a batch only while a sender is free.
+    waiting: HashMap<credentials::Id, VecDeque<T>>,
+    /// The peers of `waiting`, which the router offers to the free senders in turn.
+    waiting_order: VecDeque<credentials::Id>,
     /// The lost mark of each sender of the batch being routed, read once for each batch so that
     /// each pass over the senders sees the same marks.
     lost_marks: Vec<bool>,
@@ -320,7 +327,8 @@ where
             highest_priority,
             round_robin_idx: 0,
             closed: false,
-            waiting_batch: None,
+            waiting: HashMap::new(),
+            waiting_order: VecDeque::new(),
             lost_marks: Vec::new(),
             pick_counters,
             rejected_counters,
@@ -486,23 +494,34 @@ where
     }
 
     /// Routes `value` as [`Self::dispatch`] does, and tells upstream that the batch was
-    /// consumed once the router sent it or holds it. Returns `false` where the sender's
-    /// receiver is gone.
+    /// consumed once the router sent it or holds it. A batch of a peer whose batches wait in the
+    /// router waits behind them, so that each peer's batches go in the order the router read
+    /// them. Returns `false` where the sender's receiver is gone.
     fn route(&mut self, cx: &mut task::Context<'_>, value: T) -> bool {
         let byte_cost = value.byte_cost();
-        let routed = self.dispatch(cx, value);
-        if routed {
-            // Tell upstream that the batch was consumed, as `PickTwo` does once it sends one.
-            self.rx.on_consumed(byte_cost);
+        let peer = *value.path_secret_entry().id();
+        if let Some(waiting) = self.waiting.get_mut(&peer) {
+            waiting.push_back(value);
+        } else {
+            match self.dispatch(cx, value) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(value) => {
+                    self.waiting.insert(peer, VecDeque::from([value]));
+                    self.waiting_order.push_back(peer);
+                }
+            }
         }
-        routed
+        // Tell upstream that the batch was consumed, as `PickTwo` does once it sends one.
+        self.rx.on_consumed(byte_cost);
+        true
     }
 
     /// Chooses a sender for `value`, and sends it to the sender where the sender's interface may
     /// send now or where `value` goes to the interface for the highest-priority traffic, and
-    /// else holds it on that interface until it may. Where no sender may take `value` now, the
-    /// router holds it until one may. Returns `false` where the sender's receiver is gone.
-    fn dispatch(&mut self, cx: &mut task::Context<'_>, mut value: T) -> bool {
+    /// else holds it on that interface until it may. Returns `Err` with `value` where no sender
+    /// may take it now, and `Ok(false)` where the sender's receiver is gone.
+    fn dispatch(&mut self, cx: &mut task::Context<'_>, mut value: T) -> Result<bool, T> {
         let now = self.clock.now();
         let highest = self.highest_priority.is_some() && value.holds_highest_priority();
         let (sender, rule) = {
@@ -515,8 +534,7 @@ where
         let Some(sender) = sender else {
             // Each sender that delivers to the batch's peer is on an interface that holds a
             // batch: the batch waits in the router until one of them is free.
-            self.waiting_batch = Some(value);
-            return true;
+            return Err(value);
         };
         self.pick_counters[sender].add(1);
         value.set_sender_id(sender);
@@ -525,11 +543,51 @@ where
         // A highest-priority batch doesn't wait for its interface's tokens: it goes at once, and
         // the bucket is charged for it, so the batches after it wait for its bytes.
         if rule.on_highest_interface || self.pacers[interface].poll_ready(cx) {
-            self.deliver(interface, sender, value)
+            Ok(self.deliver(interface, sender, value))
         } else {
             self.pacers[interface].held = Some((sender, value));
-            true
+            Ok(true)
         }
+    }
+
+    /// Offers the batches that wait in the router to the free senders: the waiting peers in
+    /// turn, and each peer's batches in the order the router read them, so that a batch that no
+    /// sender may take yet keeps the later batches of its peer behind it. Returns how many
+    /// batches it sent or held on an interface, or `None` where a sender's receiver is gone.
+    fn route_waiting(&mut self, cx: &mut task::Context<'_>) -> Option<usize> {
+        let mut routed = 0;
+        for _ in 0..self.waiting_order.len() {
+            let peer = self
+                .waiting_order
+                .pop_front()
+                .expect("the order holds each waiting peer");
+            while self.has_free_sender() {
+                let waiting = self
+                    .waiting
+                    .get_mut(&peer)
+                    .expect("each peer of the order has waiting batches");
+                let Some(value) = waiting.pop_front() else {
+                    break;
+                };
+                match self.dispatch(cx, value) {
+                    Ok(true) => routed += 1,
+                    Ok(false) => return None,
+                    Err(value) => {
+                        self.waiting
+                            .get_mut(&peer)
+                            .expect("each peer of the order has waiting batches")
+                            .push_front(value);
+                        break;
+                    }
+                }
+            }
+            if self.waiting[&peer].is_empty() {
+                self.waiting.remove(&peer);
+            } else {
+                self.waiting_order.push_back(peer);
+            }
+        }
+        Some(routed)
     }
 
     /// Sends `value` to `sender`, and charges the token bucket of its `interface` for it. Where
@@ -554,9 +612,10 @@ where
                         leaked += held.total_flow_credits();
                     }
                 }
-                if let Some(waiting_batch) = self.waiting_batch.take() {
+                for waiting_batch in self.waiting.drain().flat_map(|(_, waiting)| waiting) {
                     leaked += waiting_batch.total_flow_credits();
                 }
+                self.waiting_order.clear();
                 if leaked > 0 {
                     self.send_credit_pool.release(leaked);
                 }
@@ -602,18 +661,16 @@ where
             return Poll::Ready(Some(()));
         }
 
-        // A batch that waits in the router goes before the router reads the next one.
-        if self.waiting_batch.is_some() {
-            if self.has_free_sender() {
-                let value = self.waiting_batch.take().expect("the router holds a batch");
-                if !self.dispatch(cx, value) {
-                    return Poll::Ready(None);
-                }
-                if self.waiting_batch.is_none() {
-                    return Poll::Ready(Some(()));
-                }
-            }
-        } else if !self.closed && self.has_free_sender() {
+        // The batches that wait in the router go before the router reads the next one.
+        match self.route_waiting(cx) {
+            None => return Poll::Ready(None),
+            Some(0) => {}
+            Some(_) => return Poll::Ready(Some(())),
+        }
+
+        // The router reads the next batch while a sender is free, though the batches of a peer
+        // whose senders aren't free wait in it.
+        if !self.closed && self.has_free_sender() {
             match self.rx.poll_recv(cx, budget) {
                 Poll::Ready(Some(value)) => {
                     if !self.route(cx, value) {
@@ -627,7 +684,7 @@ where
         }
 
         if self.closed
-            && self.waiting_batch.is_none()
+            && self.waiting.is_empty()
             && self.pacers.iter().all(|pacer| pacer.held.is_none())
         {
             Poll::Ready(None)
