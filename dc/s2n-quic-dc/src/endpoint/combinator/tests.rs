@@ -1749,13 +1749,13 @@ fn interface_paced_pick_two_doesnt_count_a_batch_whose_route_fails() {
 /// It answers `Pending` while it doesn't hold an item and the test hasn't closed it, and adds the
 /// bytes each `on_consumed` call reports to a count.
 #[derive(Clone, Default)]
-struct SharedReceiver {
+struct ClosableReceiver {
     values: Rc<RefCell<VecDeque<TestItem>>>,
     closed: Rc<std::cell::Cell<bool>>,
     consumed: Rc<std::cell::Cell<u64>>,
 }
 
-impl Receiver<TestItem> for SharedReceiver {
+impl Receiver<TestItem> for ClosableReceiver {
     fn poll_recv(
         &mut self,
         _cx: &mut task::Context<'_>,
@@ -1783,13 +1783,13 @@ fn interface_paced_pick_two_sends_its_highest_priority_input_ahead_of_a_waiting_
     // them, and an input for the highest priority level, which the test feeds later. The bulk
     // batches cost 100,000 to 100,004 bytes, in the order the bulk input holds them, so that the
     // records tell them apart.
-    let rx = SharedReceiver::default();
+    let rx = ClosableReceiver::default();
     for byte_cost in 100_000..100_005 {
         let items = test_items(&entry, 1, byte_cost, &drop_counter);
         rx.values.borrow_mut().extend(items);
     }
     rx.closed.set(true);
-    let highest_rx = SharedReceiver::default();
+    let highest_rx = ClosableReceiver::default();
     let sends: [Sends; 2] = Default::default();
     // The second interface carries the highest-priority traffic.
     let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
@@ -1879,10 +1879,10 @@ fn interface_paced_pick_two_without_a_chosen_interface_routes_the_highest_input_
     let clock = test_clock();
     let drop_counter = Arc::new(AtomicUsize::new(0));
     let entry = test_path_secret_entry();
-    let rx = SharedReceiver::default();
+    let rx = ClosableReceiver::default();
     rx.values.borrow_mut().extend(test_items(&entry, 4, 100_000, &drop_counter));
     rx.closed.set(true);
-    let highest_rx = SharedReceiver::default();
+    let highest_rx = ClosableReceiver::default();
     let sends: [Sends; 2] = Default::default();
     // Without an interface for the highest-priority traffic, the batches of that level's input
     // go as any other.
@@ -1938,7 +1938,7 @@ fn interface_paced_pick_two_reads_ahead_again_once_its_highest_priority_input_cl
     // The bulk input holds four bulk batches, each of more bytes than a burst, a 1-byte batch of
     // the highest priority level and a fifth bulk batch, and closes after them. The input of the
     // highest priority level stays empty until the test closes it.
-    let rx = SharedReceiver::default();
+    let rx = ClosableReceiver::default();
     rx.values.borrow_mut().extend(test_items(&entry, 4, 100_000, &drop_counter));
     let mut highest = new_test_item(entry.clone(), drop_counter.clone());
     highest.byte_cost = 1;
@@ -1946,7 +1946,7 @@ fn interface_paced_pick_two_reads_ahead_again_once_its_highest_priority_input_cl
     rx.values.borrow_mut().push_back(highest);
     rx.values.borrow_mut().extend(test_items(&entry, 1, 100_000, &drop_counter));
     rx.closed.set(true);
-    let highest_rx = SharedReceiver::default();
+    let highest_rx = ClosableReceiver::default();
     let sends: [Sends; 2] = Default::default();
     // The second interface carries the highest-priority traffic.
     let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
