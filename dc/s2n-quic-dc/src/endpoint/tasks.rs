@@ -7,8 +7,8 @@ use crate::{
         self,
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
-            CompletionDispatcher, FrameBatch, InterfacePacedPickTwo, PathSecretMapEntry, PickTwo,
-            SendPacing,
+            CompletionDispatcher, CreditlessWindow, FrameBatch, InterfacePacedPickTwo,
+            PathSecretMapEntry, PickTwo, SendPacing, WindowSender, BATCH_TARGET_BYTES,
         },
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
@@ -20,7 +20,7 @@ use crate::{
     runtime::Spawner,
     socket::{
         channel::{
-            intrusive::{self, unsync},
+            intrusive::{self, sharded::{Input as _, Storage as _}, unsync},
             Budget, FilterMap, Flatten, FlattenList, FlattenSegments, InspectErr, Map, Paced,
             Priority as PriorityRx, PrioritySelect, Receiver, ReceiverExt as _, RouterAdapter,
             SocketReceiver, SocketSender, UnboundedSender,
@@ -90,6 +90,44 @@ pub fn frame_dispatch<S, Clk>(
     S: UnboundedSender<Entry<FrameBatch>> + 'static,
     Clk: precision::Clock + Clone + 'static,
 {
+    // The frames without send credit in the lanes below, and in the batch routers after them,
+    // stay in this window until a worker's sender takes their batch, which bounds their bytes:
+    // the send credit pool bounds the other frames. The window starts at the batch router's
+    // batch target, so that it admits a full batch, and grows and shrinks with how fast the
+    // workers take the batches.
+    let window = CreditlessWindow::new(BATCH_TARGET_BYTES);
+    frame_dispatch_over(
+        spawner,
+        frame_rx,
+        worker_senders,
+        rng,
+        clock,
+        pacing,
+        budgets,
+        counter_registry,
+        send_credit_pool,
+        window,
+    );
+}
+
+/// [`frame_dispatch`] over `window`, the window of the frames without send credit, which a test
+/// passes to read its limit.
+#[allow(clippy::too_many_arguments)]
+fn frame_dispatch_over<S, Clk>(
+    spawner: &mut impl Spawner,
+    frame_rx: SubmissionReceiver,
+    worker_senders: IdMap<LocalSenderId, S>,
+    rng: crate::xorshift::Rng,
+    clock: Clk,
+    pacing: SendPacing,
+    budgets: Budgets,
+    counter_registry: counter::Registry,
+    send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    window: CreditlessWindow,
+) where
+    S: UnboundedSender<Entry<FrameBatch>> + 'static,
+    Clk: precision::Clock + Clone + 'static,
+{
     let mut priority_batch_rxs = Vec::with_capacity(Priority::LEVELS);
     let priority_txs_raw: [_; Priority::LEVELS] = core::array::from_fn(|_| {
         let (tx, rx) = intrusive::unsync::new::<Frame>();
@@ -111,12 +149,12 @@ pub fn frame_dispatch<S, Clk>(
         let priority_list_txs: [_; Priority::LEVELS] =
             core::array::from_fn(|i| priority_txs_raw[i].clone().into_list_sender());
 
-        let rx = FrameReceiver {
+        let rx = FrameReceiver::new(
             frame_rx,
-            staging: PriorityStorage::default(),
             priority_list_txs,
-            q_router_to_batcher: q_router_to_batcher.clone(),
-        };
+            q_router_to_batcher.clone(),
+            window.clone(),
+        );
         let task_counter = counter_registry
             .register_task("task.priority_router")
             .with_registration_metadata(
@@ -145,11 +183,22 @@ pub fn frame_dispatch<S, Clk>(
             })
             .collect::<Vec<_>>();
         // Batches the frames of `lanes`, a lane for each of their priority levels, highest first.
+        // Each batch router that this builds, the highest lane's among them, sets on each batch
+        // the window's round in which it reads the batch, and a worker's sender releases the
+        // batch's bytes from the window as it takes the batch.
         let batch_frames = |lanes: Vec<_>| {
             let rx = PriorityRx::new(lanes);
             let rx = BatchFramesByPathSecret::new(rx, &clock, pacing.total_rate());
-            Map::new(rx, Entry::new)
+            let read_in = window.clone();
+            Map::new(rx, move |mut batch: FrameBatch| {
+                batch.set_window_round(read_in.round());
+                Entry::new(batch)
+            })
         };
+        let worker_senders: IdMap<LocalSenderId, WindowSender<S>> = worker_senders
+            .into_iter()
+            .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
+            .collect();
         let register_task_counter = || {
             counter_registry
                 .register_task("task.frame_dispatch")
@@ -1857,13 +1906,84 @@ where
 // ── FrameReceiver ──────────────────────────────────────────────────────────
 
 /// Adapts the frame submission channel's `poll_swap` into a `Receiver<()>` so
-/// it can be drained via `drain_budgeted`. Each poll_recv performs one swap and
-/// distributes the resulting frames into per-priority lane senders.
+/// it can be drained via `drain_budgeted`. A poll_recv moves the frames of a swap
+/// into per-priority lane senders.
+///
+/// A frame without send credit goes into its lane only once `window` admits its bytes, which
+/// stay in the window until a worker's sender takes the frame's batch. The frames the window
+/// refuses wait in `staging`, each lane's in order, and the receiver doesn't swap again until
+/// it has moved them, so the frames submitted meanwhile wait in the submission channel. A frame
+/// with send credit isn't counted, since the send credit pool bounds it, but it waits behind a
+/// refused frame of its lane or of a lane before it.
 struct FrameReceiver<Tx> {
     frame_rx: SubmissionReceiver,
+    /// The frames of the last swap that the window didn't admit yet.
     staging: PriorityStorage,
+    /// An empty storage, which takes the frames that `move_admitted` keeps.
+    swapped: PriorityStorage,
     priority_list_txs: [Tx; Priority::LEVELS],
     q_router_to_batcher: [QueueGauge; Priority::LEVELS],
+    window: CreditlessWindow,
+}
+
+impl<Tx> FrameReceiver<Tx>
+where
+    Tx: UnboundedSender<crate::intrusive::List<crate::intrusive::EntryAdapter<Frame>>>,
+{
+    fn new(
+        frame_rx: SubmissionReceiver,
+        priority_list_txs: [Tx; Priority::LEVELS],
+        q_router_to_batcher: [QueueGauge; Priority::LEVELS],
+        window: CreditlessWindow,
+    ) -> Self {
+        Self {
+            frame_rx,
+            staging: PriorityStorage::default(),
+            swapped: PriorityStorage::default(),
+            priority_list_txs,
+            q_router_to_batcher,
+            window,
+        }
+    }
+
+    /// Moves the frames of `staging` into their lanes, highest priority first and each lane's
+    /// in order, until the window refuses a frame, which stays in `staging` with every frame
+    /// after it. Returns whether it moved a frame.
+    fn move_admitted(&mut self, cx: &mut core::task::Context<'_>) -> bool {
+        self.window.start_round();
+        let mut moved = false;
+        let mut refused = false;
+        for (i, ((priority, mut queue), tx)) in self
+            .staging
+            .drain()
+            .zip(&mut self.priority_list_txs)
+            .enumerate()
+        {
+            let mut admitted = Queue::<Frame>::new();
+            while !refused {
+                let Some(frame) = queue.front() else {
+                    break;
+                };
+                if !self.window.admit_frame(frame) {
+                    refused = true;
+                    break;
+                }
+                admitted.push_back(queue.pop_front().expect("the queue holds a front frame"));
+            }
+            if !admitted.is_empty() {
+                moved = true;
+                self.q_router_to_batcher[i].enqueue(admitted.len() as u64);
+                let _ = UnboundedSender::send(tx, admitted);
+            }
+            frame::HomogeneousBatch { queue, priority }.append_to(&mut self.swapped);
+        }
+        // `staging` is empty now, and `swapped` holds the frames the window refused.
+        core::mem::swap(&mut self.staging, &mut self.swapped);
+        if refused {
+            self.window.register(cx.waker());
+        }
+        moved
+    }
 }
 
 impl<Tx> Receiver<()> for FrameReceiver<Tx>
@@ -1880,22 +2000,21 @@ where
             return Poll::Pending;
         }
 
+        // The frames the window refused go before the next swap.
+        if !self.staging.is_empty() {
+            if !self.move_admitted(cx) {
+                return Poll::Pending;
+            }
+            budget.consume();
+            return Poll::Ready(Some(()));
+        }
+
         match self.frame_rx.poll_swap(cx, &mut self.staging) {
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(())) => {
                 budget.consume();
-                for (i, ((_priority, queue), tx)) in self
-                    .staging
-                    .drain()
-                    .zip(&mut self.priority_list_txs)
-                    .enumerate()
-                {
-                    if !queue.is_empty() {
-                        self.q_router_to_batcher[i].enqueue(queue.len() as u64);
-                        let _ = UnboundedSender::send(tx, queue);
-                    }
-                }
+                self.move_admitted(cx);
                 Poll::Ready(Some(()))
             }
         }
