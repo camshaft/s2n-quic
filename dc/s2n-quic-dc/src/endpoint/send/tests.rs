@@ -1310,6 +1310,7 @@ fn a_context_dropped_for_a_rejected_key_clears_its_lost_mark() {
 fn an_acknowledgement_only_pair_stops_delivering_once_its_probe_waits_too_long() {
     let registry = Registry::default();
     let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
     let clock = make_clock(100);
     let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
     ctx.last_peer_activity = clock.get_time();
@@ -1330,6 +1331,7 @@ fn an_acknowledgement_only_pair_stops_delivering_once_its_probe_waits_too_long()
 fn an_acknowledgement_ends_the_wait_of_an_acknowledgement_only_probe() {
     let registry = Registry::default();
     let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
     let clock = make_clock(100);
     let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
     ctx.ack_only_probe_sent = Some(clock.get_time());
@@ -1659,6 +1661,7 @@ fn a_cache_without_a_map_counts_a_lost_mark() {
 fn an_acknowledgement_only_context_probes_once_the_peer_is_quiet() {
     let registry = Registry::default();
     let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
     let clock = make_clock(100);
     let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
     ctx.on_peer_acknowledged(clock.get_time());
@@ -1693,6 +1696,7 @@ fn an_acknowledgement_only_context_probes_once_the_peer_is_quiet() {
 fn an_acknowledgement_only_pair_is_marked_lost_while_it_keeps_acknowledging() {
     let registry = Registry::default();
     let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
     let sender = crate::endpoint::id::LocalSenderId::from_index(0);
     let clock = make_clock(100);
     let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
@@ -1725,6 +1729,7 @@ fn an_acknowledgement_only_pair_is_marked_lost_while_it_keeps_acknowledging() {
 fn a_stale_acknowledgement_only_probe_does_not_mark_the_pair_lost() {
     let registry = Registry::default();
     let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
     let sender = crate::endpoint::id::LocalSenderId::from_index(0);
     let clock = make_clock(100);
     let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
@@ -1745,4 +1750,61 @@ fn a_stale_acknowledgement_only_probe_does_not_mark_the_pair_lost() {
         ctx.needs_delivery_probe(clock.get_time()),
         "the context's next ACK-only packet probes again"
     );
+}
+
+/// A context spreads over interfaces only where its endpoint's send sockets are on more than
+/// one interface: a context without a place, or with a place among one interface's sockets,
+/// doesn't.
+#[test]
+fn a_context_spreads_over_interfaces_only_where_its_endpoint_has_several() {
+    let registry = Registry::default();
+    let (ctx, entry) = make_context_with_sender_slots(2, &registry);
+    assert!(!ctx.spreads_over_interfaces, "a context without a place");
+
+    for (count, spreads) in [(1, false), (2, true)] {
+        let place = crate::socket::interface::SendPlace {
+            rank: 0,
+            count,
+            index: 0,
+        };
+        let ctx = Context::new_paired(
+            &entry,
+            registry.register_queue_gauge("test.inflight"),
+            registry.register_queue_gauge("test.ack"),
+            registry.register_queue_gauge("test.pending"),
+            crate::endpoint::id::LocalSenderId::from_index(0),
+            Some(place),
+            &crate::time::bach::Clock::default(),
+        )
+        .expect("the entry has peer data addresses");
+        assert_eq!(ctx.spreads_over_interfaces, spreads, "{place:?}");
+    }
+}
+
+/// A context of an endpoint with one interface doesn't probe a quiet peer when it sends
+/// acknowledgements alone, and an ack-eliciting packet that the inflight map doesn't hold
+/// doesn't mark its pair lost: no other pair could carry its traffic.
+#[test]
+fn a_context_of_one_interface_neither_probes_nor_stops_delivering() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(1, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.on_peer_acknowledged(clock.get_time());
+    ctx.ack_only_since_peer_ack = true;
+
+    clock.advance(threshold);
+    assert!(
+        !ctx.needs_delivery_probe(clock.get_time()),
+        "the peer is quiet, and the context sends acknowledgements alone"
+    );
+
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+    clock.advance(threshold);
+    ctx.ack_only_sent = Some(clock.get_time());
+    assert!(!ctx.has_stopped_delivering(clock.get_time()));
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(!ctx.is_path_lost());
+    assert!(!entry.is_sender_lost(sender));
 }

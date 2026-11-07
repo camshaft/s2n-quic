@@ -621,6 +621,12 @@ pub(crate) struct Context {
     /// When this context last sent an ACK-only packet while its inflight map was empty, or
     /// `None` where it hasn't sent one. [`Self::check_acknowledgement_only_delivery`] reads it.
     pub ack_only_sent: Option<precision::Timestamp>,
+    /// Whether the endpoint's send sockets are on more than one interface, so that another
+    /// interface pair can carry this context's traffic once its pair stops delivering. Only
+    /// then does a context that sends acknowledgements alone probe a quiet peer, and mark its
+    /// pair lost once the probe waits too long: an endpoint with one interface has no other
+    /// pair to move the traffic to, and a lost pair goes on probing the peer.
+    pub spreads_over_interfaces: bool,
     /// RTT sampler for ACK-only (read-heavy) sends.
     ///
     /// When `inflight` is empty we have no ack-eliciting packets in flight and
@@ -823,6 +829,7 @@ impl Context {
             ack_only_probe_sent: None,
             ack_only_since_peer_ack: false,
             ack_only_sent: None,
+            spreads_over_interfaces: place.is_some_and(|place| place.count > 1),
             rtt_tracker: AckRttTracker::default(),
         })
     }
@@ -1352,7 +1359,9 @@ impl Context {
     /// (RFC 9002, section 7.6.1): `(smoothed_rtt + max(4 * rttvar, 1ms) + max_ack_delay) * 3`.
     /// Where the inflight map is empty, the packet that waits is the ack-eliciting packet that
     /// [`Self::ack_only_probe_sent`] records, such as the probe of a context that sends
-    /// acknowledgements alone.
+    /// acknowledgements alone. Only a context of an endpoint whose send sockets are on more
+    /// than one interface ([`Self::spreads_over_interfaces`]) stops delivering while its
+    /// inflight map is empty.
     ///
     /// The period counts from the later of the last acknowledgement and the time the context
     /// began to wait for one. The PTO wheel checks it each time it fires for this
@@ -1363,8 +1372,10 @@ impl Context {
     pub fn has_stopped_delivering(&self, now: precision::Timestamp) -> bool {
         let waiting_since = if self.inflight.has_inflight() {
             self.ack_wait_since
-        } else {
+        } else if self.spreads_over_interfaces {
             self.ack_only_probe_sent
+        } else {
+            None
         };
         let Some(waiting_since) = waiting_since else {
             return false;
@@ -1384,10 +1395,12 @@ impl Context {
     /// probe that the peer doesn't acknowledge shows that the interface pair stopped
     /// delivering (RFC 9000, section 13.2.4). The context probes again only once it sent such
     /// a packet since the peer acknowledged its probe, so two idle endpoints stop probing
-    /// each other.
+    /// each other. A context of an endpoint with one interface doesn't probe
+    /// ([`Self::spreads_over_interfaces`]).
     pub fn needs_delivery_probe(&self, now: precision::Timestamp) -> bool {
         let threshold = self.rtt_estimator.persistent_congestion_threshold();
-        !self.inflight.has_inflight()
+        self.spreads_over_interfaces
+            && !self.inflight.has_inflight()
             && self.ack_only_probe_sent.is_none()
             && self.ack_only_since_peer_ack
             && now.nanos_since(self.last_peer_activity) >= threshold.as_nanos() as u64
