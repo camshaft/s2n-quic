@@ -1367,8 +1367,7 @@ fn a_tampered_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
             "{init_acceptor:?}: a packet that fails the AEAD check doesn't send a reset"
         );
         assert!(
-            view.slot_diag(VarInt::from_u8(1))
-                .is_none_or(|diag| diag.unallocated),
+            matches!(view.slot_diag(VarInt::from_u8(1)), Some(diag) if diag.unallocated),
             "{init_acceptor:?}: the reject's drop disables the stream it bound"
         );
         assert!(
