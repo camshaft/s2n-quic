@@ -3280,6 +3280,36 @@ fn creditless_window_wakes_its_receiver_and_admits_every_frame_once_the_senders_
     assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
 }
 
+/// A window sender releases a batch's bytes and wakes the receiver though the worker's
+/// receiver refuses the batch, which the sender returns.
+#[test]
+fn creditless_window_releases_a_batch_that_the_workers_receiver_refuses() {
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let wakes = Arc::new(CountWaker(AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(wakes.clone());
+    let window = CreditlessWindow::default();
+    let mut sender = WindowSender::new(
+        TestSender {
+            accept: false,
+            calls: 0,
+        },
+        window.clone(),
+    );
+    let mut item = new_test_item(test_path_secret_entry(), drop_counter.clone());
+    item.byte_cost = 1000;
+
+    assert!(window.admit(item.creditless_bytes()));
+    assert!(!window.admit(1));
+    window.register(&waker);
+    let refused = sender.send(item).expect_err("the worker's receiver took the batch");
+    assert_eq!(refused.byte_cost, 1000);
+    assert_eq!(window.held(), 0, "the window kept a refused batch's bytes");
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 0);
+    drop(refused);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
+}
+
 /// The bytes of a waiting peer's batches without send credit stay in the window while the
 /// batches wait in the router, and leave it as each batch goes to a worker's sender.
 #[test]
@@ -3304,11 +3334,12 @@ fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window
         assert!(window.admit(value.creditless_bytes()));
     }
     assert_eq!(window.held(), 400_000);
+    let consumed = Rc::new(std::cell::Cell::new(0));
     let registry = crate::counter::Registry::default();
     let mut router = InterfacePacedPickTwo::new(
-        TestReceiver {
+        SharedTestReceiver {
             values,
-            consumed: 0,
+            consumed: Rc::clone(&consumed),
         },
         senders,
         crate::xorshift::Rng::new(),
@@ -3323,6 +3354,8 @@ fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window
     // past its limit.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(delivers.borrow().len(), 1);
+    // The router read each batch out of its input, so the third and fourth wait in the router.
+    assert_eq!(consumed.get(), 400_000, "the third and fourth batches didn't leave the input");
     assert_eq!(window.held(), 300_000);
     assert!(!window.admit(100_001));
 
