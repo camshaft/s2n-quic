@@ -20,11 +20,13 @@ use s2n_codec::EncoderBuffer;
 use s2n_quic_core::{dc, recovery::bandwidth::Bandwidth, time::Timestamp, varint::VarInt};
 use std::{
     any::Any,
+    collections::HashSet,
     net::SocketAddr,
     sync::{
         atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
-        Arc,
+        Arc, Mutex, MutexGuard, PoisonError, Weak,
     },
+    task::Waker,
     time::Duration,
 };
 
@@ -102,6 +104,10 @@ pub struct Entry {
     sender_load_scores: Box<[AtomicU64]>,
     /// Per-peer queue state — client or server depending on role.
     queue_state: QueueState,
+    /// The routers' watches of the lost marks in `sender_load_scores`: each change of a mark
+    /// tells each watch, so that a router whose batches of this peer wait for a sender doesn't
+    /// read the marks at each poll.
+    lost_mark_watches: Mutex<Vec<Weak<LostMarkWatch>>>,
 }
 
 /// Per-peer queue slot state, determined by role (derived from credential_id).
@@ -111,6 +117,57 @@ pub enum QueueState {
     Client(Arc<crate::queue::ClientState>),
     /// Server: owns the page table that the client addresses into.
     Server(Arc<crate::queue::ServerState>),
+}
+
+/// A router's watch of the lost marks of the entries of the peers whose batches wait in it for
+/// a sender. Each entry that holds the watch tells it of each change of one of its marks: the
+/// watch records the entry's peer and wakes the router's task, which then reads that peer's
+/// marks again.
+#[derive(Debug, Default)]
+pub struct LostMarkWatch {
+    state: Mutex<LostMarkWatchState>,
+}
+
+#[derive(Debug, Default)]
+struct LostMarkWatchState {
+    /// The peers of the entries whose marks changed since the router last took them.
+    changed: HashSet<credentials::Id>,
+    /// The waker of the router's task, which the next change wakes.
+    waker: Option<Waker>,
+}
+
+impl LostMarkWatch {
+    /// Records that a lost mark of the entry of `peer` changed, and wakes the router's task.
+    pub(crate) fn mark_changed(&self, peer: credentials::Id) {
+        let waker = {
+            let mut state = lock(&self.state);
+            state.changed.insert(peer);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Moves the peers whose marks changed since the last call into `changed`, each once, and
+    /// lets the next change wake `waker`.
+    pub(crate) fn take_changed(&self, waker: &Waker, changed: &mut Vec<credentials::Id>) {
+        let mut state = lock(&self.state);
+        changed.extend(state.changed.drain());
+        if !state
+            .waker
+            .as_ref()
+            .is_some_and(|held| held.will_wake(waker))
+        {
+            state.waker = Some(waker.clone());
+        }
+    }
+}
+
+/// Locks `mutex`, and goes on with its value where a thread panicked while it held the lock:
+/// the sets and the lists these locks keep hold whole values after each write.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl SizeOf for Entry {
@@ -131,6 +188,7 @@ impl SizeOf for Entry {
             peer_data_interfaces,
             sender_load_scores,
             queue_state: _,
+            lost_mark_watches,
         } = self;
         creation_time.size()
             + peer.size()
@@ -150,6 +208,8 @@ impl SizeOf for Entry {
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + sender_load_scores.len() * std::mem::size_of::<AtomicU64>()
             + std::mem::size_of::<QueueState>()
+            + std::mem::size_of::<Mutex<Vec<Weak<LostMarkWatch>>>>()
+            + lock(lost_mark_watches).capacity() * std::mem::size_of::<Weak<LostMarkWatch>>()
     }
 }
 
@@ -252,6 +312,7 @@ impl Entry {
             peer_data_interfaces: Arc::from([]),
             sender_load_scores: Self::init_load_scores(socket_sender_count),
             queue_state,
+            lost_mark_watches: Default::default(),
         }
     }
 
@@ -385,7 +446,8 @@ impl Entry {
 
     /// Marks the interface pair of a sender lost, or delivering again, so that the routers
     /// stop choosing it for new batches while another sender delivers. Returns whether the
-    /// mark changed; an entry without sender slots doesn't keep one.
+    /// mark changed; an entry without sender slots doesn't keep one. A change tells each watch
+    /// of [`Self::watch_lost_marks`].
     pub fn set_sender_lost(&self, sender_idx: LocalSenderId, lost: bool) -> bool {
         let Some(sender_idx) = self.sender_index(sender_idx) else {
             return false;
@@ -396,7 +458,56 @@ impl Entry {
         } else {
             slot.fetch_and(!Self::LOST_SENDER, Ordering::AcqRel)
         };
-        ((previous & Self::LOST_SENDER) != 0) != lost
+        let changed = ((previous & Self::LOST_SENDER) != 0) != lost;
+        if changed {
+            self.tell_lost_mark_watches();
+        }
+        changed
+    }
+
+    /// Tells `watch` of each change of a lost mark of this entry from now on, until
+    /// [`Self::unwatch_lost_marks`]. The entry holds the watch once, however often it is added,
+    /// and doesn't keep it alive.
+    pub(crate) fn watch_lost_marks(&self, watch: &Arc<LostMarkWatch>) {
+        let mut watches = lock(&self.lost_mark_watches);
+        watches.retain(|held| held.strong_count() > 0);
+        if !watches
+            .iter()
+            .any(|held| std::ptr::eq(held.as_ptr(), Arc::as_ptr(watch)))
+        {
+            watches.push(Arc::downgrade(watch));
+        }
+    }
+
+    /// Stops telling `watch` of the changes of this entry's lost marks.
+    pub(crate) fn unwatch_lost_marks(&self, watch: &Arc<LostMarkWatch>) {
+        lock(&self.lost_mark_watches).retain(|held| {
+            held.strong_count() > 0 && !std::ptr::eq(held.as_ptr(), Arc::as_ptr(watch))
+        });
+    }
+
+    /// Tells each watch of this entry that one of its lost marks changed, once the entry has
+    /// released its list, so that a wake doesn't run under that lock.
+    fn tell_lost_mark_watches(&self) {
+        let watches: Vec<Arc<LostMarkWatch>> = {
+            let mut watches = lock(&self.lost_mark_watches);
+            if watches.is_empty() {
+                return;
+            }
+            let mut live = Vec::with_capacity(watches.len());
+            watches.retain(|held| match held.upgrade() {
+                Some(watch) => {
+                    live.push(watch);
+                    true
+                }
+                None => false,
+            });
+            live
+        };
+        let peer = *self.id();
+        for watch in watches {
+            watch.mark_changed(peer);
+        }
     }
 
     /// True when the interface pair of the sender is marked lost.

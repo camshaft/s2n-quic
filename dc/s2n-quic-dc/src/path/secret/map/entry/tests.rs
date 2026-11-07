@@ -47,9 +47,10 @@ fn entry_size() {
                 .build(None)
                 .size(),
             // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>) and the
-            // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes), and the
-            // empty peer_data_interfaces list (an Arc<[Option<u16>]>, 16 bytes).
-            353
+            // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes), the
+            // empty peer_data_interfaces list (an Arc<[Option<u16>]>, 16 bytes), and the empty
+            // list of lost mark watches (a Mutex of a Vec, 32 bytes).
+            385
         );
     }
 }
@@ -220,6 +221,59 @@ fn a_sender_marked_lost_counts_as_lost_until_cleared() {
     assert!(entry.set_sender_lost(sender0, false));
     assert!(!entry.is_sender_lost(sender0));
     assert!(entry.has_delivering_sender());
+}
+
+#[test]
+fn an_entry_tells_its_lost_mark_watch_of_each_change_until_it_drops_the_watch() {
+    #[derive(Default)]
+    struct CountWakes(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let entry = test_entry_with_senders(2);
+    let sender0 = crate::endpoint::id::LocalSenderId::from_index(0);
+    let sender1 = crate::endpoint::id::LocalSenderId::from_index(1);
+    let watch = Arc::new(LostMarkWatch::default());
+    // The entry holds the watch once, however often it is added.
+    entry.watch_lost_marks(&watch);
+    entry.watch_lost_marks(&watch);
+    let wakes = Arc::new(CountWakes::default());
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut changed = Vec::new();
+    watch.take_changed(&waker, &mut changed);
+    assert!(changed.is_empty());
+
+    // Each change of a mark records the entry's peer once and wakes the waker the router gave
+    // last; a set that doesn't change the mark doesn't tell the watch.
+    assert!(entry.set_sender_lost(sender0, true));
+    assert!(!entry.set_sender_lost(sender0, true));
+    assert!(entry.set_sender_lost(sender1, true));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+    watch.take_changed(&waker, &mut changed);
+    assert_eq!(changed, [*entry.id()]);
+    changed.clear();
+    assert!(entry.set_sender_lost(sender0, false));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
+    watch.take_changed(&waker, &mut changed);
+    assert_eq!(changed, [*entry.id()]);
+
+    // Once the entry drops the watch, a change doesn't tell it.
+    changed.clear();
+    entry.unwatch_lost_marks(&watch);
+    assert!(entry.set_sender_lost(sender1, false));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
+    watch.take_changed(&waker, &mut changed);
+    assert!(changed.is_empty());
+
+    // The entry doesn't keep a watch alive: a change after the router drops it doesn't tell
+    // anyone, and the entry lets go of it.
+    entry.watch_lost_marks(&watch);
+    drop(watch);
+    assert!(entry.set_sender_lost(sender0, true));
+    assert!(entry.lost_mark_watches.lock().unwrap().is_empty());
 }
 
 #[test]

@@ -3197,28 +3197,30 @@ fn interface_paced_pick_two_offers_a_waiting_highest_input_batch_again_only_once
 
     // The peer's first batch goes at once to the first interface, and its second waits on that
     // interface. Its third and fourth wait in the router: the first interface holds a batch, and
-    // the second interface's sender is lost for that peer. The router lists the peer once on the
-    // waiters of the first interface and once on the lost peers of the second sender.
+    // the second interface's sender is lost for that peer. The router lists the peer once, on the
+    // waiters of the first interface, and watches the peer's lost marks.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [100_000]);
     assert!(costs(&second).is_empty());
-    assert_eq!(router.highest_waiter_entries(), 2);
+    assert_eq!(router.highest_waiter_entries(), 1);
 
-    // A poll that neither frees the first interface nor clears the mark doesn't offer the
-    // waiting batches to the senders again.
+    // A poll that neither frees the first interface nor changes a lost mark of the peer doesn't
+    // offer the waiting batches to the senders again, and doesn't read the peer's marks.
     let dispatches = router.dispatches();
+    let lost_mark_reads = router.lost_mark_reads();
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(router.dispatches(), dispatches);
+    assert_eq!(router.lost_mark_reads(), lost_mark_reads);
     assert_eq!(costs(&first), [100_000]);
 
     // Once the pacer releases the peer's second batch, the router offers the waiting batches to
     // the senders again: the third waits on the first interface, and the fourth waits in the
-    // router again, which still lists the peer once on each of the two lists.
+    // router again, which still lists the peer once, on the waiters of the first interface.
     clock.advance(std::time::Duration::from_millis(1));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(router.dispatches(), dispatches + 2);
     assert_eq!(costs(&first), [100_000, 100_001]);
-    assert_eq!(router.highest_waiter_entries(), 2);
+    assert_eq!(router.highest_waiter_entries(), 1);
 
     // Once the pair of the second interface's sender delivers to the peer again, the fourth
     // batch goes at once to that sender, though the clock didn't move.
@@ -3373,12 +3375,11 @@ fn interface_paced_pick_two_lists_a_waiting_highest_input_peer_once_on_each_inte
 
     // The first peer's first batch goes at once to the first interface, and its second waits on
     // that interface. Its later batches wait in the router, which lists the peer on the waiters
-    // of the first interface and on the lost peers of the second sender. The other peer's batch
-    // goes at once to the second interface.
+    // of the first interface. The other peer's batch goes at once to the second interface.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [100_000]);
     assert_eq!(costs(&second), [1_000]);
-    assert_eq!(router.highest_waiter_entries(), 2);
+    assert_eq!(router.highest_waiter_entries(), 1);
 
     // Once the mark clears, the first peer's third batch goes at once to the free second
     // interface, its fourth waits on that interface, and its fifth waits in the router again.
@@ -3474,47 +3475,48 @@ fn interface_paced_pick_two_offers_a_waiting_highest_input_batch_only_on_a_free_
 
     // The first peer's first batch goes at once to the first interface, its second waits on
     // that interface, and its third waits in the router, which lists the peer on the waiters of
-    // the first interface and on the lost peers of the second and third senders. The second
-    // peer's first batch goes at once to the second interface, and its second waits on that
-    // interface. The third interface is free.
+    // the first interface. The second peer's first batch goes at once to the second interface,
+    // and its second waits on that interface. The third interface is free.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [100_000]);
     assert_eq!(costs(&second), [200_000]);
     assert!(costs(&third).is_empty());
-    assert_eq!(router.highest_waiter_entries(), 3);
+    assert_eq!(router.highest_waiter_entries(), 1);
 
     // The second sender's pair delivers to the first peer again, but that sender's interface
-    // holds a batch, so the router doesn't offer the first peer's batch to the senders.
+    // holds a batch: the router offers the first peer's batch once, at the poll after the change,
+    // and the batch waits again, on the waiters of the first and second interfaces.
     let dispatches = router.dispatches();
     assert!(waits.set_sender_lost(LocalSenderId::from_index(1), false));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(router.dispatches(), dispatches);
+    assert_eq!(router.dispatches(), dispatches + 1);
+    assert_eq!(router.highest_waiter_entries(), 2);
 
     // The third sender's pair delivers to the first peer again, and its interface is free: the
     // first peer's waiting batch goes at once to it. The router keeps the peer's entries on the
-    // waiters of the first interface and on the lost peers of the second sender.
+    // waiters of the first and second interfaces.
     assert!(waits.set_sender_lost(LocalSenderId::from_index(2), false));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&third), [100_002]);
     assert_eq!(router.highest_waiter_entries(), 2);
 
     // A batch of the third peer waits in the router, which lists that peer on the waiters of the
-    // first interface behind the first peer's entry, and on the lost peers of the second and
-    // third senders.
+    // first interface behind the first peer's entry.
     let mut item = new_test_item(later.clone(), drop_counter.clone());
     item.byte_cost = 300_000;
     item.highest_priority = true;
     highest_rx.values.borrow_mut().push_back(item);
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(router.highest_waiter_entries(), 5);
+    assert_eq!(router.highest_waiter_entries(), 3);
 
     // Once the pacer releases the first peer's second batch, the router skips the first peer's
     // entry on the first interface's waiters and offers the third peer's batch, which waits on
-    // that interface for its tokens, in the same poll.
+    // that interface for its tokens, in the same poll. The first peer's entry on the second
+    // interface's waiters stays, since that interface holds a batch.
     clock.advance(std::time::Duration::from_millis(1));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [100_000, 100_001]);
-    assert_eq!(router.highest_waiter_entries(), 2);
+    assert_eq!(router.highest_waiter_entries(), 1);
 
     // Once each bucket has paid for the batches sent before, the batch each interface holds goes,
     // and the router ends, with each entry gone from its lists.
@@ -3581,10 +3583,9 @@ fn interface_paced_pick_two_empties_its_highest_input_lists_when_its_worker_is_g
 
     // The first peer's first batch goes, its second waits on the first interface for that
     // interface's tokens, and its third waits in the router, as does the second peer's batch.
-    // The router lists both peers on the waiters of the first interface and on the lost peers of
-    // the second sender.
+    // The router lists both peers on the waiters of the first interface.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(router.highest_waiter_entries(), 4);
+    assert_eq!(router.highest_waiter_entries(), 2);
 
     // The pacer releases the first peer's second batch, which leaves tokens in the first
     // interface's bucket.
@@ -3593,7 +3594,7 @@ fn interface_paced_pick_two_empties_its_highest_input_lists_when_its_worker_is_g
 
     // The router offers the first peer's third batch to the freed first interface, whose
     // sender's receiver is gone now: the router ends in that poll, though its input is open, and
-    // empties both lists.
+    // empties its lists.
     gone.set(true);
     assert_eq!(poll_once(&mut router), Poll::Ready(None));
     assert_eq!(router.highest_waiter_entries(), 0);
@@ -3664,28 +3665,24 @@ fn interface_paced_pick_two_lists_a_highest_input_peer_that_waits_again_once_on_
 
     // The first peer's first batch goes at once to the first interface, its second waits on
     // that interface, and its third waits in the router, which lists the peer on the waiters of
-    // the first interface and on the lost peers of the second and third senders. The second
-    // peer's first batch goes at once to the second interface, and its second waits on that
-    // interface. The third interface is free.
+    // the first interface. The second peer's first batch goes at once to the second interface,
+    // and its second waits on that interface. The third interface is free.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [100_000]);
     assert_eq!(costs(&second), [300_000]);
     assert!(costs(&third).is_empty());
-    assert_eq!(router.highest_waiter_entries(), 3);
+    assert_eq!(router.highest_waiter_entries(), 1);
 
     // Once the pacer releases the first peer's second batch, the router offers the peer's third
     // batch to the freed first interface, which holds it for its tokens, and the peer's batches
-    // leave the router. The free third sender's lost peers drop the peer's entry, and its entry
-    // on the lost peers of the second sender stays, since that sender's interface holds a batch.
+    // leave the router, with its entry gone from the first interface's waiters.
     clock.advance(std::time::Duration::from_millis(1));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [100_000, 2_000_000]);
-    assert_eq!(router.highest_waiter_entries(), 1);
+    assert_eq!(router.highest_waiter_entries(), 0);
 
-    // A fourth batch of the first peer waits in the router. The router lists the peer on the
-    // waiters of the first interface and on the lost peers of the third sender, and the peer's
-    // entry of the earlier wait on the lost peers of the second sender stands for this wait, so
-    // that each list holds the peer once.
+    // A fourth batch of the first peer waits in the router, which lists the peer on the waiters
+    // of the first interface.
     let dispatches = router.dispatches();
     let mut item = new_test_item(waits.clone(), drop_counter.clone());
     item.byte_cost = 100_003;
@@ -3693,22 +3690,23 @@ fn interface_paced_pick_two_lists_a_highest_input_peer_that_waits_again_once_on_
     highest_rx.values.borrow_mut().push_back(item);
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(router.dispatches(), dispatches + 1);
-    assert_eq!(router.highest_waiter_entries(), 3);
+    assert_eq!(router.highest_waiter_entries(), 1);
 
     // The second sender's pair delivers to the first peer again while that sender's interface
-    // holds a batch: the router doesn't offer the peer's batch to the senders.
+    // holds a batch: the router offers the peer's batch once, at the poll after the change, and
+    // the batch waits again, on the waiters of the second interface too. The peer's entry on the
+    // waiters of the first interface stands for this wait, so that each list holds the peer once.
     assert!(waits.set_sender_lost(LocalSenderId::from_index(1), false));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(router.dispatches(), dispatches + 1);
+    assert_eq!(router.dispatches(), dispatches + 2);
+    assert_eq!(router.highest_waiter_entries(), 2);
 
-    // Once the pacer releases the second peer's second batch, the router reads the cleared mark
-    // of the second sender for this wait of the first peer, and offers the peer's batch, which
-    // the freed second interface holds for its tokens. The free third sender's lost peers drop
-    // the peer's entry, and its entry on the waiters of the first interface, which holds a
-    // batch, stays.
+    // Once the pacer releases the second peer's second batch, the router offers the first peer's
+    // batch from the waiters of the freed second interface, which holds it for its tokens. The
+    // peer's entry on the waiters of the first interface, which holds a batch, stays.
     clock.advance(std::time::Duration::from_millis(1));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(router.dispatches(), dispatches + 2);
+    assert_eq!(router.dispatches(), dispatches + 3);
     assert_eq!(router.highest_waiter_entries(), 1);
 
     // The second interface sends the first peer's fourth batch once its bucket has paid for the
@@ -3795,34 +3793,32 @@ fn interface_paced_pick_two_skips_an_entry_of_an_earlier_wait_on_a_freed_interfa
     // The second peer's first batch goes at once to the first interface, and its second waits
     // on that interface. The first peer's first batch goes at once to the second interface, its
     // second waits on that interface, and its third waits in the router, which lists the peer
-    // on the waiters of the first and second interfaces and on the lost peers of the third
-    // sender.
+    // on the waiters of the first and second interfaces.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [1_000_000]);
     assert_eq!(costs(&second), [100_000]);
     assert!(costs(&third).is_empty());
-    assert_eq!(router.highest_waiter_entries(), 3);
+    assert_eq!(router.highest_waiter_entries(), 2);
 
     // Once the pacer releases the first peer's second batch, the router offers the peer's third
     // batch to the freed second interface, which holds it for its tokens, and the peer's batches
-    // leave the router. The free third sender's lost peers drop the peer's entry, and its entry
-    // on the waiters of the first interface stays, since that interface holds a batch.
+    // leave the router. Its entry on the waiters of the first interface stays, since that
+    // interface holds a batch.
     clock.advance(std::time::Duration::from_millis(1));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&second), [100_000, 2_000_000]);
     assert_eq!(router.highest_waiter_entries(), 1);
 
     // The first sender's pair is lost for the first peer now, and a fourth batch of that peer
-    // waits in the router, on the lost peers of the first and third senders and on the waiters
-    // of the second interface. The peer's entry of the earlier wait on the waiters of the first
-    // interface stays.
+    // waits in the router, on the waiters of the second interface. The peer's entry of the
+    // earlier wait on the waiters of the first interface stays.
     assert!(waits.set_sender_lost(LocalSenderId::from_index(0), true));
     let mut item = new_test_item(waits.clone(), drop_counter.clone());
     item.byte_cost = 100_003;
     item.highest_priority = true;
     highest_rx.values.borrow_mut().push_back(item);
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(router.highest_waiter_entries(), 4);
+    assert_eq!(router.highest_waiter_entries(), 2);
 
     // Once the pacer releases the second peer's second batch, the router takes the first peer's
     // entry of the earlier wait from the waiters of the freed first interface, and doesn't offer
@@ -3832,11 +3828,10 @@ fn interface_paced_pick_two_skips_an_entry_of_an_earlier_wait_on_a_freed_interfa
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [1_000_000, 1_000_001]);
     assert_eq!(router.dispatches(), dispatches);
-    assert_eq!(router.highest_waiter_entries(), 3);
+    assert_eq!(router.highest_waiter_entries(), 1);
 
     // Once the pacer releases the first peer's third batch, the router offers the peer's fourth
-    // batch to the freed second interface, which holds it for its tokens, and the free first and
-    // third senders' lost peers drop the peer's entries.
+    // batch to the freed second interface, which holds it for its tokens.
     highest_rx.closed.set(true);
     clock.advance(std::time::Duration::from_millis(10));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
@@ -3919,25 +3914,23 @@ fn interface_paced_pick_two_skips_an_entry_left_when_a_waiting_peer_waits_again_
     // The second peer's first batch goes at once to the first interface, and its second waits
     // on that interface. The first peer's first batch goes at once to the second interface, its
     // second waits on that interface, and its third and fourth wait in the router, which lists
-    // the peer on the waiters of the first and second interfaces and on the lost peers of the
-    // third sender.
+    // the peer on the waiters of the first and second interfaces.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [1_000_000]);
     assert_eq!(costs(&second), [100_000]);
     assert!(costs(&third).is_empty());
-    assert_eq!(router.highest_waiter_entries(), 3);
+    assert_eq!(router.highest_waiter_entries(), 2);
 
     // The first sender's pair is lost for the first peer now. Once the pacer releases the
     // peer's second batch, the router offers the peer's third batch to the freed second
     // interface, which holds it for its tokens. No sender may take the peer's fourth batch,
-    // which begins a new wait, on the waiters of the second interface and on the lost peers of
-    // the first and third senders. The peer's entry of the earlier wait on the waiters of the
-    // first interface stays.
+    // which begins a new wait, on the waiters of the second interface. The peer's entry of the
+    // earlier wait on the waiters of the first interface stays.
     assert!(waits.set_sender_lost(LocalSenderId::from_index(0), true));
     clock.advance(std::time::Duration::from_millis(1));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&second), [100_000, 2_000_000]);
-    assert_eq!(router.highest_waiter_entries(), 4);
+    assert_eq!(router.highest_waiter_entries(), 2);
 
     // Once the pacer releases the second peer's second batch, the router takes the first peer's
     // entry of the earlier wait from the waiters of the freed first interface, and doesn't offer
@@ -3947,11 +3940,10 @@ fn interface_paced_pick_two_skips_an_entry_left_when_a_waiting_peer_waits_again_
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(costs(&first), [1_000_000, 1_000_001]);
     assert_eq!(router.dispatches(), dispatches);
-    assert_eq!(router.highest_waiter_entries(), 3);
+    assert_eq!(router.highest_waiter_entries(), 1);
 
     // Once the pacer releases the first peer's third batch, the router offers the peer's fourth
-    // batch to the freed second interface, which holds it for its tokens, and the free first and
-    // third senders' lost peers drop the peer's entries.
+    // batch to the freed second interface, which holds it for its tokens.
     highest_rx.closed.set(true);
     clock.advance(std::time::Duration::from_millis(10));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
@@ -3968,4 +3960,101 @@ fn interface_paced_pick_two_skips_an_entry_left_when_a_waiting_peer_waits_again_
     assert_eq!(router.highest_waiter_entries(), 0);
     assert_eq!(drop_counter.load(Ordering::Relaxed), 6);
     assert_eq!(highest_rx.consumed.get(), 4_300_006);
+}
+
+#[test]
+fn interface_paced_pick_two_sends_a_waiting_highest_input_batch_once_no_sender_delivers() {
+    #[derive(Default)]
+    struct CountWakes(AtomicUsize);
+    impl std::task::Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    // The pacing doesn't have an interface for the highest-priority traffic. The pair of the
+    // first interface's sender is lost for the peer, so the second interface's sender takes the
+    // peer's batches, paced.
+    let entry = test_path_secret_entry();
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(0), true));
+    // The input of the highest priority level holds three batches of the peer, each of more
+    // bytes than a burst and a byte more than the one before it, so that the senders' records
+    // show their order. The bulk input is closed and empty.
+    let highest_rx = ClosableReceiver::default();
+    for byte_cost in [100_000, 100_001, 100_002] {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = byte_cost;
+        item.highest_priority = true;
+        highest_rx.values.borrow_mut().push_back(item);
+    }
+    let rx = ClosableReceiver::default();
+    rx.closed.set(true);
+    let first = Sends::default();
+    let second = Sends::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&first, &second]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+    let costs = |sends: &Sends| {
+        sends
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect::<Vec<_>>()
+    };
+
+    // The peer's first batch goes at once to the second interface, its second waits on that
+    // interface, and its third waits in the router, on the waiters of the second interface. The
+    // first interface is free, but its sender may not take the batch while the second
+    // interface's sender delivers to the peer.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert!(costs(&first).is_empty());
+    assert_eq!(costs(&second), [100_000]);
+    assert_eq!(router.highest_waiter_entries(), 1);
+
+    // A poll that doesn't follow a change of a lost mark of the peer doesn't read the peer's
+    // marks, and doesn't offer its batch again.
+    let dispatches = router.dispatches();
+    let lost_mark_reads = router.lost_mark_reads();
+    let wakes = Arc::new(CountWakes::default());
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut cx = task::Context::from_waker(&waker);
+    assert_eq!(
+        router.poll_recv(&mut cx, &mut Budget::new(usize::MAX)),
+        Poll::Pending
+    );
+    assert_eq!(router.dispatches(), dispatches);
+    assert_eq!(router.lost_mark_reads(), lost_mark_reads);
+
+    // Once the pair of the second interface's sender is lost too, no sender delivers to the
+    // peer: the change wakes the router, and at the next poll the waiting batch goes at once to
+    // the free first interface, though the clock didn't move and the second interface still
+    // holds a batch.
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+    assert_eq!(poll_once(&mut router), Poll::Ready(Some(())));
+    assert_eq!(costs(&first), [100_002]);
+    assert_eq!(costs(&second), [100_000]);
+
+    // The batch the second interface holds goes once its bucket has paid for the batch before
+    // it, and the router ends, with the peer's entry gone from its lists.
+    highest_rx.closed.set(true);
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(costs(&first), [100_002]);
+    assert_eq!(costs(&second), [100_000, 100_001]);
+    assert_eq!(router.highest_waiter_entries(), 0);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+    assert_eq!(highest_rx.consumed.get(), 300_003);
 }
