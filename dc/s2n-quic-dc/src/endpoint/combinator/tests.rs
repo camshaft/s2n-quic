@@ -2001,3 +2001,334 @@ fn interface_paced_pick_two_reads_ahead_again_once_its_highest_priority_input_cl
     assert_eq!(sent(100_000), 5);
     assert_eq!(drop_counter.load(Ordering::Relaxed), 6);
 }
+
+/// Routes `items` items of `entry` with pick-two over one test sender for each of the entry's
+/// sender slots, and returns how many items each sender got.
+fn pick_two_calls(entry: &Arc<PathSecretEntry>, items: usize, seed: u64) -> Vec<usize> {
+    let mut senders: Vec<TestSender> = (0..entry.socket_sender_count())
+        .map(|_| TestSender {
+            accept: true,
+            calls: 0,
+        })
+        .collect();
+    let mut rng = crate::xorshift::Rng::with_seed(seed);
+    let mut rr = 0;
+    for _ in 0..items {
+        let item = new_test_item(entry.clone(), Arc::new(AtomicUsize::new(0)));
+        assert!(try_send_pick_two_with_rr(item, &mut senders, &mut rng, &mut rr).is_ok());
+    }
+    senders.iter().map(|sender| sender.calls).collect()
+}
+
+#[test]
+fn pick_two_skips_lost_senders_while_another_delivers() {
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    assert!(entry.set_sender_lost(sender(1), true));
+    assert!(entry.set_sender_lost(sender(3), true));
+
+    let calls = pick_two_calls(&entry, 100, 1);
+    assert_eq!(calls[1] + calls[3], 0, "a lost sender got an item: {calls:?}");
+    assert_eq!(calls[0] + calls[2], 100);
+    assert!(
+        calls[0] > 0 && calls[2] > 0,
+        "a sender that delivers didn't get an item: {calls:?}"
+    );
+
+    // Once the pair of sender 1 delivers again, the router chooses it again.
+    assert!(entry.set_sender_lost(sender(1), false));
+    let calls = pick_two_calls(&entry, 100, 2);
+    assert_eq!(calls[3], 0, "a lost sender got an item: {calls:?}");
+    assert!(calls[1] > 0, "sender 1 didn't get an item: {calls:?}");
+}
+
+#[test]
+fn pick_two_spreads_items_over_every_sender_while_every_pair_is_lost() {
+    let entry = test_path_secret_entry();
+    for idx in 0..2 {
+        assert!(entry.set_sender_lost(LocalSenderId::from_index(idx), true));
+    }
+
+    // Where no pair delivers, the router chooses among every sender, as it does with no lost
+    // pair.
+    let calls = pick_two_calls(&entry, 100, 3);
+    assert_eq!(calls.iter().sum::<usize>(), 100);
+    assert!(
+        calls.iter().all(|&calls| calls > 0),
+        "a sender didn't get an item: {calls:?}"
+    );
+}
+
+/// Returns `highest` items of `entry` that hold a frame of the highest priority level, and then
+/// `other` items that don't. A highest-priority item costs 1 byte and any other item 2, so that
+/// each sender's record tells them apart.
+fn priority_items(
+    entry: &Arc<PathSecretEntry>,
+    drop_counter: &Arc<AtomicUsize>,
+    highest: usize,
+    other: usize,
+) -> VecDeque<TestItem> {
+    let item = |highest_priority: bool| {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = if highest_priority { 1 } else { 2 };
+        item.highest_priority = highest_priority;
+        item
+    };
+    (0..highest)
+        .map(|_| item(true))
+        .chain((0..other).map(|_| item(false)))
+        .collect()
+}
+
+/// Routes `values` with an interface-paced pick-two over four senders, 0 and 1 on the first
+/// interface and 2 and 3 on the second, which carries the highest-priority traffic. Returns, for
+/// each sender, how many highest-priority items and how many other items it got.
+fn route_by_interface(values: VecDeque<TestItem>) -> [[usize; 2]; 4] {
+    let rate = Rate::new(100.0);
+    let clock = test_clock();
+    let sends: [Sends; 4] = Default::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 0, 1, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        TestReceiver {
+            values,
+            consumed: 0,
+        },
+        timed_senders(&clock, &[&sends[0], &sends[1], &sends[2], &sends[3]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+
+    let count = |sender: usize, bytes: u64| {
+        sends[sender]
+            .borrow()
+            .iter()
+            .filter(|&&(_, cost)| cost == bytes)
+            .count()
+    };
+    [0, 1, 2, 3].map(|sender| [count(sender, 1), count(sender, 2)])
+}
+
+#[test]
+fn interface_paced_pick_two_skips_lost_pairs_while_another_delivers() {
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    let items = || priority_items(&entry, &drop_counter, 20, 20);
+
+    // While the pair of sender 0 is lost, the other items go to senders 1 to 3, and the
+    // highest-priority items stay on the second interface.
+    assert!(entry.set_sender_lost(sender(0), true));
+    let counts = route_by_interface(items());
+    assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert_eq!(counts[2][0] + counts[3][0], 20);
+    assert_eq!(counts[1][1] + counts[2][1] + counts[3][1], 20);
+
+    // While every pair of the second interface is lost too, every item goes to sender 1, the
+    // highest-priority items among them.
+    assert!(entry.set_sender_lost(sender(2), true));
+    assert!(entry.set_sender_lost(sender(3), true));
+    assert_eq!(
+        route_by_interface(items()),
+        [[0, 0], [20, 20], [0, 0], [0, 0]]
+    );
+
+    // Once the pairs of the second interface deliver again, the highest-priority items go back
+    // to it.
+    assert!(entry.set_sender_lost(sender(2), false));
+    assert!(entry.set_sender_lost(sender(3), false));
+    let counts = route_by_interface(items());
+    assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert_eq!(counts[2][0] + counts[3][0], 20);
+}
+
+#[test]
+fn interface_paced_pick_two_chooses_by_one_read_of_the_lost_marks() {
+    let rate = Rate::new(100.0);
+    let clock = test_clock();
+    let sends: [Sends; 4] = Default::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 0, 1, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        TestReceiver {
+            values: VecDeque::new(),
+            consumed: 0,
+        },
+        timed_senders(&clock, &[&sends[0], &sends[1], &sends[2], &sends[3]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    assert!(entry.set_sender_lost(sender(0), true));
+
+    // The router reads the marks while sender 0 alone is lost. Senders 1 and 2 are marked lost
+    // after that read and before the router chooses: the router chooses by the marks it read,
+    // among senders 1 to 3, and doesn't panic.
+    let mut chosen = [0usize; 4];
+    for _ in 0..30 {
+        let choice = router
+            .choose_sender_after_read(&entry, false, || {
+                assert!(entry.set_sender_lost(sender(1), true));
+                assert!(entry.set_sender_lost(sender(2), true));
+            })
+            .expect("a sender the router read as delivering is free");
+        chosen[choice.as_usize()] += 1;
+        assert!(entry.set_sender_lost(sender(1), false));
+        assert!(entry.set_sender_lost(sender(2), false));
+    }
+    assert_eq!(chosen[0], 0, "the router chose the lost sender 0: {chosen:?}");
+    assert!(
+        chosen[1] + chosen[2] > 0,
+        "the router read the marks again after the first read: {chosen:?}",
+    );
+}
+
+/// A receiver of `values` that adds the bytes of each batch its router consumed to `consumed`,
+/// which the test reads while the router holds the receiver.
+struct SharedTestReceiver {
+    values: VecDeque<TestItem>,
+    consumed: Rc<std::cell::Cell<u64>>,
+}
+
+impl Receiver<TestItem> for SharedTestReceiver {
+    fn poll_recv(
+        &mut self,
+        _cx: &mut task::Context<'_>,
+        _budget: &mut Budget,
+    ) -> Poll<Option<TestItem>> {
+        Poll::Ready(self.values.pop_front())
+    }
+
+    fn on_consumed(&mut self, bytes: u64) {
+        self.consumed.set(self.consumed.get() + bytes);
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_holds_a_batch_until_a_sender_that_delivers_is_free() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    // The pair of the second interface's sender is lost, so the first interface's sender takes
+    // every batch.
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    let consumed = Rc::new(std::cell::Cell::new(0));
+    let rx = SharedTestReceiver {
+        values: test_items(&entry, 3, 100_000, &drop_counter),
+        consumed: Rc::clone(&consumed),
+    };
+    let delivers = Sends::default();
+    let lost = Sends::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&delivers, &lost]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    // Each batch costs more than a burst: the first goes at once, the second waits on the first
+    // interface, and the third waits in the router, though the second interface is free. The
+    // router consumed each of them once.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(delivers.borrow().len(), 1);
+    assert_eq!(consumed.get(), 300_000);
+
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(delivers.borrow().len(), 2);
+
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(delivers.borrow().len(), 3);
+    assert!(lost.borrow().is_empty(), "the lost sender got a batch");
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+    assert_eq!(consumed.get(), 300_000, "the router consumed a batch twice");
+}
+
+/// A sender whose receiver is gone once `gone` is set.
+struct GoneSender {
+    gone: Rc<std::cell::Cell<bool>>,
+}
+
+impl UnboundedSender<TestItem> for GoneSender {
+    fn send(&mut self, value: TestItem) -> Result<(), TestItem> {
+        if self.gone.get() {
+            Err(value)
+        } else {
+            drop(value);
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_returns_the_credit_of_a_waiting_batch_when_the_worker_is_gone() {
+    const CAP: u64 = 1_000_000;
+    const CREDIT: u64 = 4096;
+
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let pool = crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(CAP)));
+    let entry = test_path_secret_entry();
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    let mut values = test_items(&entry, 3, 100_000, &drop_counter);
+    values[2].flow_credits = CREDIT;
+    let gone = Rc::new(std::cell::Cell::new(false));
+    let senders: Vec<_> = (0..2)
+        .map(|_| GoneSender {
+            gone: Rc::clone(&gone),
+        })
+        .collect();
+    let rate = Rate::new(1.0);
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        TestReceiver {
+            values,
+            consumed: 0,
+        },
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        pool.clone(),
+    );
+
+    // The first batch goes, the second waits on the first interface, and the third, which holds
+    // the credit, waits in the router.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+
+    // Once the worker is gone, the router returns the credit of the batch that waits in it too.
+    gone.set(true);
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+    // The credit wasn't drawn from the pool, so its return shows as a balance of `CAP + CREDIT`.
+    assert_eq!(
+        pool.debug_available() as u64 + pool.debug_returned(),
+        CAP + CREDIT,
+        "the router didn't return the waiting batch's send credit to the pool",
+    );
+}

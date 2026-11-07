@@ -170,6 +170,7 @@ fn send_pto_timeout_routes_pending_context_to_tx_wheel() {
             crate::endpoint::id::LocalSendSocketId::new(0);
         let pto_immediate_tx =
             send::ImmediateSender::new(pto_socket_immediate_txs, pto_sender_idx_to_local);
+        let (retransmit_tx, _retransmit_rx) = unsync::new::<frame::Frame>();
 
         let rx = tasks::send_pto_timeout(
             input,
@@ -185,6 +186,7 @@ fn send_pto_timeout_routes_pending_context_to_tx_wheel() {
                 crate::endpoint::id::LocalSenderId,
                 crate::endpoint::id::LocalSendSocketId,
             >::new(0, crate::endpoint::id::LocalSendSocketId::new(0)),
+            retransmit_tx,
         );
 
         async move { rx.drain_budgeted(Some(32)).await }

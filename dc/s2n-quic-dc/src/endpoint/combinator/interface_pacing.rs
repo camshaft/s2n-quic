@@ -231,6 +231,12 @@ impl<T, Tm: precision::Timer> Pacer<T, Tm> {
 /// traffic, even while every interface holds a batch. It then reads the other input only while an
 /// interface doesn't hold a batch, so that it doesn't keep a batch read ahead.
 ///
+/// While the interface pair of a worker is marked lost and another worker of the batch's peer
+/// delivers, the router doesn't choose the lost worker, and a highest-priority batch whose
+/// interface's workers are all lost goes, paced, to a worker that delivers. A batch that no
+/// worker may take now waits in the router, which doesn't read the next batch of that batch's
+/// input meanwhile.
+///
 /// Implements `Receiver<()>` so it can be drained via `ReceiverExt::drain_budgeted`.
 pub struct InterfacePacedPickTwo<T, R, S, Clk>
 where
@@ -255,9 +261,18 @@ where
     /// Whether `rx` closed. The router then doesn't read another batch, and ends once it has
     /// delivered the batches it holds.
     closed: bool,
-    /// A batch the router read while every interface held a batch, which it keeps until an
-    /// interface may take it. The router doesn't read another batch while it keeps one.
+    /// A batch of `rx` that the router keeps until a sender may take it: one it read while every
+    /// interface held a batch, or one that no sender that delivers to its peer may take yet. The
+    /// router doesn't read `rx` while it keeps one.
     pending: Option<T>,
+    /// A batch of `highest_rx` that no sender that delivers to its peer may take yet: every
+    /// sender of the interface for the highest-priority traffic is marked lost, and each other
+    /// sender that delivers is on an interface that holds a batch. The router doesn't read
+    /// `highest_rx` while it keeps one.
+    highest_waiting: Option<T>,
+    /// The lost mark of each sender of the batch being routed, read once for each batch so that
+    /// each pass over the senders sees the same marks.
+    lost_marks: Vec<bool>,
     pick_counters: IdMap<LocalSenderId, crate::counter::Counter>,
     rejected_counters: IdMap<LocalSenderId, crate::counter::Summary>,
     score_delta: crate::counter::Summary,
@@ -329,6 +344,8 @@ where
             round_robin_idx: 0,
             closed: false,
             pending: None,
+            highest_waiting: None,
+            lost_marks: Vec::new(),
             pick_counters,
             rejected_counters,
             score_delta,
@@ -360,40 +377,103 @@ where
         (0..self.senders.len()).any(|sender| self.is_free(sender))
     }
 
-    /// Returns whether the sender at `sender` may take a batch: for a batch whose frames are all
-    /// of the highest priority level, where the sender is on the interface for that traffic,
-    /// and for any other batch, where its interface doesn't hold a batch.
-    fn is_candidate(&self, sender: usize, highest: bool) -> bool {
-        if highest {
-            let interface = self.sender_interfaces[LocalSenderId::from_index(sender)];
-            Some(interface) == self.highest_priority
+    /// Returns whether the sender at `sender` is on the interface for the highest-priority
+    /// traffic.
+    fn is_on_highest_interface(&self, sender: usize) -> bool {
+        let interface = self.sender_interfaces[LocalSenderId::from_index(sender)];
+        Some(interface) == self.highest_priority
+    }
+
+    /// Reads the lost mark of each sender of `entry` once, for the passes over the senders that
+    /// choose a sender for one batch: the send workers set and clear the marks meanwhile, and
+    /// each pass must see the same marks.
+    fn read_lost_marks(&mut self, entry: &PathSecretEntry) {
+        self.lost_marks.clear();
+        self.lost_marks.extend(
+            (0..self.senders.len())
+                .map(|sender| entry.is_sender_lost(LocalSenderId::from_index(sender))),
+        );
+    }
+
+    /// Returns whether a sender on the interface for the highest-priority traffic delivers to
+    /// the batch's peer by the marks [`Self::read_lost_marks`] read: its interface pair isn't
+    /// marked lost.
+    fn highest_interface_delivers(&self) -> bool {
+        (0..self.senders.len())
+            .any(|sender| self.is_on_highest_interface(sender) && !self.lost_marks[sender])
+    }
+
+    /// Returns the rule by which the router chooses a sender for a batch, where `highest` says
+    /// whether the batch goes only to the interface for the highest-priority traffic, by the
+    /// marks [`Self::read_lost_marks`] read. While the interface pair of a sender is lost and
+    /// another sender of the peer delivers, the router leaves the lost senders out; where every
+    /// sender of the interface for the highest-priority traffic is lost then, such a batch goes,
+    /// paced, to another interface.
+    fn candidates(&self, highest: bool) -> Candidates {
+        let avoid_lost = self.lost_marks.contains(&true) && self.lost_marks.contains(&false);
+        let on_highest_interface = highest && (!avoid_lost || self.highest_interface_delivers());
+        Candidates {
+            on_highest_interface,
+            avoid_lost,
+        }
+    }
+
+    /// Returns whether the sender at `sender` may take a batch by `rule` and the marks
+    /// [`Self::read_lost_marks`] read: where the rule leaves lost senders out, only a sender
+    /// whose interface pair isn't marked lost; for a batch that goes to the interface for the
+    /// highest-priority traffic, a sender on that interface; and for any other batch, a sender
+    /// whose interface doesn't hold a batch.
+    fn is_candidate(&self, sender: usize, rule: Candidates) -> bool {
+        if rule.avoid_lost && self.lost_marks[sender] {
+            return false;
+        }
+        if rule.on_highest_interface {
+            self.is_on_highest_interface(sender)
         } else {
             self.is_free(sender)
         }
     }
 
-    /// Chooses a sender for a batch of `entry` among the candidates of [`Self::is_candidate`],
-    /// as [`PickTwo`](super::PickTwo) does: the next of them in round-robin order against a
-    /// random other one, most often the one with the lower score.
+    /// Chooses a sender for a batch of `entry` as [`Self::route`] does, and calls `between`
+    /// once the router has read the senders' lost marks and before it chooses, so that a test
+    /// can change the marks between the two.
+    #[cfg(test)]
+    pub(super) fn choose_sender_after_read(
+        &mut self,
+        entry: &PathSecretEntry,
+        highest: bool,
+        between: impl FnOnce(),
+    ) -> Option<LocalSenderId> {
+        let now = self.clock.now();
+        self.read_lost_marks(entry);
+        let rule = self.candidates(highest);
+        between();
+        self.choose_sender(entry, now, rule)
+    }
+
+    /// Chooses a sender for a batch of `entry` among the candidates of [`Self::is_candidate`] by
+    /// `rule`, as [`PickTwo`](super::PickTwo) does: the next of them in round-robin order against
+    /// a random other one, most often the one with the lower score. Its passes read the lost
+    /// marks of [`Self::read_lost_marks`], so they agree on the candidates. Returns `None` where
+    /// no sender may take the batch now.
     fn choose_sender(
         &mut self,
         entry: &PathSecretEntry,
         now: precision::Timestamp,
-        highest: bool,
-    ) -> LocalSenderId {
+        rule: Candidates,
+    ) -> Option<LocalSenderId> {
         let len = self.senders.len();
         let rr = self.round_robin_idx;
         let first = (0..len)
             .map(|offset| (rr + offset) % len)
-            .find(|&sender| self.is_candidate(sender, highest))
-            .expect("the router routes a batch only while it has a candidate sender");
+            .find(|&sender| self.is_candidate(sender, rule))?;
         self.round_robin_idx = (first + 1) % len;
 
         let others = (0..len)
-            .filter(|&sender| sender != first && self.is_candidate(sender, highest))
+            .filter(|&sender| sender != first && self.is_candidate(sender, rule))
             .count();
         if others == 0 {
-            return LocalSenderId::from_index(first);
+            return Some(LocalSenderId::from_index(first));
         }
         let nth = if others == 1 {
             0
@@ -401,7 +481,7 @@ where
             self.rng.next_usize(others)
         };
         let second = (0..len)
-            .filter(|&sender| sender != first && self.is_candidate(sender, highest))
+            .filter(|&sender| sender != first && self.is_candidate(sender, rule))
             .nth(nth)
             .expect("`nth` is less than the count of the other candidates");
         let first = LocalSenderId::from_index(first);
@@ -421,10 +501,10 @@ where
         };
         if self.rng.next_f64() < pick_two_worse_probability(delta) {
             self.rejected_counters[better].record_value(delta);
-            worse
+            Some(worse)
         } else {
             self.rejected_counters[worse].record_value(delta);
-            better
+            Some(better)
         }
     }
 
@@ -449,15 +529,36 @@ where
     }
 
     /// Chooses a sender for `value`, and sends it to the sender where the sender's interface may
-    /// send now or where `highest` is true, and else holds it on that interface until it may.
-    /// `highest` is true where `value` goes only to the interface for the highest-priority
-    /// traffic. Returns `false` where the sender's receiver is gone.
-    fn route(&mut self, cx: &mut task::Context<'_>, mut value: T, highest: bool) -> bool {
+    /// send now or where `value` goes to the interface for the highest-priority traffic, and else
+    /// holds it on that interface until it may. `highest` is true where `value` goes only to the
+    /// interface for the highest-priority traffic. Where no sender may take `value` now, the
+    /// router keeps it for its `input` until one may. Returns `false` where the sender's receiver
+    /// is gone.
+    fn route(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        mut value: T,
+        highest: bool,
+        input: Input,
+    ) -> bool {
         let now = self.clock.now();
-        let sender = {
+        let (sender, rule) = {
             let entry = value.path_secret_entry();
             debug_assert_eq!(self.senders.len(), entry.socket_sender_count());
-            self.choose_sender(entry, now, highest)
+            self.read_lost_marks(entry);
+            let rule = self.candidates(highest);
+            (self.choose_sender(entry, now, rule), rule)
+        };
+        let Some(sender) = sender else {
+            // Each sender that delivers to the batch's peer is on an interface that holds a
+            // batch: the batch waits in the router until one of them is free.
+            let kept = match input {
+                Input::Highest => &mut self.highest_waiting,
+                Input::Other => &mut self.pending,
+            };
+            debug_assert!(kept.is_none(), "the router keeps one batch of each input");
+            *kept = Some(value);
+            return true;
         };
         self.pick_counters[sender].add(1);
         value.set_sender_id(sender);
@@ -465,7 +566,7 @@ where
         let interface = self.sender_interfaces[sender];
         // A highest-priority batch doesn't wait for its interface's tokens: it goes at once, and
         // the bucket is charged for it, so the batches after it wait for its bytes.
-        if highest || self.pacers[interface].poll_ready(cx) {
+        if rule.on_highest_interface || self.pacers[interface].poll_ready(cx) {
             self.deliver(interface, sender, value)
         } else {
             self.pacers[interface].held = Some((sender, value));
@@ -499,6 +600,9 @@ where
                 if let Some(pending) = self.pending.take() {
                     leaked += pending.total_flow_credits();
                 }
+                if let Some(waiting) = self.highest_waiting.take() {
+                    leaked += waiting.total_flow_credits();
+                }
                 if leaked > 0 {
                     self.send_credit_pool.release(leaked);
                 }
@@ -506,6 +610,27 @@ where
             }
         }
     }
+}
+
+/// How [`InterfacePacedPickTwo`] chooses the senders that may take a batch.
+#[derive(Clone, Copy, Debug)]
+struct Candidates {
+    /// Whether the batch goes, unpaced, to the interface for the highest-priority traffic,
+    /// whether or not that interface holds a batch.
+    on_highest_interface: bool,
+    /// Whether the senders whose interface pairs are marked lost are left out, since another
+    /// sender of the batch's peer delivers.
+    avoid_lost: bool,
+}
+
+/// The input of [`InterfacePacedPickTwo`] that a batch came from, which says where the router
+/// keeps the batch while no sender may take it.
+#[derive(Clone, Copy, Debug)]
+enum Input {
+    /// The input of the highest priority level.
+    Highest,
+    /// The other input.
+    Other,
 }
 
 #[cfg(test)]
@@ -549,15 +674,32 @@ where
         // every interface holds a batch, and else as any other batch, while an interface doesn't
         // hold a batch.
         let chosen = self.highest_priority.is_some();
-        if chosen || self.has_free_sender() {
+        if self.highest_waiting.is_some() {
+            // A batch of that input that no sender could take goes before the router reads the
+            // input again.
+            if chosen || self.has_free_sender() {
+                let value = self
+                    .highest_waiting
+                    .take()
+                    .expect("the router keeps a batch of that input");
+                if !self.route(cx, value, chosen, Input::Highest) {
+                    return Poll::Ready(None);
+                }
+                if self.highest_waiting.is_none() {
+                    return Poll::Ready(Some(()));
+                }
+            }
+        } else if chosen || self.has_free_sender() {
             if let Some(highest_rx) = &mut self.highest_rx {
                 match highest_rx.poll_recv(cx, budget) {
                     Poll::Ready(Some(value)) => {
                         let byte_cost = value.byte_cost();
-                        if !self.route(cx, value, chosen) {
+                        if !self.route(cx, value, chosen, Input::Highest) {
                             return Poll::Ready(None);
                         }
-                        // Tell upstream that the batch was consumed, as for the other input.
+                        // Tell upstream that the batch was consumed, as for the other input. A
+                        // batch that waits in the router counts here, as a batch held on an
+                        // interface does.
                         if let Some(highest_rx) = &mut self.highest_rx {
                             highest_rx.on_consumed(byte_cost);
                         }
@@ -570,14 +712,22 @@ where
             }
         }
 
-        // A batch kept while every interface held one is routed before the router reads another.
-        if self.pending.is_some() && self.has_free_sender() {
+        // A batch kept from the other input is routed before the router reads another, once an
+        // interface doesn't hold a batch, or at once where it goes only to the interface for the
+        // highest-priority traffic.
+        let kept_may_go = match &self.pending {
+            Some(value) => self.has_free_sender() || self.is_highest(value),
+            None => false,
+        };
+        if kept_may_go {
             let value = self.pending.take().expect("the router keeps a batch");
             let highest = self.is_highest(&value);
-            if !self.route(cx, value, highest) {
+            if !self.route(cx, value, highest, Input::Other) {
                 return Poll::Ready(None);
             }
-            return Poll::Ready(Some(()));
+            if self.pending.is_none() {
+                return Poll::Ready(Some(()));
+            }
         }
 
         // While every interface holds a batch, the router still reads the next batch where it has
@@ -594,7 +744,7 @@ where
                     let byte_cost = value.byte_cost();
                     let highest = self.is_highest(&value);
                     if self.has_free_sender() || highest {
-                        if !self.route(cx, value, highest) {
+                        if !self.route(cx, value, highest, Input::Other) {
                             return Poll::Ready(None);
                         }
                     } else {
@@ -614,6 +764,8 @@ where
 
         if self.closed
             && self.highest_rx.is_none()
+            && self.highest_waiting.is_none()
+            && self.pending.is_none()
             && self.pacers.iter().all(|pacer| pacer.held.is_none())
         {
             Poll::Ready(None)

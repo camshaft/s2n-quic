@@ -293,7 +293,10 @@ where
                         );
                     }
                     ProbeResult::NothingToProbe => {
-                        if context.pto.probe_state.is_probe_once() {
+                        // A lost pair has no packet that waits for an acknowledgement once its
+                        // frames moved to the pairs that deliver; a Ping probes it, and its
+                        // acknowledgement shows that the pair delivers again.
+                        if context.pto.probe_state.is_probe_once() || context.is_path_lost() {
                             // Already sent one probe — emit Ping for the second segment.
                             // Don't clear probe_state here; the general on_transmit()
                             // fires after the Ping segment is encoded (ProbeOnce → Idle).
