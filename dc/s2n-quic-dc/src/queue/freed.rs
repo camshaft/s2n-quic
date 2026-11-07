@@ -169,18 +169,19 @@ impl FreedInner {
     }
 
     /// End the hold of `queue_id` for `binding_id` once its reset leaves, and record the slot as
-    /// freed where a `record` waited on the hold. A hold for another binding stays.
+    /// freed where a `record` waited on the hold. A hold for another binding stays. Returns
+    /// whether a hold ended.
     pub fn release(
         &self,
         queue_id: VarInt,
         binding_id: VarInt,
         path_entry: &Arc<PathSecretEntry>,
         endpoint_tx: &mut FreedBatchTx,
-    ) {
+    ) -> bool {
         let mut state = self.state.lock().unwrap();
         let freed = match state.held.get(&queue_id.as_u64()) {
             Some(held) if held.binding_id == binding_id.as_u64() => held.freed,
-            _ => return,
+            _ => return false,
         };
         state.held.remove(&queue_id.as_u64());
         drop(state);
@@ -188,6 +189,7 @@ impl FreedInner {
         if freed {
             self.record(queue_id, path_entry, endpoint_tx);
         }
+        true
     }
 
     /// Drain the accumulated freed IDs into `dest`, returning a request_id.
@@ -338,11 +340,11 @@ mod tests {
                 assert!(!freed.has_pending_work());
 
                 // A release for another binding leaves the hold as it is.
-                freed.release(slot, VarInt::from_u8(2), &path_entry, &mut tx);
+                assert!(!freed.release(slot, VarInt::from_u8(2), &path_entry, &mut tx));
                 assert!(!freed.has_pending_work());
 
                 // The held binding's reset leaves: the slot is recorded as freed.
-                freed.release(slot, VarInt::from_u8(1), &path_entry, &mut tx);
+                assert!(freed.release(slot, VarInt::from_u8(1), &path_entry, &mut tx));
                 let mut dest = HierarchicalBitSet::new(1);
                 freed.take(&mut dest).unwrap();
                 assert!(dest.contains(5));

@@ -122,6 +122,17 @@ pub struct ServerView {
     view: SenderView,
 }
 
+/// What [`ServerView::hold_freed`] did with a rejected init's slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// The slot is held for the init's binding from now on.
+    New,
+    /// The slot is held already, for the binding of an earlier rejected init.
+    Already,
+    /// The slot is past the peer's queues, or at or past the freed set's capacity, and isn't held.
+    PastQueues,
+}
+
 impl ServerView {
     /// Record a queue_id as freed without binding it.
     ///
@@ -137,15 +148,21 @@ impl ServerView {
     }
 
     /// Hold the slot `queue_id` for the rejected init of `binding_id` until its reset leaves the
-    /// priority router, so that the slot is recorded as freed only then. Returns false where the
-    /// slot is held already, for a slot past the peer's queues, which `bind_for_msg` rejects
-    /// without a reset, and for a slot that the freed set can't record, at or past its capacity,
-    /// which `FreedInner::hold` refuses.
-    pub fn hold_freed(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
+    /// priority router, so that the slot is recorded as freed only then. Returns whether the hold
+    /// is new, the slot is held already, or the slot is past the peer's queues, which
+    /// `bind_for_msg` rejects without a reset. A slot at or past the freed set's capacity is past
+    /// `max_queue_id`, which `ServerState::new` bounds at the capacity's last slot, so it returns
+    /// `Hold::PastQueues`: `FreedInner::hold` refuses such a slot too, which would read as
+    /// `Hold::Already`, but `hold_freed` doesn't reach that refusal.
+    pub fn hold_freed(&self, queue_id: VarInt, binding_id: VarInt) -> Hold {
         if queue_id.as_u64() > self.state.max_queue_id {
-            return false;
+            return Hold::PastQueues;
         }
-        self.state.freed.hold(queue_id, binding_id)
+        if self.state.freed.hold(queue_id, binding_id) {
+            Hold::New
+        } else {
+            Hold::Already
+        }
     }
 
     /// Attempt to bind a slot and push the first stream entry.
@@ -488,9 +505,10 @@ mod tests {
         let (server, _path_entry, _tx, _rx) = test_server(capacity + 1);
 
         // The last slot that the freed set records is held for its rejected init.
-        assert!(server.hold_freed(v(capacity - 1), v(1)));
-        // The slot at the freed set's capacity is one of the peer's queues, and isn't held.
-        assert!(!server.hold_freed(v(capacity), v(1)));
+        assert_eq!(server.hold_freed(v(capacity - 1), v(1)), Hold::New);
+        // The slot at the freed set's capacity is one of the peer's queues, but it is past
+        // `max_queue_id`, so it isn't held.
+        assert_eq!(server.hold_freed(v(capacity), v(1)), Hold::PastQueues);
     }
 
     #[test]
@@ -703,5 +721,15 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Ok(BindResult::NewBinding { .. })));
+    }
+
+    #[test]
+    fn hold_freed_tells_a_new_hold_from_a_held_slot_and_a_slot_past_the_queues() {
+        let (server, _path_entry, _tx, _rx) = test_server(4);
+
+        assert_eq!(server.hold_freed(v(1), v(1)), Hold::New);
+        assert_eq!(server.hold_freed(v(1), v(2)), Hold::Already, "slot 1 is held for binding 1");
+        assert_eq!(server.hold_freed(v(3), v(2)), Hold::New);
+        assert_eq!(server.hold_freed(v(4), v(1)), Hold::PastQueues, "the peer has 4 queues");
     }
 }
