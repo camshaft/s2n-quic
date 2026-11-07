@@ -118,14 +118,20 @@ impl Drop for RejectedInit {
     /// Tears down a stream the reject still holds, for a packet the endpoint doesn't take or one
     /// the path secret map refuses after the decrypt, and then puts back the slot's tombstone from
     /// before the bind, so that the genuine init of the same binding isn't refused as stale. The
-    /// stream is disabled first: a stream dropped without `disable` resets its binding as its
-    /// reader drops, and that reset would release the hold of the slot's genuine rejected init as
-    /// it leaves the priority router.
+    /// teardown doesn't record the slot as freed: it was free before the bind, and the client's
+    /// stream of that binding may still hold it, so a free would let the client hand it to another
+    /// stream while that stream lives. The stream is disabled first: a stream dropped without
+    /// `disable` resets its binding as its reader drops, and that reset would release the hold of
+    /// the slot's genuine rejected init as it leaves the priority router.
     fn drop(&mut self) {
         if let Some(mut stream) = self.stream.take() {
             stream.disable();
+            self.server
+                .view()
+                .leave_free_unrecorded(self.queue_pair.dest_queue_id);
             // The stream's receivers drop here, which marks the slot unallocated with this
-            // binding as its tombstone, before the tombstone from before the bind is put back.
+            // binding as its tombstone and doesn't record it as freed, before the tombstone from
+            // before the bind is put back.
             drop(stream);
             self.server.view().restore_tombstone(
                 self.queue_pair.dest_queue_id,
@@ -2064,7 +2070,7 @@ fn reject_init(
 /// reset of the client's genuine rejected init on that slot wouldn't be sent. For a packet the
 /// endpoint doesn't take, the reject's drop tears down a stream that `bind_for_init` bound the
 /// slot to and puts back the slot's tombstone from before the bind, so that the genuine init of
-/// the same binding isn't refused as stale; the slot isn't held or reset.
+/// the same binding isn't refused as stale; the slot isn't held, reset or recorded as freed.
 fn settle_rejected_init(
     mut rejected: RejectedInit,
     take: bool,

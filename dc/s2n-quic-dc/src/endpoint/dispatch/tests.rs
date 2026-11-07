@@ -1012,10 +1012,11 @@ fn slow_path_rejected_inits_leave_one_reset_for_each_slot_until_it_leaves() {
 }
 
 /// An init that `bind_for_init` binds a slot for, whose acceptor is closed or doesn't have a slot
-/// for the stream, and whose packet fails the AEAD check, doesn't hold the slot or send a reset,
-/// and the reject disables the stream it bound and puts back the slot's tombstone from before the
-/// bind, so that the slot doesn't stay bound and the genuine init of the same binding then gets
-/// its one reset.
+/// for the stream, and whose packet fails the AEAD check, doesn't hold the slot, record it as freed
+/// or send a reset, and the reject disables the stream it bound and puts back the slot's tombstone
+/// from before the bind, so that the slot doesn't stay bound and the genuine init of the same
+/// binding then gets its one reset. The slot was free before the bind, and the client's genuine
+/// stream may hold it, so a free would let the client hand it to another stream.
 #[test]
 fn a_tampered_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
     for init_acceptor in [InitAcceptor::Closed, InitAcceptor::WithoutSlots] {
@@ -1046,6 +1047,17 @@ fn a_tampered_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
                 Some(diag) if diag.unallocated && diag.stored_binding == 1
             ),
             "{init_acceptor:?}: binding 1's receivers drop, so slot 1's tombstone is 1"
+        );
+        let path_entry = harness.path_entry.clone();
+        let crate::path::secret::map::entry::QueueState::Server(ref entry_state) =
+            *path_entry.queue_state()
+        else {
+            panic!("{init_acceptor:?}: expected a server queue state");
+        };
+        let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+        assert!(
+            entry_state.freed.take(&mut freed).is_some() && freed.contains(1),
+            "{init_acceptor:?}: binding 1's end records slot 1 as freed"
         );
 
         // An init on slot 1 for binding 2 whose payload is changed on the network.
@@ -1081,6 +1093,11 @@ fn a_tampered_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
             "{init_acceptor:?}: a packet that fails the AEAD check doesn't hold its slot"
         );
         state.freed.unhold(VarInt::from_u8(1), VarInt::from_u8(2));
+        let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+        assert!(
+            entry_state.freed.take(&mut freed).is_none(),
+            "{init_acceptor:?}: a tampered packet doesn't record its slot as freed"
+        );
 
         // The client's genuine init on slot 1 for binding 2 then gets its one reset.
         let (mut packet, opener, decrypt_len) =
@@ -1102,6 +1119,13 @@ fn a_tampered_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
             take_resets(&mut harness.frame_rx),
             vec![(1, 2)],
             "{init_acceptor:?}: the genuine init gets its one reset"
+        );
+        // The tampered init's mark was taken, so the genuine init's teardown records the slot in
+        // the path entry's queue state, which the hold on `state` doesn't cover.
+        let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+        assert!(
+            entry_state.freed.take(&mut freed).is_some() && freed.contains(1),
+            "{init_acceptor:?}: the genuine init's teardown records slot 1 as freed"
         );
     }
 }
@@ -1141,6 +1165,17 @@ fn a_dropped_rejected_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() 
             ),
             "{init_acceptor:?}: binding 1's receivers drop, so slot 1's tombstone is 1"
         );
+        let path_entry = harness.path_entry.clone();
+        let crate::path::secret::map::entry::QueueState::Server(ref entry_state) =
+            *path_entry.queue_state()
+        else {
+            panic!("{init_acceptor:?}: expected a server queue state");
+        };
+        let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+        assert!(
+            entry_state.freed.take(&mut freed).is_some() && freed.contains(1),
+            "{init_acceptor:?}: binding 1's end records slot 1 as freed"
+        );
 
         // An init on slot 1 for binding 2 whose packet the path secret map refuses after the
         // decrypt: the refusal drops the reject that the decrypt returned.
@@ -1172,6 +1207,11 @@ fn a_dropped_rejected_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() 
             "{init_acceptor:?}: a dropped reject doesn't hold its slot"
         );
         state.freed.unhold(VarInt::from_u8(1), VarInt::from_u8(2));
+        let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+        assert!(
+            entry_state.freed.take(&mut freed).is_none(),
+            "{init_acceptor:?}: a dropped reject doesn't record its slot as freed"
+        );
 
         // The client's genuine init on slot 1 for binding 2 then gets its one reset.
         let (mut packet, opener, decrypt_len) =
@@ -1193,6 +1233,13 @@ fn a_dropped_rejected_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() 
             take_resets(&mut harness.frame_rx),
             vec![(1, 2)],
             "{init_acceptor:?}: the genuine init gets its one reset"
+        );
+        // The dropped reject's mark was taken, so the genuine init's teardown records the slot in
+        // the path entry's queue state, which the hold on `state` doesn't cover.
+        let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+        assert!(
+            entry_state.freed.take(&mut freed).is_some() && freed.contains(1),
+            "{init_acceptor:?}: the genuine init's teardown records slot 1 as freed"
         );
     }
 }

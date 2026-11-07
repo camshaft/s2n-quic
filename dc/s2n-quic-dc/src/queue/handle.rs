@@ -132,10 +132,14 @@ impl Drop for StreamReceiver {
     fn drop(&mut self) {
         let slot = self.slot();
         let queue_id = slot.queue_id();
+        // Taken as the slot is marked unallocated under the half locks, before a later binding
+        // can allocate the slot. See `Slot::leave_free_unrecorded`.
+        let mut record_free = false;
         let is_last = half::close_receiver(&slot.stream, &slot.control, true, || {
             slot.mark_unallocated();
+            record_free = !slot.take_free_unrecorded();
         });
-        if is_last {
+        if is_last && record_free {
             reclaim(queue_id, &mut self.on_free);
         }
     }
@@ -215,10 +219,13 @@ impl Drop for ControlReceiver {
     fn drop(&mut self) {
         let slot = self.slot();
         let queue_id = slot.queue_id();
+        // See the stream receiver's drop.
+        let mut record_free = false;
         let is_last = half::close_receiver(&slot.stream, &slot.control, false, || {
             slot.mark_unallocated();
+            record_free = !slot.take_free_unrecorded();
         });
-        if is_last {
+        if is_last && record_free {
             reclaim(queue_id, &mut self.on_free);
         }
     }
