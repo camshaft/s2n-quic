@@ -61,6 +61,7 @@ fn setup_with_pacing(num_workers: usize, pacing: SendPacing) -> (SubmissionSende
         pacing,
         Budgets::default(),
         crate::counter::Registry::default(),
+        None,
         crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
             1_000_000,
         ))),

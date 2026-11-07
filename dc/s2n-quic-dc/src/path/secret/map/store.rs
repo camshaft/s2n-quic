@@ -219,4 +219,28 @@ pub trait Store: 'static + Send + Sync + time::Clock {
 
     /// Publishes a PathSecretMapDeadMarkSkipped event.
     fn on_dead_mark_skipped(&self, peer_address: &SocketAddr);
+
+    /// Publishes a CreditlessWindowFrameRefused event.
+    fn on_creditless_window_frame_refused(
+        &self,
+        frame_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    );
+
+    /// Publishes a CreditlessWindowLimitGrew event.
+    fn on_creditless_window_limit_grew(
+        &self,
+        released_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    );
+
+    /// Publishes a CreditlessWindowLimitHalved event.
+    fn on_creditless_window_limit_halved(
+        &self,
+        held_bytes: u64,
+        previous_limit_bytes: u64,
+        limit_bytes: u64,
+    );
 }
