@@ -69,6 +69,9 @@ mod tests;
 ///
 /// Cancelled frames (where `should_transmit()` returns false) are sent to `cancelled`
 /// for completion notification.
+///
+/// The lost mark of a pair that sends acknowledgements alone is counted on `send_counters`,
+/// and its event is published through `path_secret_map` where one is set.
 pub(crate) fn assemble<R: Recycler, Clk>(
     context: &mut Context,
     immediate_queue_status: ImmediateQueueStatus,
@@ -83,6 +86,7 @@ pub(crate) fn assemble<R: Recycler, Clk>(
     freed_batch_tx: &mut FreedBatchTx,
     counters: &AssemblerCounters,
     send_counters: &crate::endpoint::counters::Send,
+    path_secret_map: Option<&crate::path::secret::Map>,
     send_credit_pool: &crate::credit::Pool,
 ) -> Option<Segments<R>>
 where
@@ -93,12 +97,14 @@ where
     // A context that sends acknowledgements alone has no packet in the inflight map for its
     // probe timeout to check, so its interface pair is marked lost here once its last
     // ack-eliciting packet waited for a persistent congestion period without an
-    // acknowledgement.
+    // acknowledgement. The mark records its time, counts the pair on `send_counters` and
+    // publishes its event through `path_secret_map`, as the probe timeout task's mark does.
     if !context.inflight.has_inflight()
         && !context.is_path_lost()
         && context.has_stopped_delivering(now)
     {
-        context.mark_path_lost(now);
+        let mark = |context: &mut Context| context.mark_path_lost(now);
+        crate::endpoint::send::track_path_lost(context, send_counters, path_secret_map, mark);
     }
     let PathInfo {
         max_datagram_size: mtu,

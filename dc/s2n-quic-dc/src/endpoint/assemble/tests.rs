@@ -420,6 +420,7 @@ fn assemble_accounts_for_header_overhead() {
             &crate::counter::Registry::default(),
             crate::endpoint::id::LocalSenderId::from_index(0),
         ),
+        None,
         &unused_credit_pool(),
     )
     .expect("frames should assemble");
@@ -519,6 +520,7 @@ fn assemble_batches_full_mtu_data_frames() {
             &crate::counter::Registry::default(),
             crate::endpoint::id::LocalSenderId::from_index(0),
         ),
+        None,
         &unused_credit_pool(),
     )
     .expect("frames should assemble");
@@ -605,6 +607,7 @@ fn assemble_does_not_pad_small_control_only_batch() {
             &crate::counter::Registry::default(),
             crate::endpoint::id::LocalSenderId::from_index(0),
         ),
+        None,
         &unused_credit_pool(),
     )
     .expect("frames should assemble");
@@ -697,6 +700,7 @@ fn assemble_fuzz_respects_gso_invariants() {
                     &crate::counter::Registry::default(),
                     crate::endpoint::id::LocalSenderId::from_index(0),
                 ),
+                None,
                 &unused_credit_pool(),
             )
             .expect("assemble should make progress for bounded test inputs");
@@ -784,6 +788,7 @@ fn assemble_full_mtu_bursts_match_oracle() {
                     &crate::counter::Registry::default(),
                     crate::endpoint::id::LocalSenderId::from_index(0),
                 ),
+                None,
                 &unused_credit_pool(),
             );
             let (got_sizes, got_pending) = match segments {
@@ -1071,6 +1076,7 @@ fn assemble_probe_fuzz() {
                     &crate::counter::Registry::default(),
                     crate::endpoint::id::LocalSenderId::from_index(0),
                 ),
+                None,
                 &unused_credit_pool(),
             );
 
@@ -1098,6 +1104,7 @@ fn assemble_probe_fuzz() {
                     &crate::counter::Registry::default(),
                     crate::endpoint::id::LocalSenderId::from_index(0),
                 ),
+                None,
                 &unused_credit_pool(),
             );
 
@@ -1368,6 +1375,7 @@ fn orphaned_shell_survives_cancelled_probe_tail() {
                 &mut freed_batch_tx,
                 &AssemblerCounters::new(&registry),
                 &send_counters,
+                None,
                 &credit_pool,
             )
         };
@@ -1567,6 +1575,7 @@ fn ack_only_segment_must_not_consume_pto_probe_budget() {
                 &mut freed_batch_tx,
                 &AssemblerCounters::new(&registry),
                 &send_counters,
+                None,
                 &credit_pool,
             )
         };
@@ -1678,6 +1687,7 @@ fn the_first_unacknowledged_packet_starts_the_wait_for_an_acknowledgement() {
                 &mut freed_batch_tx,
                 &AssemblerCounters::new(&registry),
                 &send_counters,
+                None,
                 &credit_pool,
             )
         };
@@ -1705,5 +1715,123 @@ fn the_first_unacknowledged_packet_starts_the_wait_for_an_acknowledgement() {
         context.lost_at.map(|at| at.nanos),
         Some(marked_at.nanos),
         "the mark records when it was set"
+    );
+}
+
+/// The lost-pair events that `subscriber` received.
+fn lost_events(subscriber: &crate::event::testing::Subscriber) -> u64 {
+    subscriber
+        .path_secret_map_interface_pair_lost
+        .load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A context that sends acknowledgements alone has its pair marked lost by the assembler once
+/// its ACK-only probe waited a persistent congestion period without an acknowledgement, and
+/// not before. The mark records its time, and counts the pair and publishes its event once, as
+/// the probe timeout task's mark does.
+#[test]
+fn the_assembler_marks_an_ack_only_pair_lost_with_its_time_count_and_event() {
+    let mtu = 1500;
+    let registry = Registry::new();
+    let (mut context, _entry) = make_context(mtu, &registry);
+
+    let clock = Clock::new(Duration::from_millis(10));
+    let gso = make_gso(1);
+    let pool = pool::Pool::new(u16::MAX);
+    let mut header_buf = Vec::new();
+    let mut cancelled = Queue::new();
+    let mut ack_completions = Queue::new();
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    let send_counters = crate::endpoint::counters::Send::new(
+        &registry,
+        crate::endpoint::id::LocalSenderId::from_index(0),
+    );
+    let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+    let map = crate::path::secret::Map::builder()
+        .with_signer(crate::path::secret::stateless_reset::Signer::random())
+        .with_capacity(4)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber(subscriber.clone())
+        .build()
+        .unwrap();
+    let source_sender_id = crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1));
+    let source_control_port = 443;
+
+    let credit_pool = unused_credit_pool();
+
+    macro_rules! run_assemble {
+        () => {
+            assemble::<SyncRecycler, _>(
+                &mut context,
+                ImmediateQueueStatus::Empty,
+                &clock,
+                source_sender_id,
+                source_control_port,
+                &gso,
+                pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
+                &mut header_buf,
+                &mut cancelled,
+                &mut ack_completions,
+                &mut freed_batch_tx,
+                &AssemblerCounters::new(&registry),
+                &send_counters,
+                Some(&map),
+                &credit_pool,
+            )
+        };
+    }
+
+    // The context's last ack-eliciting packet is an ACK-only probe, which the inflight map
+    // doesn't hold, sent at the peer's last acknowledgement.
+    context.last_peer_activity = clock.get_time();
+    context.ack_only_probe_sent = Some(clock.get_time());
+    let threshold = context.rtt_estimator.persistent_congestion_threshold();
+
+    clock.advance(threshold - Duration::from_millis(1));
+    let _ = run_assemble!();
+    assert!(
+        !context.is_path_lost(),
+        "before a persistent congestion period, the pair isn't marked lost"
+    );
+    assert_eq!(lost_events(&subscriber), 0);
+
+    clock.advance(Duration::from_millis(1));
+    let marked_at = clock.get_time();
+    let _ = run_assemble!();
+    assert!(
+        context.is_path_lost(),
+        "a persistent congestion period after the probe, the pair is marked lost"
+    );
+    assert_eq!(
+        context.lost_at.map(|at| at.nanos),
+        Some(marked_at.nanos),
+        "the mark records when it was set"
+    );
+    assert_eq!(
+        lost_events(&subscriber),
+        1,
+        "the mark publishes its event once"
+    );
+
+    clock.advance(threshold);
+    let _ = run_assemble!();
+    assert_eq!(
+        context.lost_at.map(|at| at.nanos),
+        Some(marked_at.nanos),
+        "a later assembly doesn't mark the pair again"
+    );
+    assert_eq!(
+        lost_events(&subscriber),
+        1,
+        "a later assembly doesn't publish the event again"
+    );
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("tx.interface_pair.lost=1 Variant|send.0"),
+        "got: {line}"
     );
 }
