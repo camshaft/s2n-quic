@@ -47,7 +47,8 @@ const HANDSHAKE_ROUND_TRIPS: u32 = 2;
 /// the packet of that round trip waited in the endpoint's receive queue, as the socket measured
 /// it, or else the most that the packet could have waited during the endpoint's last pass, and
 /// the handshake's two round trips as the client timed them, with the part of each that the
-/// server's reply waited in the endpoint's receive queue.
+/// server's reply waited in the endpoint's receive queue, as the socket measured it, and the most
+/// that the reply could have waited during the endpoint's last pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RoundTrips {
     pub(super) lowest: Duration,
@@ -79,6 +80,17 @@ pub(super) struct RoundTrips {
     /// grows between the two round trips, as when the endpoint's load rises during the handshake,
     /// raises the second round trip by the growth, which isn't a longer path.
     pub(super) flight_waits: [Option<Duration>; 2],
+    /// The part of each of `flights` that the endpoint's pass of its event loop before the pass
+    /// that read the server's reply ran after the reply could first have reached the endpoint,
+    /// once the client sent its flight and the path's least time, `RoundTrips::path`, passed, or
+    /// zero where the round trip isn't timed. The endpoint reads a reply that arrives while a pass
+    /// runs in its next pass, so this part is the most that the reply could have waited during
+    /// the endpoint's last pass, as `waited` bounds the wait of the lowest round trip's packet
+    /// where the socket didn't measure it, and the part of that pass that ran while the reply was
+    /// still on the path doesn't count. A reply that waited through more than one pass, or past
+    /// the end of the last pass, waited more, and one whose path took longer than the least
+    /// waited less.
+    pub(super) flight_passes: [Duration; 2],
 }
 
 impl RoundTrips {
@@ -99,7 +111,12 @@ impl RoundTrips {
     /// reply's wait: the endpoint's receive queue doesn't raise them, so a wait that grows
     /// between the round trips stays in the handshake's time, and a far path whose round trips
     /// vary still shows that spread. Otherwise, as where a wait that the socket over-counted
-    /// reaches its round trip, they are the round trips as the connection measured them.
+    /// reaches its round trip, they are the lowest round trip as the connection measured it, and
+    /// each of the two less its part of `flight_passes`, the most that its reply could have
+    /// waited during the endpoint's last pass, so a wait that grows within that pass stays in the
+    /// handshake's time too. The lowest round trip keeps its whole time, so the spread and the
+    /// time of the two round trips together are never above those of the round trips as the
+    /// connection measured them.
     fn compared(self) -> (Duration, [Duration; 2]) {
         let [first, second] = self.flights;
         match (self.measured, self.flight_waits) {
@@ -110,7 +127,12 @@ impl RoundTrips {
                 let second = second.saturating_sub(second_wait);
                 (self.path(), [first, second])
             }
-            _ => (self.lowest, self.flights),
+            _ => {
+                let [first_pass, second_pass] = self.flight_passes;
+                let first = first.saturating_sub(first_pass);
+                let second = second.saturating_sub(second_pass);
+                (self.lowest, [first, second])
+            }
         }
     }
 
@@ -242,10 +264,12 @@ impl Answer {
     /// the wait of each reply, of the lowest round trip and of the two, each below its round
     /// trip, the spread compares each less its reply's wait, so a wait that grows between the
     /// handshake's round trips, as when the endpoint's load rises during the handshake, stays in
-    /// the rest. Otherwise the spread takes out the part of the wait that the longer round trip
-    /// held above the lowest. Without either time, the rest is the whole time. Where the round
-    /// trips take the whole time, the handshake doesn't show a time to compare, and it answers
-    /// `Finished`, a clean answer without a time, so that a time of zero doesn't become the base.
+    /// the rest. Otherwise the spread compares each less the most that its reply could have
+    /// waited during the endpoint's last pass, so a wait that grows within that pass stays in the
+    /// rest too, while the part of a wait past that pass counts in the spread. Without either
+    /// time, the rest is the whole time. Where the round trips take the whole time, the handshake
+    /// doesn't show a time to compare, and it answers `Finished`, a clean answer without a time,
+    /// so that a time of zero doesn't become the base.
     pub(super) fn for_handshake(
         elapsed: Duration,
         earlier_rtt: Option<Duration>,
@@ -508,6 +532,7 @@ mod tests {
             measured: false,
             flights: [ms(lowest), ms(lowest)],
             flight_waits: [None, None],
+            flight_passes: [Duration::ZERO; 2],
         })
     }
 
@@ -521,6 +546,7 @@ mod tests {
             measured: true,
             flights: [ms(lowest), ms(lowest)],
             flight_waits: [None, None],
+            flight_passes: [Duration::ZERO; 2],
         })
     }
 
@@ -539,6 +565,7 @@ mod tests {
             measured: false,
             flights: [ms(first), ms(second)],
             flight_waits: [None, None],
+            flight_passes: [Duration::ZERO; 2],
         })
     }
 
@@ -558,6 +585,24 @@ mod tests {
             measured: true,
             flights: [ms(first), ms(second)],
             flight_waits: [Some(ms(first_wait)), Some(ms(second_wait))],
+            flight_passes: [Duration::ZERO; 2],
+        })
+    }
+
+    /// The round trips of a connection whose lowest round-trip time took `lowest` ms, whose packet
+    /// couldn't have waited during the endpoint's last pass, and whose handshake's two round trips
+    /// each took the first ms of its pair in `round_trips`. The second of the pair is the part in
+    /// ms of the round trip that the endpoint's last pass before the pass that read its reply ran
+    /// after the client sent its flight. The socket didn't measure the wait of any reply.
+    fn rtt_passes(lowest: u64, round_trips: [(u64, u64); 2]) -> Option<RoundTrips> {
+        let [(first, first_pass), (second, second_pass)] = round_trips;
+        Some(RoundTrips {
+            lowest: ms(lowest),
+            waited: Duration::ZERO,
+            measured: false,
+            flights: [ms(first), ms(second)],
+            flight_waits: [None, None],
+            flight_passes: [ms(first_pass), ms(second_pass)],
         })
     }
 
@@ -889,6 +934,20 @@ mod tests {
         let mut permits = take_all(&limit).into_iter();
         permits.next().unwrap().release(without_its_spread);
         assert_eq!(limit.current(), 2);
+
+        // Where the endpoint's last pass before the pass that read the second reply ran for 1 ms
+        // after the reply could first have reached the endpoint, that 1 ms counts as the
+        // endpoint's time, the most that the reply could have waited, and 2 ms is left, within
+        // twice the base: beside the near peer's handshake, the limit grows. The connection's
+        // round trips leave out a part of that pass that ran while the reply was still on the
+        // path, which isn't the endpoint's time.
+        let with_a_pass = Answer::for_handshake(ms(120), None, rtt_passes(50, [(50, 0), (69, 1)]));
+        assert_eq!(with_a_pass, Answer::Latency(ms(2)));
+        drop(permits);
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(with_a_pass);
+        permits.next().unwrap().release(near);
+        assert_eq!(limit.current(), 3);
     }
 
     #[test]
@@ -986,8 +1045,9 @@ mod tests {
 
         // Read with the round trips as the connection measured them, the 4 ms that the second
         // reply waited counts as the spread, and the same handshake shows 1 ms, within twice the
-        // base. Where the socket didn't measure the wait of the second reply, the handshake reads
-        // its round trips that way too.
+        // base. Where the socket didn't measure the wait of the second reply, and the endpoint's
+        // last pass didn't run after the second flight went out, the handshake reads its round
+        // trips that way too.
         let as_measured = Answer::for_handshake(ms(7), Some(ms(1)), flights(1, 1, 5));
         assert_eq!(as_measured, Answer::Latency(ms(1)));
         let unmeasured = grown.map(|rtt| RoundTrips {
@@ -996,6 +1056,42 @@ mod tests {
         });
         assert_eq!(
             Answer::for_handshake(ms(7), Some(ms(1)), unmeasured),
+            Answer::Latency(ms(1))
+        );
+    }
+
+    #[test]
+    fn a_near_handshake_whose_unmeasured_wait_grows_in_the_last_pass_still_halves_the_limit() {
+        let limit = Limit::new();
+        // A near peer's handshake runs alone: its connection measures a 1 ms round trip, and the
+        // 1 ms past two of them is the base.
+        round(&limit, Answer::for_handshake(ms(3), None, rtt(1)));
+        assert_eq!(limit.current(), 2);
+
+        // The endpoint's load rises during the next handshake with the peer, and the socket
+        // doesn't measure the wait of any reply. The handshake's lowest round trip takes 1 ms, its
+        // first round trip 1 ms, and its second 5 ms, 4 ms of which the endpoint's last pass
+        // before the one that read the second reply ran after the reply could first have reached
+        // the endpoint. Less
+        // that part, both round trips take 1 ms, so the spread is zero, and 5 ms of the
+        // handshake's 7 ms is past two round trips, past twice the base, which halves the limit.
+        let grown = rtt_passes(1, [(1, 0), (5, 4)]);
+        assert_eq!(grown.unwrap().spread(), Duration::ZERO);
+        assert_eq!(grown.unwrap().flights_time(), ms(2));
+        let late = Answer::for_handshake(ms(7), Some(ms(1)), grown);
+        assert_eq!(late, Answer::Latency(ms(5)));
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(late);
+        assert_eq!(limit.current(), 1);
+
+        // Where the reply waited past the endpoint's last pass, which didn't run after the reply
+        // could have reached the endpoint, the round trips can't tell that wait from a longer
+        // path: the 4 ms counts as the spread, and the same handshake shows 1 ms, within twice
+        // the base.
+        let past_the_pass = rtt_passes(1, [(1, 0), (5, 0)]);
+        assert_eq!(past_the_pass.unwrap().spread(), ms(4));
+        assert_eq!(
+            Answer::for_handshake(ms(7), Some(ms(1)), past_the_pass),
             Answer::Latency(ms(1))
         );
     }

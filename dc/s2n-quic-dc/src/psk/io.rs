@@ -89,7 +89,8 @@ impl CoreSub for DcPathCapture {
 /// packet's datagram holds one, or else the most that the packet could have waited during the
 /// endpoint's last pass. It also records the handshake's two round trips as the client timed them
 /// from its own packets, and the part of each that the server's reply waited in the endpoint's
-/// receive queue, as the socket measured it.
+/// receive queue, as the socket measured it, and the most that the reply could have waited during
+/// the endpoint's last pass.
 #[derive(Default)]
 struct PathRtt {
     /// The endpoint's last pass of its event loop.
@@ -134,6 +135,10 @@ struct PathRttContext {
     /// The part of `first_flight` that the reply waited in the endpoint's receive queue: the
     /// `receive_wait` of the reply's datagram.
     first_wait: Option<Duration>,
+    /// The endpoint's last pass of its event loop before the pass that read the reply that ended
+    /// `first_flight`. The part of it that ran after the reply could first have reached the
+    /// endpoint is the most that the reply could have waited during that pass.
+    first_pass: Pass,
     /// Whether the connection's path secrets are ready, after which a client sends its
     /// `DC_STATELESS_RESET_TOKENS` frame.
     secrets_ready: bool,
@@ -146,6 +151,10 @@ struct PathRttContext {
     /// The part of `second_flight` that the reply waited in the endpoint's receive queue: the
     /// `receive_wait` of the datagram that the connection reads at dc.complete.
     second_wait: Option<Duration>,
+    /// The endpoint's last pass of its event loop before the pass at dc.complete, which ended
+    /// `second_flight`. The part of it that ran after the reply could first have reached the
+    /// endpoint is the most that the reply could have waited during that pass.
+    second_pass: Pass,
 }
 
 impl PathRttContext {
@@ -175,13 +184,14 @@ impl PathRttContext {
         }
     }
 
-    /// Records a packet the connection received at `now`: the first ends the first round trip,
-    /// and the wait of its datagram, where the socket measured one, is the part of it that the
-    /// reply waited.
-    fn on_received(&mut self, now: Duration) {
+    /// Records a packet the connection received at `now`, in the pass after `last_pass`: the
+    /// first ends the first round trip, and the wait of its datagram, where the socket measured
+    /// one, is the part of it that the reply waited. The connection keeps `last_pass` with it.
+    fn on_received(&mut self, now: Duration, last_pass: Pass) {
         if let (None, Some(sent)) = (self.first_flight, self.first_sent) {
             self.first_flight = Some(now.saturating_sub(sent));
             self.first_wait = self.receive_wait;
+            self.first_pass = last_pass;
         }
     }
 
@@ -190,32 +200,46 @@ impl PathRttContext {
         self.secrets_ready = true;
     }
 
-    /// Records dc.complete at `now`, which ends the second round trip, with the wait of the
-    /// datagram that the connection reads then, where the socket measured one, as the part of it
-    /// that the reply waited.
-    fn on_complete(&mut self, now: Duration) {
+    /// Records dc.complete at `now`, in the pass after `last_pass`, which ends the second round
+    /// trip, with the wait of the datagram that the connection reads then, where the socket
+    /// measured one, as the part of it that the reply waited, and keeps `last_pass` with it.
+    fn on_complete(&mut self, now: Duration, last_pass: Pass) {
         if let (None, Some(sent)) = (self.second_flight, self.second_sent) {
             self.second_flight = Some(now.saturating_sub(sent));
             self.second_wait = self.receive_wait;
+            self.second_pass = last_pass;
         }
     }
 
-    /// The connection's round trips, or `None` before its first recovery metrics. Until both of
-    /// the handshake's round trips are timed, as before dc.complete, each reads as the lowest,
-    /// which leaves the spread out.
+    /// The connection's round trips, or `None` before its first recovery metrics. With each of
+    /// the handshake's two round trips, it reads the part of the endpoint's last pass before the
+    /// pass that read the round trip's reply that ran after the reply could first have reached
+    /// the endpoint: once the flight went out and the path's least time, `RoundTrips::path`,
+    /// passed. A part of that pass that ran while the reply was still on the path isn't time
+    /// that the reply waited. Until both of the handshake's round trips are timed, as before
+    /// dc.complete, each reads as the lowest, without a part of the last pass, which leaves the
+    /// spread out.
     fn round_trips(&self) -> Option<limit::RoundTrips> {
         let lowest = self.min_rtt?;
-        let flights = match (self.first_flight, self.second_flight) {
-            (Some(first), Some(second)) => [first, second],
-            _ => [lowest, lowest],
-        };
-        Some(limit::RoundTrips {
+        let mut round_trips = limit::RoundTrips {
             lowest,
             waited: self.waited,
             measured: self.measured,
-            flights,
+            flights: [lowest, lowest],
             flight_waits: [self.first_wait, self.second_wait],
-        })
+            flight_passes: [Duration::ZERO; 2],
+        };
+        let first = self.first_flight.zip(self.first_sent);
+        let second = self.second_flight.zip(self.second_sent);
+        if let (Some((first, first_sent)), Some((second, second_sent))) = (first, second) {
+            let path = round_trips.path();
+            round_trips.flights = [first, second];
+            round_trips.flight_passes = [
+                self.first_pass.after(first_sent.saturating_add(path)),
+                self.second_pass.after(second_sent.saturating_add(path)),
+            ];
+        }
+        Some(round_trips)
     }
 }
 
@@ -267,7 +291,7 @@ impl CoreSub for PathRtt {
         meta: &events::ConnectionMeta,
         _event: &events::PacketReceived,
     ) {
-        context.on_received(meta.timestamp.duration_since_start());
+        context.on_received(meta.timestamp.duration_since_start(), self.last_pass);
     }
 
     fn on_dc_state_changed(
@@ -279,7 +303,7 @@ impl CoreSub for PathRtt {
         match event.state {
             events::DcState::PathSecretsReady { .. } => context.on_secrets_ready(),
             events::DcState::Complete { .. } => {
-                context.on_complete(meta.timestamp.duration_since_start())
+                context.on_complete(meta.timestamp.duration_since_start(), self.last_pass)
             }
             _ => {}
         }
@@ -1195,8 +1219,8 @@ mod tests {
         // at 60 ms and 62 ms.
         context.on_sent(ms(10));
         context.on_sent(ms(11));
-        context.on_received(ms(60));
-        context.on_received(ms(62));
+        context.on_received(ms(60), Pass::default());
+        context.on_received(ms(62), Pass::default());
         let first = context.round_trips().unwrap();
         assert_eq!(first.flights, [ms(50), ms(50)]);
         assert_eq!(first.spread(), Duration::ZERO);
@@ -1205,12 +1229,12 @@ mod tests {
         // Packets that arrive at 63 ms and 100 ms don't end the second round trip, and dc.complete
         // at 133 ms does, once.
         context.on_secrets_ready();
-        context.on_received(ms(63));
+        context.on_received(ms(63), Pass::default());
         context.on_sent(ms(64));
         context.on_sent(ms(65));
-        context.on_received(ms(100));
-        context.on_complete(ms(133));
-        context.on_complete(ms(140));
+        context.on_received(ms(100), Pass::default());
+        context.on_complete(ms(133), Pass::default());
+        context.on_complete(ms(140), Pass::default());
         assert_eq!(
             context.round_trips(),
             Some(limit::RoundTrips {
@@ -1219,6 +1243,7 @@ mod tests {
                 measured: false,
                 flights: [ms(50), ms(69)],
                 flight_waits: [None, None],
+                flight_passes: [Duration::ZERO; 2],
             })
         );
 
@@ -1243,18 +1268,18 @@ mod tests {
         // change the first round trip's wait.
         context.on_sent(ms(10));
         receive(&mut path_rtt, &mut context, start, 11, Some(0));
-        context.on_received(ms(11));
+        context.on_received(ms(11), Pass::default());
         receive(&mut path_rtt, &mut context, start, 12, Some(3));
-        context.on_received(ms(12));
+        context.on_received(ms(12), Pass::default());
 
         // The second flight goes out at 13 ms, and the reply that completes the handshake is
         // read at 18 ms, after it waited 4 ms in the endpoint's receive queue.
         context.on_secrets_ready();
         context.on_sent(ms(13));
         receive(&mut path_rtt, &mut context, start, 18, Some(4));
-        context.on_complete(ms(18));
+        context.on_complete(ms(18), Pass::default());
         receive(&mut path_rtt, &mut context, start, 20, Some(9));
-        context.on_complete(ms(20));
+        context.on_complete(ms(20), Pass::default());
         let round_trips = context.round_trips().unwrap();
         assert_eq!(round_trips.flights, [ms(1), ms(5)]);
         assert_eq!(round_trips.flight_waits, [Some(ms(0)), Some(ms(4))]);
@@ -1267,14 +1292,158 @@ mod tests {
         };
         context.on_sent(ms(10));
         receive(&mut path_rtt, &mut context, start, 11, None);
-        context.on_received(ms(11));
+        context.on_received(ms(11), Pass::default());
         context.on_secrets_ready();
         context.on_sent(ms(13));
         receive(&mut path_rtt, &mut context, start, 18, Some(4));
-        context.on_complete(ms(18));
+        context.on_complete(ms(18), Pass::default());
         assert_eq!(
             context.round_trips().unwrap().flight_waits,
             [None, Some(ms(4))]
+        );
+    }
+
+    /// Verifies that a connection keeps, with each of its handshake's two round trips, the
+    /// endpoint's last pass before the pass that read the round trip's reply, once, that its round
+    /// trips read the part of that pass that ran after the reply could first have reached the
+    /// endpoint, and that until both are timed its round trips read zero for each.
+    #[test]
+    fn a_connection_reads_the_part_of_the_last_pass_after_each_reply_could_have_arrived() {
+        fn pass(woke: u64, slept: u64) -> Pass {
+            Pass {
+                woke: ms(woke),
+                slept: ms(slept),
+            }
+        }
+
+        let mut context = PathRttContext {
+            min_rtt: Some(ms(1)),
+            ..Default::default()
+        };
+        // The path's least time is 1 ms. The client's first flight goes out at 10 ms, and the
+        // server's reply is read at 14 ms, in the pass after one that woke at 9 ms and slept at
+        // 13 ms: 2 ms of that pass ran after 11 ms, when the reply could first have reached the
+        // endpoint, and the 1 ms before then doesn't count. A later packet doesn't change that
+        // part.
+        context.on_sent(ms(10));
+        context.on_received(ms(14), pass(9, 13));
+        context.on_received(ms(16), pass(14, 15));
+        let first = context.round_trips().unwrap();
+        assert_eq!(first.flights, [ms(1), ms(1)]);
+        assert_eq!(first.flight_passes, [Duration::ZERO; 2]);
+
+        // The second flight goes out at 17 ms, and dc.complete comes at 24 ms, in the pass after
+        // one that woke at 16 ms and slept at 23 ms, 5 ms of which ran after 18 ms. A later
+        // dc.complete doesn't change that part.
+        context.on_secrets_ready();
+        context.on_sent(ms(17));
+        context.on_complete(ms(24), pass(16, 23));
+        context.on_complete(ms(28), pass(24, 27));
+        let round_trips = context.round_trips().unwrap();
+        assert_eq!(round_trips.flights, [ms(4), ms(7)]);
+        assert_eq!(round_trips.flight_passes, [ms(2), ms(5)]);
+    }
+
+    /// Verifies that the connection's subscriber reads the endpoint's last pass for each of the
+    /// handshake's two round trips: at the first packet it receives, and at dc.complete.
+    #[test]
+    fn a_connection_reads_the_endpoints_last_pass_as_each_round_trip_ends() {
+        let start = clock::now();
+        let mut path_rtt = PathRtt::default();
+        let mut context = PathRttContext {
+            min_rtt: Some(ms(1)),
+            ..Default::default()
+        };
+        let meta = |at: u64| -> events::ConnectionMeta {
+            builder::ConnectionMeta {
+                endpoint_type: endpoint::Type::Client,
+                id: 0,
+                timestamp: start + ms(at),
+            }
+            .into_event()
+        };
+        let sent = builder::PacketSent {
+            packet_header: builder::PacketHeader::OneRtt { number: 0 },
+            packet_len: 1200,
+        }
+        .into_event();
+        let received = builder::PacketReceived {
+            packet_header: builder::PacketHeader::OneRtt { number: 0 },
+        }
+        .into_event();
+
+        // The path's least time is 1 ms. The first flight goes out at 10 ms, and its reply is
+        // read at 13 ms, in the pass after one that woke at 9 ms and slept at 12 ms, 1 ms of which
+        // ran after 11 ms, when the reply could first have reached the endpoint.
+        CoreSub::on_packet_sent(&mut path_rtt, &mut context, &meta(10), &sent);
+        sleep(&mut path_rtt, start, 9, 12);
+        CoreSub::on_packet_received(&mut path_rtt, &mut context, &meta(13), &received);
+
+        // The second flight goes out at 15 ms, and dc.complete comes at 21 ms, in the pass after
+        // one that woke at 14 ms and slept at 20 ms, 4 ms of which ran after 16 ms.
+        let ready = builder::DcStateChanged {
+            state: builder::DcState::PathSecretsReady,
+        }
+        .into_event();
+        CoreSub::on_dc_state_changed(&mut path_rtt, &mut context, &meta(13), &ready);
+        CoreSub::on_packet_sent(&mut path_rtt, &mut context, &meta(15), &sent);
+        sleep(&mut path_rtt, start, 14, 20);
+        let complete = builder::DcStateChanged {
+            state: builder::DcState::Complete,
+        }
+        .into_event();
+        CoreSub::on_dc_state_changed(&mut path_rtt, &mut context, &meta(21), &complete);
+
+        let round_trips = context.round_trips().unwrap();
+        assert_eq!(round_trips.flights, [ms(3), ms(6)]);
+        assert_eq!(round_trips.flight_passes, [ms(1), ms(4)]);
+    }
+
+    /// Verifies that a far connection's round trips leave out each part of the endpoint's last
+    /// pass that ran while the reply was still on the path, so that the start limit reads its
+    /// handshake as it reads the same round trips without those passes.
+    #[test]
+    fn a_far_connection_doesnt_count_a_pass_that_ran_while_its_reply_was_on_the_path() {
+        let mut context = PathRttContext {
+            min_rtt: Some(ms(50)),
+            ..Default::default()
+        };
+        // The path's least time is 50 ms. The first flight goes out at 1000 ms, and its reply is
+        // read at 1050 ms, in the pass after one that ran from 1000 ms to 1001 ms, while the reply
+        // was still on the path. The second flight goes out at 1051 ms, and dc.complete comes at
+        // 1120 ms, in the pass after one that ran from 1051 ms to 1052 ms.
+        context.on_sent(ms(1000));
+        let first_pass = Pass {
+            woke: ms(1000),
+            slept: ms(1001),
+        };
+        context.on_received(ms(1050), first_pass);
+        context.on_secrets_ready();
+        context.on_sent(ms(1051));
+        let second_pass = Pass {
+            woke: ms(1051),
+            slept: ms(1052),
+        };
+        context.on_complete(ms(1120), second_pass);
+        let round_trips = context.round_trips();
+        assert_eq!(
+            round_trips,
+            Some(limit::RoundTrips {
+                lowest: ms(50),
+                waited: Duration::ZERO,
+                measured: false,
+                flights: [ms(50), ms(69)],
+                flight_waits: [None, None],
+                flight_passes: [Duration::ZERO; 2],
+            })
+        );
+
+        // Its handshake of 120 ms shows 1 ms, as `limit`'s far test reads the same round trips,
+        // within twice that test's 1 ms base. Read with each pass as the endpoint's time, it
+        // would show 3 ms, past twice that base.
+        assert_eq!(
+            limit::Answer::for_handshake(ms(120), None, round_trips),
+            limit::Answer::Latency(ms(1))
         );
     }
 
@@ -1499,6 +1668,7 @@ mod tests {
                 measured: false,
                 flights: [ms(lowest), ms(lowest)],
                 flight_waits: [None, None],
+                flight_passes: [Duration::ZERO; 2],
             })
         }
 
@@ -1550,6 +1720,7 @@ mod tests {
                 measured,
                 flights: [ms(lowest), ms(lowest)],
                 flight_waits: [None, None],
+                flight_passes: [Duration::ZERO; 2],
             })
         }
 
