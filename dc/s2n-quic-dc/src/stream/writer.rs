@@ -2367,6 +2367,14 @@ impl Inner {
         // aggregation/credit/pacing/assembly. Pairs with the Outbound record at assembly so the
         // submit→wire latency is visible. PN is not assigned yet.
         crate::endpoint::frame_trace::app_send(&frame.header, *self.path_secret_entry.id());
+        // A stream submits a frame without a completion sender only as a reset: the priority
+        // router keeps one copy of each such reset while it waits for the window of frames
+        // without send credit, and the producer of every other frame waits on its completion.
+        debug_assert!(
+            frame.completion.is_some() || matches!(frame.header, Header::QueueReset { .. }),
+            "a stream frame without a completion sender must be a QueueReset: {:?}",
+            frame.header
+        );
         self.frame_tx
             .send_batch(Entry::new(frame))
             .map_err(|mut returned| {
@@ -2383,6 +2391,13 @@ impl Inner {
     }
 
     fn send_batch(&mut self, queue: Queue<Frame>) -> io::Result<()> {
+        // As in `send_frame`, a frame without a completion sender is a reset.
+        debug_assert!(
+            queue.iter().all(|frame| {
+                frame.completion.is_some() || matches!(frame.header, Header::QueueReset { .. })
+            }),
+            "a stream frame without a completion sender must be a QueueReset"
+        );
         let priority = queue
             .iter()
             .next()
