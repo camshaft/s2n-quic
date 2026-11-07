@@ -727,6 +727,29 @@ impl Context {
         sender_idx: LocalSenderId,
         clock: &impl precision::Clock,
     ) -> Result<Self, ContextError> {
+        Self::new_paired(
+            entry,
+            inflight_gauge,
+            ack_gauge,
+            pending_gauge,
+            sender_idx,
+            None,
+            clock,
+        )
+    }
+
+    /// Builds a context whose peer address is the one `place` pairs with the sender's interface,
+    /// where the endpoint lists interfaces and the peer tags its addresses. [`Self::new`] builds
+    /// one without a place, which keeps the address the sender took before.
+    pub fn new_paired(
+        entry: &Arc<PathSecretEntry>,
+        inflight_gauge: QueueGauge,
+        ack_gauge: QueueGauge,
+        pending_gauge: QueueGauge,
+        sender_idx: LocalSenderId,
+        place: Option<crate::socket::interface::SendPlace>,
+        clock: &impl precision::Clock,
+    ) -> Result<Self, ContextError> {
         let (sealer, credentials) = entry.reusable_sealer();
         let cca = congestion::Controller::new(entry.max_datagram_size());
         let rtt_estimator = RttEstimator::new(Duration::from_millis(2));
@@ -736,7 +759,14 @@ impl Context {
         if addrs.is_empty() {
             return Err(ContextError::PeerDataAddrsEmpty);
         }
-        let peer_addr = addrs[usize::from(sender_idx) % addrs.len()];
+        // Where the endpoint and the peer both list interfaces, the sender sends to the peer's
+        // interface that its own is paired with; otherwise it keeps the address it took before.
+        let peer_addr = crate::socket::interface::paired_peer_addr(
+            addrs,
+            entry.peer_data_interfaces(),
+            usize::from(sender_idx),
+            place,
+        );
 
         ::tracing::debug!(%credentials, %peer_addr, %sender_idx, "deriving sealer for credentials");
 
@@ -1459,6 +1489,9 @@ pub(crate) struct Cache {
     pending_gauge: QueueGauge,
     sender_idx: LocalSenderId,
     send_counters: Rc<super::counters::Send>,
+    /// The place of this cache's send socket among the endpoint's interfaces, which pairs its
+    /// contexts with the peer's interfaces, or `None` where the endpoint doesn't list any.
+    place: Option<crate::socket::interface::SendPlace>,
 }
 
 impl Cache {
@@ -1473,7 +1506,15 @@ impl Cache {
             pending_gauge: counter_registry.register_queue_gauge_nominal("send.pending", &variant),
             sender_idx,
             send_counters,
+            place: None,
         }
+    }
+
+    /// Sets the place of this cache's send socket among the endpoint's interfaces, so that each
+    /// context it builds sends to the peer's interface that the socket's own is paired with.
+    pub fn with_place(mut self, place: Option<crate::socket::interface::SendPlace>) -> Self {
+        self.place = place;
+        self
     }
 
     #[cfg(test)]
@@ -1493,12 +1534,13 @@ impl Cache {
         match self.contexts.entry(id) {
             MapEntry::Occupied(e) => Ok(e.get().clone()),
             MapEntry::Vacant(e) => {
-                let ctx = Context::new(
+                let ctx = Context::new_paired(
                     entry,
                     self.inflight_gauge.clone(),
                     self.ack_gauge.clone(),
                     self.pending_gauge.clone(),
                     self.sender_idx,
+                    self.place,
                     clock,
                 )?;
                 self.send_counters.on_context_created();

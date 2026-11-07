@@ -54,6 +54,7 @@ struct TestItem {
     path_secret_entry: Arc<PathSecretEntry>,
     byte_cost: u64,
     flow_credits: u64,
+    highest_priority: bool,
     drop_counter: Arc<AtomicUsize>,
 }
 
@@ -82,6 +83,12 @@ impl AssignSender for TestItem {
 impl FlowCredits for TestItem {
     fn total_flow_credits(&self) -> u64 {
         self.flow_credits
+    }
+}
+
+impl HighestPriority for TestItem {
+    fn holds_highest_priority(&self) -> bool {
+        self.highest_priority
     }
 }
 
@@ -155,6 +162,7 @@ fn new_test_item(
         path_secret_entry,
         byte_cost: 123,
         flow_credits: 0,
+        highest_priority: false,
         drop_counter,
     }
 }
@@ -1189,4 +1197,125 @@ fn send_pacing_paces_each_interface_that_holds_a_send_socket() {
     ]);
     assert_eq!(one, SendPacing::single(fast));
     assert_eq!(one.interface_count(), 1);
+}
+
+#[test]
+fn interface_paced_pick_two_routes_highest_priority_batches_to_the_chosen_interface() {
+    let rate = Rate::new(100.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    // A highest-priority item costs 1 byte and any other item 2, so that each sender's record
+    // tells them apart.
+    let item = |highest_priority: bool| {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = if highest_priority { 1 } else { 2 };
+        item.highest_priority = highest_priority;
+        item
+    };
+    let values: VecDeque<TestItem> = (0..10)
+        .map(|_| item(true))
+        .chain((0..20).map(|_| item(false)))
+        .chain((0..10).map(|_| item(true)))
+        .collect();
+    let rx = TestReceiver {
+        values,
+        consumed: 0,
+    };
+    let sends: [Sends; 4] = Default::default();
+    // Senders 0 and 1 are on the first interface, and 2 and 3 on the second, which carries the
+    // highest-priority traffic.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 0, 1, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&sends[0], &sends[1], &sends[2], &sends[3]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+
+    let count = |sender: usize, bytes: u64| {
+        sends[sender]
+            .borrow()
+            .iter()
+            .filter(|&&(_, cost)| cost == bytes)
+            .count()
+    };
+    // Every highest-priority item went to a sender of the second interface.
+    assert_eq!(count(0, 1) + count(1, 1), 0);
+    assert_eq!(count(2, 1) + count(3, 1), 20);
+    // The other items went to the senders of both interfaces.
+    assert_eq!((0..4).map(|sender| count(sender, 2)).sum::<usize>(), 20);
+    assert!(
+        count(0, 2) + count(1, 2) > 0,
+        "the first interface didn't get an item"
+    );
+}
+
+#[test]
+fn send_pacing_routes_highest_priority_batches_to_the_chosen_interface() {
+    use crate::socket::interface;
+
+    let overall = Rate::new(25.0);
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let addrs: [std::net::SocketAddr; 3] = [
+        "127.0.0.1:4000".parse().unwrap(),
+        "127.0.0.1:4001".parse().unwrap(),
+        "127.0.0.1:4002".parse().unwrap(),
+    ];
+    let pacing = |configs: &[interface::Config]| {
+        let table = interface::Table::resolve(configs, overall, &addrs, &addrs, &interface::System);
+        SendPacing::from_interfaces(&table, overall)
+    };
+    let slow_interface = interface::Config {
+        send_rate: Some(slow),
+        send_sockets: vec![0],
+        ..Default::default()
+    };
+    let fast_interface = interface::Config {
+        send_rate: Some(fast),
+        send_sockets: vec![1, 2],
+        ..Default::default()
+    };
+
+    // The fast interface carries the highest-priority traffic.
+    let chosen = pacing(&[
+        slow_interface.clone(),
+        interface::Config {
+            carries_highest_priority: true,
+            ..fast_interface.clone()
+        },
+    ]);
+    assert_eq!(
+        chosen,
+        SendPacing::new(vec![slow, fast], vec![0, 1, 1]).with_highest_priority(1)
+    );
+
+    // An interface for the highest-priority traffic that doesn't hold a send socket doesn't count.
+    let unused = pacing(&[
+        slow_interface,
+        fast_interface,
+        interface::Config {
+            carries_highest_priority: true,
+            ..Default::default()
+        },
+    ]);
+    assert_eq!(unused, SendPacing::new(vec![slow, fast], vec![0, 1, 1]));
+
+    // With one interface that holds every send socket, the setting has no effect.
+    let one = pacing(&[interface::Config {
+        send_rate: Some(fast),
+        send_sockets: vec![0, 1, 2],
+        carries_highest_priority: true,
+        ..Default::default()
+    }]);
+    assert_eq!(one, SendPacing::single(fast));
 }
