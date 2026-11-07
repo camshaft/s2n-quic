@@ -25,6 +25,7 @@ use crate::{
 use bach::time::timeout;
 use s2n_quic_core::{stream::testing::Data, varint::VarInt};
 use std::{
+    io,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -241,10 +242,46 @@ async fn exchange(client: &mut Client, count: usize, round: &'static str, shared
     }
 }
 
+/// The acceptor of the streams the test resets both ways.
+const RESET_ACCEPTOR_ID: VarInt = VarInt::from_u32(2);
+/// The bytes each side writes on a stream the test resets.
+const RESET_STREAM_LEN: u64 = 4;
+
+/// Opens a stream to the server's reset acceptor, writes a few bytes and reads the server's
+/// answer, without a FIN either way. The client then drops its reader, which resets the server's
+/// writer, and the server then drops its reader, which resets the client's writer. Each reset is
+/// its endpoint's highest-priority traffic.
+async fn reset_round_trip(client: &mut Client) {
+    let stream = client
+        .connect("server:0", RESET_ACCEPTOR_ID)
+        .await
+        .expect("connect");
+    let (mut reader, mut writer) = stream.into_split();
+    let mut request = Data::new(RESET_STREAM_LEN);
+    writer
+        .write_all_from(&mut request)
+        .await
+        .expect("client write");
+    let mut reply = Data::new(RESET_STREAM_LEN);
+    while !reply.is_finished() {
+        let len = reader.read_into(&mut reply).await.expect("client read");
+        assert!(len > 0, "the server's answer ended early");
+    }
+    // The client stops reading before the server's FIN, so this drop resets the server's writer.
+    drop(reader);
+    let error = writer.peer_cancellation().await;
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset,
+        "the server's reset didn't reach the client: {error:?}",
+    );
+}
+
 /// While one of the client's interfaces is lost, the client and the server move their traffic to
-/// the pairs that still deliver, so the streams the client opened before the loss finish, and
-/// the expiry of the lost pairs' send contexts doesn't mark the peer dead. Once the interface
-/// delivers again, its pairs carry traffic again.
+/// the pairs that still deliver, so the streams the client opened before the loss finish, a reset
+/// sent each way on a new stream gets through though the lost interface carries each endpoint's
+/// highest-priority traffic, and the expiry of the lost pairs' send contexts doesn't mark the
+/// peer dead. Once the interface delivers again, its pairs carry traffic again.
 #[test]
 fn traffic_moves_off_a_lost_interface_and_back() {
     let _snapshots = without_snapshots();
@@ -285,6 +322,40 @@ fn traffic_moves_off_a_lost_interface_and_back() {
             let mut acceptor = server
                 .register_acceptor_channel(ACCEPTOR_ID, STREAMS * 2)
                 .expect("acceptor registration");
+            // The server answers a stream to the reset acceptor, waits for the client's reset of
+            // its writer, and then resets the client's writer.
+            let mut reset_acceptor = server
+                .register_acceptor_channel(RESET_ACCEPTOR_ID, 1)
+                .expect("reset acceptor registration");
+            async move {
+                while let Some(stream) = reset_acceptor.recv().await {
+                    async move {
+                        let (mut reader, mut writer) = stream.into_split();
+                        let mut request = Data::new(RESET_STREAM_LEN);
+                        while !request.is_finished() {
+                            let len = reader.read_into(&mut request).await.expect("server read");
+                            assert!(len > 0, "the client's request ended early");
+                        }
+                        let mut reply = Data::new(RESET_STREAM_LEN);
+                        writer
+                            .write_all_from(&mut reply)
+                            .await
+                            .expect("server write");
+                        let error = writer.peer_cancellation().await;
+                        assert_eq!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionReset,
+                            "the client's reset didn't reach the server: {error:?}",
+                        );
+                        // The server stops reading before the client's FIN, so this drop resets
+                        // the client's writer.
+                        drop(reader);
+                    }
+                    .primary()
+                    .spawn();
+                }
+            }
+            .spawn();
             while let Some(stream) = acceptor.recv().await {
                 let shared = server_side.clone();
                 async move {
@@ -329,6 +400,12 @@ fn traffic_moves_off_a_lost_interface_and_back() {
                 client_side.losing.load(Ordering::Relaxed),
                 "the interface wasn't lost",
             );
+
+            // Each endpoint's resets are its highest-priority traffic, whose pairs cross the lost
+            // interface, so they make their round trip on the pairs that still deliver.
+            timeout(ROUND_TIMEOUT, reset_round_trip(&mut client))
+                .await
+                .expect("a reset makes its round trip while an interface is lost");
 
             // Neither endpoint sends for longer than the paths' idle timeout, so the lost pairs'
             // send contexts expire with their probes unacknowledged. The peer isn't marked dead,
