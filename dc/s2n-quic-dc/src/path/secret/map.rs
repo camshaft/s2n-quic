@@ -170,6 +170,12 @@ impl Map {
         self.store.advertised_data_addrs()
     }
 
+    /// Tags each address of the `DcDataAddresses` payload with the interface of the local
+    /// socket it matches, where `local` holds each local socket's address and interface.
+    pub fn set_advertised_data_interfaces(&self, local: &[(SocketAddr, u16)]) {
+        self.store.set_advertised_data_interfaces(local);
+    }
+
     /// Gets the [`Peer`] entry for the given address
     ///
     /// NOTE: This function is used to track cache hit ratios so it
@@ -294,6 +300,70 @@ impl Map {
     /// Emits a DcConnectionTimeout event via the subscriber
     pub fn on_dc_connection_timeout(&self, peer_address: &SocketAddr) {
         self.store.on_dc_connection_timeout(peer_address);
+    }
+
+    /// Emits a PathSecretMapInterfacePairLost event via the subscriber
+    pub fn on_interface_pair_lost(&self, peer_address: &SocketAddr) {
+        self.store.on_interface_pair_lost(peer_address);
+    }
+
+    /// Emits a PathSecretMapInterfacePairDelivering event via the subscriber
+    pub fn on_interface_pair_delivering(&self, peer_address: &SocketAddr) {
+        self.store.on_interface_pair_delivering(peer_address);
+    }
+
+    /// Emits a PathSecretMapInterfacePairFramesMoved event via the subscriber
+    pub fn on_interface_pair_frames_moved(&self, peer_address: &SocketAddr, frames: usize) {
+        self.store
+            .on_interface_pair_frames_moved(peer_address, frames);
+    }
+
+    /// Emits a PathSecretMapInterfacePairPreferenceEnded event via the subscriber
+    pub fn on_interface_pair_preference_ended(&self, peer_address: &SocketAddr) {
+        self.store.on_interface_pair_preference_ended(peer_address);
+    }
+
+    /// Emits a PathSecretMapDeadMarkSkipped event via the subscriber
+    pub fn on_dead_mark_skipped(&self, peer_address: &SocketAddr) {
+        self.store.on_dead_mark_skipped(peer_address);
+    }
+
+    /// Emits a CreditlessWindowFrameRefused event via the subscriber
+    pub fn on_creditless_window_frame_refused(
+        &self,
+        peer_address: &SocketAddr,
+        frame_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.store.on_creditless_window_frame_refused(
+            peer_address,
+            frame_bytes,
+            held_bytes,
+            limit_bytes,
+        );
+    }
+
+    /// Emits a CreditlessWindowLimitGrew event via the subscriber
+    pub fn on_creditless_window_limit_grew(
+        &self,
+        released_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.store
+            .on_creditless_window_limit_grew(released_bytes, held_bytes, limit_bytes);
+    }
+
+    /// Emits a CreditlessWindowLimitHalved event via the subscriber
+    pub fn on_creditless_window_limit_halved(
+        &self,
+        held_bytes: u64,
+        previous_limit_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.store
+            .on_creditless_window_limit_halved(held_bytes, previous_limit_bytes, limit_bytes);
     }
 
     pub fn handle_control_packet(&self, packet: &control::Packet, peer: &SocketAddr) {
