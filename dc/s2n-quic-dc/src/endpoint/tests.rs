@@ -25,6 +25,7 @@ use std::{
 };
 
 pub mod bach_handshake;
+pub mod counted_lost;
 pub mod deterministic;
 pub mod fair_share;
 pub mod half_close;
