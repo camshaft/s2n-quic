@@ -321,6 +321,19 @@ mod tests {
         let (waits, reads) = read(&mut channels, &clock, ms(5));
         assert_eq!(waits, [Some(ms(3))]);
         assert_eq!(reads, 1);
+
+        // The socket received a datagram on each of two channels, 3 ms and 2 ms before the
+        // batch's read: the batch reads the clock once for both channels, so the second
+        // datagram's wait doesn't count the 5 ms that the endpoint spent on the first
+        let (mut other_producer, other_consumer) =
+            ring::pair::<T>(4, u16::from(MaxMtu::default()) as _);
+        channels.push(other_consumer);
+        send(&mut producer, &[Some(received + ms(20))]);
+        send(&mut other_producer, &[Some(received + ms(21))]);
+        let clock = Cell::new(received + ms(23));
+        let (waits, reads) = read(&mut channels, &clock, ms(5));
+        assert_eq!(waits, [Some(ms(3)), Some(ms(2))]);
+        assert_eq!(reads, 1);
     }
 
     /// Where a datagram without a receive time goes to the endpoint before the batch reads the
