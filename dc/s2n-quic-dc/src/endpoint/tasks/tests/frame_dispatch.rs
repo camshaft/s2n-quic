@@ -824,11 +824,9 @@ fn frame_dispatch_records_the_windows_refused_frames_through_the_path_secret_map
         .primary()
         .spawn();
 
-        async move {
-            while worker_rx.recv().await.is_some() {}
-        }
-        .primary()
-        .spawn();
+        async move { while worker_rx.recv().await.is_some() {} }
+            .primary()
+            .spawn();
     });
 
     let refused = refused.refused.lock().unwrap();
