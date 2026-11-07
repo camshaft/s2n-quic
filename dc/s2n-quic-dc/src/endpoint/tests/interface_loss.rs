@@ -23,8 +23,9 @@
 //! The endpoints record each acknowledgement and freed batch they route to a send worker. None
 //! may go to a sender whose interface pair its path marks lost while another sender of that path
 //! delivers, and the endpoints must route at least one of each while a pair of its path is lost.
-//! While the peer has acknowledged a sender of the path since its lost pairs stopped delivering,
-//! each must go to such a sender, and the endpoints must route at least one of each then too.
+//! While the routers prefer the senders the peer acknowledged since the path's lost pairs
+//! stopped delivering, each must go to such a sender, and the endpoints must route at least one
+//! of each then too.
 //!
 //! While the interface is lost, no pair whose routes avoid it may be marked lost, either once
 //! the first streams finish or once the stream the client opens next finishes: each endpoint
@@ -634,9 +635,9 @@ fn run(recover: bool) {
 
     // While a pair of a path was marked lost and another delivered, neither endpoint routed an
     // acknowledgement or a freed batch of that path to a sender whose pair was marked lost, and
-    // the endpoints routed at least one of each. While a sender of the path delivered since the
-    // loss, each went to a sender that delivered since the loss, and the endpoints routed at
-    // least one of each then too.
+    // the endpoints routed at least one of each. While the routers preferred the senders of the
+    // path that delivered since the loss, each went to such a sender, and the endpoints routed
+    // at least one of each then too.
     let routed = routed.lock().unwrap();
     let (mut acks, mut freed) = (0, 0);
     let (mut acks_since, mut freed_since) = (0, 0);

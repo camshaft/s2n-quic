@@ -92,6 +92,9 @@ pub struct Entry {
     sender_delivered_at: Box<[AtomicU64]>,
     /// The latest time a lost interface pair stopped delivering, as u64 nanoseconds.
     senders_lost_since: AtomicU64,
+    /// The end of the routers' preference for the senders that deliver since a lost pair
+    /// stopped delivering, as u64 nanoseconds.
+    senders_preferred_until: AtomicU64,
     /// Per-socket-sender load scores encoded as u64 nanoseconds.
     ///
     /// A lower score means the sender is expected to drain its queue sooner and is
@@ -138,6 +141,7 @@ impl SizeOf for Entry {
             sender_load_scores,
             sender_delivered_at,
             senders_lost_since,
+            senders_preferred_until,
             queue_state: _,
         } = self;
         creation_time.size()
@@ -160,6 +164,7 @@ impl SizeOf for Entry {
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + sender_delivered_at.len() * std::mem::size_of::<AtomicU64>()
             + senders_lost_since.size()
+            + senders_preferred_until.size()
             + std::mem::size_of::<QueueState>()
     }
 }
@@ -264,6 +269,7 @@ impl Entry {
             sender_load_scores: Self::init_load_scores(socket_sender_count),
             sender_delivered_at: Self::init_load_scores(socket_sender_count),
             senders_lost_since: AtomicU64::new(0),
+            senders_preferred_until: AtomicU64::new(0),
             queue_state,
         }
     }
@@ -441,14 +447,16 @@ impl Entry {
     /// after it, by slot, whose pair delivers, so that a message bound for a lost pair goes to a
     /// pair that delivers. While a pair is marked lost and a sender has an acknowledgement after
     /// the lost pairs stopped delivering, a pair delivers only where its sender has one too, as
-    /// the routers choose, since a sender on the same down interface may not be marked lost yet;
-    /// otherwise a pair delivers while it isn't marked lost. Returns `preferred` where no pair
-    /// delivers, or where the entry doesn't keep sender slots.
+    /// the routers choose, since a sender on the same down interface may not be marked lost yet,
+    /// until a sender has an acknowledgement after the end of that preference, as
+    /// [`Self::prefers_senders_delivering_since_lost`] says; otherwise a pair delivers while it
+    /// isn't marked lost. Returns `preferred` where no pair delivers, or where the entry doesn't
+    /// keep sender slots.
     pub fn delivering_sender(&self, preferred: LocalSenderId) -> LocalSenderId {
         let Some(start) = self.sender_index(preferred) else {
             return preferred;
         };
-        let prefer_delivered = self.has_sender_delivering_since_lost();
+        let prefer_delivered = self.prefers_senders_delivering_since_lost();
         let delivers = |index: usize| {
             if prefer_delivered {
                 self.delivers_since_lost(LocalSenderId::from_index(index))
@@ -507,6 +515,28 @@ impl Entry {
         self.has_lost_sender()
             && (0..self.sender_delivered_at.len())
                 .any(|idx| self.delivers_since_lost(LocalSenderId::from_index(idx)))
+    }
+
+    /// Records the end of the routers' preference for the senders that deliver since a lost
+    /// pair stopped delivering. The entry keeps the latest such end, so that a later mark
+    /// extends the preference and an earlier one doesn't move it back.
+    pub fn set_senders_preferred_until(&self, until: crate::time::precision::Timestamp) {
+        self.senders_preferred_until
+            .fetch_max(until.nanos, Ordering::AcqRel);
+    }
+
+    /// True while the routers prefer the senders that deliver since the loss: some sender does,
+    /// as [`Self::has_sender_delivering_since_lost`] says, and no sender has an acknowledgement
+    /// after the end of the preference. The routers don't read a clock, so an acknowledgement
+    /// after the end shows that it passed; from then on, a sender that was idle at the loss
+    /// gets items again.
+    pub fn prefers_senders_delivering_since_lost(&self) -> bool {
+        let until = self.senders_preferred_until.load(Ordering::Acquire);
+        self.has_sender_delivering_since_lost()
+            && self
+                .sender_delivered_at
+                .iter()
+                .all(|delivered_at| delivered_at.load(Ordering::Acquire) <= until)
     }
 
     pub fn idle_timeout(&self) -> Duration {

@@ -346,9 +346,10 @@ where
     highest_next_wait: u64,
     /// The lost mark of each sender of the batch being routed, read once for each batch so that
     /// each pass over the senders sees the same marks. Where a sender has an acknowledgement
-    /// after the lost pairs stopped delivering, every sender without one counts as lost.
-    /// Where no sender has one, a sender that shares an interface with a pair marked lost counts
-    /// as lost too, as `counts_as_lost` in the combinator module says.
+    /// after the lost pairs stopped delivering, every sender without one counts as lost, until
+    /// the end of that preference. Where no sender has one, or once the preference ends, a
+    /// sender that shares an interface with a pair marked lost counts as lost too, as
+    /// `counts_as_lost` in the combinator module says.
     lost_marks: Vec<bool>,
     pick_counters: IdMap<LocalSenderId, crate::counter::Counter>,
     rejected_counters: IdMap<LocalSenderId, crate::counter::Summary>,
@@ -491,12 +492,12 @@ where
     ///
     /// Where a sender has an acknowledgement after the lost pairs stopped delivering, a sender
     /// without one counts as lost too, since it may be on the same down interface and not be
-    /// marked yet.
-    /// Where no sender has one, a sender that shares the local interface or the peer interface
-    /// of a pair marked lost counts as lost too, as `counts_as_lost` in the combinator module
-    /// says.
+    /// marked yet, until a sender has an acknowledgement after the end of that preference,
+    /// which the lost marks set. Where no sender has one, or once the preference ends, a sender
+    /// that shares the local interface or the peer interface of a pair marked lost counts as
+    /// lost too, as `counts_as_lost` in the combinator module says.
     fn read_lost_marks(&mut self, entry: &PathSecretEntry) {
-        let prefer_delivered = entry.has_sender_delivering_since_lost();
+        let prefer_delivered = entry.prefers_senders_delivering_since_lost();
         // Counting the senders that share a marked pair's interfaces reads every sender's
         // interfaces, so the router counts them only while a pair is marked lost.
         let counted_lost = if !prefer_delivered && entry.has_lost_sender() {

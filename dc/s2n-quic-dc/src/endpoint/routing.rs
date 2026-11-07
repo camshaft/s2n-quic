@@ -337,8 +337,9 @@ pub(crate) mod observe {
         pub(crate) path_has_lost: bool,
         /// Whether the interface pair of at least one sender of the path isn't marked lost.
         pub(crate) path_delivers: bool,
-        /// Whether the path marks a pair lost and the peer acknowledged a sender of the path
-        /// after the lost pairs stopped delivering.
+        /// Whether the routers prefer the senders the peer acknowledged after the path's lost
+        /// pairs stopped delivering: a pair is marked lost, a sender has such an acknowledgement,
+        /// and no sender has an acknowledgement after the end of that preference.
         pub(crate) path_delivers_since_lost: bool,
         /// Whether the pair of `sender` isn't marked lost and the peer acknowledged `sender`
         /// after the lost pairs of the path stopped delivering.
@@ -375,7 +376,7 @@ pub(crate) mod observe {
                     lost: path.is_sender_lost(sender),
                     path_has_lost: path.has_lost_sender(),
                     path_delivers: path.has_delivering_sender(),
-                    path_delivers_since_lost: path.has_sender_delivering_since_lost(),
+                    path_delivers_since_lost: path.prefers_senders_delivering_since_lost(),
                     delivers_since_lost: path.delivers_since_lost(sender),
                 });
             }

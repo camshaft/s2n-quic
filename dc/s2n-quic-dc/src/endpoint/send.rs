@@ -1326,6 +1326,13 @@ impl Context {
     /// one smoothed RTT after the later of its last acknowledgement and the time it began to
     /// wait for one. The routers then prefer the senders the peer acknowledged after that
     /// time, since a sender on the same down interface may not be marked lost yet.
+    ///
+    /// The preference ends two persistent congestion periods after that time: the pair is
+    /// marked lost about one period after it stopped, and another pair of the same down
+    /// interface that waits for an acknowledgement is marked within about one period more.
+    /// A pair that began to wait later can be marked after the end; the items the routers
+    /// give it until then move again at its mark. Once the preference ends, a sender that
+    /// was idle at the loss gets items again.
     pub fn set_path_lost(&mut self, lost: bool) {
         self.lost_from = lost.then_some(self.next_packet_number);
         self.lost_at = None;
@@ -1337,6 +1344,9 @@ impl Context {
                 });
             let stopped_at = waiting_since + self.rtt_estimator.smoothed_rtt();
             self.path_secret_entry.set_senders_lost_since(stopped_at);
+            self.path_secret_entry.set_senders_preferred_until(
+                stopped_at + self.rtt_estimator.persistent_congestion_threshold() * 2,
+            );
         }
         let _ = self
             .path_secret_entry

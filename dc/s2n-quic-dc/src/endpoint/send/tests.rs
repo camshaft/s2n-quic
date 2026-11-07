@@ -1897,7 +1897,9 @@ fn a_context_of_one_interface_neither_probes_nor_stops_delivering() {
 
 /// A lost mark records on the path secret entry when the pair stopped delivering: one smoothed
 /// RTT after the later of its last acknowledgement and the time it began to wait for one. A
-/// sender delivers since the loss only with an acknowledgement after that time.
+/// sender delivers since the loss only with an acknowledgement after that time, and the routers
+/// prefer such senders until a sender has an acknowledgement more than two persistent
+/// congestion periods after it.
 #[test]
 fn a_lost_mark_records_when_the_pair_stopped_delivering() {
     use crate::time::precision::Timestamp as PreciseTimestamp;
@@ -1929,6 +1931,20 @@ fn a_lost_mark_records_when_the_pair_stopped_delivering() {
         entry.record_sender_delivered(other, at(stopped_at + 1));
         assert!(entry.delivers_since_lost(other));
         assert!(entry.has_sender_delivering_since_lost());
+
+        let period = ctx.rtt_estimator.persistent_congestion_threshold();
+        let preferred_until = stopped_at + 2 * period.as_nanos() as u64;
+        assert!(entry.prefers_senders_delivering_since_lost());
+        entry.record_sender_delivered(other, at(preferred_until));
+        assert!(
+            entry.prefers_senders_delivering_since_lost(),
+            "an acknowledgement at the preference's end is within it"
+        );
+        entry.record_sender_delivered(other, at(preferred_until + 1));
+        assert!(
+            !entry.prefers_senders_delivering_since_lost(),
+            "an acknowledgement after the preference's end ends it"
+        );
     }
 }
 
