@@ -2696,6 +2696,16 @@ fn interface_paced_pick_two_offers_a_waiting_batch_only_once_an_interface_it_wai
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(first.borrow().len(), 1);
 
+    // While the pair of the second interface's sender stays lost, the second interface is free,
+    // but the waiting batch doesn't wait on it: the poll doesn't offer the batch to the senders.
+    let offers = router.waiting_offers();
+    assert_eq!(poll_once(&mut router), Poll::Pending);
+    assert_eq!(
+        router.waiting_offers(),
+        offers,
+        "the router offered the waiting batch though no interface it waits on freed",
+    );
+
     // The pair of the second interface's sender delivers again, and that interface is free, but
     // the first interface, which the waiting batch waits on, still holds a batch: the poll
     // doesn't offer the waiting batch again, so the second interface's sender doesn't get it.
@@ -2715,6 +2725,11 @@ fn interface_paced_pick_two_offers_a_waiting_batch_only_once_an_interface_it_wai
     assert_eq!(first.borrow().len() + second.borrow().len(), 3);
     assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
     assert_eq!(consumed.get(), 300_000);
+    assert_eq!(
+        router.waiting_offers(),
+        1,
+        "the router didn't offer the waiting batch exactly once",
+    );
 }
 
 #[test]
