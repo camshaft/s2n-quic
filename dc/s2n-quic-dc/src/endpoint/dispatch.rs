@@ -1996,6 +1996,10 @@ fn send_reset(
 /// the peer's queues, which `bind_for_msg` rejects without a reset, doesn't get one. The resets
 /// of a peer's rejected inits that wait in front of the window are then at most one for each of
 /// its queues, whatever the queue and binding ids of its frames.
+///
+/// Each reject records what it does with the slot as a [`frame_trace::SlotHold`]: a new hold,
+/// whose reset is sent, a slot held already, whose reset isn't sent, or a slot past the peer's
+/// queues, which isn't held.
 fn reject_init(
     server_view: &crate::queue::ServerView,
     path_secret_entry: &Arc<PathSecretEntry>,
@@ -2005,9 +2009,22 @@ fn reject_init(
     frame_tx: &mut SubmissionSender,
     free: impl FnOnce(&crate::queue::ServerView),
 ) {
-    let reset = server_view.hold_freed(incoming_pair.dest_queue_id, binding_id);
+    use crate::queue::server::Hold;
+
+    let hold = server_view.hold_freed(incoming_pair.dest_queue_id, binding_id);
     free(server_view);
-    if reset {
+    let outcome = match hold {
+        Hold::New => frame_trace::HoldOutcome::Held,
+        Hold::Already => frame_trace::HoldOutcome::AlreadyHeld,
+        Hold::PastQueues => frame_trace::HoldOutcome::PastQueues,
+    };
+    frame_trace::slot_hold(
+        incoming_pair.dest_queue_id,
+        binding_id,
+        outcome,
+        *path_secret_entry.id(),
+    );
+    if hold == Hold::New {
         send_reset(path_secret_entry, incoming_pair, binding_id, error_code, frame_tx);
     }
 }
