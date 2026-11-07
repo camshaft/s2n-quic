@@ -484,6 +484,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             GaugedSender::new(pto_wheel_tx.clone(), pto_wheel_sender),
             GaugedSender::new(idle_wheel_tx.clone(), idle_wheel_sender),
             send_credit_pool.clone(),
+            frame_tx.clone(),
         );
         let task_counter = counter_registry
             .register_nominal_task("task.context_resolver", &variant)
@@ -865,8 +866,12 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 ///   no wheel work is emitted.
 /// - Otherwise the batch is appended to the peer's pending send state and the resulting wheel
 ///   interest is forwarded to `immediate_tx`, `tx_wheel_tx`, `pto_wheel_tx`, and `idle_wheel_tx`.
+/// - Where the context's interface pair is marked lost and another pair of its peer still
+///   delivers, the context's pending and unacknowledged frames, the batch's among them, go to
+///   `retransmit_tx` at once, so that the routers send them on the pairs that deliver instead
+///   of the frames waiting for the context's next probe timeout.
 #[allow(clippy::too_many_arguments)]
-pub fn context_resolver<BatchRx, Clk, ImmW, TxW, PtoW, IdleW>(
+pub fn context_resolver<BatchRx, Clk, ImmW, TxW, PtoW, IdleW, RetxW>(
     batch_rx: BatchRx,
     mut send_caches: IdMap<LocalSendSocketId, Rc<RefCell<send::Cache>>>,
     sender_idx_to_local: IdMap<LocalSenderId, LocalSendSocketId>,
@@ -877,6 +882,7 @@ pub fn context_resolver<BatchRx, Clk, ImmW, TxW, PtoW, IdleW>(
     pto_wheel_tx: PtoW,
     idle_wheel_tx: IdleW,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    mut retransmit_tx: RetxW,
 ) -> impl Receiver<()>
 where
     BatchRx: Receiver<Entry<FrameBatch>>,
@@ -885,6 +891,7 @@ where
     TxW: UnboundedSender<Rc<RefCell<send::Context>>>,
     PtoW: UnboundedSender<Rc<RefCell<send::Context>>>,
     IdleW: UnboundedSender<Rc<RefCell<send::Context>>>,
+    RetxW: UnboundedSender<Entry<Frame>>,
 {
     let rx = Map::new(
         batch_rx,
@@ -932,7 +939,17 @@ where
 
             let wheel_interest = {
                 let mut ctx = sender.borrow_mut();
-                ctx.push_batch(batch.into_inner(), &clock)
+                let interest = ctx.push_batch(batch.into_inner(), &clock);
+                if ctx.should_move_frames() {
+                    let moved = cache.borrow().move_frames(&mut ctx, &mut retransmit_tx);
+                    debug!(
+                        moved,
+                        sender_idx = ?ctx.sender_idx,
+                        peer = %ctx.path_secret_entry.peer(),
+                        "moved a batch pushed to a lost interface pair to the pairs that deliver"
+                    );
+                }
+                interest
             };
 
             Some((sender, wheel_interest))

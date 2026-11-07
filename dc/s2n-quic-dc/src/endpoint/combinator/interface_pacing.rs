@@ -288,7 +288,8 @@ where
     /// The peers of `highest_waiting`, which the router offers to the senders in turn.
     highest_waiting_order: VecDeque<credentials::Id>,
     /// The lost mark of each sender of the batch being routed, read once for each batch so that
-    /// each pass over the senders sees the same marks.
+    /// each pass over the senders sees the same marks. Where a sender has an acknowledgement
+    /// after the lost pairs stopped delivering, every sender without one counts as lost.
     lost_marks: Vec<bool>,
     pick_counters: IdMap<LocalSenderId, crate::counter::Counter>,
     rejected_counters: IdMap<LocalSenderId, crate::counter::Summary>,
@@ -407,12 +408,22 @@ where
     /// Reads the lost mark of each sender of `entry` once, for the passes over the senders that
     /// choose a sender for one batch: the send workers set and clear the marks meanwhile, and
     /// each pass must see the same marks.
+    ///
+    /// Where a sender has an acknowledgement after the lost pairs stopped delivering, a sender
+    /// without one counts as lost too, since it may be on the same down interface and not be
+    /// marked yet.
     fn read_lost_marks(&mut self, entry: &PathSecretEntry) {
+        let prefer_delivered = entry.has_sender_delivering_since_lost();
         self.lost_marks.clear();
-        self.lost_marks.extend(
-            (0..self.senders.len())
-                .map(|sender| entry.is_sender_lost(LocalSenderId::from_index(sender))),
-        );
+        self.lost_marks
+            .extend((0..self.senders.len()).map(|sender| {
+                let sender = LocalSenderId::from_index(sender);
+                if prefer_delivered {
+                    !entry.delivers_since_lost(sender)
+                } else {
+                    entry.is_sender_lost(sender)
+                }
+            }));
     }
 
     /// Returns whether a sender on the interface for the highest-priority traffic delivers to

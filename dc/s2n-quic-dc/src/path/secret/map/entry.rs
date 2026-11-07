@@ -86,6 +86,12 @@ pub struct Entry {
     /// The interface of each of the peer's data recv addresses, or empty where the peer
     /// doesn't tag an address.
     peer_data_interfaces: PeerDataInterfaces,
+    /// When the peer last acknowledged a packet of each socket sender, as u64 nanoseconds, so
+    /// that the routers can tell the senders that deliver since a pair was lost from the
+    /// senders on the same down interface that aren't marked lost yet.
+    sender_delivered_at: Box<[AtomicU64]>,
+    /// The latest time a lost interface pair stopped delivering, as u64 nanoseconds.
+    senders_lost_since: AtomicU64,
     /// Per-socket-sender load scores encoded as u64 nanoseconds.
     ///
     /// A lower score means the sender is expected to drain its queue sooner and is
@@ -130,6 +136,8 @@ impl SizeOf for Entry {
             peer_data_addrs,
             peer_data_interfaces,
             sender_load_scores,
+            sender_delivered_at,
+            senders_lost_since,
             queue_state: _,
         } = self;
         creation_time.size()
@@ -149,6 +157,9 @@ impl SizeOf for Entry {
             + peer_data_interfaces.len() * std::mem::size_of::<Option<u16>>()
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + sender_load_scores.len() * std::mem::size_of::<AtomicU64>()
+            + std::mem::size_of::<Box<[AtomicU64]>>()
+            + sender_delivered_at.len() * std::mem::size_of::<AtomicU64>()
+            + senders_lost_since.size()
             + std::mem::size_of::<QueueState>()
     }
 }
@@ -251,6 +262,8 @@ impl Entry {
             peer_data_addrs,
             peer_data_interfaces: Arc::from([]),
             sender_load_scores: Self::init_load_scores(socket_sender_count),
+            sender_delivered_at: Self::init_load_scores(socket_sender_count),
+            senders_lost_since: AtomicU64::new(0),
             queue_state,
         }
     }
@@ -446,6 +459,46 @@ impl Entry {
                 preferred,
                 <LocalSenderId as crate::endpoint::id::Id>::from_index,
             )
+    }
+
+    /// Records that the peer acknowledged a packet of the sender at `at`, so that the routers
+    /// can tell the senders that deliver since a pair was lost.
+    pub fn record_sender_delivered(
+        &self,
+        sender_idx: LocalSenderId,
+        at: crate::time::precision::Timestamp,
+    ) {
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return;
+        };
+        self.sender_delivered_at[sender_idx].fetch_max(at.nanos, Ordering::AcqRel);
+    }
+
+    /// Records the time a lost interface pair stopped delivering. The entry keeps the latest
+    /// such time, so that a sender delivers since the loss only with an acknowledgement after
+    /// every lost pair stopped.
+    pub fn set_senders_lost_since(&self, since: crate::time::precision::Timestamp) {
+        self.senders_lost_since
+            .fetch_max(since.nanos, Ordering::AcqRel);
+    }
+
+    /// True when the interface pair of the sender isn't marked lost and the peer acknowledged
+    /// one of its packets after the latest time a lost pair stopped delivering.
+    pub fn delivers_since_lost(&self, sender_idx: LocalSenderId) -> bool {
+        let Some(idx) = self.sender_index(sender_idx) else {
+            return false;
+        };
+        !self.is_sender_lost(sender_idx)
+            && self.sender_delivered_at[idx].load(Ordering::Acquire)
+                > self.senders_lost_since.load(Ordering::Acquire)
+    }
+
+    /// True when the interface pair of at least one sender is marked lost and another sender
+    /// delivers since the lost pairs stopped delivering.
+    pub fn has_sender_delivering_since_lost(&self) -> bool {
+        self.has_lost_sender()
+            && (0..self.sender_delivered_at.len())
+                .any(|idx| self.delivers_since_lost(LocalSenderId::from_index(idx)))
     }
 
     pub fn idle_timeout(&self) -> Duration {

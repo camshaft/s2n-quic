@@ -885,8 +885,7 @@ impl Context {
         Clk: s2n_quic_core::time::Clock + precision::Clock + ?Sized,
         Rand: random::Generator,
     {
-        self.on_peer_acknowledged(clock.now());
-        self.on_largest_acknowledged(largest_acknowledged);
+        self.on_peer_acknowledgement(clock.now(), largest_acknowledged);
 
         super::ack::process_ack(
             largest_acknowledged,
@@ -1322,9 +1321,23 @@ impl Context {
     /// that packet or a later one shows that the pair delivers again.
     ///
     /// It clears the mark's time, which [`Self::mark_path_lost`] sets again after this call.
+    ///
+    /// A lost mark also records on the path secret entry when the pair stopped delivering:
+    /// one smoothed RTT after the later of its last acknowledgement and the time it began to
+    /// wait for one. The routers then prefer the senders the peer acknowledged after that
+    /// time, since a sender on the same down interface may not be marked lost yet.
     pub fn set_path_lost(&mut self, lost: bool) {
         self.lost_from = lost.then_some(self.next_packet_number);
         self.lost_at = None;
+        if lost {
+            let waiting_since = self
+                .ack_wait_since
+                .map_or(self.last_peer_activity, |since| {
+                    since.max(self.last_peer_activity)
+                });
+            let stopped_at = waiting_since + self.rtt_estimator.smoothed_rtt();
+            self.path_secret_entry.set_senders_lost_since(stopped_at);
+        }
         let _ = self
             .path_secret_entry
             .set_sender_lost(self.sender_idx, lost);
@@ -1352,6 +1365,20 @@ impl Context {
         self.last_peer_activity = now;
         self.ack_only_probe_sent = None;
         self.ack_only_since_peer_ack = false;
+    }
+
+    /// Records an acknowledgement from the peer received at `now`: the peer's activity, as
+    /// [`Self::on_peer_acknowledged`] records it, this sender's delivery on the path secret
+    /// entry, and the end of a lost mark that the acknowledgement covers.
+    pub fn on_peer_acknowledgement(
+        &mut self,
+        now: precision::Timestamp,
+        largest_acknowledged: VarInt,
+    ) {
+        self.on_peer_acknowledged(now);
+        self.path_secret_entry
+            .record_sender_delivered(self.sender_idx, now);
+        self.on_largest_acknowledged(largest_acknowledged);
     }
 
     /// True when this context has packets that wait for an acknowledgement and the peer

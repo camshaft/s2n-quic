@@ -516,3 +516,85 @@ fn send_ack_processor_records_a_lost_pair_that_delivers_again() {
         .spawn();
     });
 }
+
+/// The context resolver moves a batch pushed to a context whose interface pair is marked lost
+/// to the frame channel at once, while another pair of the peer delivers, instead of keeping
+/// it on the lost pair until the context's next probe timeout.
+#[test]
+fn context_resolver_moves_a_batch_pushed_to_a_lost_pair() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let registry = crate::counter::Registry::default();
+        let entry = test_entry();
+        let clock = Clock::default();
+        let cache = Rc::new(RefCell::new(send::Cache::new(
+            &registry,
+            crate::endpoint::id::LocalSenderId::from_index(0),
+        )));
+        let ctx = cache
+            .borrow_mut()
+            .get_or_insert(&entry, &clock)
+            .expect("the test entry has a peer data address");
+        ctx.borrow_mut().set_path_lost(true);
+        assert!(entry.has_delivering_sender());
+        let send_caches: crate::endpoint::id::IdMap<crate::endpoint::id::LocalSendSocketId, _> =
+            vec![cache].into();
+        let sender_idx_to_local = crate::endpoint::id::IdMap::<
+            crate::endpoint::id::LocalSenderId,
+            crate::endpoint::id::LocalSendSocketId,
+        >::new(1, crate::endpoint::id::LocalSendSocketId::new(0));
+
+        let (tx_wheel_tx, tx_wheel_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
+        let (pto_wheel_tx, pto_wheel_rx) = unsync::new_with_adapter::<send::PtoWheelAdapter>();
+        let (idle_wheel_tx, idle_wheel_rx) = unsync::new_with_adapter::<send::IdleWheelAdapter>();
+        let (immediate_tx_raw, immediate_rx) =
+            unsync::new_with_adapter::<send::TxImmediateAdapter>();
+        let socket_immediate_txs: crate::endpoint::id::IdMap<
+            crate::endpoint::id::LocalSendSocketId,
+            _,
+        > = core::iter::once((
+            crate::endpoint::id::LocalSendSocketId::new(0),
+            immediate_tx_raw,
+        ))
+        .collect();
+        let immediate_tx = send::ImmediateSender::new(
+            socket_immediate_txs,
+            crate::endpoint::id::IdMap::new(1, crate::endpoint::id::LocalSendSocketId::new(0)),
+        );
+        let (retransmit_tx, mut retransmit_rx) = unsync::new::<frame::Frame>();
+        let send_credit_pool = crate::sync::Arc::new(crate::credit::Pool::new(
+            crate::credit::Config::new(1_000_000),
+        ));
+
+        let rx = tasks::context_resolver(
+            TestReceiver::new([test_batch(&entry)]),
+            send_caches,
+            sender_idx_to_local,
+            1,
+            clock,
+            immediate_tx,
+            tx_wheel_tx,
+            pto_wheel_tx,
+            idle_wheel_tx,
+            send_credit_pool,
+            retransmit_tx,
+        );
+
+        async move { rx.drain_budgeted(Some(32)).await }.spawn();
+
+        async move {
+            // The wheels' receivers stay open until the resolver ends.
+            let _wheels = (tx_wheel_rx, pto_wheel_rx, idle_wheel_rx, immediate_rx);
+            assert!(
+                retransmit_rx.recv().await.is_some(),
+                "the batch pushed to the lost pair didn't go to the frame channel"
+            );
+            assert!(
+                retransmit_rx.recv().await.is_none(),
+                "the batch's one frame went to the frame channel more than once"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}

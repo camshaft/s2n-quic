@@ -617,7 +617,14 @@ where
                 // While some of the senders' interface pairs are lost and another still
                 // delivers, choose among the senders that deliver, so that a lost pair gets
                 // only the probes of its own send worker.
-                Self::pick_delivering_sender(entry, len, rng, round_robin_idx)
+                Self::pick_delivering_sender(
+                    entry,
+                    len,
+                    rng,
+                    round_robin_idx,
+                    rejected_counters,
+                    score_delta,
+                )
             } else {
                 // First candidate: round-robin for deterministic striping across senders.
                 let rr = *round_robin_idx;
@@ -679,13 +686,28 @@ where
     /// Chooses among the senders whose interface pairs deliver as the pick-two rule chooses
     /// among every sender: the first candidate in round-robin order, the second at random, and
     /// the less loaded of the two, or the more loaded with the probability the rule sets for it.
+    ///
+    /// Where a sender that isn't marked lost has an acknowledgement after the lost pairs
+    /// stopped delivering, it chooses among those senders alone, since a sender on the same
+    /// down interface may not be marked lost yet. It records the score gap and the rejected
+    /// candidate in the pick-two counters, as the rule does among every sender.
     fn pick_delivering_sender(
         entry: &PathSecretEntry,
         len: usize,
         rng: &mut crate::xorshift::Rng,
         round_robin_idx: &mut usize,
+        rejected_counters: &IdMap<LocalSenderId, crate::counter::Summary>,
+        score_delta: &crate::counter::Summary,
     ) -> LocalSenderId {
-        let delivers = |idx: usize| !entry.is_sender_lost(LocalSenderId::from_index(idx));
+        let prefer_delivered = entry.has_sender_delivering_since_lost();
+        let delivers = |idx: usize| {
+            let sender = LocalSenderId::from_index(idx);
+            if prefer_delivered {
+                entry.delivers_since_lost(sender)
+            } else {
+                !entry.is_sender_lost(sender)
+            }
+        };
 
         let rr = *round_robin_idx % len;
         let first_idx = (0..len)
@@ -709,14 +731,18 @@ where
 
         let score1 = entry.sender_load_score(first);
         let score2 = entry.sender_load_score(second);
+        let delta = score1.abs_diff(score2);
+        score_delta.record_value(delta);
         let (better, worse) = if score1 <= score2 {
             (first, second)
         } else {
             (second, first)
         };
-        if rng.next_f64() < pick_two_worse_probability(score1.abs_diff(score2)) {
+        if rng.next_f64() < pick_two_worse_probability(delta) {
+            rejected_counters[better].record_value(delta);
             worse
         } else {
+            rejected_counters[worse].record_value(delta);
             better
         }
     }

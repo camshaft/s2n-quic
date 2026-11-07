@@ -3398,3 +3398,139 @@ fn frame_batch_counts_the_bytes_of_its_frames_without_send_credit() {
     assert_eq!(entry.creditless_bytes(), first_cost);
     assert_eq!(entry.window_round(), 7);
 }
+
+/// While a pair is lost, pick-two chooses among the senders the peer acknowledged after the
+/// lost pairs stopped delivering, and among every sender that isn't marked lost where none has
+/// an acknowledgement since.
+#[test]
+fn pick_two_prefers_senders_that_deliver_since_a_pair_was_lost() {
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    let at = |nanos| crate::time::precision::Timestamp { nanos };
+    assert!(entry.set_sender_lost(sender(0), true));
+    entry.record_sender_delivered(sender(1), at(100));
+    entry.record_sender_delivered(sender(2), at(300));
+    entry.record_sender_delivered(sender(3), at(400));
+    entry.set_senders_lost_since(at(200));
+
+    let calls = pick_two_calls(&entry, 100, 4);
+    assert_eq!(
+        calls[0] + calls[1],
+        0,
+        "a sender without an acknowledgement since the loss got an item: {calls:?}"
+    );
+    assert!(
+        calls[2] > 0 && calls[3] > 0,
+        "a sender that delivers since the loss didn't get an item: {calls:?}"
+    );
+
+    // Where no sender has an acknowledgement since the loss, the router chooses among every
+    // sender that isn't marked lost.
+    entry.set_senders_lost_since(at(500));
+    let calls = pick_two_calls(&entry, 100, 5);
+    assert_eq!(calls[0], 0, "a lost sender got an item: {calls:?}");
+    assert!(
+        calls[1] > 0 && calls[2] > 0 && calls[3] > 0,
+        "a sender that isn't marked lost didn't get an item: {calls:?}"
+    );
+}
+
+/// While a pair is lost, pick-two records its score gap and the candidate it rejects, as it
+/// does among every sender.
+#[test]
+fn pick_two_records_its_counters_while_a_pair_is_lost() {
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(3)
+        .build(None);
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(0), true));
+    let registry = crate::counter::Registry::default();
+    let pick_counters: crate::endpoint::id::IdMap<LocalSenderId, _> = (0..3)
+        .map(|i| registry.register_nominal("pick_two.chosen", format_args!("send.{i}")))
+        .collect::<Vec<_>>()
+        .into();
+    let rejected_counters: crate::endpoint::id::IdMap<LocalSenderId, _> = (0..3)
+        .map(|i| {
+            registry.register_nominal_summary(
+                "pick_two.rejected",
+                format_args!("send.{i}"),
+                crate::counter::Unit::Microsecond,
+            )
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let score_delta =
+        registry.register_summary("pick_two.score_delta", crate::counter::Unit::Microsecond);
+    let mut senders: crate::endpoint::id::IdMap<LocalSenderId, _> = (0..3)
+        .map(|_| TestSender {
+            accept: true,
+            calls: 0,
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let mut rng = crate::xorshift::Rng::with_seed(7);
+    let mut rr = 0;
+    for _ in 0..10 {
+        let item = new_test_item(entry.clone(), Arc::new(AtomicUsize::new(0)));
+        let result = PickTwo::<TestItem, TestReceiver<TestItem>, TestSender>::try_send_pick_two(
+            item,
+            &mut senders,
+            &mut rng,
+            &mut rr,
+            &pick_counters,
+            &rejected_counters,
+            &score_delta,
+        );
+        assert!(result.is_ok());
+    }
+    assert_eq!(
+        senders[LocalSenderId::from_index(0)].calls,
+        0,
+        "the lost sender got an item"
+    );
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("the counters recorded values");
+    let recorded = |name: &str| {
+        line.split(',')
+            .any(|field| field.contains(name) && field.contains('*'))
+    };
+    assert!(
+        recorded("pick_two.score_delta"),
+        "the score gap isn't recorded: {line}"
+    );
+    assert!(
+        recorded("pick_two.rejected"),
+        "no rejected candidate is recorded: {line}"
+    );
+}
+
+/// While a pair is lost, the interface-paced router sends each batch to the senders the peer
+/// acknowledged after the lost pairs stopped delivering, and not to a sender on the lost
+/// pair's interface without such an acknowledgement.
+#[test]
+fn interface_paced_pick_two_prefers_senders_that_deliver_since_a_pair_was_lost() {
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    let at = |nanos| crate::time::precision::Timestamp { nanos };
+    assert!(entry.set_sender_lost(sender(0), true));
+    entry.record_sender_delivered(sender(1), at(100));
+    entry.record_sender_delivered(sender(2), at(300));
+    entry.record_sender_delivered(sender(3), at(300));
+    entry.set_senders_lost_since(at(200));
+
+    let counts = route_by_interface(priority_items(&entry, &drop_counter, 20, 20));
+    assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert_eq!(
+        counts[1],
+        [0, 0],
+        "sender 1 got an item without an acknowledgement since the loss: {counts:?}"
+    );
+    assert_eq!(counts[2][0] + counts[3][0], 20);
+    assert_eq!(counts[2][1] + counts[3][1], 20);
+}
