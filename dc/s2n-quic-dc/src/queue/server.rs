@@ -148,6 +148,12 @@ impl ServerView {
         self.state.freed.hold(queue_id, binding_id)
     }
 
+    /// End the hold of the slot `queue_id` for the rejected init of `binding_id`, where its reset
+    /// doesn't reach the priority router, before the slot is freed.
+    pub fn unhold_freed(&self, queue_id: VarInt, binding_id: VarInt) {
+        self.state.freed.unhold(queue_id, binding_id)
+    }
+
     /// Attempt to bind a slot and push the first stream entry.
     pub fn bind_and_send_stream(
         &mut self,
