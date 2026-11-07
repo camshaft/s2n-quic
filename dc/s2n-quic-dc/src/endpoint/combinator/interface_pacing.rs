@@ -269,11 +269,11 @@ where
     /// The batches of `rx` that no sender may take yet, since each sender that delivers to their
     /// peer is on an interface that holds a batch, by the path secret of their peer, each peer's
     /// in the order the router read them. Meanwhile the router reads and routes the batches of
-    /// other peers. Their count isn't bounded. The send credit pool bounds the credit their
-    /// frames hold, so it bounds only the frames that borrow credit. Frames that don't borrow
-    /// credit, such as control frames, acknowledgements and resets, aren't bounded here, as they
-    /// aren't bounded in the frame lanes they come from either: those lanes accept each frame,
-    /// and their `on_consumed` doesn't count anything.
+    /// other peers. Their count isn't bounded, but in `frame_dispatch` their frames are: the
+    /// send credit pool bounds the credit they hold, and a
+    /// [`CreditlessWindow`](super::CreditlessWindow) bounds the bytes of those without send
+    /// credit, which stay in the window until the router delivers their batch through a
+    /// [`WindowSender`](super::WindowSender).
     waiting: HashMap<credentials::Id, VecDeque<T>>,
     /// The peers of `waiting`, which the router offers to the free senders in turn.
     waiting_order: VecDeque<credentials::Id>,
@@ -282,8 +282,8 @@ where
     /// holds those of `rx`. Where the router has an interface for the highest-priority traffic,
     /// such a batch waits while every sender of that interface is marked lost for its peer and
     /// each other sender that delivers is on an interface that holds a batch. Meanwhile the router
-    /// reads and routes the batches of other peers. Their count isn't bounded, as that of
-    /// `waiting` isn't.
+    /// reads and routes the batches of other peers. Their count isn't bounded, and their frames
+    /// are bounded in `frame_dispatch` as those of `waiting` are.
     highest_waiting: HashMap<credentials::Id, VecDeque<T>>,
     /// The peers of `highest_waiting`, which the router offers to the senders in turn.
     highest_waiting_order: VecDeque<credentials::Id>,
