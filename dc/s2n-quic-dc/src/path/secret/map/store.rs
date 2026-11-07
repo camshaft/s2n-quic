@@ -108,6 +108,9 @@ pub trait Store: 'static + Send + Sync + time::Clock {
 
     fn advertised_data_addrs(&self) -> Option<bytes::Bytes>;
 
+    /// Tags each advertised data address with the interface of the local socket it matches.
+    fn set_advertised_data_interfaces(&self, local: &[(SocketAddr, u16)]);
+
     fn check_dedup(
         &self,
         entry: &Entry,

@@ -256,6 +256,16 @@ impl Table {
     pub fn recv_sockets(&self) -> &[Id] {
         &self.recv_sockets
     }
+
+    /// Returns the interface of each recv socket, to advertise with the endpoint's data
+    /// addresses, or `None` where the configuration doesn't list an interface, so that the
+    /// addresses go untagged.
+    pub fn advertised_recv_interfaces(&self) -> Option<Vec<u16>> {
+        if self.interfaces.len() <= 1 {
+            return None;
+        }
+        Some(self.recv_sockets.iter().map(|id| id.0).collect())
+    }
 }
 
 /// Returns, for each of `socket_count` sockets, the interface that lists it, where one does.

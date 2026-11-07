@@ -665,6 +665,15 @@ where
         debug!(?interfaces, "resolved local interfaces");
     }
 
+    // Tag each advertised data address with the interface of its recv socket, so that a peer
+    // learns the interface of each address. A config that doesn't list an interface leaves
+    // the addresses untagged.
+    if let Some(recv_interfaces) = interfaces.advertised_recv_interfaces() {
+        let local: Vec<(std::net::SocketAddr, u16)> =
+            data_addrs.iter().copied().zip(recv_interfaces).collect();
+        path_secret_map.set_advertised_data_interfaces(&local);
+    }
+
     // Frame submission channel: all writers share one sharded sender; one dispatch task drains it.
     let (frame_tx, frame_rx) = frame::submission_channel(submission_shards);
 
