@@ -323,6 +323,39 @@ impl Map {
         self.store.on_dead_mark_skipped(peer_address);
     }
 
+    /// Emits a CreditlessWindowFrameRefused event via the subscriber
+    pub fn on_creditless_window_frame_refused(
+        &self,
+        frame_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.store
+            .on_creditless_window_frame_refused(frame_bytes, held_bytes, limit_bytes);
+    }
+
+    /// Emits a CreditlessWindowLimitGrew event via the subscriber
+    pub fn on_creditless_window_limit_grew(
+        &self,
+        released_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.store
+            .on_creditless_window_limit_grew(released_bytes, held_bytes, limit_bytes);
+    }
+
+    /// Emits a CreditlessWindowLimitHalved event via the subscriber
+    pub fn on_creditless_window_limit_halved(
+        &self,
+        held_bytes: u64,
+        previous_limit_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.store
+            .on_creditless_window_limit_halved(held_bytes, previous_limit_bytes, limit_bytes);
+    }
+
     pub fn handle_control_packet(&self, packet: &control::Packet, peer: &SocketAddr) {
         match packet {
             control::Packet::StaleKey(packet) => {

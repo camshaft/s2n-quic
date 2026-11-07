@@ -3671,6 +3671,140 @@ fn frame_batch_counts_the_bytes_of_its_frames_without_send_credit() {
     assert_eq!(entry.window_round(), 7);
 }
 
+/// Records the creditless window's events, each as its kind and its three byte fields in the
+/// order the event lists them.
+#[derive(Default)]
+struct WindowEvents {
+    events: std::sync::Mutex<Vec<(&'static str, u64, u64, u64)>>,
+}
+
+impl WindowEvents {
+    /// Returns the events recorded since the last call.
+    fn take(&self) -> Vec<(&'static str, u64, u64, u64)> {
+        core::mem::take(&mut *self.events.lock().unwrap())
+    }
+}
+
+impl crate::event::Subscriber for WindowEvents {
+    type ConnectionContext = ();
+
+    fn create_connection_context(
+        &self,
+        _meta: &crate::event::api::ConnectionMeta,
+        _info: &crate::event::api::ConnectionInfo,
+    ) -> Self::ConnectionContext {
+    }
+
+    fn on_creditless_window_frame_refused(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::CreditlessWindowFrameRefused,
+    ) {
+        let entry = ("frame_refused", event.frame_bytes, event.held_bytes, event.limit_bytes);
+        self.events.lock().unwrap().push(entry);
+    }
+
+    fn on_creditless_window_limit_grew(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::CreditlessWindowLimitGrew,
+    ) {
+        let entry = ("limit_grew", event.released_bytes, event.held_bytes, event.limit_bytes);
+        self.events.lock().unwrap().push(entry);
+    }
+
+    fn on_creditless_window_limit_halved(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::CreditlessWindowLimitHalved,
+    ) {
+        let entry = (
+            "limit_halved",
+            event.held_bytes,
+            event.previous_limit_bytes,
+            event.limit_bytes,
+        );
+        self.events.lock().unwrap().push(entry);
+    }
+}
+
+/// Returns a window whose limit starts at `minimum`, with a path secret map that publishes the
+/// window's events to `events`.
+fn creditless_window_with_events(
+    minimum: u64,
+    events: std::sync::Arc<WindowEvents>,
+) -> CreditlessWindow {
+    let path_secret_map = crate::path::secret::Map::builder()
+        .with_signer(crate::path::secret::stateless_reset::Signer::random())
+        .with_capacity(4)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber(events)
+        .build()
+        .unwrap();
+    CreditlessWindow::with_path_secret_map(minimum, path_secret_map)
+}
+
+/// The window records each frame it refuses, each growth of its limit and each halving, with the
+/// bytes it holds and its limit. It records a halving once a round, also where its minimum keeps
+/// the limit where it is, and doesn't record an event where nothing changes.
+#[test]
+fn creditless_window_records_its_refusals_and_limit_changes_as_events() {
+    let events = std::sync::Arc::new(WindowEvents::default());
+    let window = creditless_window_with_events(64, events.clone());
+    // A clone stands for the batch router's, so that the window counts the frames.
+    let _router = window.clone();
+
+    // A frame while the window holds nothing doesn't record an event.
+    window.start_round();
+    assert!(window.admit(100));
+    assert!(events.take().is_empty());
+    // A refused frame records its bytes, the bytes the window holds and the limit.
+    assert!(!window.admit(1));
+    assert_eq!(events.take(), [("frame_refused", 1, 100, 64)]);
+
+    // A release in the round in which the window refused a frame grows the limit by its bytes.
+    window.release(100, window.round());
+    assert_eq!(window.limit(), 164);
+    assert_eq!(events.take(), [("limit_grew", 100, 0, 164)]);
+
+    // A frame within the limit, a release in a round without a refusal and a release of no
+    // bytes leave the limit as it is and don't record an event.
+    window.start_round();
+    assert!(window.admit(100));
+    assert!(window.admit(64));
+    window.release(164, window.round());
+    window.release(0, 0);
+    assert_eq!(window.limit(), 164);
+    assert!(events.take().is_empty());
+
+    // A batch read in an earlier round halves the limit, which the window records once a round.
+    let read_in = window.round();
+    assert!(window.admit(100));
+    window.start_round();
+    window.release(60, read_in);
+    window.release(40, read_in);
+    assert_eq!(window.limit(), 82);
+    assert_eq!(events.take(), [("limit_halved", 40, 164, 82)]);
+
+    // The minimum bounds a halving and then keeps the limit where it is, and each round still
+    // records the event.
+    let read_in = window.round();
+    assert!(window.admit(30));
+    window.start_round();
+    window.release(30, read_in);
+    assert_eq!(window.limit(), 64);
+    let read_in = window.round();
+    assert!(window.admit(10));
+    window.start_round();
+    window.release(10, read_in);
+    assert_eq!(window.limit(), 64);
+    assert_eq!(
+        events.take(),
+        [("limit_halved", 0, 82, 64), ("limit_halved", 0, 64, 64)]
+    );
+    assert_eq!(window.held(), 0);
+}
+
 /// While a pair is lost, pick-two chooses among the senders the peer acknowledged after the
 /// lost pairs stopped delivering, and among every sender that isn't marked lost where none has
 /// an acknowledgement since.
