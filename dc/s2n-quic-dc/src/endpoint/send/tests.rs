@@ -1876,3 +1876,53 @@ fn a_peer_acknowledgement_records_the_senders_delivery() {
         "the acknowledgement that clears the mark is a delivery after the loss"
     );
 }
+
+/// The acknowledgement handler records the sender's delivery on the path secret entry, so that
+/// an acknowledgement that clears a lost mark makes the sender one that delivers since the loss.
+#[test]
+fn the_acknowledgement_handler_records_the_senders_delivery() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(1000);
+    ctx.last_peer_activity = clock.get_time();
+    ctx.ack_wait_since = None;
+    ctx.next_packet_number = VarInt::from_u8(5);
+    ctx.set_path_lost(true);
+    assert!(!entry.delivers_since_lost(sender));
+
+    // The pair sends packet 5 after the mark, and the peer acknowledges it after the time the
+    // pair stopped delivering.
+    ctx.next_packet_number = VarInt::from_u8(6);
+    clock.advance(ctx.rtt_estimator.smoothed_rtt() + Duration::from_millis(1));
+    let counters = crate::endpoint::counters::Send::new(&Registry::default(), sender);
+    let mut completed = CollectFrames::default();
+    let mut lost = CollectFrames::default();
+    let mut cancelled = CollectFrames::default();
+    let mut random = crate::xorshift::Rng::with_seed(1);
+    let mut deferred = Vec::new();
+    let _ = ctx.process_ack(
+        VarInt::from_u8(5),
+        VarInt::from_u8(5),
+        &[],
+        s2n_quic_core::frame::ack::EcnCounts::default(),
+        Duration::ZERO,
+        &counters,
+        &mut completed,
+        &mut lost,
+        &mut cancelled,
+        &clock,
+        &mut random,
+        &mut deferred,
+    );
+
+    assert_eq!(ctx.last_peer_activity, clock.get_time());
+    assert!(
+        !ctx.is_path_lost(),
+        "an ack of the packet sent after the mark clears it"
+    );
+    assert!(
+        entry.delivers_since_lost(sender),
+        "the handler records the acknowledgement as a delivery after the loss"
+    );
+}

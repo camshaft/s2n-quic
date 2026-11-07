@@ -3534,3 +3534,29 @@ fn interface_paced_pick_two_prefers_senders_that_deliver_since_a_pair_was_lost()
     assert_eq!(counts[2][0] + counts[3][0], 20);
     assert_eq!(counts[2][1] + counts[3][1], 20);
 }
+
+/// Where no sender has an acknowledgement after the lost pairs stopped delivering, the
+/// interface-paced router reads each sender's lost mark: every batch goes to the one sender that
+/// isn't marked lost, the highest-priority ones among them.
+#[test]
+fn interface_paced_pick_two_reads_the_lost_marks_where_no_sender_delivers_since_a_loss() {
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    let at = |nanos| crate::time::precision::Timestamp { nanos };
+    for idx in [0, 2, 3] {
+        assert!(entry.set_sender_lost(sender(idx), true));
+    }
+    entry.record_sender_delivered(sender(1), at(100));
+    entry.record_sender_delivered(sender(2), at(300));
+    entry.record_sender_delivered(sender(3), at(300));
+    entry.set_senders_lost_since(at(500));
+    assert!(!entry.has_sender_delivering_since_lost());
+
+    assert_eq!(
+        route_by_interface(priority_items(&entry, &drop_counter, 20, 20)),
+        [[0, 0], [20, 20], [0, 0], [0, 0]]
+    );
+}
