@@ -613,6 +613,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             tx_pto_requested,
             send_caches.clone(),
             sender_idx_to_local.clone(),
+            frame_tx.clone(),
         );
         let task_counter = counter_registry
             .register_nominal_task("task.pto_wheel", &variant)
@@ -928,7 +929,11 @@ where
 ///
 /// For each send context emitted by the PTO wheel, this updates probe state and forwards the
 /// resulting wheel interest back to the caller-supplied scheduling channels.
-pub fn send_pto_timeout<CtxRx, Clk, ImmW, TxW, PtoW, IdleW>(
+///
+/// Where a context's interface pair is marked lost and another pair of its peer still
+/// delivers, the context's pending and unacknowledged frames go to `retransmit_tx`, so that the
+/// routers send them on the pairs that deliver.
+pub fn send_pto_timeout<CtxRx, Clk, ImmW, TxW, PtoW, IdleW, RetxW>(
     pto_context_rx: CtxRx,
     clock: Clk,
     immediate_tx: ImmW,
@@ -939,6 +944,7 @@ pub fn send_pto_timeout<CtxRx, Clk, ImmW, TxW, PtoW, IdleW>(
     tx_pto_requested: counter::Counter,
     send_caches: IdMap<LocalSendSocketId, Rc<RefCell<send::Cache>>>,
     sender_idx_to_local: IdMap<LocalSenderId, LocalSendSocketId>,
+    mut retransmit_tx: RetxW,
 ) -> impl Receiver<()>
 where
     CtxRx: Receiver<Rc<RefCell<send::Context>>>,
@@ -947,6 +953,7 @@ where
     TxW: UnboundedSender<Rc<RefCell<send::Context>>>,
     PtoW: UnboundedSender<Rc<RefCell<send::Context>>>,
     IdleW: UnboundedSender<Rc<RefCell<send::Context>>>,
+    RetxW: UnboundedSender<Entry<Frame>>,
 {
     let rx = Map::new(
         pto_context_rx,
@@ -967,6 +974,15 @@ where
                     if ctx.pto.backoff > 2 {
                         counters.on_probe_no_response();
                     }
+                }
+                if ctx.should_move_frames() {
+                    let moved = ctx.move_frames(&mut retransmit_tx);
+                    debug!(
+                        moved,
+                        sender_idx = ?ctx.sender_idx,
+                        peer = %ctx.path_secret_entry.peer(),
+                        "moved the frames of a lost interface pair to the pairs that deliver"
+                    );
                 }
                 interest
             };
@@ -1269,6 +1285,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let peer_addr = ctx.peer_addr;
                 let ever_responded = ctx.last_peer_activity.nanos != ctx.created_at.nanos;
                 let has_inflight = ctx.inflight.has_inflight();
+                let path_lost = ctx.is_path_lost();
                 let pto_backoff = ctx.pto.backoff;
                 let packets_sent = ctx.next_packet_number.as_u64();
 
@@ -1337,7 +1354,10 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // were never acknowledged — that's evidence the peer is
                 // unreachable. If there are no inflight packets, both sides
                 // simply stopped talking (natural idle) and we must not mark dead.
+                // A lost pair's probes go unacknowledged, so a lost pair marks the peer dead only
+                // once every pair of the peer is lost.
                 let marked_dead = has_inflight
+                    && !(path_lost && path_secret_entry.has_delivering_sender())
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
 
                 let result = send_caches[local_id].borrow_mut().invalidate(

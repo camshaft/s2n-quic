@@ -602,6 +602,11 @@ where
             let len = senders.len();
             if len <= 1 {
                 LocalSenderId::from_index(0)
+            } else if entry.has_lost_sender() && entry.has_delivering_sender() {
+                // While some of the senders' interface pairs are lost and another still
+                // delivers, choose among the senders that deliver, so that a lost pair gets
+                // only the probes of its own send worker.
+                Self::pick_delivering_sender(entry, len, rng, round_robin_idx)
             } else {
                 // First candidate: round-robin for deterministic striping across senders.
                 let rr = *round_robin_idx;
@@ -658,6 +663,51 @@ where
         value.set_sender_id(chosen_idx);
 
         senders[chosen_idx].send(value)
+    }
+
+    /// Chooses among the senders whose interface pairs deliver as the pick-two rule chooses
+    /// among every sender: the first candidate in round-robin order, the second at random, and
+    /// the less loaded of the two, or the more loaded with the probability the rule sets for it.
+    fn pick_delivering_sender(
+        entry: &PathSecretEntry,
+        len: usize,
+        rng: &mut crate::xorshift::Rng,
+        round_robin_idx: &mut usize,
+    ) -> LocalSenderId {
+        let delivers = |idx: usize| !entry.is_sender_lost(LocalSenderId::from_index(idx));
+
+        let rr = *round_robin_idx % len;
+        let first_idx = (0..len)
+            .map(|offset| (rr + offset) % len)
+            .find(|&idx| delivers(idx))
+            .unwrap_or(rr);
+        *round_robin_idx = (first_idx + 1) % len;
+        let first = LocalSenderId::from_index(first_idx);
+
+        let others = (0..len)
+            .filter(|&idx| idx != first_idx && delivers(idx))
+            .count();
+        if others == 0 {
+            return first;
+        }
+        let nth = rng.next_usize(others);
+        let second = (0..len)
+            .filter(|&idx| idx != first_idx && delivers(idx))
+            .nth(nth)
+            .map_or(first, LocalSenderId::from_index);
+
+        let score1 = entry.sender_load_score(first);
+        let score2 = entry.sender_load_score(second);
+        let (better, worse) = if score1 <= score2 {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        if rng.next_f64() < pick_two_worse_probability(score1.abs_diff(score2)) {
+            worse
+        } else {
+            better
+        }
     }
 }
 
