@@ -32,7 +32,7 @@ use super::{
     slot::BindState,
     Error,
 };
-use crate::{endpoint::msg, intrusive};
+use crate::{bitset::HierarchicalBitSet, endpoint::msg, intrusive};
 use s2n_quic_core::varint::VarInt;
 use std::sync::Arc;
 
@@ -78,10 +78,13 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new(max_queues: VarInt, initial_recv_window: u64) -> Self {
+        // The freed set records a slot's free only below its capacity, so the server doesn't
+        // bind a slot at or past it, and the free of each slot it binds reaches its client.
+        let max_queues = max_queues.as_u64().min(HierarchicalBitSet::MAX_CAPACITY as u64);
         Self {
             pages: PageTable::new(),
             freed: FreedInner::new(),
-            max_queue_id: max_queues.as_u64().saturating_sub(1),
+            max_queue_id: max_queues.saturating_sub(1),
             initial_recv_window,
         }
     }
@@ -488,6 +491,38 @@ mod tests {
         assert!(server.hold_freed(v(capacity - 1), v(1)));
         // The slot at the freed set's capacity is one of the peer's queues, and isn't held.
         assert!(!server.hold_freed(v(capacity), v(1)));
+    }
+
+    #[test]
+    fn max_queue_id_is_bounded_at_the_freed_set_capacity() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // Up to the freed set's capacity, the last queue id is the peer's last queue.
+        assert_eq!(ServerState::new(v(10), 0).max_queue_id, 9);
+        assert_eq!(ServerState::new(v(capacity), 0).max_queue_id, capacity - 1);
+        // Past it, the last queue id is the freed set's last slot.
+        assert_eq!(ServerState::new(v(capacity + 1), 0).max_queue_id, capacity - 1);
+        assert_eq!(ServerState::new(VarInt::MAX, 0).max_queue_id, capacity - 1);
+    }
+
+    #[test]
+    fn a_slot_the_freed_set_cant_record_isnt_bound() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // The peer's queues reach past the slots that the freed set records.
+        let (mut server, path_entry, mut tx, _rx) = test_server(capacity + 1);
+        assert_eq!(server.state.max_queue_id, capacity - 1);
+
+        // The slot at the freed set's capacity is one of the peer's queues, and the server
+        // doesn't bind it, since the freed set doesn't record its free.
+        let result = server.bind_and_send_stream(
+            v(capacity),
+            v(1),
+            make_stream_entry(),
+            &path_entry,
+            &mut tx,
+        );
+        assert!(matches!(result, Err(Error::CapExceeded(_))));
+        let result = server.bind_for_msg(v(capacity), v(1), &path_entry, &mut tx);
+        assert!(matches!(result, Err(Error::CapExceeded(_))));
     }
 
     #[test]
