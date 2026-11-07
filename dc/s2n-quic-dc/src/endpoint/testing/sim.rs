@@ -232,6 +232,10 @@ pub struct SimEndpointConfig {
     /// Overall send rate cap (Gbps).
     pub overall_send_rate: Rate,
 
+    /// The local interfaces, each with its send rate and its sockets. Empty puts every socket
+    /// on the default interface at `overall_send_rate`.
+    pub interfaces: Vec<crate::socket::interface::Config>,
+
     /// Per-poll budgets.
     pub budgets: Budgets,
 
@@ -271,6 +275,7 @@ impl Default for SimEndpointConfig {
             num_recv_dispatch_workers: 4,
             submission_shards: 4,
             overall_send_rate: Rate::new(25.0),
+            interfaces: Vec::new(),
             budgets: Budgets::default(),
             mtu: 1500,
             send_window: None,
@@ -294,6 +299,11 @@ impl SimEndpointConfig {
 
     pub fn overall_send_rate(mut self, rate: Rate) -> Self {
         self.overall_send_rate = rate;
+        self
+    }
+
+    pub fn interfaces(mut self, interfaces: Vec<crate::socket::interface::Config>) -> Self {
+        self.interfaces = interfaces;
         self
     }
 
@@ -347,6 +357,7 @@ pub fn setup_sim_endpoint(
         num_recv_dispatch_workers,
         submission_shards,
         overall_send_rate,
+        interfaces,
         budgets,
         mtu,
         send_window,
@@ -472,8 +483,7 @@ pub fn setup_sim_endpoint(
         gso,
         acceptor_registry,
         overall_send_rate,
-        // Sim sockets are on the default interface, at `overall_send_rate`.
-        interfaces: Vec::new(),
+        interfaces,
         budgets,
         submission_shards,
         ups_rate: crate::socket::rate::Rate::new(0.001),

@@ -926,3 +926,267 @@ fn ack_processor_drops_message_with_out_of_range_sender_idx() {
     let result = with_noop_context(|cx| router.poll_recv(cx, &mut Budget::new(usize::MAX)));
     assert_eq!(result, Poll::Ready(None));
 }
+
+// -- InterfacePacedPickTwo tests ---------------------------------------------
+
+type Sends = Rc<RefCell<Vec<(crate::time::precision::Timestamp, u64)>>>;
+
+/// A sender that records the time each item reached it and the item's byte cost.
+struct TimedSender {
+    clock: test_clock_mod::Clock,
+    sends: Sends,
+}
+
+impl UnboundedSender<TestItem> for TimedSender {
+    fn send(&mut self, value: TestItem) -> Result<(), TestItem> {
+        let now = crate::time::precision::Clock::now(&self.clock);
+        self.sends.borrow_mut().push((now, value.byte_cost()));
+        Ok(())
+    }
+}
+
+fn timed_senders(
+    clock: &test_clock_mod::Clock,
+    sends: &[&Sends],
+) -> crate::endpoint::id::IdMap<LocalSenderId, TimedSender> {
+    sends
+        .iter()
+        .map(|sends| TimedSender {
+            clock: clock.clone(),
+            sends: Rc::clone(sends),
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn test_items(
+    entry: &Arc<PathSecretEntry>,
+    count: usize,
+    byte_cost: u64,
+    drop_counter: &Arc<AtomicUsize>,
+) -> VecDeque<TestItem> {
+    (0..count)
+        .map(|_| {
+            let mut item = new_test_item(entry.clone(), drop_counter.clone());
+            item.byte_cost = byte_cost;
+            item
+        })
+        .collect()
+}
+
+fn test_pool() -> crate::sync::Arc<crate::credit::Pool> {
+    crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
+        1_000_000,
+    )))
+}
+
+/// Polls `router` until it has nothing to do now: it returns `Pending`, or `Ready(None)` once
+/// its input is closed and it holds no batch.
+fn poll_until_idle<R: Receiver<()>>(router: &mut R) -> Poll<Option<()>> {
+    with_noop_context(|cx| loop {
+        match router.poll_recv(cx, &mut Budget::new(usize::MAX)) {
+            Poll::Ready(Some(())) => {}
+            other => return other,
+        }
+    })
+}
+
+/// Checks that each of `sends`, a time and a byte count, came once the bytes sent before it fit
+/// in `rate` and its burst since `start`, with 2 us allowed for timer rounding.
+fn assert_within_rate(
+    sends: &[(crate::time::precision::Timestamp, u64)],
+    rate: Rate,
+    start: crate::time::precision::Timestamp,
+) {
+    let mut sent_before = 0;
+    for &(at, bytes) in sends {
+        let allowed = at.nanos_since(start) + rate.burst_nanos() + 2_000;
+        assert!(
+            rate.nanos_for_bytes(sent_before) <= allowed,
+            "a send at {at:?} after {sent_before} bytes came early for {rate:?}",
+        );
+        sent_before += bytes;
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_paces_each_interface_to_its_rate() {
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let clock = test_clock();
+    let start = crate::time::precision::Clock::now(&clock);
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let rx = TestReceiver {
+        values: test_items(&test_path_secret_entry(), 200, 100_000, &drop_counter),
+        consumed: 0,
+    };
+    let slow_sends = Sends::default();
+    let fast_sends = Sends::default();
+    let pacing = SendPacing::new(vec![slow, fast], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&slow_sends, &fast_sends]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    // 20 ms of the test clock, in steps of 10 us.
+    for _ in 0..2_000 {
+        assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+        clock.advance(std::time::Duration::from_micros(10));
+    }
+
+    let slow_sends = slow_sends.borrow();
+    let fast_sends = fast_sends.borrow();
+    assert_within_rate(&slow_sends, slow, start);
+    assert_within_rate(&fast_sends, fast, start);
+    // A batch of 100,000 bytes takes 800 us at 1 Gbps and 200 us at 4 Gbps, so in 20 ms the slow
+    // interface sends about 25 batches and the fast one about 100.
+    let slow_count = slow_sends.len();
+    let fast_count = fast_sends.len();
+    assert!(slow_count >= 20, "slow: {slow_count} batches");
+    assert!(
+        fast_count >= 3 * slow_count,
+        "fast: {fast_count} batches, slow: {slow_count}",
+    );
+}
+
+#[test]
+fn interface_paced_pick_two_delivers_held_batches_after_upstream_closes() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let rx = TestReceiver {
+        values: test_items(&test_path_secret_entry(), 3, 100_000, &drop_counter),
+        consumed: 0,
+    };
+    let sends = Sends::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&sends, &sends]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    // Each batch costs more than a burst: two go at once, one on each interface, and the third
+    // waits until its interface has paid for the batch it sent.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sends.borrow().len(), 2);
+
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(sends.borrow().len(), 3);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn interface_paced_pick_two_returns_credit_when_the_worker_is_gone() {
+    const CAP: u64 = 1_000_000;
+    const CREDIT: u64 = 4096;
+
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let pool = crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(CAP)));
+    let mut item = new_test_item(test_path_secret_entry(), drop_counter.clone());
+    item.flow_credits = CREDIT;
+    let rx = TestReceiver {
+        values: [item].into(),
+        consumed: 0,
+    };
+    let senders = vec![
+        TestSender {
+            accept: false,
+            calls: 0,
+        },
+        TestSender {
+            accept: false,
+            calls: 0,
+        },
+    ];
+    let rate = Rate::new(1.0);
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        test_clock(),
+        &pacing,
+        &registry,
+        pool.clone(),
+    );
+
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
+    // The item's credit wasn't drawn from the pool, so its return shows as a balance of
+    // `CAP + CREDIT`.
+    assert_eq!(
+        pool.debug_available() as u64 + pool.debug_returned(),
+        CAP + CREDIT,
+        "the router didn't return the batch's send credit to the pool",
+    );
+}
+
+#[test]
+fn send_pacing_paces_each_interface_that_holds_a_send_socket() {
+    use crate::socket::interface;
+
+    let overall = Rate::new(25.0);
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let addrs: [std::net::SocketAddr; 4] = [
+        "127.0.0.1:4000".parse().unwrap(),
+        "127.0.0.1:4001".parse().unwrap(),
+        "127.0.0.1:4002".parse().unwrap(),
+        "127.0.0.1:4003".parse().unwrap(),
+    ];
+    let pacing = |configs: &[interface::Config]| {
+        let table = interface::Table::resolve(configs, overall, &addrs, &addrs, &interface::System);
+        SendPacing::from_interfaces(&table, overall)
+    };
+
+    // Without interfaces, one rate paces every send socket, as before.
+    assert_eq!(pacing(&[]), SendPacing::single(overall));
+
+    // Sockets 0 and 2 on the slow interface, 1 on the fast one, and 3, which neither lists, on
+    // the default interface.
+    let split = pacing(&[
+        interface::Config {
+            send_rate: Some(slow),
+            send_sockets: vec![0, 2],
+            ..Default::default()
+        },
+        interface::Config {
+            send_rate: Some(fast),
+            send_sockets: vec![1],
+            ..Default::default()
+        },
+    ]);
+    let expected = SendPacing::new(vec![overall, slow, fast], vec![1, 2, 1, 0]);
+    assert_eq!(split, expected);
+    assert_eq!(split.interface_count(), 3);
+    assert_eq!(format!("{:?}", split.total_rate()), "30.0Gbps");
+
+    // Where every send socket is on one interface, that interface's rate paces them all.
+    let one = pacing(&[
+        interface::Config {
+            send_rate: Some(slow),
+            ..Default::default()
+        },
+        interface::Config {
+            send_rate: Some(fast),
+            send_sockets: vec![0, 1, 2, 3],
+            ..Default::default()
+        },
+    ]);
+    assert_eq!(one, SendPacing::single(fast));
+    assert_eq!(one.interface_count(), 1);
+}

@@ -369,15 +369,15 @@ pub struct Config {
     pub gso: s2n_quic_platform::features::Gso,
     /// Server-side acceptor registry.
     pub acceptor_registry: acceptor::Registry<Stream>,
-    /// Overall bandwidth cap applied by the frame-dispatch pacing stage.
-    ///
-    /// The [`Paced`] combinator in the dispatch pipeline enforces this rate across all
-    /// send sockets combined. Set to a very high value (e.g. `Rate::new(100.0)` for
-    /// 100 Gbps) to effectively disable pacing when the network is not a bottleneck.
-    ///
-    /// It is also the send rate of the default interface, and of each listed interface (see
+    /// The send rate of the default interface, and of each listed interface (see
     /// [`interfaces`](Self::interfaces)) whose link speed the operating system doesn't report
     /// and whose rate the configuration doesn't set.
+    ///
+    /// Where every send socket is on one interface, the [`Paced`] combinator in the dispatch
+    /// pipeline holds the send sockets combined to that interface's send rate. Where they are on
+    /// several interfaces, the pipeline paces the send sockets of each interface together, at
+    /// that interface's send rate. Set it to a very high value, such as `Rate::new(100.0)` for
+    /// 100 Gbps, so that pacing doesn't limit sends where the network isn't the bottleneck.
     ///
     /// [`Paced`]: crate::socket::channel::Paced
     pub overall_send_rate: crate::socket::rate::Rate,
@@ -387,8 +387,9 @@ pub struct Config {
     /// `overall_send_rate`, as an endpoint without interfaces sends. Otherwise the endpoint
     /// numbers the listed interfaces from 1, beside the default interface 0, and puts each socket
     /// that no interface lists on the listed interface whose name its local address is on, or on
-    /// the default interface. Pacing still holds every send socket to `overall_send_rate`
-    /// combined. See [`crate::socket::interface`].
+    /// the default interface. Frame dispatch paces the send sockets of each interface together,
+    /// at that interface's send rate, and the send and receive credit pools refill at the sum of
+    /// the send rates of the interfaces that hold a send socket. See [`crate::socket::interface`].
     pub interfaces: Vec<crate::socket::interface::Config>,
     /// Per-poll budgets for each pipeline task.
     pub budgets: Budgets,
@@ -620,6 +621,10 @@ where
         debug!(?interfaces, "resolved local interfaces");
     }
 
+    // Frame dispatch paces the send sockets of each interface together, at that interface's
+    // send rate. Where every send socket is on one interface, one rate paces them all.
+    let pacing = combinator::SendPacing::from_interfaces(&interfaces, overall_send_rate);
+
     // Frame submission channel: all writers share one sharded sender; one dispatch task drains it.
     let (frame_tx, frame_rx) = frame::submission_channel(submission_shards);
 
@@ -638,7 +643,7 @@ where
     // placeholder rate); here we substitute the real rate. A caller that explicitly *disabled*
     // refill (`refill: None`, via `Config::without_refill`) is preserved — `.map` only rewrites the
     // rate of an already-enabled refill, it never re-enables a disabled one.
-    let refill_rate = overall_send_rate;
+    let refill_rate = pacing.total_rate();
     let send_credit_pool_config = crate::credit::Config {
         refill: send_credit_pool_config
             .refill
@@ -815,7 +820,7 @@ where
         frame_rx,
         socket_senders,
         clock: clock.clone(),
-        overall_send_rate,
+        pacing,
         send_credit_distributor,
         recv_credit_distributor,
         send_credit_waker_sink: send_credit_distributor_waker_sink,
@@ -1067,8 +1072,8 @@ struct FrameDispatchParts<Clk> {
     socket_senders: IdMap<LocalSenderId, BatchSender>,
     /// Clock used by the pacing stage.
     clock: Clk,
-    /// Overall bandwidth cap for the pacing stage.
-    overall_send_rate: crate::socket::rate::Rate,
+    /// How the pacing stage paces the send sockets of each interface.
+    pacing: combinator::SendPacing,
     /// Send-direction credit-pool distributor. Spawned alongside the frame-dispatch
     /// task on the same worker so distribution and submission share a thread.
     send_credit_distributor: crate::credit::Distributor,
@@ -1291,7 +1296,7 @@ where
                     fd.socket_senders,
                     crate::xorshift::Rng::new(),
                     fd.clock,
-                    fd.overall_send_rate,
+                    fd.pacing,
                     budgets,
                     counter_registry.clone(),
                     fd.send_credit_pool,

@@ -7,7 +7,8 @@ use crate::{
         self,
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
-            CompletionDispatcher, FrameBatch, PathSecretMapEntry, PickTwo,
+            CompletionDispatcher, FrameBatch, InterfacePacedPickTwo, PathSecretMapEntry, PickTwo,
+            SendPacing,
         },
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
@@ -60,8 +61,8 @@ mod tests;
 ///
 /// `frame_dispatch` is the boundary between producers that submit individual [`Frame`] values
 /// and send workers that consume [`FrameBatch`] values. It is responsible for preserving frame
-/// priority, batching work by peer/path secret, applying endpoint-wide pacing, and choosing a
-/// send worker for each batch.
+/// priority, batching work by peer/path secret, pacing the send sockets of each local interface
+/// at that interface's send rate, and choosing a send worker for each batch.
 ///
 /// # Contract
 ///
@@ -70,8 +71,10 @@ mod tests;
 /// - Frames from different priority classes are never merged into the same batch.
 /// - The spawned tasks are the only side effect; callers do not receive a handle back and must
 ///   keep the underlying executor running for progress.
-/// - `overall_send_rate` and `budgets` bound how aggressively work is drained once the tasks are
-///   spawned.
+/// - `pacing` and `budgets` bound how aggressively work is drained once the tasks are spawned.
+///   With one interface, a [`Paced`] stage paces every send socket at its rate before
+///   [`PickTwo`] chooses a worker; with more, [`InterfacePacedPickTwo`] chooses the worker first
+///   and paces each interface's sockets with a token bucket of their own.
 #[allow(clippy::too_many_arguments)]
 pub fn frame_dispatch<S, Clk>(
     spawner: &mut impl Spawner,
@@ -79,7 +82,7 @@ pub fn frame_dispatch<S, Clk>(
     worker_senders: IdMap<LocalSenderId, S>,
     rng: crate::xorshift::Rng,
     clock: Clk,
-    overall_send_rate: Rate,
+    pacing: SendPacing,
     budgets: Budgets,
     counter_registry: counter::Registry,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
@@ -142,22 +145,47 @@ pub fn frame_dispatch<S, Clk>(
             })
             .collect();
         let rx = PriorityRx::new(priority_batch_rxs);
-        let rx = BatchFramesByPathSecret::new(rx, &clock, overall_send_rate);
+        let rx = BatchFramesByPathSecret::new(rx, &clock, pacing.total_rate());
         let rx = Map::new(rx, Entry::new);
-        let rx = Paced::new(rx, clock, overall_send_rate);
-        let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
-        let task_counter = counter_registry
-            .register_task("task.frame_dispatch")
-            .with_registration_metadata(
-                "task.frame_dispatch",
-                "Batches, paces, and routes frame batches to worker send sockets",
-                "endpoint::tasks::frame_dispatch",
+        let register_task_counter = || {
+            counter_registry
+                .register_task("task.frame_dispatch")
+                .with_registration_metadata(
+                    "task.frame_dispatch",
+                    "Batches, paces, and routes frame batches to worker send sockets",
+                    "endpoint::tasks::frame_dispatch",
+                )
+        };
+        if pacing.interface_count() == 1 {
+            // Every send socket is on one interface: pace them together at its rate, then choose
+            // a worker for each batch.
+            let rx = Paced::new(rx, clock, pacing.total_rate());
+            let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
+            let task_counter = register_task_counter();
+            spawner.spawn_receiver_task(
+                rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
+                Some(budgets.frame_dispatch),
+                task_counter,
             );
-        spawner.spawn_receiver_task(
-            rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
-            Some(budgets.frame_dispatch),
-            task_counter,
-        );
+        } else {
+            // The send sockets are on several interfaces: choose a worker for each batch first,
+            // then pace the batch with the token bucket of that worker's interface.
+            let rx = InterfacePacedPickTwo::new(
+                rx,
+                worker_senders,
+                rng,
+                clock,
+                &pacing,
+                &counter_registry,
+                send_credit_pool,
+            );
+            let task_counter = register_task_counter();
+            spawner.spawn_receiver_task(
+                rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
+                Some(budgets.frame_dispatch),
+                task_counter,
+            );
+        }
     }
 }
 

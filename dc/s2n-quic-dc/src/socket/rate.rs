@@ -46,6 +46,11 @@ impl Rate {
     pub fn burst_nanos(&self) -> u64 {
         self.burst_nanos
     }
+
+    /// Returns the rate in gigabits per second.
+    pub fn gigabits_per_second(&self) -> f64 {
+        8.0 / self.nanos_per_byte
+    }
 }
 
 impl core::fmt::Debug for Rate {
@@ -96,5 +101,48 @@ impl TokenBucket {
     /// Returns the current token balance in nanoseconds.
     pub fn tokens_nanos(&self) -> i64 {
         self.tokens_nanos
+    }
+
+    /// Returns the nanoseconds of debt the bucket holds at `now`: the time from `now` until the
+    /// sends already charged are paid for, or 0 where the bucket holds tokens.
+    pub fn debt_nanos(&self, now: Timestamp) -> u64 {
+        let elapsed = now.nanos_since(self.last_refill) as i64;
+        self.tokens_nanos.saturating_add(elapsed).min(0).unsigned_abs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::time::Duration;
+
+    const START: Timestamp = Timestamp {
+        nanos: 1_000_000_000,
+    };
+
+    #[test]
+    fn debt_is_the_time_until_the_charged_sends_are_paid_for() {
+        let rate = Rate::new(1.0);
+        let mut bucket = TokenBucket::new(START, &rate);
+        assert_eq!(bucket.debt_nanos(START), 0);
+
+        // Spend the burst and 1 us more.
+        assert_eq!(bucket.consume(START, rate.burst_nanos() + 1_000), 1_000);
+        assert_eq!(bucket.debt_nanos(START), 1_000);
+        assert_eq!(bucket.debt_nanos(START + Duration::from_nanos(400)), 600);
+        assert_eq!(bucket.debt_nanos(START + Duration::from_nanos(1_000)), 0);
+        assert_eq!(bucket.debt_nanos(START + Duration::from_nanos(5_000)), 0);
+
+        // Reading the debt doesn't change the bucket.
+        assert_eq!(bucket.tokens_nanos(), -1_000);
+    }
+
+    #[test]
+    fn gigabits_per_second_returns_the_configured_rate() {
+        for gigabits_per_second in [1.0, 2.5, 25.0] {
+            let rate = Rate::new(gigabits_per_second);
+            let error = (rate.gigabits_per_second() - gigabits_per_second).abs();
+            assert!(error < 1e-9, "{rate:?}: error {error}");
+        }
     }
 }

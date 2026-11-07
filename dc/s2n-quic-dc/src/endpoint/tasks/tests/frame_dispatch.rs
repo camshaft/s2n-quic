@@ -11,19 +11,20 @@
 use super::helpers::{test_frame, test_frame_with_payload, TestReceiverExt as _};
 use crate::{
     endpoint::{
-        combinator::FrameBatch,
+        combinator::{FrameBatch, SendPacing},
         frame::{self, PriorityInput, SubmissionSender},
         tasks, Budgets,
     },
     intrusive::EntryAdapter,
     runtime::bach::Local,
     socket::{
-        channel::{intrusive::unsync, UnboundedSender},
+        channel::{intrusive::unsync, ByteCost, UnboundedSender},
         rate::Rate,
     },
     testing::{ext::*, sim},
     time::bach::Clock,
 };
+use std::sync::{Arc, Mutex};
 
 type WorkerRx = unsync::Receiver<EntryAdapter<FrameBatch>>;
 
@@ -35,6 +36,11 @@ fn setup(num_workers: usize) -> (SubmissionSender, Vec<WorkerRx>) {
 
 /// Like [`setup`] but with a configurable overall send rate.
 fn setup_with_rates(num_workers: usize, overall_rate: Rate) -> (SubmissionSender, Vec<WorkerRx>) {
+    setup_with_pacing(num_workers, SendPacing::single(overall_rate))
+}
+
+/// Like [`setup`] but with a configurable pacing of the workers' send sockets.
+fn setup_with_pacing(num_workers: usize, pacing: SendPacing) -> (SubmissionSender, Vec<WorkerRx>) {
     let (frame_tx, frame_rx) = frame::submission_channel(1);
 
     let mut workers = Vec::with_capacity(num_workers);
@@ -52,7 +58,7 @@ fn setup_with_rates(num_workers: usize, overall_rate: Rate) -> (SubmissionSender
         workers.into(),
         crate::xorshift::Rng::new(),
         Clock::default(),
-        overall_rate,
+        pacing,
         Budgets::default(),
         crate::counter::Registry::default(),
         crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
@@ -240,4 +246,71 @@ fn pacing_delays_frames_beyond_burst() {
         .primary()
         .spawn();
     });
+}
+
+/// With two interfaces, each worker's batches arrive within its interface's rate and burst, and
+/// the worker on the fast interface gets more than the slow interface's rate allows.
+#[test]
+fn two_interfaces_pace_each_worker_to_its_interface_rate() {
+    let _snapshots = crate::testing::without_snapshots();
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let arrivals = Arc::new(Mutex::new(Vec::<(usize, u64, u64)>::new()));
+    let arrivals_in_sim = arrivals.clone();
+
+    sim(move || {
+        let pacing = SendPacing::new(vec![slow, fast], vec![0, 1]);
+        let (mut frame_tx, rxs) = setup_with_pacing(2, pacing);
+
+        // Each frame fills a batch of its own, as in `pacing_delays_frames_beyond_burst`.
+        async move {
+            let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+                .socket_sender_count(2)
+                .build(None);
+            let mut input = PriorityInput::default();
+            for _ in 0..40 {
+                input.push(test_frame_with_payload(&pse, u16::MAX as usize));
+            }
+            frame_tx.send_batch(input).unwrap();
+        }
+        .primary()
+        .spawn();
+
+        for (worker, mut worker_rx) in rxs.into_iter().enumerate() {
+            let arrivals = arrivals_in_sim.clone();
+            async move {
+                while let Some(batch) = worker_rx.recv().await {
+                    let at = bach::time::Instant::now().elapsed_since_start().as_nanos() as u64;
+                    let bytes = batch.byte_cost();
+                    arrivals.lock().unwrap().push((worker, at, bytes));
+                }
+            }
+            .primary()
+            .spawn();
+        }
+    });
+
+    let arrivals = arrivals.lock().unwrap();
+    assert_eq!(arrivals.len(), 40, "one batch for each frame");
+    let mut received = [0u64; 2];
+    for (worker, rate) in [(0, slow), (1, fast)] {
+        let mut sent_before = 0;
+        for &(_, at, bytes) in arrivals.iter().filter(|arrival| arrival.0 == worker) {
+            // The batches before this one fit in the interface's rate and burst, with 2 us
+            // allowed for timer rounding.
+            let allowed = at + rate.burst_nanos() + 2_000;
+            assert!(
+                rate.nanos_for_bytes(sent_before) <= allowed,
+                "worker {worker} got a batch at {at} ns after {sent_before} bytes",
+            );
+            sent_before += bytes;
+        }
+        received[worker] = sent_before;
+    }
+    let [slow_bytes, fast_bytes] = received;
+    assert!(slow_bytes > 0, "the slow worker didn't get a batch");
+    assert!(
+        fast_bytes >= 2 * slow_bytes,
+        "the fast worker got {fast_bytes} bytes, the slow one {slow_bytes}",
+    );
 }

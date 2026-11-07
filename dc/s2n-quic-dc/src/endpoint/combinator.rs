@@ -30,6 +30,10 @@ use core::task::{self, Poll};
 use s2n_quic_core::{packet::number::PacketNumber, ready};
 use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 
+mod interface_pacing;
+
+pub use interface_pacing::{InterfacePacedPickTwo, SendPacing};
+
 #[cfg(test)]
 mod tests;
 
