@@ -68,6 +68,10 @@ const RECOVERY_PAUSE: Duration = Duration::from_secs(1);
 /// How long neither endpoint sends while the interface is lost: longer than the 30 s idle
 /// timeout of the sim's paths, so that the send contexts of the lost pairs expire.
 const QUIET: Duration = Duration::from_secs(45);
+/// How long the last packets of the exchanges before the quiet period, such as acknowledgements,
+/// may take to reach the endpoints. The network counts each packet it passes in the rest of the
+/// quiet period.
+const SETTLE: Duration = Duration::from_secs(1);
 /// How long each round of streams may take before the test fails.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 /// The interface of each client socket: sockets 0 to 3 on the slow one, 4 to 7 on the fast one.
@@ -97,6 +101,10 @@ struct Shared {
     only_from_lost: AtomicBool,
     /// The packets the network dropped.
     dropped: AtomicU64,
+    /// Whether the network counts the packets it passes: the quiet period, after `SETTLE`.
+    quiet: AtomicBool,
+    /// The source and destination of each packet the network passed while `quiet` was set.
+    passed_while_quiet: Mutex<Vec<(SocketAddr, SocketAddr)>>,
     /// The bytes the server read.
     read: AtomicU64,
     /// The bytes the server read while the interface was lost.
@@ -446,6 +454,10 @@ fn run(recover: bool) {
                 network.dropped.fetch_add(1, Ordering::Relaxed);
                 return bach::net::monitor::Command::Drop;
             }
+            if network.quiet.load(Ordering::Relaxed) {
+                let route = (packet.source(), packet.destination());
+                network.passed_while_quiet.lock().unwrap().push(route);
+            }
             bach::net::monitor::Command::Pass
         });
 
@@ -551,7 +563,13 @@ fn run(recover: bool) {
             // send contexts expire with their probes unacknowledged. The peer isn't marked dead,
             // so the next connect isn't refused, and a stream the client opens while the
             // interface is lost gets its answer.
-            QUIET.sleep().await;
+            // A packet from the peer that an endpoint authenticates moves the idle expiry of its
+            // send contexts for that peer, so the network counts each packet it passes in the
+            // quiet period after `SETTLE`, and the test asserts that it passes none.
+            SETTLE.sleep().await;
+            client_side.quiet.store(true, Ordering::Relaxed);
+            (QUIET - SETTLE).sleep().await;
+            client_side.quiet.store(false, Ordering::Relaxed);
             timeout(
                 ROUND_TIMEOUT,
                 exchange(&mut client, 1, "the quiet round", &client_side),
@@ -639,6 +657,11 @@ fn run(recover: bool) {
 
     let dropped = shared.dropped.load(Ordering::Relaxed);
     assert!(dropped > 0, "the network didn't drop a packet");
+    let passed_while_quiet = shared.passed_while_quiet.lock().unwrap().clone();
+    assert!(
+        passed_while_quiet.is_empty(),
+        "the network passed packets to an endpoint in the quiet period: {passed_while_quiet:?}",
+    );
     let read_while_lost = shared.read_while_lost.load(Ordering::Relaxed);
     assert!(
         read_while_lost >= STREAM_LEN,
