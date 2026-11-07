@@ -1216,7 +1216,9 @@ fn a_context_dropped_for_a_rejected_key_clears_its_lost_mark() {
 fn a_dropped_context_does_not_mark_its_pair_lost_again() {
     let (mut cache, entry) = make_cache_with_a_lost_context();
     let sender = crate::endpoint::id::LocalSenderId::from_index(0);
-    let ctx = cache.get(entry.id()).expect("the cache holds the lost context");
+    let ctx = cache
+        .get(entry.id())
+        .expect("the cache holds the lost context");
     let clock = make_clock(100);
     {
         // The lost pair sent a Ping, which the inflight map doesn't hold, and its wait for the
@@ -1229,7 +1231,9 @@ fn a_dropped_context_does_not_mark_its_pair_lost_again() {
 
     let reason = crate::endpoint::frame::FailureReason::PeerDead;
     let mut cancelled = CollectFrames::default();
-    assert!(cache.invalidate(entry.id(), reason, &mut cancelled).is_some());
+    assert!(cache
+        .invalidate(entry.id(), reason, &mut cancelled)
+        .is_some());
     assert!(!entry.is_sender_lost(sender));
 
     let mut ctx = ctx.borrow_mut();
