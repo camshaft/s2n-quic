@@ -1472,6 +1472,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     lost_at.is_some_and(|since| path_secret_entry.last_activity() < since);
                 let unacknowledged = has_inflight
                     && !peer_silent_since_lost
+                    && !path_secret_entry.is_marked_dead()
                     && !send_caches[local_id]
                         .borrow()
                         .skips_dead_mark(path_lost, &path_secret_entry);
