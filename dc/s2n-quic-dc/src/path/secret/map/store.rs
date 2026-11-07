@@ -217,6 +217,9 @@ pub trait Store: 'static + Send + Sync + time::Clock {
     /// Publishes a PathSecretMapInterfacePairFramesMoved event.
     fn on_interface_pair_frames_moved(&self, peer_address: &SocketAddr, frames: usize);
 
+    /// Publishes a PathSecretMapInterfacePairPreferenceEnded event.
+    fn on_interface_pair_preference_ended(&self, peer_address: &SocketAddr);
+
     /// Publishes a PathSecretMapDeadMarkSkipped event.
     fn on_dead_mark_skipped(&self, peer_address: &SocketAddr);
 

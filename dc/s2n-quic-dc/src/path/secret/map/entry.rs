@@ -95,6 +95,9 @@ pub struct Entry {
     /// The end of the routers' preference for the senders that deliver since a lost pair
     /// stopped delivering, as u64 nanoseconds.
     senders_preferred_until: AtomicU64,
+    /// The latest end of the routers' preference that an acknowledgement after it reported, as
+    /// u64 nanoseconds, so that the entry reports each end once.
+    senders_preference_ended: AtomicU64,
     /// Per-socket-sender load scores encoded as u64 nanoseconds.
     ///
     /// A lower score means the sender is expected to drain its queue sooner and is
@@ -142,6 +145,7 @@ impl SizeOf for Entry {
             sender_delivered_at,
             senders_lost_since,
             senders_preferred_until,
+            senders_preference_ended,
             queue_state: _,
         } = self;
         creation_time.size()
@@ -165,6 +169,7 @@ impl SizeOf for Entry {
             + sender_delivered_at.len() * std::mem::size_of::<AtomicU64>()
             + senders_lost_since.size()
             + senders_preferred_until.size()
+            + senders_preference_ended.size()
             + std::mem::size_of::<QueueState>()
     }
 }
@@ -270,6 +275,7 @@ impl Entry {
             sender_delivered_at: Self::init_load_scores(socket_sender_count),
             senders_lost_since: AtomicU64::new(0),
             senders_preferred_until: AtomicU64::new(0),
+            senders_preference_ended: AtomicU64::new(0),
             queue_state,
         }
     }
@@ -478,16 +484,34 @@ impl Entry {
     }
 
     /// Records that the peer acknowledged a packet of the sender at `at`, so that the routers
-    /// can tell the senders that deliver since a pair was lost.
+    /// can tell the senders that deliver since a pair was lost. Returns true where the
+    /// acknowledgement ends the routers' preference for those senders: it is the first after
+    /// the end of the preference while the routers prefer them. The entry reports each end
+    /// once, so that another acknowledgement after the same end returns false.
     pub fn record_sender_delivered(
         &self,
         sender_idx: LocalSenderId,
         at: crate::time::precision::Timestamp,
-    ) {
+    ) -> bool {
         let Some(sender_idx) = self.sender_index(sender_idx) else {
-            return;
+            return false;
         };
+        let until = self.senders_preferred_until.load(Ordering::Acquire);
+        let ends_preference = at.nanos > until
+            && self.sender_delivered_at[sender_idx].load(Ordering::Acquire) <= until
+            && self.prefers_senders_delivering_since_lost();
         self.sender_delivered_at[sender_idx].fetch_max(at.nanos, Ordering::AcqRel);
+        ends_preference && self.record_preference_end(until)
+    }
+
+    /// Records that an acknowledgement ended the routers' preference that ends at `until`, as
+    /// u64 nanoseconds. Returns true where the entry hadn't recorded that end, or a later one,
+    /// yet, so that one acknowledgement alone reports each end.
+    fn record_preference_end(&self, until: u64) -> bool {
+        let ended = self
+            .senders_preference_ended
+            .fetch_max(until, Ordering::AcqRel);
+        ended < until
     }
 
     /// Records the time a lost interface pair stopped delivering. The entry keeps the latest

@@ -1495,6 +1495,15 @@ where
             );
     }
 
+    fn on_interface_pair_preference_ended(&self, peer_address: &SocketAddr) {
+        self.subscriber()
+            .on_path_secret_map_interface_pair_preference_ended(
+                event::builder::PathSecretMapInterfacePairPreferenceEnded {
+                    peer_address: SocketAddress::from(*peer_address).into_event(),
+                },
+            );
+    }
+
     fn on_dead_mark_skipped(&self, peer_address: &SocketAddr) {
         self.subscriber().on_path_secret_map_dead_mark_skipped(
             event::builder::PathSecretMapDeadMarkSkipped {

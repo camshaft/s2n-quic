@@ -522,3 +522,10 @@ struct CreditlessWindowLimitHalved {
     #[measure("limit_bytes", Bytes)]
     limit_bytes: u64,
 }
+
+#[event("path_secret_map:interface_pair_preference_ended")]
+#[subject(endpoint)]
+/// Emitted when the routers stop preferring the senders that deliver since a pair was lost
+struct PathSecretMapInterfacePairPreferenceEnded<'a> {
+    peer_address: SocketAddress<'a>,
+}

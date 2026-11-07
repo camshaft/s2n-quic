@@ -68,6 +68,7 @@ mod counter {
                 137usize => Self(creditless_window_frame_refused),
                 141usize => Self(creditless_window_limit_grew),
                 145usize => Self(creditless_window_limit_halved),
+                149usize => Self(path_secret_map_interface_pair_preference_ended),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -181,6 +182,8 @@ mod counter {
             fn creditless_window_limit_grew(value: u64);
             # [link_name = s2n_quic_dc__event__counter__creditless_window_limit_halved]
             fn creditless_window_limit_halved(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__path_secret_map_interface_pair_preference_ended]
+            fn path_secret_map_interface_pair_preference_ended(value: u64);
         }
     );
     pub mod bool {

@@ -1478,6 +1478,7 @@ struct PairEvents {
     delivering: std::sync::Mutex<Vec<std::net::SocketAddr>>,
     frames_moved: std::sync::Mutex<Vec<(std::net::SocketAddr, usize)>>,
     dead_mark_skipped: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+    preference_ended: std::sync::Mutex<Vec<std::net::SocketAddr>>,
 }
 
 fn socket_addr(address: &crate::event::api::SocketAddress) -> std::net::SocketAddr {
@@ -1534,6 +1535,15 @@ impl crate::event::Subscriber for PairEvents {
     ) {
         let peer = socket_addr(&event.peer_address);
         self.dead_mark_skipped.lock().unwrap().push(peer);
+    }
+
+    fn on_path_secret_map_interface_pair_preference_ended(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::PathSecretMapInterfacePairPreferenceEnded,
+    ) {
+        let peer = socket_addr(&event.peer_address);
+        self.preference_ended.lock().unwrap().push(peer);
     }
 }
 
@@ -2030,5 +2040,59 @@ fn the_acknowledgement_handler_records_the_senders_delivery() {
     assert!(
         entry.delivers_since_lost(sender),
         "the handler records the acknowledgement as a delivery after the loss"
+    );
+}
+
+/// An acknowledgement that ends the routers' preference for the senders that deliver since a
+/// loss records the end's event and count once.
+#[test]
+fn the_end_of_the_preference_for_senders_that_deliver_records_its_event_and_count() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let (cache, registry, subscriber, events) = make_cache_with_events();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let lost_sender = crate::endpoint::id::LocalSenderId::from_index(1);
+    let at = |nanos| PreciseTimestamp { nanos };
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    assert!(entry.set_sender_lost(lost_sender, true));
+
+    cache.track_path_lost(&mut ctx, |ctx| {
+        ctx.on_peer_acknowledgement(at(300), VarInt::from_u8(0))
+    });
+    assert!(entry.prefers_senders_delivering_since_lost());
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_preference_ended),
+        0
+    );
+
+    cache.track_path_lost(&mut ctx, |ctx| {
+        ctx.on_peer_acknowledgement(at(1_100), VarInt::from_u8(0))
+    });
+    assert!(!entry.prefers_senders_delivering_since_lost());
+    assert!(
+        !ctx.preference_ended,
+        "the tracker takes the end it records"
+    );
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_preference_ended),
+        1
+    );
+    assert_eq!(*events.preference_ended.lock().unwrap(), [*entry.peer()]);
+
+    cache.track_path_lost(&mut ctx, |ctx| {
+        ctx.on_peer_acknowledgement(at(1_200), VarInt::from_u8(0))
+    });
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_preference_ended),
+        1,
+        "a later acknowledgement doesn't record the end again"
+    );
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("tx.interface_pair.preference_ended=1 Variant|send.0"),
+        "got: {line}"
     );
 }

@@ -52,8 +52,8 @@ fn entry_size() {
             // The senders' delivery times add a Box<[AtomicU64]> (16 bytes), and the time the
             // lost pairs stopped delivering an AtomicU64 (8 bytes).
             // The end of the preference for the senders that deliver since a loss adds an
-            // AtomicU64 (8 bytes).
-            385
+            // AtomicU64 (8 bytes), and the end that an acknowledgement reported another (8 bytes).
+            393
         );
     }
 }
@@ -447,4 +447,83 @@ fn a_message_keeps_its_sender_once_the_preference_for_senders_that_deliver_ends(
         "a sender that isn't marked lost keeps its message once the preference ends"
     );
     assert_eq!(entry.delivering_sender(sender(0)), sender(1));
+}
+
+/// An acknowledgement reports the end of the routers' preference for the senders that deliver
+/// since a loss where it is the first after that end, while the routers prefer them.
+#[test]
+fn the_acknowledgement_that_ends_the_preference_for_senders_that_deliver_reports_it() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let sender = crate::endpoint::id::LocalSenderId::from_index;
+    let at = |nanos| PreciseTimestamp { nanos };
+
+    let unmarked = test_entry_with_senders(3);
+    unmarked.set_senders_lost_since(at(200));
+    unmarked.set_senders_preferred_until(at(1_000));
+    assert!(
+        !unmarked.record_sender_delivered(sender(1), at(1_100)),
+        "an entry without a lost pair doesn't prefer any sender, so nothing ends"
+    );
+
+    let entry = test_entry_with_senders(3);
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    assert!(entry.set_sender_lost(sender(0), true));
+    assert!(
+        !entry.record_sender_delivered(sender(1), at(300)),
+        "an acknowledgement within the preference doesn't end it"
+    );
+    assert!(
+        !entry.record_sender_delivered(sender(1), at(1_000)),
+        "an acknowledgement at the preference's end is within it"
+    );
+    assert!(entry.prefers_senders_delivering_since_lost());
+    assert!(
+        entry.record_sender_delivered(sender(2), at(1_100)),
+        "the first acknowledgement after the preference's end ends it"
+    );
+    assert!(!entry.prefers_senders_delivering_since_lost());
+    assert!(
+        !entry.record_sender_delivered(sender(2), at(1_200)),
+        "a later acknowledgement of the same sender doesn't end it again"
+    );
+    assert!(
+        !entry.record_sender_delivered(sender(1), at(1_300)),
+        "nor does a later acknowledgement of another sender"
+    );
+
+    entry.set_senders_preferred_until(at(2_000));
+    assert!(entry.prefers_senders_delivering_since_lost());
+    assert!(
+        entry.record_sender_delivered(sender(1), at(2_100)),
+        "an acknowledgement after a later end ends that preference too"
+    );
+}
+
+/// The entry reports each end of the routers' preference once, though the acknowledgements of
+/// several senders after the end may race to report it.
+#[test]
+fn an_end_of_the_preference_is_reported_once() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let entry = test_entry_with_senders(3);
+    let sender = crate::endpoint::id::LocalSenderId::from_index;
+    let at = |nanos| PreciseTimestamp { nanos };
+
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    assert!(entry.set_sender_lost(sender(0), true));
+    entry.record_sender_delivered(sender(1), at(300));
+    assert!(entry.prefers_senders_delivering_since_lost());
+
+    // Another sender's acknowledgement reports the end first, as on another thread.
+    assert!(entry.record_preference_end(1_000));
+    assert!(
+        !entry.record_sender_delivered(sender(2), at(1_100)),
+        "an acknowledgement after an end that was reported doesn't report it again"
+    );
+    assert!(!entry.record_preference_end(1_000));
+    assert!(
+        entry.record_preference_end(2_000),
+        "a later end is reported once too"
+    );
 }

@@ -611,6 +611,10 @@ pub(crate) struct Context {
     /// When [`Self::mark_path_lost`] marked this context's interface pair lost, or `None`
     /// while the pair delivers or was marked lost without a time.
     pub lost_at: Option<precision::Timestamp>,
+    /// Whether an acknowledgement this context recorded ended the routers' preference for the
+    /// senders that deliver since a pair was lost. The function `track_path_lost` records the
+    /// end's event and count, and clears it.
+    pub preference_ended: bool,
     /// When this context sent an ack-eliciting packet that the inflight map doesn't hold, such
     /// as an ACK-only probe or a Ping, with no acknowledgement from the peer since, or `None`.
     /// [`Self::has_stopped_delivering`] reads it where the inflight map is empty.
@@ -826,6 +830,7 @@ impl Context {
             lost_from: None,
             ack_wait_since: None,
             lost_at: None,
+            preference_ended: false,
             ack_only_probe_sent: None,
             ack_only_since_peer_ack: false,
             ack_only_sent: None,
@@ -1379,15 +1384,19 @@ impl Context {
 
     /// Records an acknowledgement from the peer received at `now`: the peer's activity, as
     /// [`Self::on_peer_acknowledged`] records it, this sender's delivery on the path secret
-    /// entry, and the end of a lost mark that the acknowledgement covers.
+    /// entry, the end of the routers' preference for the senders that deliver since a pair was
+    /// lost where the delivery ends it, and the end of a lost mark that the acknowledgement
+    /// covers.
     pub fn on_peer_acknowledgement(
         &mut self,
         now: precision::Timestamp,
         largest_acknowledged: VarInt,
     ) {
         self.on_peer_acknowledged(now);
-        self.path_secret_entry
+        let preference_ended = self
+            .path_secret_entry
             .record_sender_delivered(self.sender_idx, now);
+        self.preference_ended |= preference_ended;
         self.on_largest_acknowledged(largest_acknowledged);
     }
 
@@ -1787,7 +1796,9 @@ impl Pto {
 
 /// Runs `f` on `ctx`, and records a change of the context's lost mark that `f` makes: a pair
 /// marked lost, or a lost pair that delivers again. It counts the change on `send_counters`,
-/// and publishes its event through `path_secret_map` where one is set.
+/// and publishes its event through `path_secret_map` where one is set. It records the end of
+/// the routers' preference for the senders that deliver since a pair was lost, where an
+/// acknowledgement the context recorded ended it, the same way.
 ///
 /// [`Cache::track_path_lost`] runs its calls through it. The assembler, which doesn't hold the
 /// cache, runs its lost mark of a pair that sends acknowledgements alone through it.
@@ -1813,6 +1824,12 @@ pub(crate) fn track_path_lost<R>(
             }
         }
         _ => {}
+    }
+    if core::mem::take(&mut ctx.preference_ended) {
+        send_counters.on_interface_pair_preference_ended();
+        if let Some(map) = path_secret_map {
+            map.on_interface_pair_preference_ended(ctx.path_secret_entry.peer());
+        }
     }
     result
 }
@@ -1908,9 +1925,10 @@ impl Cache {
         self
     }
 
-    /// Runs `f` on `ctx`, and records a change of the context's lost mark that `f` makes, as
-    /// the function `track_path_lost` of this module does, with this cache's send counters
-    /// and path secret map.
+    /// Runs `f` on `ctx`, and records a change of the context's lost mark that `f` makes and an
+    /// end of the routers' preference that an acknowledgement in `f` reports, as the function
+    /// `track_path_lost` of this module does, with this cache's send counters and path secret
+    /// map.
     ///
     /// The probe timeout task and the ACK processor run their calls through it. The clear in
     /// [`Self::invalidate`] isn't recorded, since the context leaves the cache there.

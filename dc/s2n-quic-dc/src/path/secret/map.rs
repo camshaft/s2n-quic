@@ -318,6 +318,11 @@ impl Map {
             .on_interface_pair_frames_moved(peer_address, frames);
     }
 
+    /// Emits a PathSecretMapInterfacePairPreferenceEnded event via the subscriber
+    pub fn on_interface_pair_preference_ended(&self, peer_address: &SocketAddr) {
+        self.store.on_interface_pair_preference_ended(peer_address);
+    }
+
     /// Emits a PathSecretMapDeadMarkSkipped event via the subscriber
     pub fn on_dead_mark_skipped(&self, peer_address: &SocketAddr) {
         self.store.on_dead_mark_skipped(peer_address);
