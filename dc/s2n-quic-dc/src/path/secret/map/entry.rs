@@ -664,6 +664,14 @@ impl Entry {
         dead_at >= 0 && now_ms.saturating_sub(dead_at) < cooldown_ms
     }
 
+    /// Returns `true` while the entry holds a dead mark, within the dead-peer cooldown or after
+    /// it. Only an authenticated packet from the peer clears the mark
+    /// ([`touch_activity`](Self::touch_activity)).
+    #[inline]
+    pub fn is_marked_dead(&self) -> bool {
+        self.dead_at.load(Ordering::Acquire) >= 0
+    }
+
     /// Returns `true` when the entry is marked dead, the dead-peer `cooldown` has passed since the
     /// mark, and the peer hasn't sent an authenticated packet for at least one idle timeout.
     ///
