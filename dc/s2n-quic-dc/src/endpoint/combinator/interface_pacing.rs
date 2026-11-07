@@ -11,8 +11,8 @@
 //! batch with the token bucket of that worker's interface, so that a batch waiting for one
 //! interface's tokens doesn't hold a batch for another interface behind it.
 //!
-//! Where the endpoint chooses an interface for its highest-priority traffic, a batch that holds
-//! a frame of the highest priority level goes only to a worker of that interface.
+//! Where the endpoint chooses an interface for its highest-priority traffic, a batch whose frames
+//! are all of the highest priority level goes only to a worker of that interface.
 
 use super::{AssignSender, FlowCredits, HighestPriority, PathSecretMapEntry};
 use crate::{
@@ -79,8 +79,8 @@ impl SendPacing {
         }
     }
 
-    /// Sends the batches that hold a frame of the highest priority level only on the sockets of
-    /// the interface at `position`.
+    /// Sends the batches whose frames are all of the highest priority level only on the sockets
+    /// of the interface at `position`.
     ///
     /// # Panics
     ///
@@ -99,8 +99,8 @@ impl SendPacing {
     /// [`Self::single`] at that interface's send rate, and where there isn't a send socket, at
     /// `overall_send_rate`.
     /// Where the table has an interface for the highest-priority traffic and more than one
-    /// interface holds a send socket, the batches that hold a frame of the highest priority level
-    /// go only on the sockets of that interface.
+    /// interface holds a send socket, the batches whose frames are all of the highest priority
+    /// level go only on the sockets of that interface.
     pub fn from_interfaces(interfaces: &interface::Table, overall_send_rate: Rate) -> Self {
         let mut ids = interfaces.send_sockets().to_vec();
         ids.sort_unstable();
@@ -214,8 +214,8 @@ impl<T, Tm: precision::Timer> Pacer<T, Tm> {
 /// interface, and goes on routing batches to the workers of the other interfaces. While every
 /// interface holds a batch, the router doesn't read the next one.
 ///
-/// Where the [`SendPacing`] has an interface for the highest-priority traffic, a batch that
-/// holds a frame of the highest priority level goes only to a worker of that interface, and goes
+/// Where the [`SendPacing`] has an interface for the highest-priority traffic, a batch whose
+/// frames are all of the highest priority level goes only to a worker of that interface, and goes
 /// at once, charged to that interface's bucket, even while the interface holds a batch.
 ///
 /// Implements `Receiver<()>` so it can be drained via `ReceiverExt::drain_budgeted`.
@@ -327,9 +327,9 @@ where
         (0..self.senders.len()).any(|sender| self.is_free(sender))
     }
 
-    /// Returns whether the sender at `sender` may take a batch: for a batch that holds a frame of
-    /// the highest priority level, where the sender is on the interface for that traffic, and
-    /// for any other batch, where its interface doesn't hold a batch.
+    /// Returns whether the sender at `sender` may take a batch: for a batch whose frames are all
+    /// of the highest priority level, where the sender is on the interface for that traffic,
+    /// and for any other batch, where its interface doesn't hold a batch.
     fn is_candidate(&self, sender: usize, highest: bool) -> bool {
         if highest {
             let interface = self.sender_interfaces[LocalSenderId::from_index(sender)];
@@ -409,8 +409,9 @@ where
     }
 
     /// Chooses a sender for `value`, and sends it to the sender where the sender's interface may
-    /// send now or where `value` holds a frame of the highest priority level, and else holds it
-    /// on that interface until it may. Returns `false` where the sender's receiver is gone.
+    /// send now or where `value` is a batch whose frames are all of the highest priority level,
+    /// and else holds it on that interface until it may. Returns `false` where the sender's
+    /// receiver is gone.
     fn route(&mut self, cx: &mut task::Context<'_>, mut value: T) -> bool {
         let byte_cost = value.byte_cost();
         let now = self.clock.now();

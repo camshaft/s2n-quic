@@ -81,8 +81,8 @@ pub struct Config {
     /// The recv sockets on this interface, each by its position in the list of recv sockets that
     /// [`setup_endpoint`](crate::endpoint::setup_endpoint) takes.
     pub recv_sockets: Vec<usize>,
-    /// Whether this interface carries the endpoint's highest-priority traffic: the batches that
-    /// hold a frame of the highest priority level. Where more than one interface sets it, the
+    /// Whether this interface carries the endpoint's highest-priority traffic: the batches whose
+    /// frames are all of the highest priority level. Where more than one interface sets it, the
     /// first of them in the list that holds a send socket carries that traffic; where none sets
     /// it, that traffic goes as any other.
     /// Defaults to `false`.

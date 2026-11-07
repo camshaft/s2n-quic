@@ -315,7 +315,7 @@ fn two_interfaces_pace_each_worker_to_its_interface_rate() {
     );
 }
 
-/// With an interface chosen for the highest-priority traffic, each batch that holds a frame of
+/// With an interface chosen for the highest-priority traffic, each batch whose frames are all of
 /// the highest priority level goes to a worker of that interface, and the other batches still go
 /// to the workers of both interfaces.
 #[test]
