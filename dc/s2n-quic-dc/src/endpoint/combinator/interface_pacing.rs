@@ -271,8 +271,11 @@ where
     /// The batches of `rx` that no sender may take yet, since each sender that delivers to their
     /// peer is on an interface that holds a batch, by the path secret of their peer, each peer's
     /// in the order the router read them. Meanwhile the router reads and routes the batches of
-    /// other peers. Their count isn't bounded: the send credit pool bounds the credit their
-    /// frames hold.
+    /// other peers. Their count isn't bounded. The send credit pool bounds the credit their
+    /// frames hold, so it bounds only the frames that borrow credit. Frames that don't borrow
+    /// credit, such as control frames, acknowledgements and resets, aren't bounded here, as they
+    /// aren't bounded in the frame lanes they come from either: those lanes accept each frame,
+    /// and their `on_consumed` doesn't count anything.
     waiting: HashMap<credentials::Id, VecDeque<T>>,
     /// The peers of `waiting`, which the router offers to the free senders in turn.
     waiting_order: VecDeque<credentials::Id>,
