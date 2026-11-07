@@ -840,6 +840,7 @@ where
         send_credit_waker_sink: send_credit_distributor_waker_sink,
         recv_credit_waker_sink: recv_credit_distributor_waker_sink,
         send_credit_pool: send_credit_pool.clone(),
+        freed_batch_tx: freed_batch_tx.clone(),
     });
 
     for (idx, drain) in waker_drains.into_iter().enumerate() {
@@ -1094,6 +1095,9 @@ struct FrameDispatchParts<Clk> {
     /// Send credit pool handle, passed to `frame_dispatch` so the pick-two router can
     /// return credit when it has to drop an undeliverable batch (worker teardown).
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    /// Freed-queue submission sender, passed to `frame_dispatch` so the priority router records
+    /// a slot that a rejected init held as freed once the slot's reset leaves for its lane.
+    freed_batch_tx: crate::queue::FreedBatchTx,
     /// Recv-direction credit-pool distributor. Reserved for the Reader integration;
     /// spawned today so the close path is wired and `recv_credit_pool.release` works.
     recv_credit_distributor: crate::credit::Distributor,
@@ -1317,6 +1321,7 @@ where
                     budgets,
                     counter_registry.clone(),
                     fd.send_credit_pool,
+                    fd.freed_batch_tx,
                 );
                 tasks::spawn_credit_distributor(
                     &mut local,
