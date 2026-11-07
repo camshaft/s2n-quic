@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     credentials::{self, Credentials},
-    endpoint::id::LocalSenderId,
+    endpoint::id::{Id as _, LocalSenderId},
     packet::{secret_control as control, WireVersion},
     path::secret::{
         open, receiver,
@@ -437,16 +437,24 @@ impl Entry {
             .any(|slot| slot.load(Ordering::Acquire) & Self::LOST_SENDER == 0)
     }
 
-    /// Returns `preferred` while its interface pair isn't marked lost, and otherwise the first
-    /// sender after it, by slot, whose pair isn't marked lost, so that a message bound for a
-    /// lost pair goes to a pair that delivers. Returns `preferred` where every pair is marked
-    /// lost, or where the entry doesn't keep sender slots.
+    /// Returns `preferred` while its interface pair delivers, and otherwise the first sender
+    /// after it, by slot, whose pair delivers, so that a message bound for a lost pair goes to a
+    /// pair that delivers. While a pair is marked lost and a sender has an acknowledgement after
+    /// the lost pairs stopped delivering, a pair delivers only where its sender has one too, as
+    /// the routers choose, since a sender on the same down interface may not be marked lost yet;
+    /// otherwise a pair delivers while it isn't marked lost. Returns `preferred` where no pair
+    /// delivers, or where the entry doesn't keep sender slots.
     pub fn delivering_sender(&self, preferred: LocalSenderId) -> LocalSenderId {
         let Some(start) = self.sender_index(preferred) else {
             return preferred;
         };
+        let prefer_delivered = self.has_sender_delivering_since_lost();
         let delivers = |index: usize| {
-            self.sender_load_scores[index].load(Ordering::Acquire) & Self::LOST_SENDER == 0
+            if prefer_delivered {
+                self.delivers_since_lost(LocalSenderId::from_index(index))
+            } else {
+                self.sender_load_scores[index].load(Ordering::Acquire) & Self::LOST_SENDER == 0
+            }
         };
         if delivers(start) {
             return preferred;

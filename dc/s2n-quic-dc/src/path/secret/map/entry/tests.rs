@@ -279,6 +279,47 @@ fn a_message_for_a_lost_sender_goes_to_the_next_sender_that_delivers() {
 }
 
 #[test]
+fn a_message_goes_to_a_sender_that_delivers_since_a_loss_where_one_does() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let entry = test_entry_with_senders(4);
+    let sender = crate::endpoint::id::LocalSenderId::from_index;
+    let at = |nanos| PreciseTimestamp { nanos };
+
+    // The pair of sender 0 is marked lost, and sender 1, acknowledged before the lost pair
+    // stopped delivering, may be on the same down interface. While no sender has an
+    // acknowledgement since, a sender delivers while it isn't marked lost.
+    entry.record_sender_delivered(sender(1), at(100));
+    entry.set_senders_lost_since(at(200));
+    assert!(entry.set_sender_lost(sender(0), true));
+    assert!(!entry.has_sender_delivering_since_lost());
+    assert_eq!(entry.delivering_sender(sender(0)), sender(1));
+    assert_eq!(entry.delivering_sender(sender(1)), sender(1));
+
+    // Once sender 3 has an acknowledgement since the loss, a message for a sender without one
+    // goes to it, though that sender isn't marked lost.
+    entry.record_sender_delivered(sender(3), at(300));
+    assert!(entry.has_sender_delivering_since_lost());
+    assert_eq!(
+        entry.delivering_sender(sender(1)),
+        sender(3),
+        "a sender without an acknowledgement since the loss may be on the down interface"
+    );
+    assert_eq!(entry.delivering_sender(sender(0)), sender(3));
+    assert_eq!(entry.delivering_sender(sender(3)), sender(3));
+
+    // The search goes on by slot, among the senders with an acknowledgement since the loss.
+    entry.record_sender_delivered(sender(2), at(400));
+    assert_eq!(entry.delivering_sender(sender(1)), sender(2));
+    assert_eq!(entry.delivering_sender(sender(2)), sender(2));
+
+    // Once no pair is marked lost, each sender keeps its message.
+    assert!(entry.set_sender_lost(sender(0), false));
+    assert!(!entry.has_sender_delivering_since_lost());
+    assert_eq!(entry.delivering_sender(sender(0)), sender(0));
+    assert_eq!(entry.delivering_sender(sender(1)), sender(1));
+}
+
+#[test]
 fn a_sender_delivers_since_a_loss_only_after_the_lost_pairs_stopped() {
     use crate::time::precision::Timestamp as PreciseTimestamp;
     let entry = test_entry_with_senders(3);
