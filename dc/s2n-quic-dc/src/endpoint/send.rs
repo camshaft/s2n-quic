@@ -1385,9 +1385,7 @@ impl Context {
     /// would show that the pair delivers again. The context then forgets the probe and doesn't
     /// mark the pair lost, so that it probes again as [`Self::needs_delivery_probe`] says.
     pub fn check_acknowledgement_only_delivery(&mut self, now: precision::Timestamp) {
-        if self.inflight.has_inflight()
-            || self.is_path_lost()
-            || self.ack_only_probe_sent.is_none()
+        if self.inflight.has_inflight() || self.is_path_lost() || self.ack_only_probe_sent.is_none()
         {
             return;
         }
