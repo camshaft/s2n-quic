@@ -8,7 +8,8 @@ use crate::{
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
             CompletionDispatcher, CreditlessWindow, FrameBatch, InterfacePacedPickTwo,
-            PathSecretMapEntry, PickTwo, SendPacing, WindowReader, WindowSender, BATCH_TARGET_BYTES,
+            PathSecretMapEntry, PickTwo, SendPacing, WindowReader, WindowSender,
+            BATCH_TARGET_BYTES,
         },
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
