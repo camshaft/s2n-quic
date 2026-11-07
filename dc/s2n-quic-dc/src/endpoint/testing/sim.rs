@@ -472,6 +472,8 @@ pub fn setup_sim_endpoint(
         gso,
         acceptor_registry,
         overall_send_rate,
+        // Sim sockets are on the default interface, at `overall_send_rate`.
+        interfaces: Vec::new(),
         budgets,
         submission_shards,
         ups_rate: crate::socket::rate::Rate::new(0.001),
