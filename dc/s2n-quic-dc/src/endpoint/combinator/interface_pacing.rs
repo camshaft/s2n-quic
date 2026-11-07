@@ -212,11 +212,16 @@ impl<T, Tm: precision::Timer> Pacer<T, Tm> {
 /// goes to its worker at once. Any other batch waits on its interface until the bucket has paid
 /// for the batches sent before it; meanwhile the router doesn't choose a worker of that
 /// interface, and goes on routing batches to the workers of the other interfaces. While every
-/// interface holds a batch, the router doesn't read the next one.
+/// interface holds a batch, the router doesn't read the next one, unless it has an interface for
+/// the highest-priority traffic.
 ///
 /// Where the [`SendPacing`] has an interface for the highest-priority traffic, a batch whose
 /// frames are all of the highest priority level goes only to a worker of that interface, and goes
-/// at once, charged to that interface's bucket, even while the interface holds a batch.
+/// at once, charged to that interface's bucket, even while the interface holds a batch. While
+/// every interface holds a batch, the router still reads the next batch: it sends a batch of that
+/// level at once, and keeps any other batch until an interface may take it. It doesn't read
+/// another batch while it keeps one, so that it routes the other batches in the order it reads
+/// them.
 ///
 /// Implements `Receiver<()>` so it can be drained via `ReceiverExt::drain_budgeted`.
 pub struct InterfacePacedPickTwo<T, R, S, Clk>
@@ -239,6 +244,9 @@ where
     /// Whether `rx` closed. The router then doesn't read another batch, and ends once it has
     /// delivered the batches it holds.
     closed: bool,
+    /// A batch the router read while every interface held a batch, which it keeps until an
+    /// interface may take it. The router doesn't read another batch while it keeps one.
+    pending: Option<T>,
     pick_counters: IdMap<LocalSenderId, crate::counter::Counter>,
     rejected_counters: IdMap<LocalSenderId, crate::counter::Summary>,
     score_delta: crate::counter::Summary,
@@ -308,6 +316,7 @@ where
             highest_priority,
             round_robin_idx: 0,
             closed: false,
+            pending: None,
             pick_counters,
             rejected_counters,
             score_delta,
@@ -408,14 +417,20 @@ where
         entry.sender_load_score(sender).saturating_add(debt)
     }
 
+    /// Returns whether `value` goes only to the interface for the highest-priority traffic: a
+    /// batch whose frames are all of the highest priority level, where the [`SendPacing`] has
+    /// that interface.
+    fn is_highest(&self, value: &T) -> bool {
+        self.highest_priority.is_some() && value.holds_highest_priority()
+    }
+
     /// Chooses a sender for `value`, and sends it to the sender where the sender's interface may
     /// send now or where `value` is a batch whose frames are all of the highest priority level,
     /// and else holds it on that interface until it may. Returns `false` where the sender's
     /// receiver is gone.
     fn route(&mut self, cx: &mut task::Context<'_>, mut value: T) -> bool {
-        let byte_cost = value.byte_cost();
         let now = self.clock.now();
-        let highest = self.highest_priority.is_some() && value.holds_highest_priority();
+        let highest = self.is_highest(&value);
         let sender = {
             let entry = value.path_secret_entry();
             debug_assert_eq!(self.senders.len(), entry.socket_sender_count());
@@ -427,17 +442,12 @@ where
         let interface = self.sender_interfaces[sender];
         // A highest-priority batch doesn't wait for its interface's tokens: it goes at once, and
         // the bucket is charged for it, so the batches after it wait for its bytes.
-        let routed = if highest || self.pacers[interface].poll_ready(cx) {
+        if highest || self.pacers[interface].poll_ready(cx) {
             self.deliver(interface, sender, value)
         } else {
             self.pacers[interface].held = Some((sender, value));
             true
-        };
-        if routed {
-            // Tell upstream that the batch was consumed, as `PickTwo` does once it sends one.
-            self.rx.on_consumed(byte_cost);
         }
-        routed
     }
 
     /// Sends `value` to `sender`, and charges the token bucket of its `interface` for it. Where
@@ -452,15 +462,19 @@ where
                 true
             }
             Err(value) => {
-                // The worker's receiver is gone (worker teardown): this batch and the batches
-                // held for the other interfaces will never be assembled, so the send credit their
-                // frames borrowed must return to the pool, as `PickTwo` returns it.
+                // The worker's receiver is gone (worker teardown): this batch, the batches held
+                // for the other interfaces and the batch the router keeps will never be
+                // assembled, so the send credit their frames borrowed must return to the pool, as
+                // `PickTwo` returns it.
                 let mut leaked = value.total_flow_credits();
                 drop(value);
                 for pacer in &mut self.pacers {
                     if let Some((_, held)) = pacer.held.take() {
                         leaked += held.total_flow_credits();
                     }
+                }
+                if let Some(pending) = self.pending.take() {
+                    leaked += pending.total_flow_credits();
                 }
                 if leaked > 0 {
                     self.send_credit_pool.release(leaked);
@@ -507,12 +521,37 @@ where
             return Poll::Ready(Some(()));
         }
 
-        if !self.closed && self.has_free_sender() {
+        // A batch kept while every interface held one is routed before the router reads another.
+        if self.pending.is_some() && self.has_free_sender() {
+            let value = self.pending.take().expect("the router keeps a batch");
+            if !self.route(cx, value) {
+                return Poll::Ready(None);
+            }
+            return Poll::Ready(Some(()));
+        }
+
+        // While every interface holds a batch, the router still reads the next batch where it has
+        // an interface for the highest-priority traffic, so that a batch of that level doesn't
+        // wait behind them. It doesn't read while it keeps a batch.
+        if !self.closed
+            && self.pending.is_none()
+            && (self.has_free_sender() || self.highest_priority.is_some())
+        {
             match self.rx.poll_recv(cx, budget) {
                 Poll::Ready(Some(value)) => {
-                    if !self.route(cx, value) {
-                        return Poll::Ready(None);
+                    let byte_cost = value.byte_cost();
+                    if self.has_free_sender() || self.is_highest(&value) {
+                        if !self.route(cx, value) {
+                            return Poll::Ready(None);
+                        }
+                    } else {
+                        // Every interface holds a batch: keep this one until an interface may
+                        // take it.
+                        self.pending = Some(value);
                     }
+                    // Tell upstream that the batch was consumed, as `PickTwo` does once it sends
+                    // one. A kept batch counts here, as a batch held on an interface does.
+                    self.rx.on_consumed(byte_cost);
                     return Poll::Ready(Some(()));
                 }
                 Poll::Ready(None) => self.closed = true,
