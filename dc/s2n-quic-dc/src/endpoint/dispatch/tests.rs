@@ -524,6 +524,12 @@ fn rejected_inits_leave_one_reset_for_each_slot_until_it_leaves() {
         vec![(0, 1), (1, 1), (2, 1), (3, 1)],
         "each of the peer's 4 queues gets the reset of its first rejected init alone"
     );
+    // The slots past the peer's queues are recorded as freed, and each held slot waits on its
+    // reset.
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the slots past the peer's queues are freed");
+    assert!((4..8).all(|slot| freed.contains(slot)));
+    assert!((0..4).all(|slot| !freed.contains(slot)), "a held slot waits on its reset");
 
     // Slot 2's reset leaves the priority router: slot 2 gets the reset of its next rejected init,
     // and slot 3, whose reset still waits, doesn't.
@@ -533,6 +539,9 @@ fn rejected_inits_leave_one_reset_for_each_slot_until_it_leaves() {
         &harness.path_entry,
         &mut harness.freed_batch_tx,
     );
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the release records slot 2 as freed");
+    assert!(freed.contains(2) && !freed.contains(3));
     init(&mut harness, &mut view, 2, 4);
     init(&mut harness, &mut view, 3, 4);
     assert_eq!(take_resets(&mut harness.frame_rx), vec![(2, 4)]);
