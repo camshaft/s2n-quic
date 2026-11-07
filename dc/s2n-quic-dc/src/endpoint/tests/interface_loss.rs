@@ -23,6 +23,8 @@
 //! The endpoints record each acknowledgement and freed batch they route to a send worker. None
 //! may go to a sender whose interface pair its path marks lost while another sender of that path
 //! delivers, and the endpoints must route at least one of each while a pair of its path is lost.
+//! While the peer has acknowledged a sender of the path since its lost pairs stopped delivering,
+//! each must go to such a sender, and the endpoints must route at least one of each then too.
 //!
 //! While the interface is lost, no pair whose routes avoid it may be marked lost, either once
 //! the first streams finish or once the stream the client opens next finishes: each endpoint
@@ -632,9 +634,12 @@ fn run(recover: bool) {
 
     // While a pair of a path was marked lost and another delivered, neither endpoint routed an
     // acknowledgement or a freed batch of that path to a sender whose pair was marked lost, and
-    // the endpoints routed at least one of each.
+    // the endpoints routed at least one of each. While a sender of the path delivered since the
+    // loss, each went to a sender that delivered since the loss, and the endpoints routed at
+    // least one of each then too.
     let routed = routed.lock().unwrap();
     let (mut acks, mut freed) = (0, 0);
+    let (mut acks_since, mut freed_since) = (0, 0);
     for route in routed
         .iter()
         .filter(|route| route.path_has_lost && route.path_delivers)
@@ -647,9 +652,24 @@ fn run(recover: bool) {
             Kind::PendingAck => acks += 1,
             Kind::PendingFreed => freed += 1,
         }
+        if route.path_delivers_since_lost {
+            assert!(
+                route.delivers_since_lost,
+                "{route:?} went to a sender that doesn't deliver since the loss",
+            );
+            match route.kind {
+                Kind::PendingAck => acks_since += 1,
+                Kind::PendingFreed => freed_since += 1,
+            }
+        }
     }
     assert!(acks > 0, "no acknowledgement was routed while a pair was lost");
     assert!(freed > 0, "no freed batch was routed while a pair was lost");
+    assert!(
+        acks_since > 0,
+        "no acknowledgement was routed while a sender delivered since the loss",
+    );
+    assert!(freed_since > 0, "no freed batch was routed while a sender delivered since the loss");
 
     // The server acknowledges each packet from the client's slow interface on a sender of its
     // own slow interface.
