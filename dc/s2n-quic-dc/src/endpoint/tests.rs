@@ -30,6 +30,7 @@ pub mod fair_share;
 pub mod half_close;
 pub mod interface_pacing;
 pub mod interface_pairing;
+pub mod interface_priority;
 pub mod interfaces;
 pub mod unidirectional;
 

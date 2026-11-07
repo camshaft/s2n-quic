@@ -293,6 +293,24 @@ impl Table {
     pub fn highest_priority(&self) -> Option<Id> {
         self.highest_priority
     }
+
+    /// Returns the send sockets of the interface that carries the endpoint's highest-priority
+    /// traffic, each by its position in the list of send sockets, where the configuration flags
+    /// one and at least one other interface holds a send socket too.
+    pub fn highest_priority_send_sockets(&self) -> Option<Vec<usize>> {
+        let highest = self.highest_priority?;
+        if self.send_sockets.iter().all(|id| *id == highest) {
+            return None;
+        }
+        Some(
+            self.send_sockets
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| **id == highest)
+                .map(|(position, _)| position)
+                .collect(),
+        )
+    }
 }
 
 /// Returns, for each of `socket_count` sockets, the interface that lists it, where one does.

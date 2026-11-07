@@ -41,9 +41,9 @@ struct Write {
     at_nanos: u64,
 }
 
-/// Two interfaces, the first at `SLOW` and the second at `FAST`, which also carries the
-/// highest-priority traffic, each with the sockets `layout` puts on it.
-fn interfaces(layout: &[usize; 8]) -> Vec<interface::Config> {
+/// Two interfaces, the first at `SLOW` and the second at `FAST`, each with the sockets `layout`
+/// puts on it. The second carries the highest-priority traffic where `highest_priority` is set.
+fn interfaces(layout: &[usize; 8], highest_priority: bool) -> Vec<interface::Config> {
     let sockets = |interface: usize| -> Vec<usize> {
         (0..layout.len())
             .filter(|&socket| layout[socket] == interface)
@@ -60,7 +60,7 @@ fn interfaces(layout: &[usize; 8]) -> Vec<interface::Config> {
             send_rate: Some(FAST),
             send_sockets: sockets(1),
             recv_sockets: sockets(1),
-            carries_highest_priority: true,
+            carries_highest_priority: highest_priority,
             ..Default::default()
         },
     ]
@@ -97,7 +97,9 @@ fn each_interface_sends_to_the_peer_interface_it_pairs_with() {
 
         async move {
             let server = SimEndpointConfig::default()
-                .interfaces(interfaces(&SERVER_INTERFACE))
+                // The server doesn't flag an interface for its highest-priority traffic, so that
+                // it writes on both of its interfaces, as the counts below expect.
+                .interfaces(interfaces(&SERVER_INTERFACE, false))
                 .server();
             *server_addrs_in_sim.lock().unwrap() = server.data_addrs().to_vec();
             let mut acceptor = server
@@ -119,7 +121,7 @@ fn each_interface_sends_to_the_peer_interface_it_pairs_with() {
 
         async move {
             let mut client = SimEndpointConfig::default()
-                .interfaces(interfaces(&CLIENT_INTERFACE))
+                .interfaces(interfaces(&CLIENT_INTERFACE, true))
                 .client();
             *client_addrs_in_sim.lock().unwrap() = client.data_addrs().to_vec();
             for _ in 0..STREAMS {

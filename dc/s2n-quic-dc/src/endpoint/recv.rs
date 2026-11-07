@@ -447,6 +447,9 @@ impl core::hash::Hash for Key {
 pub(crate) struct Cache {
     pub senders: FxHashMap<Key, Rc<RefCell<Context>>>,
     pub worker_id: RecvDispatchWorkerId,
+    /// The senders of the interface that carries the endpoint's highest-priority traffic, which
+    /// a peer's acknowledgements go to, where the endpoint has one.
+    pub priority_senders: Option<Vec<LocalSenderId>>,
 }
 
 impl Cache {
@@ -454,7 +457,15 @@ impl Cache {
         Self {
             senders: FxHashMap::default(),
             worker_id,
+            priority_senders: None,
         }
+    }
+
+    /// Sets the senders of the interface for the highest-priority traffic, which a peer's
+    /// acknowledgements go to.
+    pub fn with_priority_senders(mut self, priority_senders: Option<Vec<LocalSenderId>>) -> Self {
+        self.priority_senders = priority_senders;
+        self
     }
 
     /// Look up an existing [`Context`] by `(credentials.id, remote_sender_id)`, or derive
@@ -576,7 +587,11 @@ impl Cache {
                     "recv cache key_id advanced — replacing entry"
                 );
 
-                let dest_sender_id = route.sender_id_for_ack(remote_sender_id);
+                let dest_sender_id = super::routing::ack_sender_id(
+                    route.sender_id_for_ack(remote_sender_id),
+                    remote_sender_id,
+                    self.priority_senders.as_deref(),
+                );
 
                 // Take queue_view from old context — it was already used by decrypt
                 // and is independent of the PN space being replaced.
@@ -645,7 +660,11 @@ impl Cache {
                     )
                     .map_err(|_| CacheError::ReplayDetected)?;
 
-                let dest_sender_id = route.sender_id_for_ack(remote_sender_id);
+                let dest_sender_id = super::routing::ack_sender_id(
+                    route.sender_id_for_ack(remote_sender_id),
+                    remote_sender_id,
+                    self.priority_senders.as_deref(),
+                );
 
                 let ctx = Rc::new(RefCell::new(Context::new(
                     path_entry,

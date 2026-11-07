@@ -823,6 +823,13 @@ where
     // interfaces. A config that doesn't list an interface leaves every socket without a place.
     let send_places = interfaces.send_places();
 
+    // The send sockets of the interface that carries the highest-priority traffic, which the
+    // freed batches and a peer's acknowledgements go to, where the config flags one and at least
+    // one other interface holds a send socket too.
+    let priority_senders: Option<Vec<LocalSenderId>> = interfaces
+        .highest_priority_send_sockets()
+        .map(|sockets| sockets.into_iter().map(LocalSenderId::from_index).collect());
+
     // Distribute send sockets across send workers round-robin.
     for (socket_id, socket) in send_sockets.into_iter() {
         let raw_idx = socket_id.as_usize();
@@ -1010,6 +1017,7 @@ where
             clock: clock.clone(),
             stream_clock: stream_clock.clone(),
             route: ack_route,
+            priority_senders: priority_senders.clone(),
             waker_sink,
             ups_tx: ups_tx.clone(),
             invalidation_rx,
@@ -1096,6 +1104,7 @@ where
         send_txs: invalidation_send_txs,
         recv_txs: invalidation_recv_txs,
         sender_id_to_worker,
+        priority_senders,
         ups_rx,
         ups_queue_gauge: counter_registry.register_queue_gauge("q.ups"),
         ups_socket,
@@ -1222,6 +1231,9 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     /// Concrete clock used for stream construction (checked once at endpoint startup).
     stream_clock: crate::time::DefaultClock,
     route: Route,
+    /// The send sockets of the interface for the highest-priority traffic, which a peer's
+    /// acknowledgements go to, where the endpoint has one.
+    priority_senders: Option<Vec<LocalSenderId>>,
     waker_sink: waker::Sink,
     ups_tx: UpsSender,
     invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
@@ -1249,6 +1261,9 @@ struct BackgroundParts<UpsSocket> {
     send_txs: IdMap<id::SendWorkerId, InvalidationSender>,
     recv_txs: IdMap<id::RecvDispatchWorkerId, InvalidationSender>,
     sender_id_to_worker: IdMap<LocalSenderId, id::SendWorkerId>,
+    /// The send sockets of the interface for the highest-priority traffic, which the freed
+    /// batches go to, where the endpoint has one.
+    priority_senders: Option<Vec<LocalSenderId>>,
     ups_rx: ups::PendingReceiver<sync_queue::Receiver<ups::Response>>,
     ups_queue_gauge: crate::counter::QueueGauge,
     ups_socket: UpsSocket,
@@ -1512,7 +1527,8 @@ where
                 );
                 let recv_dispatch_idx = rd.recv_dispatch_idx;
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx),
+                    crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx)
+                        .with_priority_senders(rd.priority_senders),
                 ));
                 let (ack_burst_tx, ack_burst_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<
@@ -1762,31 +1778,19 @@ where
                     use crate::socket::channel::{ReceiverExt as _, UnboundedSender as _};
                     let mut ack_sender = bg.ack_sender;
                     let socket_count = total_sender_ids;
+                    let priority_senders = bg.priority_senders;
                     let mut rng = crate::xorshift::Rng::new();
                     let rx = crate::socket::channel::Map::new(
                         bg.freed_batch_rx,
                         move |mut entry: crate::intrusive::Entry<msg::Sender>| {
-                            // Pick-two LB using sender_load_score atomics
-                            let chosen = if socket_count <= 1 {
-                                LocalSenderId::from_index(0)
-                            } else {
-                                let path_entry = entry.path_secret_entry().clone();
-                                let idx1 = LocalSenderId::from_index(rng.next_usize(socket_count));
-                                let idx2 = {
-                                    let mut raw = rng.next_usize(socket_count - 1);
-                                    if raw >= idx1.as_usize() {
-                                        raw += 1;
-                                    }
-                                    LocalSenderId::from_index(raw)
-                                };
-                                let s1 = path_entry.sender_load_score(idx1);
-                                let s2 = path_entry.sender_load_score(idx2);
-                                if s1 <= s2 {
-                                    idx1
-                                } else {
-                                    idx2
-                                }
-                            };
+                            // Pick-two LB using sender_load_score atomics, among the senders of
+                            // the interface for the highest-priority traffic where there is one.
+                            let chosen = routing::freed_batch_sender_id(
+                                priority_senders.as_deref(),
+                                socket_count,
+                                &mut rng,
+                                |sender| entry.path_secret_entry().sender_load_score(sender),
+                            );
 
                             // Set the chosen sender and forward
                             if let msg::Sender::PendingFreed {

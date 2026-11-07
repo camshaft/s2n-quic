@@ -222,4 +222,36 @@ mod tests {
         let table = Table::resolve(&configs[1..2], Rate::new(1.0), &sockets, &[], &System);
         assert_eq!(table.highest_priority(), None);
     }
+
+    #[test]
+    fn lists_the_send_sockets_of_the_highest_priority_interface() {
+        let sockets = addrs(4);
+        let configs = |carries_highest_priority| {
+            [
+                Config {
+                    send_sockets: vec![0, 2],
+                    ..Default::default()
+                },
+                Config {
+                    send_sockets: vec![1, 3],
+                    carries_highest_priority,
+                    ..Default::default()
+                },
+            ]
+        };
+        let table = Table::resolve(&configs(true), Rate::new(1.0), &sockets, &[], &System);
+        assert_eq!(table.highest_priority_send_sockets(), Some(vec![1, 3]));
+
+        let table = Table::resolve(&configs(false), Rate::new(1.0), &sockets, &[], &System);
+        assert_eq!(table.highest_priority_send_sockets(), None);
+
+        // One interface holds every send socket.
+        let one = [Config {
+            send_sockets: vec![0, 1, 2, 3],
+            carries_highest_priority: true,
+            ..Default::default()
+        }];
+        let table = Table::resolve(&one, Rate::new(1.0), &sockets, &[], &System);
+        assert_eq!(table.highest_priority_send_sockets(), None);
+    }
 }
