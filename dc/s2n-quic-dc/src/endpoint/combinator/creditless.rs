@@ -121,8 +121,8 @@ impl CreditlessWindow {
     /// nothing, where the bytes it holds stay within its limit with them, or where no other
     /// clone of the window is left. Otherwise it refuses them and returns `false`.
     ///
-    /// Each refusal records a frame-refused event of the window's path secret map, where it
-    /// has one.
+    /// A refusal here doesn't record an event, since the bytes don't tell whose frames they
+    /// are: [`Self::admit_frame`] records each frame it refuses, with its peer.
     pub fn admit(&self, bytes: u64) -> bool {
         let state = &self.state;
         if Rc::strong_count(&self.state) == 1 {
@@ -131,9 +131,6 @@ impl CreditlessWindow {
         let held = state.held.get();
         if held != 0 && held.saturating_add(bytes) > state.limit.get() {
             state.refused.set(true);
-            if let Some(path_secret_map) = &state.path_secret_map {
-                path_secret_map.on_creditless_window_frame_refused(bytes, held, state.limit.get());
-            }
             return false;
         }
         state.held.set(held.saturating_add(bytes));
@@ -142,8 +139,28 @@ impl CreditlessWindow {
 
     /// Admits `frame` where it borrows send credit, which the send credit pool bounds, and
     /// otherwise admits its bytes as [`Self::admit`] does.
+    ///
+    /// Each refusal records a frame-refused event of the window's path secret map, where it
+    /// has one, with the frame's peer and its bytes.
     pub fn admit_frame(&self, frame: &Frame) -> bool {
-        frame.flow_credits != 0 || self.admit(frame.byte_cost())
+        if frame.flow_credits != 0 {
+            return true;
+        }
+        let bytes = frame.byte_cost();
+        if self.admit(bytes) {
+            return true;
+        }
+        // A refusal leaves the bytes the window holds and its limit as they were.
+        let state = &self.state;
+        if let Some(path_secret_map) = &state.path_secret_map {
+            path_secret_map.on_creditless_window_frame_refused(
+                frame.path_secret_entry.peer(),
+                bytes,
+                state.held.get(),
+                state.limit.get(),
+            );
+        }
+        false
     }
 
     /// Releases `bytes` of a batch that the batch router read in round `read_in`, as a worker's
