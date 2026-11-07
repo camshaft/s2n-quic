@@ -141,13 +141,14 @@ fn decrypt_fast_path(
                 binding_id,
                 frame_trace::BindOutcome::NoAcceptor,
             );
-            server_view.record_freed(queue_pair.dest_queue_id, path_entry, freed_batch_tx);
-            send_reset(
+            reject_init(
+                server_view,
                 path_entry,
                 queue_pair,
                 binding_id,
                 error::ACCEPTOR_NOT_FOUND,
                 frame_tx,
+                |view| view.record_freed(queue_pair.dest_queue_id, path_entry, freed_batch_tx),
             );
             // Un-authenticated reject — caller must authenticate before ACKing. See `AuthForDrop`.
             return Err(FastPathError::AuthForDrop);
@@ -213,7 +214,6 @@ fn decrypt_fast_path(
                         drop(AutoWake::new(acceptor_waker));
                     }
                     Err(acceptor::channel::SendError::Closed(mut s)) => {
-                        s.disable();
                         counters.rx_init_acceptor_closed.add(1);
                         trace_server_bind(
                             *path_entry.id(),
@@ -225,16 +225,17 @@ fn decrypt_fast_path(
                         // client is still establishing this binding and the QueueInit it sent
                         // gets ACKed, so without an explicit reset it wedges in InitSent forever.
                         // Notify it like the acceptor-not-found arm does.
-                        send_reset(
+                        reject_init(
+                            server_view,
                             path_entry,
                             queue_pair,
                             binding_id,
                             error::ACCEPTOR_NOT_FOUND,
                             frame_tx,
+                            |_| s.disable(),
                         );
                     }
                     Err(acceptor::channel::SendError::NoSlots(mut s)) => {
-                        s.disable();
                         counters.rx_init_acceptor_no_slots.add(1);
                         trace_server_bind(
                             *path_entry.id(),
@@ -244,12 +245,14 @@ fn decrypt_fast_path(
                         );
                         // See the `Closed` arm: the client must be reset explicitly or it
                         // wedges in InitSent after its QueueInit is ACKed.
-                        send_reset(
+                        reject_init(
+                            server_view,
                             path_entry,
                             queue_pair,
                             binding_id,
                             error::SERVER_BUSY,
                             frame_tx,
+                            |_| s.disable(),
                         );
                     }
                 }
@@ -1516,13 +1519,14 @@ fn handle_queue_msg_init(
             binding_id,
             frame_trace::BindOutcome::NoAcceptor,
         );
-        server_view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx);
-        send_reset(
+        reject_init(
+            server_view,
             &peer.path_entry,
             queue_pair,
             binding_id,
             error::ACCEPTOR_NOT_FOUND,
             frame_tx,
+            |view| view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx),
         );
         return;
     };
@@ -1588,7 +1592,6 @@ fn handle_queue_msg_init(
                     let _ = waker_sink.send(AutoWake::new(acceptor_waker));
                 }
                 Err(acceptor::channel::SendError::Closed(mut stream)) => {
-                    stream.disable();
                     counters.rx_init_acceptor_closed.add(1);
                     trace_server_bind(
                         cred_id,
@@ -1598,16 +1601,17 @@ fn handle_queue_msg_init(
                     );
                     // `disable()` is a local-only teardown; reset the client explicitly so its
                     // ACKed QueueInit doesn't leave the writer wedged in InitSent forever.
-                    send_reset(
+                    reject_init(
+                        server_view,
                         &peer.path_entry,
                         queue_pair,
                         binding_id,
                         error::ACCEPTOR_NOT_FOUND,
                         frame_tx,
+                        |_| stream.disable(),
                     );
                 }
                 Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
-                    stream.disable();
                     counters.rx_init_acceptor_no_slots.add(1);
                     trace_server_bind(
                         cred_id,
@@ -1615,12 +1619,14 @@ fn handle_queue_msg_init(
                         binding_id,
                         frame_trace::BindOutcome::NoSlots,
                     );
-                    send_reset(
+                    reject_init(
+                        server_view,
                         &peer.path_entry,
                         queue_pair,
                         binding_id,
                         error::SERVER_BUSY,
                         frame_tx,
+                        |_| stream.disable(),
                     );
                 }
             }
@@ -1720,13 +1726,14 @@ fn handle_queue_data_init(
             binding_id,
             frame_trace::BindOutcome::NoAcceptor,
         );
-        server_view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx);
-        send_reset(
+        reject_init(
+            server_view,
             &peer.path_entry,
             queue_pair,
             binding_id,
             error::ACCEPTOR_NOT_FOUND,
             frame_tx,
+            |view| view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx),
         );
         return;
     };
@@ -1794,7 +1801,6 @@ fn handle_queue_data_init(
                     let _ = waker_sink.send(AutoWake::new(acceptor_waker));
                 }
                 Err(acceptor::channel::SendError::Closed(mut stream)) => {
-                    stream.disable();
                     counters.rx_init_acceptor_closed.add(1);
                     trace_server_bind(
                         cred_id,
@@ -1804,16 +1810,17 @@ fn handle_queue_data_init(
                     );
                     // `disable()` is a local-only teardown; reset the client explicitly so its
                     // ACKed QueueInit doesn't leave the writer wedged in InitSent forever.
-                    send_reset(
+                    reject_init(
+                        server_view,
                         &peer.path_entry,
                         queue_pair,
                         binding_id,
                         error::ACCEPTOR_NOT_FOUND,
                         frame_tx,
+                        |_| stream.disable(),
                     );
                 }
                 Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
-                    stream.disable();
                     counters.rx_init_acceptor_no_slots.add(1);
                     trace_server_bind(
                         cred_id,
@@ -1821,12 +1828,14 @@ fn handle_queue_data_init(
                         binding_id,
                         frame_trace::BindOutcome::NoSlots,
                     );
-                    send_reset(
+                    reject_init(
+                        server_view,
                         &peer.path_entry,
                         queue_pair,
                         binding_id,
                         error::SERVER_BUSY,
                         frame_tx,
+                        |_| stream.disable(),
                     );
                 }
             }
@@ -1919,6 +1928,32 @@ fn send_reset(
         flow_credits: 0,
     };
     let _ = frame_tx.send_batch(Entry::new(frame));
+}
+
+/// Rejects the init of `binding_id` that `incoming_pair` routes to the server slot
+/// `incoming_pair.dest_queue_id` with a reset of `error_code`, where `free` frees the slot.
+///
+/// The slot is held before `free` frees it, so that the client learns that the slot is free only
+/// once the reset leaves the priority router for its lane. While the creditless window refuses
+/// frames, the client doesn't send another init on the slot, so the reset is sent only where the
+/// hold is new: a slot whose earlier reset waits still doesn't get a second one, and a slot past
+/// the peer's queues, which `bind_for_msg` rejects without a reset, doesn't get one. The resets
+/// of a peer's rejected inits that wait in front of the window are then at most one for each of
+/// its queues, whatever the queue and binding ids of its frames.
+fn reject_init(
+    server_view: &crate::queue::ServerView,
+    path_secret_entry: &Arc<PathSecretEntry>,
+    incoming_pair: QueuePair,
+    binding_id: VarInt,
+    error_code: VarInt,
+    frame_tx: &mut SubmissionSender,
+    free: impl FnOnce(&crate::queue::ServerView),
+) {
+    let reset = server_view.hold_freed(incoming_pair.dest_queue_id, binding_id);
+    free(server_view);
+    if reset {
+        send_reset(path_secret_entry, incoming_pair, binding_id, error_code, frame_tx);
+    }
 }
 
 // ── QueueControl ───────────────────────────────────────────────────────────
@@ -2248,13 +2283,14 @@ fn bind_for_reset(
             binding_id,
             frame_trace::BindOutcome::NoAcceptor,
         );
-        server_view.record_freed(dest_queue_id, &peer.path_entry, freed_batch_tx);
-        send_reset(
+        reject_init(
+            server_view,
             &peer.path_entry,
             queue_pair,
             binding_id,
             error::ACCEPTOR_NOT_FOUND,
             frame_tx,
+            |view| view.record_freed(dest_queue_id, &peer.path_entry, freed_batch_tx),
         );
         return;
     };
@@ -2311,7 +2347,6 @@ fn bind_for_reset(
                     let _ = waker_sink.send(AutoWake::new(acceptor_waker));
                 }
                 Err(acceptor::channel::SendError::Closed(mut stream)) => {
-                    stream.disable();
                     counters.rx_init_acceptor_closed.add(1);
                     trace_server_bind(
                         cred_id,
@@ -2319,16 +2354,17 @@ fn bind_for_reset(
                         binding_id,
                         frame_trace::BindOutcome::AcceptorClosed,
                     );
-                    send_reset(
+                    reject_init(
+                        server_view,
                         &peer.path_entry,
                         queue_pair,
                         binding_id,
                         error::ACCEPTOR_NOT_FOUND,
                         frame_tx,
+                        |_| stream.disable(),
                     );
                 }
                 Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
-                    stream.disable();
                     counters.rx_init_acceptor_no_slots.add(1);
                     trace_server_bind(
                         cred_id,
@@ -2336,12 +2372,14 @@ fn bind_for_reset(
                         binding_id,
                         frame_trace::BindOutcome::NoSlots,
                     );
-                    send_reset(
+                    reject_init(
+                        server_view,
                         &peer.path_entry,
                         queue_pair,
                         binding_id,
                         error::SERVER_BUSY,
                         frame_tx,
+                        |_| stream.disable(),
                     );
                 }
             }
