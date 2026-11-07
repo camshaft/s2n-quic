@@ -2213,6 +2213,16 @@ fn interface_paced_pick_two_skips_lost_pairs_while_another_delivers() {
     let counts = route_by_interface(items());
     assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
     assert_eq!(counts[2][0] + counts[3][0], 20);
+
+    // Once the mark of sender 0 clears, though no sender delivers since the loss, sender 1 no
+    // longer counts as lost and gets items again.
+    assert!(entry.set_sender_lost(sender(0), false));
+    let counts = route_by_interface(items());
+    assert_ne!(
+        counts[1],
+        [0, 0],
+        "sender 1 didn't get an item once sender 0's mark cleared: {counts:?}"
+    );
 }
 
 #[test]
