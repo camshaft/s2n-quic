@@ -41,6 +41,16 @@ fn setup_with_rates(num_workers: usize, overall_rate: Rate) -> (SubmissionSender
 
 /// Like [`setup`] but with a configurable pacing of the workers' send sockets.
 fn setup_with_pacing(num_workers: usize, pacing: SendPacing) -> (SubmissionSender, Vec<WorkerRx>) {
+    setup_with_path_secret_map(num_workers, pacing, None)
+}
+
+/// Like [`setup_with_pacing`] but with the endpoint's path secret map, where it is `Some`, whose
+/// subscriber records the events of the window of the frames without send credit.
+fn setup_with_path_secret_map(
+    num_workers: usize,
+    pacing: SendPacing,
+    path_secret_map: Option<crate::path::secret::Map>,
+) -> (SubmissionSender, Vec<WorkerRx>) {
     let (frame_tx, frame_rx) = frame::submission_channel(1);
 
     let mut workers = Vec::with_capacity(num_workers);
@@ -61,7 +71,7 @@ fn setup_with_pacing(num_workers: usize, pacing: SendPacing) -> (SubmissionSende
         pacing,
         Budgets::default(),
         crate::counter::Registry::default(),
-        None,
+        path_secret_map,
         crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
             1_000_000,
         ))),
@@ -738,4 +748,93 @@ fn a_highest_priority_batch_keeps_the_windows_round_and_its_limit() {
             "the window's limit after worker {worker}'s batch (highest: {highest})"
         );
     }
+}
+
+// -- The window's events through the path secret map --------------------------------------
+
+/// Records each frame that the window of the frames without send credit refuses, as the frame's
+/// bytes, the bytes the window held and the window's limit.
+#[derive(Default)]
+struct RefusedFrames {
+    refused: Mutex<Vec<(u64, u64, u64)>>,
+}
+
+impl crate::event::Subscriber for RefusedFrames {
+    type ConnectionContext = ();
+
+    fn create_connection_context(
+        &self,
+        _meta: &crate::event::api::ConnectionMeta,
+        _info: &crate::event::api::ConnectionInfo,
+    ) -> Self::ConnectionContext {
+    }
+
+    fn on_creditless_window_frame_refused(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::CreditlessWindowFrameRefused,
+    ) {
+        let entry = (event.frame_bytes, event.held_bytes, event.limit_bytes);
+        self.refused.lock().unwrap().push(entry);
+    }
+}
+
+/// Where the endpoint passes its path secret map, `frame_dispatch` builds the window of the frames
+/// without send credit over it, so that the map's subscriber records each frame the window
+/// refuses, with the bytes the window holds and its limit, which starts at the batch target.
+#[test]
+fn frame_dispatch_records_the_windows_refused_frames_through_the_path_secret_map() {
+    use crate::endpoint::combinator::BATCH_TARGET_BYTES;
+
+    let _snapshots = crate::testing::without_snapshots();
+    let refused = Arc::new(RefusedFrames::default());
+    let path_secret_map = crate::path::secret::Map::builder()
+        .with_signer(crate::path::secret::stateless_reset::Signer::random())
+        .with_capacity(4)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber(refused.clone())
+        .build()
+        .unwrap();
+
+    // The priority router moves the frames of one submission while the window admits their
+    // bytes, so in its first pass, before any batch leaves the window, the window admits
+    // `admitted` frames of `cost` bytes and refuses the next one.
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(1)
+        .build(None);
+    let cost = test_frame_with_payload(&pse, 1000).byte_cost();
+    let admitted = BATCH_TARGET_BYTES / cost;
+
+    sim(move || {
+        let pacing = SendPacing::single(Rate::new(100.0));
+        let (mut frame_tx, mut rxs) =
+            setup_with_path_secret_map(1, pacing, Some(path_secret_map.clone()));
+        let mut worker_rx = rxs.pop().unwrap();
+
+        async move {
+            let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+                .socket_sender_count(1)
+                .build(None);
+            let mut input = PriorityInput::default();
+            for _ in 0..admitted + 2 {
+                input.push(test_frame_with_payload(&pse, 1000));
+            }
+            frame_tx.send_batch(input).unwrap();
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            while worker_rx.recv().await.is_some() {}
+        }
+        .primary()
+        .spawn();
+    });
+
+    let refused = refused.refused.lock().unwrap();
+    assert_eq!(
+        refused.first(),
+        Some(&(cost, admitted * cost, BATCH_TARGET_BYTES)),
+        "the window refuses the first frame past its limit, which starts at the batch target"
+    );
 }
