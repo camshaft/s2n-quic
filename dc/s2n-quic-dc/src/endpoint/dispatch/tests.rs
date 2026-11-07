@@ -300,24 +300,27 @@ impl FastPathHarness {
         )
     }
 
-    /// Authenticates `packet` in place and finishes the init the fast path rejected, as
-    /// `process` does, and returns whether the packet authenticated.
+    /// Authenticates `packet` in place and settles the init the fast path rejected, as `process`
+    /// does once it reads whether the packet number is new, and returns whether the packet
+    /// authenticated.
     fn authenticate(
         &mut self,
         rejected: RejectedInit,
         packet: &mut datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
         opener: &crate::crypto::awslc::open::Application,
         queue_view: &mut recv::QueueView,
+        new_packet_number: bool,
     ) -> bool {
-        authenticate_rejected_init(
+        let authenticated = packet.decrypt_in_place(opener).is_ok();
+        settle_rejected_init(
             rejected,
-            packet,
-            opener,
+            authenticated && new_packet_number,
             queue_view,
             &self.path_entry,
             &mut self.frame_tx,
             &mut self.freed_batch_tx,
-        )
+        );
+        authenticated
     }
 }
 
@@ -563,7 +566,7 @@ fn rejected_inits_leave_one_reset_for_each_slot_until_it_leaves() {
             panic!("the server rejects an init without an acceptor");
         };
         assert!(
-            harness.authenticate(rejected, &mut packet, &opener, view),
+            harness.authenticate(rejected, &mut packet, &opener, view, true),
             "the init is sealed with its own header, so it authenticates"
         );
     };
@@ -621,7 +624,7 @@ fn a_rejected_init_that_fails_authentication_leaves_the_slot_unheld() {
     };
     packet.payload_mut()[0] ^= 0xFF;
     assert!(
-        !harness.authenticate(rejected, &mut packet, &opener, &mut view),
+        !harness.authenticate(rejected, &mut packet, &opener, &mut view, true),
         "a tampered packet fails the AEAD check, so it isn't ACKed"
     );
     assert!(
@@ -642,6 +645,56 @@ fn a_rejected_init_that_fails_authentication_leaves_the_slot_unheld() {
     let Err(FastPathError::RejectInit(rejected)) = result else {
         panic!("the server rejects an init without an acceptor");
     };
-    assert!(harness.authenticate(rejected, &mut packet, &opener, &mut view));
+    assert!(harness.authenticate(rejected, &mut packet, &opener, &mut view, true));
     assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 1)]);
+}
+
+/// A copy of an authentic rejected init whose packet number the endpoint took already, as a
+/// replayed packet, leaves the slot as the first copy left it: it doesn't hold the slot, record it
+/// as freed or send a reset, so the genuine rejected init of the next binding on the slot gets its
+/// reset.
+#[test]
+fn a_replayed_rejected_init_leaves_the_slot_as_the_first_copy_left_it() {
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let mut view = recv::QueueView::Server(state.view());
+    let mut harness = FastPathHarness::new();
+
+    let init = |harness: &mut FastPathHarness,
+                view: &mut recv::QueueView,
+                binding: u8,
+                new_packet_number: bool| {
+        // The registry doesn't hold an acceptor, so the server rejects the init.
+        let (mut packet, opener, decrypt_len) = sealed_queue_init_packet(
+            VarInt::from_u8(1),
+            VarInt::from_u8(binding),
+            VarInt::from_u8(9),
+        );
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("the server rejects an init without an acceptor");
+        };
+        harness.authenticate(rejected, &mut packet, &opener, view, new_packet_number)
+    };
+
+    // Binding 1's init on slot 1 is rejected with a reset, and the reset leaves.
+    assert!(init(&mut harness, &mut view, 1, true));
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 1)]);
+    state.freed.release(
+        VarInt::from_u8(1),
+        VarInt::from_u8(1),
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+
+    // A copy of that packet comes again: it authenticates, and its packet number was taken.
+    assert!(init(&mut harness, &mut view, 1, false));
+    assert!(
+        take_resets(&mut harness.frame_rx).is_empty(),
+        "a replayed init doesn't send a reset"
+    );
+
+    // Binding 2's genuine init on slot 1 then holds the slot and gets its reset.
+    assert!(init(&mut harness, &mut view, 2, true));
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 2)]);
 }

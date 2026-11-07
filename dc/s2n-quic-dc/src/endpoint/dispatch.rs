@@ -66,6 +66,9 @@ pub(crate) enum Error {
 enum DecryptResult {
     FastPath(AutoWake),
     SlowPath(BytesMut),
+    /// The fast path rejected an init and its packet authenticated in place: `process` settles
+    /// the reject with [`settle_rejected_init`] once it reads whether the packet number is new.
+    RejectedInit(RejectedInit),
 }
 
 enum FastPathError {
@@ -85,16 +88,17 @@ enum FastPathError {
     /// and the ACK is suppressed, so the genuine packet is retransmitted and recovers.
     AuthForDrop,
     /// The init's acceptor is missing, closed or full, so the scatter-decrypt never ran and the
-    /// packet is still un-authenticated, as for `AuthForDrop`. The caller passes the reject to
-    /// [`authenticate_rejected_init`], which authenticates the packet in place before it holds
-    /// the slot, frees it and sends the reset: those take the packet's cleartext routing fields
-    /// as given, so a tampered or forged init that held the slot for its own binding would keep
-    /// the reset of the client's genuine rejected init on that slot from being sent.
+    /// packet is still un-authenticated, as for `AuthForDrop`. The caller authenticates the
+    /// packet in place, and [`settle_rejected_init`] holds the slot, frees it and sends the reset
+    /// only for a packet that authenticates and whose packet number is new: those take the
+    /// packet's cleartext routing fields as given, so a tampered, forged or replayed init that
+    /// held the slot for its binding would keep the reset of the client's genuine rejected init
+    /// on that slot from being sent.
     RejectInit(RejectedInit),
 }
 
-/// An init that the fast path rejected before the scatter-decrypt ran, kept until its packet
-/// authenticates.
+/// An init that the fast path rejected before the scatter-decrypt ran, kept until `process`
+/// knows whether its packet authenticates and whether its packet number is new.
 struct RejectedInit {
     queue_pair: QueuePair,
     binding_id: VarInt,
@@ -497,19 +501,24 @@ where
                     Ok(()) => Some(DecryptResult::FastPath(AutoWake::default())),
                     Err(_) => None,
                 },
-                // The init was rejected before the scatter-decrypt ran: the slot is held, freed
-                // and reset only for a packet that authenticates, and a tampered packet returns
-                // `None`, so no ACK, as for `AuthForDrop`.
-                Err(FastPathError::RejectInit(rejected)) => authenticate_rejected_init(
-                    rejected,
-                    &mut packet,
-                    opener,
-                    queue_view,
-                    path_entry,
-                    frame_tx,
-                    freed_batch_tx,
-                )
-                .then(|| DecryptResult::FastPath(AutoWake::default())),
+                // The init was rejected before the scatter-decrypt ran. Authenticate it in place:
+                // a tampered packet returns `None`, so no ACK, as for `AuthForDrop`, and doesn't
+                // hold, free or reset the slot. An authentic one is settled once its packet
+                // number is known to be new, below.
+                Err(FastPathError::RejectInit(rejected)) => match packet.decrypt_in_place(opener) {
+                    Ok(()) => Some(DecryptResult::RejectedInit(rejected)),
+                    Err(_) => {
+                        settle_rejected_init(
+                            rejected,
+                            false,
+                            queue_view,
+                            path_entry,
+                            frame_tx,
+                            freed_batch_tx,
+                        );
+                        None
+                    }
+                },
                 Err(FastPathError::HeaderMismatch) | Err(FastPathError::WriteFailed) => None,
             };
         }
@@ -612,7 +621,28 @@ where
     let mut peer = peer_rc.borrow_mut();
 
     // Packet number deduplication
-    if peer.dedup_filter.on_packet_number(packet_number).is_err() {
+    let new_packet_number = peer.dedup_filter.on_packet_number(packet_number).is_ok();
+
+    // An init the fast path rejected holds, frees and resets its slot only for a new packet
+    // number: a replayed copy of an authentic init doesn't. See `RejectInit`.
+    let decrypt_result = match decrypt_result {
+        DecryptResult::FastPath(waker) => Ok(waker),
+        DecryptResult::SlowPath(buf) => Err(buf),
+        DecryptResult::RejectedInit(rejected) => {
+            let peer = &mut *peer;
+            settle_rejected_init(
+                rejected,
+                new_packet_number,
+                &mut peer.queue_view,
+                &peer.path_entry,
+                frame_tx,
+                freed_batch_tx,
+            );
+            Ok(AutoWake::default())
+        }
+    };
+
+    if !new_packet_number {
         record_packet_drop(
             packet_number,
             source_sender_id,
@@ -637,7 +667,7 @@ where
 
     // Fast path: single QueueMsg already dispatched during decrypt — just send the waker.
     let payload_storage = match decrypt_result {
-        DecryptResult::FastPath(waker) => {
+        Ok(waker) => {
             let _ = waker_sink.send(waker);
             counters.on_received_frame(&single_queue_msg.unwrap());
             counters.rx_frames_per_packet.record_value(1);
@@ -668,7 +698,7 @@ where
 
             return Ok(());
         }
-        DecryptResult::SlowPath(buf) => buf,
+        Err(buf) => buf,
     };
     let mut payload_storage = payload_storage;
 
@@ -1979,25 +2009,23 @@ fn reject_init(
     }
 }
 
-/// Authenticates the packet of an init that the fast path rejected, in place, and returns whether
-/// it authenticated, so that the caller ACKs it only then.
+/// Settles an init that the fast path rejected before its packet authenticated. `take` is
+/// whether the endpoint takes the packet: it authenticated in place and its packet number is new.
 ///
-/// The hold, the free and the reset of [`reject_init`] run only for a packet that authenticates:
-/// they take the packet's cleartext routing fields as given, so a tampered or forged init on a
-/// slot would otherwise hold the slot for its own binding, and the reset of the client's genuine
-/// rejected init on that slot wouldn't be sent. For a packet that fails, a slot that
-/// `bind_for_msg` bound for it is torn down, and nothing else changes: the slot isn't held,
-/// recorded as freed or reset.
-fn authenticate_rejected_init(
+/// The hold, the free and the reset of [`reject_init`] run only for a packet the endpoint takes:
+/// they take the packet's cleartext routing fields as given, so a tampered or forged init, or a
+/// replayed copy of an authentic one, would otherwise hold the slot for its binding, and the
+/// reset of the client's genuine rejected init on that slot wouldn't be sent. For a packet the
+/// endpoint doesn't take, a slot that `bind_for_msg` bound for it is torn down, and nothing else
+/// changes: the slot isn't held, recorded as freed or reset.
+fn settle_rejected_init(
     rejected: RejectedInit,
-    packet: &mut packet::datagram::decoder::Packet<descriptor::Filled>,
-    opener: &crate::crypto::awslc::open::Application,
+    take: bool,
     queue_view: &mut recv::QueueView,
     path_entry: &Arc<PathSecretEntry>,
     frame_tx: &mut SubmissionSender,
     freed_batch_tx: &mut crate::queue::FreedBatchTx,
-) -> bool {
-    let authenticated = packet.decrypt_in_place(opener).is_ok();
+) {
     let RejectedInit {
         queue_pair,
         binding_id,
@@ -2005,15 +2033,15 @@ fn authenticate_rejected_init(
         stream,
     } = rejected;
 
-    if !authenticated {
+    if !take {
         if let Some(mut stream) = stream {
             stream.disable();
         }
-        return false;
+        return;
     }
 
     let Some(server_view) = queue_view.as_server_mut() else {
-        return true;
+        return;
     };
     reject_init(
         server_view,
@@ -2027,7 +2055,6 @@ fn authenticate_rejected_init(
             None => view.record_freed(queue_pair.dest_queue_id, path_entry, freed_batch_tx),
         },
     );
-    true
 }
 
 // ── QueueControl ───────────────────────────────────────────────────────────
