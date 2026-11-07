@@ -168,22 +168,9 @@ impl FreedInner {
         }
     }
 
-    /// End the hold of `queue_id` for `binding_id`, where its reset doesn't reach the priority
-    /// router, before the slot is freed, so that the free records the slot. A hold for another
-    /// binding stays.
-    pub fn unhold(&self, queue_id: VarInt, binding_id: VarInt) {
-        let mut state = self.state.lock().unwrap();
-        let held = matches!(
-            state.held.get(&queue_id.as_u64()),
-            Some(held) if held.binding_id == binding_id.as_u64()
-        );
-        if held {
-            state.held.remove(&queue_id.as_u64());
-        }
-    }
-
-    /// End the hold of `queue_id` for `binding_id` once its reset leaves, and record the slot as
-    /// freed where a `record` waited on the hold. A hold for another binding stays.
+    /// End the hold of `queue_id` for `binding_id` once its reset leaves, or where its reset
+    /// doesn't reach the priority router, and record the slot as freed where a `record` waited
+    /// on the hold. A hold for another binding stays.
     pub fn release(
         &self,
         queue_id: VarInt,

@@ -1378,8 +1378,9 @@ fn a_tampered_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
 }
 
 /// Where the priority router has ended, the submission channel refuses the reset of a rejected
-/// init, which then doesn't leave the router and release the slot: the reject doesn't hold the
-/// slot, so that the slot is recorded as freed at once.
+/// init, which then doesn't leave the router and release the slot: the reject releases the hold
+/// itself, so that the slot is recorded as freed at once. For an init without an acceptor, the
+/// reject's free records the slot while it is held, so the release meets a marked hold.
 #[test]
 fn a_rejected_init_whose_reset_the_ended_router_refuses_leaves_the_slot_unheld() {
     for init_acceptor in [InitAcceptor::Missing, InitAcceptor::Closed] {
