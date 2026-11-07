@@ -982,10 +982,15 @@ impl HighestListed {
         };
         let wait = entry.take();
         debug_assert!(wait.is_some(), "a peer on a list has an entry there");
-        if record.waits_on.iter().chain(&record.lost_on).all(Option::is_none) {
+        if record.is_empty() {
             listed.remove(&peer);
         }
         wait
+    }
+
+    /// Returns whether the peer doesn't have an entry on any list.
+    fn is_empty(&self) -> bool {
+        self.waits_on.iter().all(Option::is_none) && self.lost_on.iter().all(Option::is_none)
     }
 }
 
@@ -1016,10 +1021,25 @@ where
 
     /// Returns how many entries the router's lists of the peers whose batches of the input of
     /// the highest priority level wait in it hold: the waiters of each interface and the lost
-    /// peers of each sender.
+    /// peers of each sender. Panics where the records of the waits that the entries stand for
+    /// don't agree with the lists.
     pub(super) fn highest_waiter_entries(&self) -> usize {
         let waiters: usize = self.highest_waiters.iter().map(VecDeque::len).sum();
         let lost: usize = self.highest_lost.iter().map(Vec::len).sum();
+        // Each entry has its wait in the record of its peer, and each record holds an entry, so
+        // that a peer's record leaves with its last entry.
+        let mut listed = 0;
+        for record in self.highest_listed.values() {
+            let entries = record
+                .waits_on
+                .iter()
+                .chain(&record.lost_on)
+                .flatten()
+                .count();
+            assert_ne!(entries, 0, "a peer's record holds an entry");
+            listed += entries;
+        }
+        assert_eq!(listed, waiters + lost);
         waiters + lost
     }
 }
