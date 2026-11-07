@@ -2048,7 +2048,9 @@ fn reject_init(
 /// reset of the client's genuine rejected init on that slot wouldn't be sent. For a packet the
 /// endpoint doesn't take, the reject tears down a stream that `bind_for_init` bound the slot to
 /// and puts back the slot's tombstone from before the bind, so that the genuine init of the same
-/// binding isn't refused as stale; the slot isn't held or reset.
+/// binding isn't refused as stale. The slot isn't held or reset, and the teardown doesn't record
+/// it as freed: it was free before the bind, and the client's stream of that binding may still
+/// hold it, so a free would let the client hand it to another stream while that stream lives.
 fn settle_rejected_init(
     mut rejected: RejectedInit,
     take: bool,
@@ -2059,9 +2061,13 @@ fn settle_rejected_init(
 ) {
     if !take {
         if let Some(mut stream) = rejected.stream.take() {
+            if let Some(server_view) = queue_view.as_server_mut() {
+                server_view.leave_free_unrecorded(rejected.queue_pair.dest_queue_id);
+            }
             stream.disable();
             // The stream's receivers drop here, which marks the slot unallocated with this
-            // binding as its tombstone, before the tombstone from before the bind is put back.
+            // binding as its tombstone and doesn't record it as freed, before the tombstone from
+            // before the bind is put back.
             drop(stream);
             if let Some(server_view) = queue_view.as_server_mut() {
                 server_view.restore_tombstone(

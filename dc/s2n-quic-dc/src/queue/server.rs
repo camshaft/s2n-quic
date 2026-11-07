@@ -346,6 +346,16 @@ impl ServerView {
         }
     }
 
+    /// Marks the slot at `queue_id` so that the last receiver's drop of its binding doesn't
+    /// record the slot as freed, where the endpoint tears down a binding whose init it doesn't
+    /// take. See [`super::slot::Slot::leave_free_unrecorded`].
+    pub(crate) fn leave_free_unrecorded(&mut self, queue_id: VarInt) {
+        let index = queue_id.as_u64() as usize;
+        if let Some(slot) = self.view.get(index, &self.state.pages) {
+            slot.leave_free_unrecorded();
+        }
+    }
+
     #[inline]
     pub fn send_control(
         &mut self,
@@ -699,5 +709,51 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Ok(BindResult::NewBinding { .. })));
+    }
+
+    #[test]
+    fn a_free_left_unrecorded_doesnt_record_the_slot() {
+        let (mut server, path_entry, mut tx, _rx) = test_server(10);
+
+        // Binding 1 and then binding 2 of slot 1, each marked before its receivers drop, in
+        // each order of the drops.
+        for (binding, stream_last) in [(1, true), (2, false)] {
+            let result = server.bind_for_msg(v(1), v(binding), &path_entry, &mut tx);
+            let Ok(BindResult::NewBinding {
+                stream, control, ..
+            }) = result
+            else {
+                panic!("expected NewBinding for binding {binding}");
+            };
+            server.leave_free_unrecorded(v(1));
+            if stream_last {
+                drop(control);
+                drop(stream);
+            } else {
+                drop(stream);
+                drop(control);
+            }
+            let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+            assert!(
+                server.state.freed.take(&mut freed).is_none(),
+                "binding {binding}'s end doesn't record slot 1 as freed"
+            );
+        }
+
+        // Binding 3 isn't marked, so its end records slot 1 as freed.
+        let result = server.bind_for_msg(v(1), v(3), &path_entry, &mut tx);
+        let Ok(BindResult::NewBinding {
+            stream, control, ..
+        }) = result
+        else {
+            panic!("expected NewBinding for binding 3");
+        };
+        drop(stream);
+        drop(control);
+        let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+        assert!(
+            server.state.freed.take(&mut freed).is_some() && freed.contains(1),
+            "binding 3's end records slot 1 as freed"
+        );
     }
 }
