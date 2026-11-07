@@ -689,11 +689,13 @@ where
     ///
     /// Where a sender that isn't marked lost has an acknowledgement after the lost pairs
     /// stopped delivering, it chooses among those senders alone, since a sender on the same
-    /// down interface may not be marked lost yet. It records the score gap and the rejected
-    /// candidate in the pick-two counters, as the rule does among every sender.
+    /// down interface may not be marked lost yet, until a sender has an acknowledgement after
+    /// the end of that preference, which the lost marks set. It records the score gap and the
+    /// rejected candidate in the pick-two counters, as the rule does among every sender.
     ///
-    /// Where no sender has one, a sender that sends to the peer interface of a pair marked lost
-    /// counts as lost too, as `counts_as_lost` says: every sender here is on one local interface.
+    /// Where no sender has one, or once the preference ends, a sender that sends to the peer
+    /// interface of a pair marked lost counts as lost too, as `counts_as_lost` says: every sender
+    /// here is on one local interface.
     fn pick_delivering_sender(
         entry: &PathSecretEntry,
         len: usize,
@@ -702,9 +704,10 @@ where
         rejected_counters: &IdMap<LocalSenderId, crate::counter::Summary>,
         score_delta: &crate::counter::Summary,
     ) -> LocalSenderId {
-        let prefer_delivered = entry.has_sender_delivering_since_lost();
-        // Where no sender delivers since the loss, a sender that sends to a lost pair's peer
-        // interface counts as lost too, since that interface may be down.
+        let prefer_delivered = entry.prefers_senders_delivering_since_lost();
+        // Where no sender delivers since the loss, or once the preference for such senders
+        // ends, a sender that sends to a lost pair's peer interface counts as lost too, since
+        // that interface may be down.
         let counted_lost = if prefer_delivered {
             Vec::new()
         } else {
@@ -759,8 +762,9 @@ where
 }
 
 /// Returns the lost mark each of the `len` senders of `entry` counts as having where no sender
-/// delivers since a pair was lost: a sender whose interface pair is marked lost, and a sender
-/// that shares more of the marked pairs' interfaces than another sender that isn't marked.
+/// delivers since a pair was lost, or once the routers' preference for such senders ends: a
+/// sender whose interface pair is marked lost, and a sender that shares more of the marked
+/// pairs' interfaces than another sender that isn't marked.
 ///
 /// A down interface stops every pair it is on, and the send workers mark one pair at a time, so
 /// a sender on the local interface or the peer interface of a marked pair may be down and not

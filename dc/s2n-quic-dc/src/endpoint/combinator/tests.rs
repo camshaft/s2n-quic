@@ -4755,6 +4755,7 @@ fn pick_two_prefers_senders_that_deliver_since_a_pair_was_lost() {
     entry.record_sender_delivered(sender(2), at(300));
     entry.record_sender_delivered(sender(3), at(400));
     entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
 
     let calls = pick_two_calls(&entry, 100, 4);
     assert_eq!(
@@ -4776,6 +4777,81 @@ fn pick_two_prefers_senders_that_deliver_since_a_pair_was_lost() {
         calls[1] > 0 && calls[2] > 0 && calls[3] > 0,
         "a sender that isn't marked lost didn't get an item: {calls:?}"
     );
+}
+
+/// Once a sender has an acknowledgement after the end of the preference that the lost marks
+/// set, pick-two chooses again as it does where no sender delivers since the loss, so that a
+/// sender idle at the loss gets items.
+#[test]
+fn pick_two_ends_the_preference_for_senders_that_deliver_since_a_loss() {
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    let at = |nanos| crate::time::precision::Timestamp { nanos };
+    assert!(entry.set_sender_lost(sender(0), true));
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    entry.record_sender_delivered(sender(2), at(300));
+    entry.record_sender_delivered(sender(3), at(400));
+
+    let calls = pick_two_calls(&entry, 100, 6);
+    assert_eq!(
+        calls[0] + calls[1],
+        0,
+        "a sender without an acknowledgement since the loss got an item: {calls:?}"
+    );
+
+    entry.record_sender_delivered(sender(3), at(1_100));
+    let calls = pick_two_calls(&entry, 100, 7);
+    assert_eq!(calls[0], 0, "a lost sender got an item: {calls:?}");
+    assert!(
+        calls[1] > 0,
+        "the sender idle at the loss didn't get an item after the preference: {calls:?}"
+    );
+}
+
+/// Once a sender has an acknowledgement after the end of the preference that the lost marks
+/// set, the interface-paced router reads the lost marks again, so that the senders of an
+/// interface idle at the loss get its batches, and a sender that shares the lost pair's local
+/// interface counts as lost.
+#[test]
+fn interface_paced_pick_two_ends_the_preference_for_senders_that_deliver_since_a_loss() {
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    let at = |nanos| crate::time::precision::Timestamp { nanos };
+    let items = || priority_items(&entry, &drop_counter, 20, 20);
+    assert!(entry.set_sender_lost(sender(0), true));
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    entry.record_sender_delivered(sender(1), at(300));
+
+    // Within the preference, the idle senders of the second interface count as lost, and
+    // every item goes to sender 1.
+    assert_eq!(
+        route_by_interface(items()),
+        [[0, 0], [20, 20], [0, 0], [0, 0]]
+    );
+
+    // Once sender 1 has an acknowledgement after the preference's end, the items go back to
+    // the second interface: sender 1 shares the lost pair's local interface and counts as lost.
+    entry.record_sender_delivered(sender(1), at(1_100));
+    let counts = route_by_interface(items());
+    assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert_eq!(
+        counts[1],
+        [0, 0],
+        "sender 1 got an item though it shares the lost pair's interface: {counts:?}"
+    );
+    assert_eq!(
+        counts[2][0] + counts[3][0],
+        20,
+        "the second interface didn't get the highest-priority items: {counts:?}"
+    );
+    assert_eq!(counts[2][1] + counts[3][1], 20);
 }
 
 /// While a pair is lost, pick-two records its score gap and the candidate it rejects, as it
@@ -4864,6 +4940,7 @@ fn interface_paced_pick_two_prefers_senders_that_deliver_since_a_pair_was_lost()
     entry.record_sender_delivered(sender(2), at(300));
     entry.record_sender_delivered(sender(3), at(300));
     entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
 
     let counts = route_by_interface(priority_items(&entry, &drop_counter, 20, 20));
     assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
@@ -4933,6 +5010,7 @@ fn pick_two_skips_the_senders_on_a_lost_pairs_peer_interface() {
     // Once senders 1 to 3 deliver since the loss, the router chooses sender 2 again.
     let at = |nanos| crate::time::precision::Timestamp { nanos };
     entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
     for idx in 1..4 {
         entry.record_sender_delivered(sender(idx), at(300));
     }
@@ -4986,6 +5064,7 @@ fn interface_paced_pick_two_skips_the_senders_that_share_a_lost_pairs_interfaces
     // Once senders 1 to 3 deliver since the loss, the router chooses sender 1 again.
     let at = |nanos| crate::time::precision::Timestamp { nanos };
     one.set_senders_lost_since(at(200));
+    one.set_senders_preferred_until(at(1_000));
     for idx in 1..4 {
         one.record_sender_delivered(sender(idx), at(300));
     }
