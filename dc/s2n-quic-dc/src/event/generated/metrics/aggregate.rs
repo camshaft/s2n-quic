@@ -14,7 +14,7 @@ use crate::event::{
 };
 #[allow(unused_imports)]
 use core::sync::atomic::{AtomicU64, Ordering};
-static INFO: &[Info; 149usize] = &[
+static INFO: &[Info; 151usize] = &[
     info::Builder {
         id: 0usize,
         name: Str::new("stream_write_key_updated\0"),
@@ -909,6 +909,18 @@ static INFO: &[Info; 149usize] = &[
         units: Units::Bytes,
     }
     .build(),
+    info::Builder {
+        id: 149usize,
+        name: Str::new("path_secret_map_sender_counted_lost\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 150usize,
+        name: Str::new("path_secret_map_sender_counted_lost_cleared\0"),
+        units: Units::None,
+    }
+    .build(),
 ];
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -917,7 +929,7 @@ pub struct ConnectionContext {
 }
 pub struct Subscriber<R: Registry> {
     #[allow(dead_code)]
-    counters: Box<[R::Counter; 51usize]>,
+    counters: Box<[R::Counter; 53usize]>,
     #[allow(dead_code)]
     bool_counters: Box<[R::BoolCounter; 4usize]>,
     #[allow(dead_code)]
@@ -952,7 +964,7 @@ impl<R: Registry> Subscriber<R> {
     #[allow(unused_mut)]
     #[inline]
     pub fn new(registry: R) -> Self {
-        let mut counters = Vec::with_capacity(51usize);
+        let mut counters = Vec::with_capacity(53usize);
         let mut bool_counters = Vec::with_capacity(4usize);
         let mut nominal_counters = Vec::with_capacity(32usize);
         let mut nominal_counter_offsets = Vec::with_capacity(32usize);
@@ -1012,6 +1024,8 @@ impl<R: Registry> Subscriber<R> {
         counters.push(registry.register_counter(&INFO[137usize]));
         counters.push(registry.register_counter(&INFO[141usize]));
         counters.push(registry.register_counter(&INFO[145usize]));
+        counters.push(registry.register_counter(&INFO[149usize]));
+        counters.push(registry.register_counter(&INFO[150usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[5usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[6usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[101usize]));
@@ -1519,6 +1533,8 @@ impl<R: Registry> Subscriber<R> {
                 48usize => (&INFO[137usize], entry),
                 49usize => (&INFO[141usize], entry),
                 50usize => (&INFO[145usize], entry),
+                51usize => (&INFO[149usize], entry),
+                52usize => (&INFO[150usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -2588,6 +2604,30 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
         self.measure(146usize, 59usize, event.held_bytes);
         self.measure(147usize, 60usize, event.previous_limit_bytes);
         self.measure(148usize, 61usize, event.limit_bytes);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_sender_counted_lost(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapSenderCountedLost,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(149usize, 51usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_sender_counted_lost_cleared(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapSenderCountedLostCleared,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(150usize, 52usize, 1usize);
         let _ = event;
         let _ = meta;
     }
