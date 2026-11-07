@@ -1310,7 +1310,14 @@ impl Context {
     ///
     /// A lost mark keeps the next packet number this context sends: an acknowledgement of
     /// that packet or a later one shows that the pair delivers again.
+    ///
+    /// A context that its cache dropped leaves the mark as it is: once it left the cache, none
+    /// of its probes can clear a mark it sets, and a newer context of its sender slot may hold
+    /// the mark by then. Its probe timeout can still fire once after the cache drops it.
     pub fn set_path_lost(&mut self, lost: bool) {
+        if self.invalidated {
+            return;
+        }
         self.lost_from = lost.then_some(self.next_packet_number);
         let _ = self
             .path_secret_entry
@@ -1791,12 +1798,13 @@ impl Cache {
         };
         self.send_counters.on_context_removed();
         let mut ctx = ctx.borrow_mut();
-        ctx.invalidated = true;
         // The routers read the lost mark from the path secret entry, and once the context leaves
-        // the cache, none of its probes can clear the mark.
+        // the cache, none of its probes can clear the mark. The mark clears before the context
+        // is marked invalidated, since an invalidated context leaves the mark as it is.
         if ctx.is_path_lost() {
             ctx.set_path_lost(false);
         }
+        ctx.invalidated = true;
         debug!(%id, sender_idx = %self.sender_idx, "invalidating send context");
         Some(ctx.drain_frames(Some(reason), cancelled))
     }
@@ -1846,11 +1854,11 @@ impl Cache {
         let ctx = self.contexts.remove(id).unwrap();
         self.send_counters.on_context_removed();
         let mut ctx = ctx.borrow_mut();
-        ctx.invalidated = true;
-        // Clear the lost mark, as `invalidate` does.
+        // Clear the lost mark before the context is marked invalidated, as `invalidate` does.
         if ctx.is_path_lost() {
             ctx.set_path_lost(false);
         }
+        ctx.invalidated = true;
         debug!(
             %id,
             sender_idx = %self.sender_idx,
