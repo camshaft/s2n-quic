@@ -410,3 +410,62 @@ fn a_batch_that_mixes_a_ping_with_a_bulk_frame_isnt_of_the_highest_priority() {
     let bulk = FrameBatch::single(test_frame_with_payload(&pse, 1000));
     assert!(!bulk.holds_highest_priority(), "a bulk frame");
 }
+
+/// With an interface chosen for the highest-priority traffic, frame dispatch batches the frames
+/// of the highest priority level apart from the bulk frames of the same peer, so that each such
+/// frame goes in a batch of that level to a worker of the chosen interface.
+#[test]
+fn highest_priority_frames_beside_bulk_frames_go_to_the_chosen_interface() {
+    const PINGS: usize = 20;
+    let _snapshots = crate::testing::without_snapshots();
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let arrivals = Arc::new(Mutex::new(Vec::<(usize, bool, usize)>::new()));
+    let arrivals_in_sim = arrivals.clone();
+
+    sim(move || {
+        // Workers 0 and 1 are on the slow interface, and workers 2 and 3 on the fast one, which
+        // carries the highest-priority traffic.
+        let pacing = SendPacing::new(vec![slow, fast], vec![0, 0, 1, 1]).with_highest_priority(1);
+        let (mut frame_tx, rxs) = setup_with_pacing(4, pacing);
+
+        async move {
+            // Each submission holds a bulk frame and a ping, both for the same peer.
+            let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+                .socket_sender_count(4)
+                .build(None);
+            for _ in 0..PINGS {
+                let mut input = PriorityInput::default();
+                input.push(test_frame_with_payload(&pse, 1000));
+                let mut ping = test_frame(&pse);
+                ping.header = frame::Header::Ping;
+                input.push(ping);
+                frame_tx.send_batch(input).unwrap();
+                bach::time::sleep(core::time::Duration::from_micros(50)).await;
+            }
+        }
+        .primary()
+        .spawn();
+
+        for (worker, mut worker_rx) in rxs.into_iter().enumerate() {
+            let arrivals = arrivals_in_sim.clone();
+            async move {
+                while let Some(batch) = worker_rx.recv().await {
+                    let highest = batch.holds_highest_priority();
+                    arrivals.lock().unwrap().push((worker, highest, batch.len()));
+                }
+            }
+            .primary()
+            .spawn();
+        }
+    });
+
+    let arrivals = arrivals.lock().unwrap();
+    let frames: usize = arrivals.iter().map(|arrival| arrival.2).sum();
+    assert_eq!(frames, 2 * PINGS, "every frame arrived");
+    let pings: usize = arrivals.iter().filter(|arrival| arrival.1).map(|arrival| arrival.2).sum();
+    assert_eq!(pings, PINGS, "a ping was batched beside a bulk frame");
+    for &(worker, highest, _) in arrivals.iter() {
+        assert!(!highest || worker >= 2, "worker {worker} on the slow interface got a ping");
+    }
+}

@@ -13,6 +13,8 @@
 //!
 //! Where the endpoint chooses an interface for its highest-priority traffic, a batch whose frames
 //! are all of the highest priority level goes only to a worker of that interface.
+//! Frame dispatch then batches the frames of that level apart from the others, and passes
+//! [`InterfacePacedPickTwo`] an input of its own for them.
 
 use super::{AssignSender, FlowCredits, HighestPriority, PathSecretMapEntry};
 use crate::{
@@ -156,7 +158,7 @@ impl SendPacing {
 
     /// Returns the position of the interface that carries the highest-priority traffic, where
     /// the endpoint chooses one.
-    fn highest_priority(&self) -> Option<usize> {
+    pub fn highest_priority(&self) -> Option<usize> {
         self.highest_priority
     }
 }
@@ -223,12 +225,21 @@ impl<T, Tm: precision::Timer> Pacer<T, Tm> {
 /// another batch while it keeps one, so that it routes the other batches in the order it reads
 /// them.
 ///
+/// Where frame dispatch passes the router an input of its own for the highest priority level,
+/// with [`Self::with_highest_priority_input`], the router reads that input before the other one,
+/// and sends each of its batches at once to a worker of the interface for the highest-priority
+/// traffic, even while every interface holds a batch. It then reads the other input only while an
+/// interface doesn't hold a batch, so that it doesn't keep a batch read ahead.
+///
 /// Implements `Receiver<()>` so it can be drained via `ReceiverExt::drain_budgeted`.
 pub struct InterfacePacedPickTwo<T, R, S, Clk>
 where
     Clk: precision::Clock,
 {
     rx: R,
+    /// The input of the highest priority level, where frame dispatch passes the router one. The
+    /// router drops it once it closes, and doesn't end while it has it.
+    highest_rx: Option<R>,
     senders: IdMap<LocalSenderId, S>,
     rng: crate::xorshift::Rng,
     clock: Clk,
@@ -308,6 +319,7 @@ where
         });
         Self {
             rx,
+            highest_rx: None,
             senders,
             rng,
             clock,
@@ -322,6 +334,18 @@ where
             score_delta,
             send_credit_pool,
         }
+    }
+
+    /// Adds `highest_rx` to the router, as an input of its own for the batches of the highest
+    /// priority level. The router reads it before `rx`, and sends each of its batches at once to a
+    /// worker of the interface for the highest-priority traffic, as a batch whose frames are all
+    /// of that level, even while every interface holds a batch. It then reads `rx` only while an
+    /// interface doesn't hold a batch. Where the [`SendPacing`] doesn't have that interface, or
+    /// that interface doesn't hold a sender, the router routes the batches of `highest_rx` as any
+    /// other, while an interface doesn't hold a batch.
+    pub fn with_highest_priority_input(mut self, highest_rx: R) -> Self {
+        self.highest_rx = Some(highest_rx);
+        self
     }
 
     /// Returns whether the interface of the sender at `sender` doesn't hold a batch.
@@ -425,12 +449,11 @@ where
     }
 
     /// Chooses a sender for `value`, and sends it to the sender where the sender's interface may
-    /// send now or where `value` is a batch whose frames are all of the highest priority level,
-    /// and else holds it on that interface until it may. Returns `false` where the sender's
-    /// receiver is gone.
-    fn route(&mut self, cx: &mut task::Context<'_>, mut value: T) -> bool {
+    /// send now or where `highest` is true, and else holds it on that interface until it may.
+    /// `highest` is true where `value` goes only to the interface for the highest-priority
+    /// traffic. Returns `false` where the sender's receiver is gone.
+    fn route(&mut self, cx: &mut task::Context<'_>, mut value: T, highest: bool) -> bool {
         let now = self.clock.now();
-        let highest = self.is_highest(&value);
         let sender = {
             let entry = value.path_secret_entry();
             debug_assert_eq!(self.senders.len(), entry.socket_sender_count());
@@ -521,10 +544,37 @@ where
             return Poll::Ready(Some(()));
         }
 
+        // The input of the highest priority level goes before the other one. Each of its batches
+        // goes at once to a worker of the chosen interface where the router has one, even while
+        // every interface holds a batch, and else as any other batch, while an interface doesn't
+        // hold a batch.
+        let chosen = self.highest_priority.is_some();
+        if chosen || self.has_free_sender() {
+            if let Some(highest_rx) = &mut self.highest_rx {
+                match highest_rx.poll_recv(cx, budget) {
+                    Poll::Ready(Some(value)) => {
+                        let byte_cost = value.byte_cost();
+                        if !self.route(cx, value, chosen) {
+                            return Poll::Ready(None);
+                        }
+                        // Tell upstream that the batch was consumed, as for the other input.
+                        if let Some(highest_rx) = &mut self.highest_rx {
+                            highest_rx.on_consumed(byte_cost);
+                        }
+                        return Poll::Ready(Some(()));
+                    }
+                    // The input closed: the router goes on with the other input alone.
+                    Poll::Ready(None) => self.highest_rx = None,
+                    Poll::Pending => {}
+                }
+            }
+        }
+
         // A batch kept while every interface held one is routed before the router reads another.
         if self.pending.is_some() && self.has_free_sender() {
             let value = self.pending.take().expect("the router keeps a batch");
-            if !self.route(cx, value) {
+            let highest = self.is_highest(&value);
+            if !self.route(cx, value, highest) {
                 return Poll::Ready(None);
             }
             return Poll::Ready(Some(()));
@@ -532,16 +582,19 @@ where
 
         // While every interface holds a batch, the router still reads the next batch where it has
         // an interface for the highest-priority traffic, so that a batch of that level doesn't
-        // wait behind them. It doesn't read while it keeps a batch.
+        // wait behind them, but not where that level has an input of its own, which the router
+        // reads above. It doesn't read while it keeps a batch.
         if !self.closed
             && self.pending.is_none()
-            && (self.has_free_sender() || self.highest_priority.is_some())
+            && (self.has_free_sender()
+                || (self.highest_priority.is_some() && self.highest_rx.is_none()))
         {
             match self.rx.poll_recv(cx, budget) {
                 Poll::Ready(Some(value)) => {
                     let byte_cost = value.byte_cost();
-                    if self.has_free_sender() || self.is_highest(&value) {
-                        if !self.route(cx, value) {
+                    let highest = self.is_highest(&value);
+                    if self.has_free_sender() || highest {
+                        if !self.route(cx, value, highest) {
                             return Poll::Ready(None);
                         }
                     } else {
@@ -559,7 +612,10 @@ where
             }
         }
 
-        if self.closed && self.pacers.iter().all(|pacer| pacer.held.is_none()) {
+        if self.closed
+            && self.highest_rx.is_none()
+            && self.pacers.iter().all(|pacer| pacer.held.is_none())
+        {
             Poll::Ready(None)
         } else {
             Poll::Pending

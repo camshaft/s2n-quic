@@ -143,10 +143,13 @@ pub fn frame_dispatch<S, Clk>(
                     .with_function("endpoint::tasks::frame_dispatch");
                 counter::GaugedQueueReceiver::new(rx.into_list_receiver(), receiver)
             })
-            .collect();
-        let rx = PriorityRx::new(priority_batch_rxs);
-        let rx = BatchFramesByPathSecret::new(rx, &clock, pacing.total_rate());
-        let rx = Map::new(rx, Entry::new);
+            .collect::<Vec<_>>();
+        // Batches the frames of `lanes`, a lane for each of their priority levels, highest first.
+        let batch_frames = |lanes: Vec<_>| {
+            let rx = PriorityRx::new(lanes);
+            let rx = BatchFramesByPathSecret::new(rx, &clock, pacing.total_rate());
+            Map::new(rx, Entry::new)
+        };
         let register_task_counter = || {
             counter_registry
                 .register_task("task.frame_dispatch")
@@ -159,6 +162,7 @@ pub fn frame_dispatch<S, Clk>(
         if pacing.interface_count() == 1 {
             // Every send socket is on one interface: pace them together at its rate, then choose
             // a worker for each batch.
+            let rx = batch_frames(priority_batch_rxs);
             let rx = Paced::new(rx, clock, pacing.total_rate());
             let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
             let task_counter = register_task_counter();
@@ -170,6 +174,16 @@ pub fn frame_dispatch<S, Clk>(
         } else {
             // The send sockets are on several interfaces: choose a worker for each batch first,
             // then pace the batch with the token bucket of that worker's interface.
+            // Where the endpoint chooses an interface for the highest-priority traffic, the
+            // frames of the highest level are batched apart from the others, into an input of
+            // the router's own, so that their batches go to that interface even while every
+            // interface holds a batch.
+            let mut lanes = priority_batch_rxs;
+            let highest_lane = pacing
+                .highest_priority()
+                .map(|_| lanes.remove(Priority::QueueReset.as_index()));
+            let rx = batch_frames(lanes);
+            let highest_rx = highest_lane.map(|lane| batch_frames(vec![lane]));
             let rx = InterfacePacedPickTwo::new(
                 rx,
                 worker_senders,
@@ -179,6 +193,10 @@ pub fn frame_dispatch<S, Clk>(
                 &counter_registry,
                 send_credit_pool,
             );
+            let rx = match highest_rx {
+                Some(highest_rx) => rx.with_highest_priority_input(highest_rx),
+                None => rx,
+            };
             let task_counter = register_task_counter();
             spawner.spawn_receiver_task(
                 rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
