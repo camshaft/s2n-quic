@@ -209,7 +209,10 @@ pub fn packet_tag(packet: &bach::net::monitor::Packet) -> Option<crate::packet::
 /// The config is used only on the first call for a given group (or after a
 /// previous endpoint for that group has been fully dropped); subsequent calls
 /// upgrade the cached [`Weak`] reference and return the same [`Endpoint`].
-fn get_or_create_group_endpoint(config: SimEndpointConfig) -> Arc<Endpoint> {
+///
+/// The endpoint uses the config's [`SimEndpointConfig::path_secret_map`] where it holds
+/// one, and otherwise a new map that publishes its events to a tracing subscriber.
+fn get_or_create_group_endpoint(mut config: SimEndpointConfig) -> Arc<Endpoint> {
     let group_id = bach::group::current().id();
     SIM_ENDPOINT_BY_GROUP.with(|r| {
         let mut map = r.borrow_mut();
@@ -218,7 +221,10 @@ fn get_or_create_group_endpoint(config: SimEndpointConfig) -> Arc<Endpoint> {
                 return ep;
             }
         }
-        let path_secret_map = crate::path::secret::map::testing::new(50_000);
+        let path_secret_map = config
+            .path_secret_map
+            .take()
+            .unwrap_or_else(|| crate::path::secret::map::testing::new(50_000));
         let acceptor_registry = acceptor::Registry::new();
         let ep = Arc::new(setup_sim_endpoint(
             config,
@@ -295,6 +301,12 @@ pub struct SimEndpointConfig {
     /// The endpoint's local interfaces. Defaults to none, which puts every socket on the
     /// default interface.
     pub interfaces: Vec<crate::socket::interface::Config>,
+
+    /// The path secret map the endpoint uses, such as a map that publishes its events to a
+    /// testing subscriber. Defaults to none: the endpoint then uses a new map that publishes its
+    /// events to a tracing subscriber. Only [`Server`], [`Client`] and [`Peer`] read it:
+    /// [`setup_sim_endpoint`] takes its map as an argument.
+    pub path_secret_map: Option<PathSecretMap>,
 }
 
 impl Default for SimEndpointConfig {
@@ -321,6 +333,7 @@ impl Default for SimEndpointConfig {
             recv_credit_pool_config: crate::credit::Config::default(),
             send_credit_pool_config: crate::credit::Config::default(),
             interfaces: Vec::new(),
+            path_secret_map: None,
         }
     }
 }
@@ -353,6 +366,12 @@ impl SimEndpointConfig {
 
     pub fn interfaces(mut self, interfaces: Vec<crate::socket::interface::Config>) -> Self {
         self.interfaces = interfaces;
+        self
+    }
+
+    /// Sets the path secret map the endpoint uses.
+    pub fn path_secret_map(mut self, map: PathSecretMap) -> Self {
+        self.path_secret_map = Some(map);
         self
     }
 
@@ -404,6 +423,9 @@ pub fn setup_sim_endpoint(
         recv_credit_pool_config,
         send_credit_pool_config,
         interfaces,
+        // `get_or_create_group_endpoint` reads the config's map, and this function takes its
+        // map as an argument.
+        path_secret_map: _,
     } = config;
 
     assert!(
