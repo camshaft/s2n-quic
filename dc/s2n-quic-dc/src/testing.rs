@@ -76,6 +76,20 @@ thread_local! {
     static SNAPSHOT_BUFFER: Cell<Option<Arc<Mutex<Vec<u8>>>>> = const { Cell::new(None) };
 }
 
+thread_local! {
+    static DIAG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Turns the interface loss test's diagnostics on or off on this thread.
+pub fn set_diag(on: bool) {
+    DIAG.with(|diag| diag.set(on));
+}
+
+/// Whether the interface loss test's diagnostics print on this thread.
+pub fn diag() -> bool {
+    DIAG.with(|diag| diag.get())
+}
+
 struct TracingDisabledGuard;
 
 impl TracingDisabledGuard {

@@ -42,3 +42,18 @@ pub use stream as stream3;
 pub mod testing;
 
 pub use s2n_quic_core::dc::{Version, SUPPORTED_VERSIONS};
+
+/// Whether the interface loss test's diagnostics print on this thread.
+#[cfg(test)]
+#[doc(hidden)]
+pub fn diag() -> bool {
+    testing::diag()
+}
+
+/// Whether the interface loss test's diagnostics print on this thread.
+#[cfg(not(test))]
+#[doc(hidden)]
+#[inline(always)]
+pub fn diag() -> bool {
+    false
+}

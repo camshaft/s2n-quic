@@ -42,7 +42,7 @@ const REPLY_LEN: u64 = 1024;
 const LOSS_AFTER: u64 = STREAMS as u64 * STREAM_LEN / 4;
 /// How long the client may take, once the interface delivers again, to write on it again: a
 /// lost pair probes again at its next probe timeout, whose backoff grows with the outage.
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the client waits after each stream while the interface recovers, so that the sim
 /// doesn't carry one stream after another until the lost pairs probe again.
 const RECOVERY_PAUSE: Duration = Duration::from_secs(1);
@@ -231,7 +231,6 @@ fn traffic_moves_off_a_lost_interface() {
 /// As `traffic_moves_off_a_lost_interface`, and once the interface delivers again, its pairs
 /// carry traffic again.
 #[test]
-#[ignore = "a lost interface doesn't carry traffic again within RECOVERY_TIMEOUT yet"]
 fn traffic_moves_off_a_lost_interface_and_back() {
     run(true);
 }
@@ -250,6 +249,14 @@ fn run(recover: bool) {
         let monitor = in_sim.clone();
         bach::net::monitor::on_socket_write(move |write| {
             monitor.on_write(*write.local_addr, *write.peer_addr);
+            if crate::diag() {
+                let lost_addrs = monitor.lost_addrs.lock().unwrap();
+                if lost_addrs.contains(&*write.local_addr) || lost_addrs.contains(&*write.peer_addr)
+                {
+                    let bytes: usize = write.payload.iter().map(|slice| slice.len()).sum();
+                    eprintln!("diag write {} -> {} {}", *write.local_addr, *write.peer_addr, bytes);
+                }
+            }
             if monitor.recording.load(Ordering::Relaxed) {
                 let bytes: usize = write.payload.iter().map(|slice| slice.len()).sum();
                 monitor.writes.lock().unwrap().push(Write {
@@ -323,12 +330,19 @@ fn run(recover: bool) {
                 client_side.losing.load(Ordering::Relaxed),
                 "the interface wasn't lost",
             );
+            if recover {
+                crate::testing::set_diag(true);
+                eprintln!("diag phase quiet");
+            }
 
             // Neither endpoint sends for longer than the paths' idle timeout, so the lost pairs'
             // send contexts expire with their probes unacknowledged. The peer isn't marked dead,
             // so the next connect isn't refused, and a stream the client opens while the
             // interface is lost gets its answer.
             QUIET.sleep().await;
+            if crate::diag() {
+                eprintln!("diag phase quiet-round");
+            }
             timeout(
                 ROUND_TIMEOUT,
                 exchange(&mut client, 1, "the quiet round", &client_side),
@@ -345,8 +359,14 @@ fn run(recover: bool) {
             // counts.
             client_side.losing.store(false, Ordering::Relaxed);
             client_side.watching.store(true, Ordering::Relaxed);
+            if crate::diag() {
+                eprintln!("diag phase recovery");
+            }
             timeout(RECOVERY_TIMEOUT, async {
                 while !client_side.wrote_on_lost_interface() {
+                    if crate::diag() {
+                        eprintln!("diag recovery round");
+                    }
                     timeout(
                         ROUND_TIMEOUT,
                         exchange(&mut client, 1, "a recovery round", &client_side),

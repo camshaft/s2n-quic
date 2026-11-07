@@ -547,7 +547,30 @@ where
             debug_assert_eq!(self.senders.len(), entry.socket_sender_count());
             self.read_lost_marks(entry);
             let rule = self.candidates(highest);
-            (self.choose_sender(entry, now, rule), rule)
+            let sender = self.choose_sender(entry, now, rule);
+            if crate::diag() {
+                let scores: Vec<i128> = (0..self.senders.len())
+                    .map(|index| {
+                        self.score(entry, LocalSenderId::from_index(index), now) as i128
+                            - now.nanos as i128
+                    })
+                    .collect();
+                let free: Vec<bool> = (0..self.senders.len())
+                    .map(|index| self.is_free(index))
+                    .collect();
+                eprintln!(
+                    "diag {} route peer={} highest={} rule={:?} lost={:?} free={:?} chosen={:?} scores_ns={:?}",
+                    now,
+                    entry.peer(),
+                    highest,
+                    rule,
+                    self.lost_marks,
+                    free,
+                    sender.map(|sender| sender.as_usize()),
+                    scores,
+                );
+            }
+            (sender, rule)
         };
         let Some(sender) = sender else {
             // Each sender that delivers to the batch's peer is on an interface that holds a

@@ -1377,6 +1377,23 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let marked_dead = has_inflight
                     && !(path_lost && path_secret_entry.has_delivering_sender())
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
+                if crate::diag() {
+                    eprintln!(
+                        "diag {} idle-expire peer={} sender={} lost={} inflight={} dead={} responded={} backoff={} sent={} last_peer={} path_last={} lifetime={:?}",
+                        now,
+                        peer_addr,
+                        sender_idx,
+                        path_lost,
+                        has_inflight,
+                        marked_dead,
+                        ever_responded,
+                        pto_backoff,
+                        packets_sent,
+                        last_peer_activity_nanos,
+                        path_last_activity_nanos,
+                        lifetime,
+                    );
+                }
 
                 let result = send_caches[local_id].borrow_mut().invalidate(
                     &id,
