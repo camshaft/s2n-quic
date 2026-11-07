@@ -135,8 +135,9 @@ impl ServerView {
 
     /// Hold the slot `queue_id` for the rejected init of `binding_id` until its reset leaves the
     /// priority router, so that the slot is recorded as freed only then. Returns false where the
-    /// slot is held already, and for a slot past the peer's queues, which `bind_for_msg` rejects
-    /// without a reset.
+    /// slot is held already, for a slot past the peer's queues, which `bind_for_msg` rejects
+    /// without a reset, and for a slot that the freed set can't record, at or past its capacity,
+    /// which `FreedInner::hold` refuses.
     pub fn hold_freed(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
         if queue_id.as_u64() > self.state.max_queue_id {
             return false;
@@ -475,6 +476,18 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(5), v(1), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Err(Error::CapExceeded(_))));
+    }
+
+    #[test]
+    fn hold_freed_refuses_a_slot_the_freed_set_cant_record() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // The peer's queues reach past the slots that the freed set records.
+        let (server, _path_entry, _tx, _rx) = test_server(capacity + 1);
+
+        // The last slot that the freed set records is held for its rejected init.
+        assert!(server.hold_freed(v(capacity - 1), v(1)));
+        // The slot at the freed set's capacity is one of the peer's queues, and isn't held.
+        assert!(!server.hold_freed(v(capacity), v(1)));
     }
 
     #[test]
