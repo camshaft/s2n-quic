@@ -1,0 +1,13 @@
+{
+  "publisher": "Microsoft",
+  "product": "Windows Server 2025",
+  "edition": "Standard Evaluation, Server Core",
+  "display_name": "Windows Server 2025 Standard Evaluation",
+  "architecture": "amd64",
+  "license": "evaluation",
+  "evaluation_days": 180,
+  "page": "https://www.microsoft.com/en-us/evalcenter/download-windows-server-2025",
+  "url": "https://go.microsoft.com/fwlink/?linkid=2345730&clcid=0x409&culture=en-us&country=us",
+  "download_hosts": ["software-static.download.prss.microsoft.com", "download.microsoft.com"],
+  "publisher_sha256": null
+}

@@ -1,0 +1,15 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+Port 22
+HostKey C:/ProgramData/ssh/bench_host_ed25519_key
+HostKeyAlgorithms ssh-ed25519
+AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+AllowUsers benchprobe
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AllowAgentForwarding no
+AllowTcpForwarding no
+# Authentication requires the per-run public key.
+PermitEmptyPasswords no
