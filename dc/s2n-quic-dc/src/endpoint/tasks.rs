@@ -1468,6 +1468,24 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // silent since that mark too, and a renewal at each lost context's expiry
                 // would keep the peer in the dead-peer cooldown, so a connect would never find
                 // the entry dead and silent and replace it.
+                //
+                // Unacknowledged packets renew a mark the entry holds, once the cooldown has
+                // passed, on a pair that isn't marked lost, or on a lost pair where the peer has
+                // sent an authenticated packet since the lost mark and no other pair of the peer
+                // delivers. In the endpoint a context reaches this point with unacknowledged
+                // packets only after its pair is marked lost. It expires once the later of its
+                // last acknowledgement and the start of its wait for one is more than one idle
+                // timeout less one wheel tick (a second) old, and its probe timeout marks the
+                // pair lost within one persistent congestion period and one probe timeout of
+                // that time (`send::Context::has_stopped_delivering`): four probe timeout
+                // periods of its RTT estimate, tens of milliseconds for the 2 ms initial
+                // estimate, so this holds while those four periods are shorter than the idle
+                // timeout less one tick. The peer hasn't sent an authenticated packet since the
+                // entry's mark, so a pair marked lost after that mark is silent since its lost
+                // mark and doesn't renew it. A renewal comes only from a context whose pair was
+                // marked lost before the peer's last packet, and each context renews the mark at
+                // most once, since its expiry removes the context, so the mark stops moving and
+                // the cooldown ends.
                 let peer_silent_since_lost =
                     lost_at.is_some_and(|since| path_secret_entry.last_activity() < since);
                 let unacknowledged = has_inflight
