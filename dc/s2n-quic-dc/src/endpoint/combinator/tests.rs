@@ -1319,3 +1319,144 @@ fn send_pacing_routes_highest_priority_batches_to_the_chosen_interface() {
     }]);
     assert_eq!(one, SendPacing::single(fast));
 }
+
+/// A receiver of the items a test adds between polls: it returns `Pending` while it holds none.
+struct SharedReceiver<T> {
+    values: Rc<RefCell<VecDeque<T>>>,
+}
+
+impl<T> Receiver<T> for SharedReceiver<T> {
+    fn poll_recv(&mut self, _cx: &mut task::Context<'_>, _budget: &mut Budget) -> Poll<Option<T>> {
+        match self.values.borrow_mut().pop_front() {
+            Some(value) => Poll::Ready(Some(value)),
+            None => Poll::Pending,
+        }
+    }
+
+    fn on_consumed(&mut self, _bytes: u64) {}
+}
+
+/// Each frame batch a sender got: whether its frames are all of the highest priority level, and
+/// how many frames it holds.
+type BatchArrivals = Rc<RefCell<Vec<(bool, usize)>>>;
+
+/// A sender that records each frame batch it gets.
+struct BatchSender {
+    arrivals: BatchArrivals,
+}
+
+impl UnboundedSender<FrameBatch> for BatchSender {
+    fn send(&mut self, value: FrameBatch) -> Result<(), FrameBatch> {
+        let arrival = (value.holds_highest_priority(), value.len());
+        self.arrivals.borrow_mut().push(arrival);
+        Ok(())
+    }
+}
+
+/// A `QueueData` header, whose frames are of the lowest priority level.
+fn queue_data_header() -> Header {
+    Header::QueueData {
+        queue_pair: crate::packet::datagram::QueuePair {
+            source_queue_id: VarInt::from_u8(0),
+            dest_queue_id: VarInt::from_u8(1),
+        },
+        binding_id: VarInt::from_u8(0),
+        offset: VarInt::ZERO,
+        largest_offset: VarInt::ZERO,
+        is_fin: false,
+        blocked: false,
+        dest_acceptor_id: None,
+        priority: crate::credit::Priority::default(),
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_charges_highest_priority_batches_and_paces_mixed_ones() {
+    const PINGS: usize = 3;
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let entry = test_path_secret_entry();
+    let ping = || new_test_frame_with_header(entry.clone(), 0, Header::Ping);
+    let data = |len: usize| new_test_frame_with_header(entry.clone(), len, queue_data_header());
+    // A bulk batch costs more than a burst at `rate`, so it puts its interface's bucket in debt.
+    let bulk = || FrameBatch::single(data(100_000));
+
+    let input = Rc::new(RefCell::new(VecDeque::new()));
+    let arrivals: [BatchArrivals; 2] = Default::default();
+    let senders: Vec<BatchSender> = arrivals
+        .iter()
+        .map(|arrivals| BatchSender {
+            arrivals: Rc::clone(arrivals),
+        })
+        .collect();
+    // Sender 0 is on the first interface, and sender 1 on the second, which carries the
+    // highest-priority traffic.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        SharedReceiver {
+            values: Rc::clone(&input),
+        },
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+    let arrived = |sender: usize, batch: (bool, usize)| {
+        arrivals[sender]
+            .borrow()
+            .iter()
+            .filter(|&&arrival| arrival == batch)
+            .count()
+    };
+
+    // Put the bucket of each interface in debt with bulk batches, one at a time and without
+    // moving the clock. The first goes to either interface, and the second most often to the
+    // other one; where the second goes to the same one, it waits there, and the third goes to
+    // the other one, the only interface that doesn't hold a batch.
+    let mut bulk_batches = 0;
+    while router.debt_nanos(0) == 0 || router.debt_nanos(1) == 0 {
+        assert!(bulk_batches < 3, "three bulk batches didn't put both interfaces in debt");
+        input.borrow_mut().push_back(bulk());
+        bulk_batches += 1;
+        assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    }
+
+    // A batch of pings goes at once to the chosen interface, though its bucket holds a debt, and
+    // its cost is charged to that bucket alone.
+    let mut pings = FrameBatch::single(ping());
+    for _ in 1..PINGS {
+        pings.push(ping());
+    }
+    assert!(pings.holds_highest_priority());
+    let cost = rate.nanos_for_bytes(pings.byte_cost());
+    let debts = [router.debt_nanos(0), router.debt_nanos(1)];
+    input.borrow_mut().push_back(pings);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(arrived(1, (true, PINGS)), 1, "the pings didn't reach the chosen interface");
+    assert_eq!(arrived(0, (true, PINGS)), 0, "the pings reached the other interface");
+    assert_eq!(router.debt_nanos(1), debts[1] + cost);
+    assert_eq!(router.debt_nanos(0), debts[0]);
+
+    // A ping beside a `QueueData` frame isn't a batch of the highest priority level: it waits on
+    // its interface until that interface's timer fires, once the bucket has paid its debt.
+    let mut mixed = FrameBatch::single(ping());
+    mixed.push(data(1_000));
+    assert!(!mixed.holds_highest_priority());
+    input.borrow_mut().push_back(mixed);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    let mixed_arrivals = || arrived(0, (false, 2)) + arrived(1, (false, 2));
+    assert_eq!(mixed_arrivals(), 0, "the mixed batch went at once");
+
+    // Each interface's timer fires once the clock reaches its debt.
+    let debts = [router.debt_nanos(0), router.debt_nanos(1)];
+    let (first, last) = (debts[0].min(debts[1]), debts[0].max(debts[1]));
+    clock.advance(std::time::Duration::from_nanos(first - 1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(mixed_arrivals(), 0, "the mixed batch went before its interface's timer");
+    clock.advance(std::time::Duration::from_nanos(last - first + 1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(mixed_arrivals(), 1, "the mixed batch didn't go once its interface's timer fired");
+}

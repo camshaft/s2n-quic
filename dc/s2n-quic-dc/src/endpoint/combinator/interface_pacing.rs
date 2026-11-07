@@ -471,6 +471,17 @@ where
     }
 }
 
+#[cfg(test)]
+impl<T, R, S, Clk> InterfacePacedPickTwo<T, R, S, Clk>
+where
+    Clk: precision::Clock,
+{
+    /// Returns the debt of the token bucket of the interface at `position` now, in nanoseconds.
+    pub(super) fn debt_nanos(&self, position: usize) -> u64 {
+        self.pacers[position].bucket.debt_nanos(self.clock.now())
+    }
+}
+
 impl<T, R, S, Clk> Receiver<()> for InterfacePacedPickTwo<T, R, S, Clk>
 where
     T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits + HighestPriority,
