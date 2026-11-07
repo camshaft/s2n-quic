@@ -914,4 +914,88 @@ mod tests {
         assert_eq!(submission_sender(&mut ctx), sender(2));
         assert_eq!(ctx.local_sender_id, sender(2));
     }
+
+    #[test]
+    fn a_context_replaced_at_a_key_id_advance_acknowledges_on_the_paired_interface() {
+        let local: SocketAddr = "10.0.1.1:4433".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.1:4433".parse().unwrap();
+        // The peer's data addresses: two on its interface 1 and two on its interface 2.
+        let peer_data_addrs: [SocketAddr; 4] = [
+            "10.0.0.1:4000".parse().unwrap(),
+            "10.0.0.1:4001".parse().unwrap(),
+            "10.0.0.2:4000".parse().unwrap(),
+            "10.0.0.2:4001".parse().unwrap(),
+        ];
+        let peer_data_interfaces: [Option<u16>; 4] = [Some(1), Some(1), Some(2), Some(2)];
+
+        let map = path::secret::map::testing::new(16);
+        map.test_stop_cleaner();
+        let peer_map = path::secret::map::testing::new(16);
+        peer_map.test_stop_cleaner();
+        let id = map
+            .test_insert_pair(
+                PathSecretEntry::builder(peer)
+                    .local(local)
+                    .peer_data_addrs(peer_data_addrs)
+                    .peer_data_interfaces(peer_data_interfaces),
+                &peer_map,
+                PathSecretEntry::builder(local).local(peer),
+            )
+            .local;
+        let entry = map.get_by_id(&id).expect("the map holds the peer's entry");
+
+        // Four send sockets on two interfaces: sockets 0 and 2 on the first, 1 and 3 on the
+        // second.
+        let place = |rank, index| SendPlace {
+            rank,
+            count: 2,
+            index,
+        };
+        let places: Arc<[SendPlace]> =
+            vec![place(0, 0), place(1, 0), place(0, 1), place(1, 1)].into();
+        // The first interface carries the highest-priority traffic.
+        let priority = vec![LocalSenderId::from_index(0), LocalSenderId::from_index(2)];
+
+        // The peer's sender 6 sends from the first address of its interface 2. Four senders
+        // route that sender's acknowledgements to sender 2, a sender of the first interface,
+        // which the flagged-interface rule keeps. The paired sender is on the second interface:
+        // the first of senders 1 and 3, as the address is the first of its interface.
+        let source = peer_data_addrs[2];
+        let route = ModuloRoute::new(4);
+        let remote_sender_id = RemoteSenderId::new(VarInt::from_u8(6));
+        let paired = paired_ack_sender(
+            entry.peer_data_addrs(),
+            entry.peer_data_interfaces(),
+            &places,
+            source.into(),
+            6,
+        )
+        .map(LocalSenderId::from_index)
+        .expect("a packet from a tagged address is paired");
+        assert_eq!(paired, LocalSenderId::from_index(1));
+        let routed = route.sender_id_for_ack(remote_sender_id);
+        assert_ne!(paired, routed);
+        assert!(priority.contains(&routed));
+
+        let mut cache = Cache::new(RecvDispatchWorkerId::new(0))
+            .with_priority_senders(Some(priority))
+            .with_send_places(Some(places));
+
+        let (derived, hit) = receive(&mut cache, &map, source, id, 0, remote_sender_id, &route);
+        assert!(!hit, "the first packet derives a context");
+        assert_eq!(derived.borrow().local_sender_id, paired);
+
+        // The peer's sender keeps its socket across a key id advance, so the packet of the new
+        // key comes from the same address.
+        let (replaced, hit) = receive(&mut cache, &map, source, id, 1, remote_sender_id, &route);
+        assert!(!hit, "a packet of a newer key id replaces the context");
+        assert!(!Rc::ptr_eq(&derived, &replaced));
+        assert_eq!(replaced.borrow().current_key_id, VarInt::from_u8(1));
+        let key = Key {
+            id,
+            remote_sender_id,
+        };
+        assert!(Rc::ptr_eq(&cache.senders[&key], &replaced));
+        assert_eq!(replaced.borrow().local_sender_id, paired);
+    }
 }
