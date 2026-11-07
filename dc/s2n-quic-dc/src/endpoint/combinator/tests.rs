@@ -2495,3 +2495,183 @@ fn window_reader_starves_the_window_only_while_budget_is_left() {
     assert_eq!(window.limit(), 200);
     assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
 }
+
+/// The priority router of the partial-batch test: it makes frames of one peer, each smaller than
+/// a batch, and moves them into the batch router's lane, in order, while the window admits their
+/// bytes, and stops at the first frame the window refuses.
+struct FrameWindowLanes {
+    window: CreditlessWindow,
+    path_secret_entry: Arc<PathSecretEntry>,
+    payload_len: usize,
+    /// The frames left to make.
+    left: usize,
+    /// The frame that the window refused last, which the next pass moves first.
+    refused: Option<Entry<Frame>>,
+    moved: Rc<RefCell<VecDeque<Entry<Frame>>>>,
+}
+
+impl FrameWindowLanes {
+    fn new(
+        window: CreditlessWindow,
+        path_secret_entry: Arc<PathSecretEntry>,
+        payload_len: usize,
+        frames: usize,
+    ) -> Self {
+        Self {
+            window,
+            path_secret_entry,
+            payload_len,
+            left: frames,
+            refused: None,
+            moved: Rc::default(),
+        }
+    }
+
+    /// Returns the receiver of the lane, which is `Pending` while the lane is empty.
+    fn receiver(&self) -> FrameLaneReceiver {
+        FrameLaneReceiver {
+            moved: Rc::clone(&self.moved),
+        }
+    }
+
+    /// Moves frames into the lane while the window admits their bytes.
+    fn pass(&mut self) {
+        loop {
+            let frame = match self.refused.take() {
+                Some(frame) => frame,
+                None if self.left > 0 => {
+                    self.left -= 1;
+                    new_test_frame(self.path_secret_entry.clone(), self.payload_len)
+                }
+                None => return,
+            };
+            if !self.window.admit_frame(&frame) {
+                self.refused = Some(frame);
+                return;
+            }
+            self.moved.borrow_mut().push_back(frame);
+        }
+    }
+}
+
+/// The receiver of the lane of a [`FrameWindowLanes`].
+struct FrameLaneReceiver {
+    moved: Rc<RefCell<VecDeque<Entry<Frame>>>>,
+}
+
+impl Receiver<Entry<Frame>> for FrameLaneReceiver {
+    fn poll_recv(
+        &mut self,
+        _cx: &mut task::Context<'_>,
+        _budget: &mut Budget,
+    ) -> Poll<Option<Entry<Frame>>> {
+        match self.moved.borrow_mut().pop_front() {
+            Some(frame) => Poll::Ready(Some(frame)),
+            None => Poll::Pending,
+        }
+    }
+
+    fn on_consumed(&mut self, _bytes: u64) {}
+}
+
+/// A worker's sender that records the time each batch reached it with the batch's byte cost,
+/// and the count of the batch's frames.
+struct BatchSender {
+    clock: test_clock_mod::Clock,
+    sends: Sends,
+    frames: Rc<RefCell<Vec<usize>>>,
+}
+
+impl UnboundedSender<FrameBatch> for BatchSender {
+    fn send(&mut self, value: FrameBatch) -> Result<(), FrameBatch> {
+        let now = crate::time::precision::Clock::now(&self.clock);
+        self.sends.borrow_mut().push((now, value.byte_cost()));
+        self.frames.borrow_mut().push(value.len());
+        Ok(())
+    }
+}
+
+/// Under one paced interface, with frames smaller than a batch, the batch router fills a
+/// partial batch as the pacer asks for its next one: the `Pending` of that poll tells the window
+/// that a worker could take a batch, and the limit grows past its minimum. A pacer that holds a
+/// batch doesn't ask for another, and the batch router has a full batch each time the pacer asks
+/// again, so the limit stays within the batch the pacer holds, the next one and the minimum,
+/// though the frames keep coming.
+#[test]
+fn creditless_window_stays_bounded_while_the_batch_router_fills_a_partial_batch() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let start = crate::time::precision::Clock::now(&clock);
+    let path = test_path_secret_entry();
+    let payload_len = 50;
+    let frame_cost = new_test_frame(path.clone(), payload_len).byte_cost();
+    // A batch's packet overhead is more than a frame's bytes, so the frames that the window
+    // admits up to its minimum leave a partial batch after the first full one, and the frames
+    // that it admits up to twice its minimum fill the next batch while the pacer holds one.
+    assert!(frame_cost < MAX_FRAME_BATCH_PACKET_OVERHEAD);
+    let window = CreditlessWindow::new(BATCH_TARGET_BYTES);
+    let mut lanes = FrameWindowLanes::new(window.clone(), path, payload_len, 100_000);
+    let sends = Sends::default();
+    let frames = Rc::new(RefCell::new(Vec::new()));
+    let senders: IdMap<LocalSenderId, _> = (0..2)
+        .map(|_| {
+            let sender = BatchSender {
+                clock: clock.clone(),
+                sends: Rc::clone(&sends),
+                frames: Rc::clone(&frames),
+            };
+            WindowSender::new(sender, window.clone())
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let rx = BatchFramesByPathSecret::new(lanes.receiver(), &clock, rate);
+    let rx = WindowReader::new(rx, window.clone());
+    let rx: crate::socket::channel::Paced<_, _, FrameBatch> =
+        crate::socket::channel::Paced::new(rx, clock.clone(), rate);
+    let registry = crate::counter::Registry::default();
+    let mut router = PickTwo::new(
+        rx,
+        senders,
+        crate::xorshift::Rng::new(),
+        &registry,
+        test_pool(),
+    );
+
+    // 20 ms of the test clock, in steps of 10 us: in each step the lanes move the frames that
+    // the window admits, and the router sends what the pacer lets through.
+    let mut limits = Vec::new();
+    for _ in 0..2_000 {
+        lanes.pass();
+        assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+        clock.advance(std::time::Duration::from_micros(10));
+        limits.push(window.limit());
+    }
+
+    // A full batch of these frames takes about 500 us at 1 Gbps, so the interface sends about
+    // 40 in 20 ms, each of many frames, and the lanes still have frames to make.
+    let sends = sends.borrow();
+    let sent = sends.len();
+    assert!(sent >= 30, "{sent} batches");
+    assert_within_rate(&sends, rate, start);
+    let frames = frames.borrow();
+    assert!(
+        frames.iter().all(|&count| count > 1),
+        "the batches held {frames:?} frames",
+    );
+    assert!(lanes.left > 0, "the lanes made every frame");
+    // The pacer asked for its second batch while the batch router filled a partial one, and
+    // the limit grew past its minimum.
+    let settled = *limits.last().expect("the run has steps");
+    assert!(
+        settled > BATCH_TARGET_BYTES,
+        "the limit settled at {settled}",
+    );
+    // The limit doesn't grow past the batch the pacer holds, the next one and the minimum.
+    let most = limits.iter().copied().max().unwrap_or_default();
+    let bound = 3 * BATCH_TARGET_BYTES;
+    assert!(most <= bound, "the limit grew to {most}");
+    assert!(
+        limits[1_000..].iter().all(|&limit| limit == settled),
+        "the limit changed in the last 10 ms",
+    );
+}
