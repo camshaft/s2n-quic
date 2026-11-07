@@ -1711,6 +1711,11 @@ fn an_acknowledgement_only_pair_is_marked_lost_while_it_keeps_acknowledging() {
     ctx.check_acknowledgement_only_delivery(clock.get_time());
     assert!(ctx.is_path_lost());
     assert!(entry.is_sender_lost(sender));
+    assert_eq!(
+        ctx.lost_at.map(|at| at.nanos),
+        Some(clock.get_time().nanos),
+        "the mark records when it was set"
+    );
 }
 
 /// A probe that waited while the context didn't send anything for a persistent congestion

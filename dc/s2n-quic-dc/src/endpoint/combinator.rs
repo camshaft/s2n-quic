@@ -781,6 +781,8 @@ pub(crate) struct Assembler<R, Clk, C, A> {
     freed_batch_tx: crate::queue::FreedBatchTx,
     pub(crate) counters: AssemblerCounters,
     send_counters: Rc<super::counters::Send>,
+    /// Publishes the lost-pair events of the contexts this assembler marks lost, where set.
+    path_secret_map: Option<crate::path::secret::Map>,
     /// Self-contained unsync descriptor reuse state for the send pipeline.
     recycle_pool: UnsyncReusePool,
     /// Endpoint-wide credit pool. The assembler releases credit on the admit path —
@@ -943,6 +945,7 @@ impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
         freed_batch_tx: crate::queue::FreedBatchTx,
         counters: AssemblerCounters,
         send_counters: Rc<super::counters::Send>,
+        path_secret_map: Option<crate::path::secret::Map>,
         initial_tx_descriptor_allocs: usize,
         send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
     ) -> Self {
@@ -961,6 +964,7 @@ impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
             freed_batch_tx,
             counters,
             send_counters,
+            path_secret_map,
             recycle_pool,
             send_credit_pool,
         }
@@ -1009,6 +1013,7 @@ where
                     &mut self.freed_batch_tx,
                     &self.counters,
                     &self.send_counters,
+                    self.path_secret_map.as_ref(),
                     &self.send_credit_pool,
                 )
             });
