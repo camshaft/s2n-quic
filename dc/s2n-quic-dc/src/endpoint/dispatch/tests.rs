@@ -739,6 +739,9 @@ fn a_dropped_rejected_init_disables_its_bound_stream() {
 fn a_rejected_init_records_what_it_does_with_its_slot() {
     use crate::endpoint::frame_trace::{resident_slot_holds, HoldOutcome};
 
+    // The recorder's capture starts off; arm it, as a test process doesn't otherwise.
+    crate::testing::init_tracing();
+
     let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
     let view = state.view();
     // An address no other test uses, so that the records of its credentials in the process-wide

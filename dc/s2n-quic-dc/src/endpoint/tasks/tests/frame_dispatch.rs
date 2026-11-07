@@ -883,6 +883,9 @@ fn the_priority_router_records_each_hold_that_a_leaving_reset_releases() {
     use core::task::Poll;
     use s2n_quic_core::varint::VarInt;
 
+    // The recorder's capture starts off; arm it, as a test process doesn't otherwise.
+    crate::testing::init_tracing();
+
     // An address no other test uses, so that the records of its credentials in the process-wide
     // recorder are this test's alone.
     let pse = crate::path::secret::map::Entry::builder("127.0.0.1:44702".parse().unwrap())
