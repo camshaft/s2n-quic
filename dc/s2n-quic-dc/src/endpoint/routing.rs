@@ -144,6 +144,8 @@ where
     T: UnboundedSender<Entry<msg::Sender>>,
 {
     fn send(&mut self, msg: Entry<msg::Sender>) -> Result<(), Entry<msg::Sender>> {
+        #[cfg(test)]
+        observe::record(&msg);
         let sender_idx = msg.sender_idx();
         debug_assert!(
             sender_idx.as_usize() < self.senders.len(),
@@ -219,5 +221,201 @@ where
         }
 
         Ok(())
+    }
+}
+
+/// Returns the sender that a peer sender's acknowledgements go to.
+///
+/// `routed` is the sender the route picks for `source_sender_id`. Where the endpoint has senders
+/// for its highest-priority traffic (`priority_senders`) and `routed` isn't one of them, the
+/// acknowledgements go to one of those senders, picked by `source_sender_id`, so that each peer
+/// sender's acknowledgements keep to one sender.
+#[inline]
+pub(crate) fn ack_sender_id(
+    routed: LocalSenderId,
+    source_sender_id: RemoteSenderId,
+    priority_senders: Option<&[LocalSenderId]>,
+) -> LocalSenderId {
+    let Some(senders) = priority_senders.filter(|senders| !senders.is_empty()) else {
+        return routed;
+    };
+    if senders.contains(&routed) {
+        return routed;
+    }
+    let position = source_sender_id.as_varint().as_u64() % senders.len() as u64;
+    senders[position as usize]
+}
+
+/// Returns the sender that a freed batch goes to: of two different senders drawn at random, the
+/// one with the lower `score`, or the first where the scores are equal.
+///
+/// The senders are `priority_senders`, the senders of the endpoint's highest-priority traffic,
+/// where it has some, and otherwise the first `socket_count` senders. Where there is one sender,
+/// or none, it returns the first without a draw.
+pub(crate) fn freed_batch_sender_id<S: PartialOrd>(
+    priority_senders: Option<&[LocalSenderId]>,
+    socket_count: usize,
+    rng: &mut crate::xorshift::Rng,
+    mut score: impl FnMut(LocalSenderId) -> S,
+) -> LocalSenderId {
+    let priority_senders = priority_senders.filter(|senders| !senders.is_empty());
+    let count = priority_senders.map_or(socket_count, |senders| senders.len());
+    let sender = |position: usize| match priority_senders {
+        Some(senders) => senders[position],
+        None => LocalSenderId::from_index(position),
+    };
+    if count <= 1 {
+        return sender(0);
+    }
+    let first = rng.next_usize(count);
+    let mut second = rng.next_usize(count - 1);
+    if second >= first {
+        second += 1;
+    }
+    let (first, second) = (sender(first), sender(second));
+    if score(first) <= score(second) {
+        first
+    } else {
+        second
+    }
+}
+
+/// Records each acknowledgement and freed batch that the endpoint routes to a send worker, for
+/// the tests that check which sender each goes to.
+#[cfg(test)]
+pub(crate) mod observe {
+    use super::{msg, LocalSenderId};
+    use core::cell::RefCell;
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
+
+    /// What a routed message carries.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Kind {
+        /// A peer's pending acknowledgements.
+        PendingAck,
+        /// A freed batch, which returns the `QueueFree` tokens of a peer's queues.
+        PendingFreed,
+    }
+
+    /// One message routed to a send worker: what it carries, its sender and its path's peer.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Routed {
+        pub(crate) kind: Kind,
+        pub(crate) sender: LocalSenderId,
+        pub(crate) peer: SocketAddr,
+    }
+
+    thread_local! {
+        static SINK: RefCell<Option<Arc<Mutex<Vec<Routed>>>>> = const { RefCell::new(None) };
+    }
+
+    /// Records each message that this thread routes from now on in `sink`.
+    pub(crate) fn record_into(sink: Arc<Mutex<Vec<Routed>>>) {
+        SINK.with(|current| *current.borrow_mut() = Some(sink));
+    }
+
+    /// Records `message`, where this thread records the messages it routes.
+    pub(crate) fn record(message: &msg::Sender) {
+        let kind = match message {
+            msg::Sender::PendingAck(_) => Kind::PendingAck,
+            msg::Sender::PendingFreed { .. } => Kind::PendingFreed,
+            msg::Sender::ReceivedAck { .. } => return,
+        };
+        SINK.with(|sink| {
+            if let Some(sink) = sink.borrow().as_ref() {
+                sink.lock().unwrap().push(Routed {
+                    kind,
+                    sender: message.sender_idx(),
+                    peer: *message.path_secret_entry().peer(),
+                });
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xorshift::Rng;
+
+    fn sender(position: usize) -> LocalSenderId {
+        LocalSenderId::from_index(position)
+    }
+
+    fn remote(id: u32) -> RemoteSenderId {
+        RemoteSenderId::new(VarInt::from_u32(id))
+    }
+
+    #[test]
+    fn acknowledgements_keep_the_routed_sender_without_priority_senders() {
+        assert_eq!(ack_sender_id(sender(2), remote(5), None), sender(2));
+        assert_eq!(
+            ack_sender_id(sender(2), remote(5), Some(&[][..])),
+            sender(2)
+        );
+    }
+
+    #[test]
+    fn acknowledgements_go_to_a_sender_of_the_highest_priority_interface() {
+        let priority = [sender(1), sender(3)];
+        // The route's sender is on that interface already.
+        assert_eq!(
+            ack_sender_id(sender(3), remote(4), Some(&priority[..])),
+            sender(3)
+        );
+        // Otherwise the peer's sender picks one of the interface's senders.
+        assert_eq!(
+            ack_sender_id(sender(2), remote(4), Some(&priority[..])),
+            sender(1)
+        );
+        assert_eq!(
+            ack_sender_id(sender(2), remote(5), Some(&priority[..])),
+            sender(3)
+        );
+    }
+
+    #[test]
+    fn freed_batches_go_to_the_lower_scored_of_two_different_senders() {
+        let mut rng = Rng::with_seed(7);
+        // Scored by index, the higher of two different senders never wins, so sender 7 doesn't.
+        for _ in 0..256 {
+            let chosen = freed_batch_sender_id(None, 8, &mut rng, |id| id.as_usize());
+            assert!(
+                chosen.as_usize() < 7,
+                "{chosen} won over a sender of a lower score"
+            );
+        }
+        // One sender, or none, takes every freed batch.
+        for socket_count in [0, 1] {
+            let chosen = freed_batch_sender_id(None, socket_count, &mut rng, |_| 0);
+            assert_eq!(chosen, sender(0));
+        }
+        // Where the two scores are equal, the first draw wins.
+        for _ in 0..256 {
+            let first = sender(rng.clone().next_usize(8));
+            let chosen = freed_batch_sender_id(None, 8, &mut rng, |_| 0);
+            assert_eq!(chosen, first);
+        }
+    }
+
+    #[test]
+    fn freed_batches_go_to_a_sender_of_the_highest_priority_interface() {
+        let mut rng = Rng::with_seed(7);
+        let priority = [sender(1), sender(3)];
+        for _ in 0..256 {
+            // Both draws are of the interface's senders, and sender 3 scores lower.
+            let chosen = freed_batch_sender_id(Some(&priority[..]), 8, &mut rng, |id| {
+                usize::MAX - id.as_usize()
+            });
+            assert_eq!(chosen, sender(3));
+        }
+        let chosen = freed_batch_sender_id(Some(&[sender(5)][..]), 8, &mut rng, |_| 0);
+        assert_eq!(chosen, sender(5));
+        // An empty list keeps the choice among every sender.
+        let chosen = freed_batch_sender_id(Some(&[][..]), 1, &mut rng, |_| 0);
+        assert_eq!(chosen, sender(0));
     }
 }

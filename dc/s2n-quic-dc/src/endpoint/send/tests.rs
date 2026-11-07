@@ -1019,3 +1019,382 @@ fn ack_rtt_tracker_make_ack_eliciting_true_records_probe() {
         "sampled=true keeps is_pending after consumption"
     );
 }
+
+/// Collects the frames a context moves.
+#[derive(Default)]
+struct CollectFrames(Vec<crate::intrusive::Entry<Frame>>);
+
+impl crate::socket::channel::UnboundedSender<crate::intrusive::Entry<Frame>> for CollectFrames {
+    fn send(
+        &mut self,
+        value: crate::intrusive::Entry<Frame>,
+    ) -> Result<(), crate::intrusive::Entry<Frame>> {
+        self.0.push(value);
+        Ok(())
+    }
+}
+
+/// A lost mark records the next packet number, and only an acknowledgement of that packet or
+/// a later one clears it, on the context and on the path secret entry alike.
+#[test]
+fn a_lost_mark_clears_on_an_ack_of_a_packet_sent_after_it() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    ctx.next_packet_number = VarInt::from_u8(5);
+
+    ctx.set_path_lost(true);
+    assert_eq!(ctx.lost_from, Some(VarInt::from_u8(5)));
+    assert!(entry.is_sender_lost(sender));
+
+    ctx.on_largest_acknowledged(VarInt::from_u8(4));
+    assert!(
+        ctx.is_path_lost(),
+        "an ack of a packet sent before the mark keeps it"
+    );
+    assert!(entry.is_sender_lost(sender));
+
+    ctx.on_largest_acknowledged(VarInt::from_u8(5));
+    assert!(
+        !ctx.is_path_lost(),
+        "an ack of the first packet sent after the mark clears it"
+    );
+    assert!(!entry.is_sender_lost(sender));
+}
+
+/// A lost pair moves its pending frames, marked pending, while another sender of the path
+/// secret entry delivers.
+#[test]
+fn a_lost_pair_moves_its_pending_frames_while_another_sender_delivers() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(1000);
+    for _ in 0..2 {
+        let _ = ctx.push_batch(FrameBatch::single(make_frame(64)), &clock);
+    }
+    assert!(
+        !ctx.should_move_frames(),
+        "a pair that delivers keeps its frames"
+    );
+
+    ctx.set_path_lost(true);
+    assert!(ctx.should_move_frames());
+
+    let mut moved = CollectFrames::default();
+    assert_eq!(ctx.move_frames(&mut moved), 2);
+    assert_eq!(moved.0.len(), 2);
+    for frame in &moved.0 {
+        assert!(matches!(frame.status, TransmissionStatus::Pending));
+    }
+    assert!(!ctx.has_pending_data());
+    assert!(!ctx.should_move_frames(), "nothing is left to move");
+}
+
+/// A lost pair keeps its frames where no other sender of the path secret entry delivers.
+#[test]
+fn a_lost_pair_keeps_its_frames_where_no_other_sender_delivers() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(1, &registry);
+    let clock = make_clock(1000);
+    let _ = ctx.push_batch(FrameBatch::single(make_frame(64)), &clock);
+
+    ctx.set_path_lost(true);
+    assert!(!ctx.should_move_frames());
+    assert!(ctx.has_pending_data());
+}
+
+/// A lost pair keeps its probe timeout armed with nothing to acknowledge, and the timeout
+/// asks for a probe, which the assembler sends as a Ping.
+#[test]
+fn a_lost_pair_keeps_probing_with_nothing_to_acknowledge() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(100);
+
+    assert!(
+        !ctx.wheel_interest(&clock).pto,
+        "a pair that delivers has nothing to probe"
+    );
+
+    ctx.set_path_lost(true);
+    assert!(
+        ctx.wheel_interest(&clock).pto,
+        "a lost pair arms its probe timeout"
+    );
+
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(
+        ctx.pto.probe_state.is_requested(),
+        "the timeout of a lost pair asks for a probe with nothing to acknowledge"
+    );
+}
+
+/// A pair with nothing to acknowledge isn't marked lost, however long ago the peer last
+/// acknowledged a packet on it.
+#[test]
+fn a_pair_with_nothing_to_acknowledge_is_not_marked_lost() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(100);
+    let _ = ctx.wheel_interest(&clock);
+    clock.advance(Duration::from_secs(60));
+
+    assert!(!ctx.has_stopped_delivering(clock.get_time()));
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(!ctx.is_path_lost());
+}
+
+/// A new context of a sender slot clears the lost mark that an earlier context of the slot
+/// left on the path secret entry.
+#[test]
+fn a_new_context_clears_the_lost_mark_of_its_sender_slot() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    ctx.set_path_lost(true);
+    assert!(entry.is_sender_lost(sender));
+
+    let replacement = Context::new(
+        &entry,
+        registry.register_queue_gauge("test.inflight"),
+        registry.register_queue_gauge("test.ack"),
+        registry.register_queue_gauge("test.pending"),
+        sender,
+        &crate::time::bach::Clock::default(),
+    )
+    .expect("Context::new should succeed with peer_data_addrs populated");
+    assert!(!replacement.is_path_lost());
+    assert!(!entry.is_sender_lost(sender));
+}
+
+/// Builds a send cache of sender slot 0 holding one context, marked lost, for a path secret
+/// entry with two sender slots.
+fn make_cache_with_a_lost_context() -> (super::Cache, Arc<PathSecretEntry>) {
+    let registry = Registry::default();
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let entry = PathSecretEntry::builder("127.0.0.1:9999".parse().unwrap())
+        .socket_sender_count(2)
+        .build(None);
+    let mut cache = super::Cache::new(&registry, sender);
+    let ctx = cache
+        .get_or_insert(&entry, &crate::time::bach::Clock::default())
+        .expect("Context::new should succeed with peer_data_addrs populated");
+    ctx.borrow_mut().set_path_lost(true);
+    assert!(entry.is_sender_lost(sender));
+    (cache, entry)
+}
+
+/// A cache that drops a lost pair's context clears the pair's lost mark on the path secret
+/// entry, since none of the dropped context's probes can clear it.
+#[test]
+fn an_invalidated_context_clears_its_lost_mark() {
+    let (mut cache, entry) = make_cache_with_a_lost_context();
+    let reason = crate::endpoint::frame::FailureReason::PeerDead;
+    let mut cancelled = CollectFrames::default();
+    let removed = cache.invalidate(entry.id(), reason, &mut cancelled);
+    assert!(removed.is_some());
+    assert!(!entry.is_sender_lost(crate::endpoint::id::LocalSenderId::from_index(0)));
+}
+
+/// A cache that drops a lost pair's context for a rejected key clears the pair's lost mark
+/// on the path secret entry too.
+#[test]
+fn a_context_dropped_for_a_rejected_key_clears_its_lost_mark() {
+    let (mut cache, entry) = make_cache_with_a_lost_context();
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let mut retransmit = CollectFrames::default();
+    let removed = cache.invalidate_stale_key(entry.id(), sender, VarInt::MAX, &mut retransmit);
+    assert!(removed.is_some());
+    assert!(!entry.is_sender_lost(sender));
+}
+
+/// A pair whose context sends acknowledgements alone stops delivering once its last
+/// ack-eliciting packet, which the inflight map doesn't hold, waited for a persistent
+/// congestion period without an acknowledgement.
+#[test]
+fn an_acknowledgement_only_pair_stops_delivering_once_its_probe_waits_too_long() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.last_peer_activity = clock.get_time();
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+
+    clock.advance(threshold - Duration::from_millis(1));
+    assert!(
+        !ctx.has_stopped_delivering(clock.get_time()),
+        "the probe hasn't waited for a persistent congestion period yet"
+    );
+    clock.advance(Duration::from_millis(1));
+    assert!(ctx.has_stopped_delivering(clock.get_time()));
+}
+
+/// An acknowledgement from the peer ends the wait of an ack-eliciting packet that the
+/// inflight map doesn't hold, so the pair isn't marked lost for it.
+#[test]
+fn an_acknowledgement_ends_the_wait_of_an_acknowledgement_only_probe() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+    ctx.ack_only_since_peer_ack = true;
+
+    ctx.on_peer_acknowledged(clock.get_time());
+    assert!(ctx.ack_only_probe_sent.is_none());
+    assert!(!ctx.ack_only_since_peer_ack);
+    clock.advance(threshold * 2);
+    assert!(!ctx.has_stopped_delivering(clock.get_time()));
+}
+
+/// A context that sends acknowledgements alone probes once the peer hasn't acknowledged one
+/// of its packets for a persistent congestion period, and not while a probe waits, nor before
+/// it sent an ACK-only packet that isn't ack-eliciting since the peer's last acknowledgement.
+#[test]
+fn an_acknowledgement_only_context_probes_once_the_peer_is_quiet() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.on_peer_acknowledged(clock.get_time());
+    clock.advance(threshold);
+    assert!(
+        !ctx.needs_delivery_probe(clock.get_time()),
+        "a context that sent nothing since the peer's acknowledgement doesn't probe"
+    );
+
+    ctx.ack_only_since_peer_ack = true;
+    assert!(ctx.needs_delivery_probe(clock.get_time()));
+
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+    assert!(
+        !ctx.needs_delivery_probe(clock.get_time()),
+        "a probe waits for its acknowledgement"
+    );
+
+    ctx.on_peer_acknowledged(clock.get_time());
+    ctx.ack_only_since_peer_ack = true;
+    clock.advance(threshold - Duration::from_millis(1));
+    assert!(
+        !ctx.needs_delivery_probe(clock.get_time()),
+        "the peer acknowledged a packet less than a persistent congestion period ago"
+    );
+}
+
+/// A context that sends acknowledgements alone marks its pair lost once its probe waited for
+/// a persistent congestion period without an acknowledgement while the context kept sending
+/// ACK-only packets.
+#[test]
+fn an_acknowledgement_only_pair_is_marked_lost_while_it_keeps_acknowledging() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.on_peer_acknowledged(clock.get_time());
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+
+    clock.advance(threshold - Duration::from_millis(1));
+    ctx.ack_only_sent = Some(clock.get_time());
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(
+        !ctx.is_path_lost(),
+        "the probe hasn't waited for a persistent congestion period yet"
+    );
+
+    clock.advance(Duration::from_millis(1));
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(ctx.is_path_lost());
+    assert!(entry.is_sender_lost(sender));
+}
+
+/// A probe that waited while the context didn't send anything for a persistent congestion
+/// period, such as a probe lost in an earlier outage, doesn't mark the pair lost: the context
+/// forgets it, and its next ACK-only packet probes again.
+#[test]
+fn a_stale_acknowledgement_only_probe_does_not_mark_the_pair_lost() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    ctx.spreads_over_interfaces = true;
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.on_peer_acknowledged(clock.get_time());
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+    ctx.ack_only_sent = Some(clock.get_time());
+    ctx.ack_only_since_peer_ack = true;
+
+    clock.advance(threshold * 2);
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(!ctx.is_path_lost());
+    assert!(!entry.is_sender_lost(sender));
+    assert!(
+        ctx.ack_only_probe_sent.is_none(),
+        "the context forgets the stale probe"
+    );
+    assert!(
+        ctx.needs_delivery_probe(clock.get_time()),
+        "the context's next ACK-only packet probes again"
+    );
+}
+
+/// A context spreads over interfaces only where its endpoint's send sockets are on more than
+/// one interface: a context without a place, or with a place among one interface's sockets,
+/// doesn't.
+#[test]
+fn a_context_spreads_over_interfaces_only_where_its_endpoint_has_several() {
+    let registry = Registry::default();
+    let (ctx, entry) = make_context_with_sender_slots(2, &registry);
+    assert!(!ctx.spreads_over_interfaces, "a context without a place");
+
+    for (count, spreads) in [(1, false), (2, true)] {
+        let place = crate::socket::interface::SendPlace {
+            rank: 0,
+            count,
+            index: 0,
+        };
+        let ctx = Context::new_paired(
+            &entry,
+            registry.register_queue_gauge("test.inflight"),
+            registry.register_queue_gauge("test.ack"),
+            registry.register_queue_gauge("test.pending"),
+            crate::endpoint::id::LocalSenderId::from_index(0),
+            Some(place),
+            &crate::time::bach::Clock::default(),
+        )
+        .expect("the entry has peer data addresses");
+        assert_eq!(ctx.spreads_over_interfaces, spreads, "{place:?}");
+    }
+}
+
+/// A context of an endpoint with one interface doesn't probe a quiet peer when it sends
+/// acknowledgements alone, and an ack-eliciting packet that the inflight map doesn't hold
+/// doesn't mark its pair lost: no other pair could carry its traffic.
+#[test]
+fn a_context_of_one_interface_neither_probes_nor_stops_delivering() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(1, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(100);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    ctx.on_peer_acknowledged(clock.get_time());
+    ctx.ack_only_since_peer_ack = true;
+
+    clock.advance(threshold);
+    assert!(
+        !ctx.needs_delivery_probe(clock.get_time()),
+        "the peer is quiet, and the context sends acknowledgements alone"
+    );
+
+    ctx.ack_only_probe_sent = Some(clock.get_time());
+    clock.advance(threshold);
+    ctx.ack_only_sent = Some(clock.get_time());
+    assert!(!ctx.has_stopped_delivering(clock.get_time()));
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(!ctx.is_path_lost());
+    assert!(!entry.is_sender_lost(sender));
+}

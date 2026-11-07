@@ -54,6 +54,7 @@ struct TestItem {
     path_secret_entry: Arc<PathSecretEntry>,
     byte_cost: u64,
     flow_credits: u64,
+    highest_priority: bool,
     drop_counter: Arc<AtomicUsize>,
 }
 
@@ -82,6 +83,12 @@ impl AssignSender for TestItem {
 impl FlowCredits for TestItem {
     fn total_flow_credits(&self) -> u64 {
         self.flow_credits
+    }
+}
+
+impl HighestPriority for TestItem {
+    fn holds_highest_priority(&self) -> bool {
+        self.highest_priority
     }
 }
 
@@ -155,6 +162,7 @@ fn new_test_item(
         path_secret_entry,
         byte_cost: 123,
         flow_credits: 0,
+        highest_priority: false,
         drop_counter,
     }
 }
@@ -925,4 +933,1463 @@ fn ack_processor_drops_message_with_out_of_range_sender_idx() {
     // then the input is exhausted so the channel closes.
     let result = with_noop_context(|cx| router.poll_recv(cx, &mut Budget::new(usize::MAX)));
     assert_eq!(result, Poll::Ready(None));
+}
+
+// -- InterfacePacedPickTwo tests ---------------------------------------------
+
+type Sends = Rc<RefCell<Vec<(crate::time::precision::Timestamp, u64)>>>;
+
+/// A sender that records the time each item reached it and the item's byte cost.
+struct TimedSender {
+    clock: test_clock_mod::Clock,
+    sends: Sends,
+}
+
+impl UnboundedSender<TestItem> for TimedSender {
+    fn send(&mut self, value: TestItem) -> Result<(), TestItem> {
+        let now = crate::time::precision::Clock::now(&self.clock);
+        self.sends.borrow_mut().push((now, value.byte_cost()));
+        Ok(())
+    }
+}
+
+fn timed_senders(
+    clock: &test_clock_mod::Clock,
+    sends: &[&Sends],
+) -> crate::endpoint::id::IdMap<LocalSenderId, TimedSender> {
+    sends
+        .iter()
+        .map(|sends| TimedSender {
+            clock: clock.clone(),
+            sends: Rc::clone(sends),
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn test_items(
+    entry: &Arc<PathSecretEntry>,
+    count: usize,
+    byte_cost: u64,
+    drop_counter: &Arc<AtomicUsize>,
+) -> VecDeque<TestItem> {
+    (0..count)
+        .map(|_| {
+            let mut item = new_test_item(entry.clone(), drop_counter.clone());
+            item.byte_cost = byte_cost;
+            item
+        })
+        .collect()
+}
+
+fn test_pool() -> crate::sync::Arc<crate::credit::Pool> {
+    crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
+        1_000_000,
+    )))
+}
+
+/// Polls `router` until it has nothing to do now: it returns `Pending`, or `Ready(None)` once
+/// its input is closed and it holds no batch.
+fn poll_until_idle<R: Receiver<()>>(router: &mut R) -> Poll<Option<()>> {
+    with_noop_context(|cx| loop {
+        match router.poll_recv(cx, &mut Budget::new(usize::MAX)) {
+            Poll::Ready(Some(())) => {}
+            other => return other,
+        }
+    })
+}
+
+/// Checks that each of `sends`, a time and a byte count, came once the bytes sent before it fit
+/// in `rate` and its burst since `start`, with 2 us allowed for timer rounding.
+fn assert_within_rate(
+    sends: &[(crate::time::precision::Timestamp, u64)],
+    rate: Rate,
+    start: crate::time::precision::Timestamp,
+) {
+    let mut sent_before = 0;
+    for &(at, bytes) in sends {
+        let allowed = at.nanos_since(start) + rate.burst_nanos() + 2_000;
+        assert!(
+            rate.nanos_for_bytes(sent_before) <= allowed,
+            "a send at {at:?} after {sent_before} bytes came early for {rate:?}",
+        );
+        sent_before += bytes;
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_paces_each_interface_to_its_rate() {
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let clock = test_clock();
+    let start = crate::time::precision::Clock::now(&clock);
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let rx = TestReceiver {
+        values: test_items(&test_path_secret_entry(), 200, 100_000, &drop_counter),
+        consumed: 0,
+    };
+    let slow_sends = Sends::default();
+    let fast_sends = Sends::default();
+    let pacing = SendPacing::new(vec![slow, fast], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&slow_sends, &fast_sends]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    // 20 ms of the test clock, in steps of 10 us.
+    for _ in 0..2_000 {
+        assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+        clock.advance(std::time::Duration::from_micros(10));
+    }
+
+    let slow_sends = slow_sends.borrow();
+    let fast_sends = fast_sends.borrow();
+    assert_within_rate(&slow_sends, slow, start);
+    assert_within_rate(&fast_sends, fast, start);
+    // A batch of 100,000 bytes takes 800 us at 1 Gbps and 200 us at 4 Gbps, so in 20 ms the slow
+    // interface sends about 25 batches and the fast one about 100.
+    let slow_count = slow_sends.len();
+    let fast_count = fast_sends.len();
+    assert!(slow_count >= 20, "slow: {slow_count} batches");
+    assert!(
+        fast_count >= 3 * slow_count,
+        "fast: {fast_count} batches, slow: {slow_count}",
+    );
+}
+
+#[test]
+fn interface_paced_pick_two_delivers_held_batches_after_upstream_closes() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let rx = TestReceiver {
+        values: test_items(&test_path_secret_entry(), 3, 100_000, &drop_counter),
+        consumed: 0,
+    };
+    let sends = Sends::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&sends, &sends]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    // Each batch costs more than a burst: two go at once, one on each interface, and the third
+    // waits until its interface has paid for the batch it sent.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sends.borrow().len(), 2);
+
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(sends.borrow().len(), 3);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn interface_paced_pick_two_returns_credit_when_the_worker_is_gone() {
+    const CAP: u64 = 1_000_000;
+    const CREDIT: u64 = 4096;
+
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let pool = crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(CAP)));
+    let mut item = new_test_item(test_path_secret_entry(), drop_counter.clone());
+    item.flow_credits = CREDIT;
+    let rx = TestReceiver {
+        values: [item].into(),
+        consumed: 0,
+    };
+    let senders = vec![
+        TestSender {
+            accept: false,
+            calls: 0,
+        },
+        TestSender {
+            accept: false,
+            calls: 0,
+        },
+    ];
+    let rate = Rate::new(1.0);
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        test_clock(),
+        &pacing,
+        &registry,
+        pool.clone(),
+    );
+
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
+    // The item's credit wasn't drawn from the pool, so its return shows as a balance of
+    // `CAP + CREDIT`.
+    assert_eq!(
+        pool.debug_available() as u64 + pool.debug_returned(),
+        CAP + CREDIT,
+        "the router didn't return the batch's send credit to the pool",
+    );
+}
+
+#[test]
+fn send_pacing_paces_each_interface_that_holds_a_send_socket() {
+    use crate::socket::interface;
+
+    let overall = Rate::new(25.0);
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let addrs: [std::net::SocketAddr; 4] = [
+        "127.0.0.1:4000".parse().unwrap(),
+        "127.0.0.1:4001".parse().unwrap(),
+        "127.0.0.1:4002".parse().unwrap(),
+        "127.0.0.1:4003".parse().unwrap(),
+    ];
+    let pacing = |configs: &[interface::Config]| {
+        let table = interface::Table::resolve(configs, overall, &addrs, &addrs, &interface::System);
+        SendPacing::from_interfaces(&table, overall)
+    };
+
+    // Without interfaces, one rate paces every send socket, as before.
+    assert_eq!(pacing(&[]), SendPacing::single(overall));
+
+    // Sockets 0 and 2 on the slow interface, 1 on the fast one, and 3, which neither lists, on
+    // the default interface.
+    let split = pacing(&[
+        interface::Config {
+            send_rate: Some(slow),
+            send_sockets: vec![0, 2],
+            ..Default::default()
+        },
+        interface::Config {
+            send_rate: Some(fast),
+            send_sockets: vec![1],
+            ..Default::default()
+        },
+    ]);
+    let expected = SendPacing::new(vec![overall, slow, fast], vec![1, 2, 1, 0]);
+    assert_eq!(split, expected);
+    assert_eq!(split.interface_count(), 3);
+    assert_eq!(format!("{:?}", split.total_rate()), "30.0Gbps");
+
+    // Where every send socket is on one interface, that interface's rate paces them all.
+    let one = pacing(&[
+        interface::Config {
+            send_rate: Some(slow),
+            ..Default::default()
+        },
+        interface::Config {
+            send_rate: Some(fast),
+            send_sockets: vec![0, 1, 2, 3],
+            ..Default::default()
+        },
+    ]);
+    assert_eq!(one, SendPacing::single(fast));
+    assert_eq!(one.interface_count(), 1);
+}
+
+#[test]
+fn interface_paced_pick_two_routes_highest_priority_batches_to_the_chosen_interface() {
+    let rate = Rate::new(100.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    // A highest-priority item costs 1 byte and any other item 2, so that each sender's record
+    // tells them apart.
+    let item = |highest_priority: bool| {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = if highest_priority { 1 } else { 2 };
+        item.highest_priority = highest_priority;
+        item
+    };
+    let values: VecDeque<TestItem> = (0..10)
+        .map(|_| item(true))
+        .chain((0..20).map(|_| item(false)))
+        .chain((0..10).map(|_| item(true)))
+        .collect();
+    let rx = TestReceiver {
+        values,
+        consumed: 0,
+    };
+    let sends: [Sends; 4] = Default::default();
+    // Senders 0 and 1 are on the first interface, and 2 and 3 on the second, which carries the
+    // highest-priority traffic.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 0, 1, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&sends[0], &sends[1], &sends[2], &sends[3]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+
+    let count = |sender: usize, bytes: u64| {
+        sends[sender]
+            .borrow()
+            .iter()
+            .filter(|&&(_, cost)| cost == bytes)
+            .count()
+    };
+    // Every highest-priority item went to a sender of the second interface.
+    assert_eq!(count(0, 1) + count(1, 1), 0);
+    assert_eq!(count(2, 1) + count(3, 1), 20);
+    // The other items went to the senders of both interfaces.
+    assert_eq!((0..4).map(|sender| count(sender, 2)).sum::<usize>(), 20);
+    assert!(
+        count(0, 2) + count(1, 2) > 0,
+        "the first interface didn't get an item"
+    );
+}
+
+#[test]
+fn send_pacing_routes_highest_priority_batches_to_the_chosen_interface() {
+    use crate::socket::interface;
+
+    let overall = Rate::new(25.0);
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let addrs: [std::net::SocketAddr; 3] = [
+        "127.0.0.1:4000".parse().unwrap(),
+        "127.0.0.1:4001".parse().unwrap(),
+        "127.0.0.1:4002".parse().unwrap(),
+    ];
+    let pacing = |configs: &[interface::Config]| {
+        let table = interface::Table::resolve(configs, overall, &addrs, &addrs, &interface::System);
+        SendPacing::from_interfaces(&table, overall)
+    };
+    let slow_interface = interface::Config {
+        send_rate: Some(slow),
+        send_sockets: vec![0],
+        ..Default::default()
+    };
+    let fast_interface = interface::Config {
+        send_rate: Some(fast),
+        send_sockets: vec![1, 2],
+        ..Default::default()
+    };
+
+    // The fast interface carries the highest-priority traffic.
+    let chosen = pacing(&[
+        slow_interface.clone(),
+        interface::Config {
+            carries_highest_priority: true,
+            ..fast_interface.clone()
+        },
+    ]);
+    assert_eq!(
+        chosen,
+        SendPacing::new(vec![slow, fast], vec![0, 1, 1]).with_highest_priority(1)
+    );
+
+    // An interface for the highest-priority traffic that doesn't hold a send socket doesn't count.
+    let unused = pacing(&[
+        slow_interface,
+        fast_interface,
+        interface::Config {
+            carries_highest_priority: true,
+            ..Default::default()
+        },
+    ]);
+    assert_eq!(unused, SendPacing::new(vec![slow, fast], vec![0, 1, 1]));
+
+    // With one interface that holds every send socket, the setting has no effect.
+    let one = pacing(&[interface::Config {
+        send_rate: Some(fast),
+        send_sockets: vec![0, 1, 2],
+        carries_highest_priority: true,
+        ..Default::default()
+    }]);
+    assert_eq!(one, SendPacing::single(fast));
+}
+
+/// A receiver of the items a test adds between polls: it returns `Pending` while it holds none.
+struct SharedReceiver<T> {
+    values: Rc<RefCell<VecDeque<T>>>,
+}
+
+impl<T> Receiver<T> for SharedReceiver<T> {
+    fn poll_recv(&mut self, _cx: &mut task::Context<'_>, _budget: &mut Budget) -> Poll<Option<T>> {
+        match self.values.borrow_mut().pop_front() {
+            Some(value) => Poll::Ready(Some(value)),
+            None => Poll::Pending,
+        }
+    }
+
+    fn on_consumed(&mut self, _bytes: u64) {}
+}
+
+/// Each frame batch a sender got: whether its frames are all of the highest priority level, and
+/// how many frames it holds.
+type BatchArrivals = Rc<RefCell<Vec<(bool, usize)>>>;
+
+/// A sender that records each frame batch it gets.
+struct BatchSender {
+    arrivals: BatchArrivals,
+}
+
+impl UnboundedSender<FrameBatch> for BatchSender {
+    fn send(&mut self, value: FrameBatch) -> Result<(), FrameBatch> {
+        let arrival = (value.holds_highest_priority(), value.len());
+        self.arrivals.borrow_mut().push(arrival);
+        Ok(())
+    }
+}
+
+/// A `QueueData` header, whose frames are of the lowest priority level.
+fn queue_data_header() -> Header {
+    Header::QueueData {
+        queue_pair: crate::packet::datagram::QueuePair {
+            source_queue_id: VarInt::from_u8(0),
+            dest_queue_id: VarInt::from_u8(1),
+        },
+        binding_id: VarInt::from_u8(0),
+        offset: VarInt::ZERO,
+        largest_offset: VarInt::ZERO,
+        is_fin: false,
+        blocked: false,
+        dest_acceptor_id: None,
+        priority: crate::credit::Priority::default(),
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_charges_highest_priority_batches_and_paces_mixed_ones() {
+    const PINGS: usize = 3;
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let entry = test_path_secret_entry();
+    let ping = || new_test_frame_with_header(entry.clone(), 0, Header::Ping);
+    let data = |len: usize| new_test_frame_with_header(entry.clone(), len, queue_data_header());
+    // A bulk batch costs more than a burst at `rate`, so it puts its interface's bucket in debt.
+    let bulk = || FrameBatch::single(data(100_000));
+
+    let input = Rc::new(RefCell::new(VecDeque::new()));
+    let arrivals: [BatchArrivals; 2] = Default::default();
+    let senders: Vec<BatchSender> = arrivals
+        .iter()
+        .map(|arrivals| BatchSender {
+            arrivals: Rc::clone(arrivals),
+        })
+        .collect();
+    // Sender 0 is on the first interface, and sender 1 on the second, which carries the
+    // highest-priority traffic.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        SharedReceiver {
+            values: Rc::clone(&input),
+        },
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+    let arrived = |sender: usize, batch: (bool, usize)| {
+        arrivals[sender]
+            .borrow()
+            .iter()
+            .filter(|&&arrival| arrival == batch)
+            .count()
+    };
+
+    // Put the bucket of each interface in debt with bulk batches, one at a time and without
+    // moving the clock. The first goes to either interface, and the second most often to the
+    // other one; where the second goes to the same one, it waits there, and the third goes to
+    // the other one, the only interface that doesn't hold a batch.
+    let mut bulk_batches = 0;
+    while router.debt_nanos(0) == 0 || router.debt_nanos(1) == 0 {
+        assert!(
+            bulk_batches < 3,
+            "three bulk batches didn't put both interfaces in debt"
+        );
+        input.borrow_mut().push_back(bulk());
+        bulk_batches += 1;
+        assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    }
+
+    // A batch of pings goes at once to the chosen interface, though its bucket holds a debt, and
+    // its cost is charged to that bucket alone.
+    let mut pings = FrameBatch::single(ping());
+    for _ in 1..PINGS {
+        pings.push(ping());
+    }
+    assert!(pings.holds_highest_priority());
+    let cost = rate.nanos_for_bytes(pings.byte_cost());
+    let debts = [router.debt_nanos(0), router.debt_nanos(1)];
+    input.borrow_mut().push_back(pings);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(
+        arrived(1, (true, PINGS)),
+        1,
+        "the pings didn't reach the chosen interface"
+    );
+    assert_eq!(
+        arrived(0, (true, PINGS)),
+        0,
+        "the pings reached the other interface"
+    );
+    assert_eq!(router.debt_nanos(1), debts[1] + cost);
+    assert_eq!(router.debt_nanos(0), debts[0]);
+
+    // A ping beside a `QueueData` frame isn't a batch of the highest priority level: it waits on
+    // its interface until that interface's timer fires, once the bucket has paid its debt.
+    let mut mixed = FrameBatch::single(ping());
+    mixed.push(data(1_000));
+    assert!(!mixed.holds_highest_priority());
+    input.borrow_mut().push_back(mixed);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    let mixed_arrivals = || arrived(0, (false, 2)) + arrived(1, (false, 2));
+    assert_eq!(mixed_arrivals(), 0, "the mixed batch went at once");
+
+    // Each interface's timer fires once the clock reaches its debt.
+    let debts = [router.debt_nanos(0), router.debt_nanos(1)];
+    let (first, last) = (debts[0].min(debts[1]), debts[0].max(debts[1]));
+    clock.advance(std::time::Duration::from_nanos(first - 1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(
+        mixed_arrivals(),
+        0,
+        "the mixed batch went before its interface's timer"
+    );
+    clock.advance(std::time::Duration::from_nanos(last - first + 1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(
+        mixed_arrivals(),
+        1,
+        "the mixed batch didn't go once its interface's timer fired"
+    );
+}
+
+/// A receiver of test items that adds the bytes each `on_consumed` call reports to a count the
+/// test reads while the router holds the receiver.
+struct ConsumedReceiver {
+    inner: TestReceiver<TestItem>,
+    consumed: Rc<std::cell::Cell<u64>>,
+}
+
+impl Receiver<TestItem> for ConsumedReceiver {
+    fn poll_recv(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        budget: &mut Budget,
+    ) -> Poll<Option<TestItem>> {
+        self.inner.poll_recv(cx, budget)
+    }
+
+    fn on_consumed(&mut self, bytes: u64) {
+        self.consumed.set(self.consumed.get() + bytes);
+    }
+}
+
+/// A sender that takes `accepts` items and then refuses each item, as a worker that has gone.
+struct GoneAfter {
+    accepts: usize,
+}
+
+impl UnboundedSender<TestItem> for GoneAfter {
+    fn send(&mut self, value: TestItem) -> Result<(), TestItem> {
+        if self.accepts == 0 {
+            return Err(value);
+        }
+        self.accepts -= 1;
+        drop(value);
+        Ok(())
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_sends_a_highest_priority_batch_while_every_interface_holds_one() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    // Four bulk batches, each of more bytes than a burst, and then a batch of the highest
+    // priority level of 1 byte.
+    let mut values = test_items(&entry, 4, 100_000, &drop_counter);
+    let mut highest = new_test_item(entry.clone(), drop_counter.clone());
+    highest.byte_cost = 1;
+    highest.highest_priority = true;
+    values.push_back(highest);
+    let rx = TestReceiver {
+        values,
+        consumed: 0,
+    };
+    let sends: [Sends; 2] = Default::default();
+    // The second interface carries the highest-priority traffic.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&sends[0], &sends[1]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+    let costs = |sender: usize| -> Vec<u64> {
+        sends[sender]
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect()
+    };
+
+    // Each interface sends one bulk batch at once and holds the next until its bucket has paid
+    // for the first, so that every interface holds a batch. The highest-priority batch behind
+    // them still reaches the second interface's worker at once, before either held batch goes.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(costs(0), [100_000]);
+    assert_eq!(costs(1), [100_000, 1]);
+
+    // Once the buckets have paid, the held batches go.
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(costs(0), [100_000, 100_000]);
+    assert_eq!(costs(1), [100_000, 1, 100_000]);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn interface_paced_pick_two_keeps_a_batch_read_while_every_interface_holds_one() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    // Four bulk batches fill both interfaces, and the two after them cost 1 and 2 bytes more,
+    // so that the records tell them apart.
+    let mut values = test_items(&entry, 4, 100_000, &drop_counter);
+    values.extend(test_items(&entry, 1, 100_001, &drop_counter));
+    values.extend(test_items(&entry, 1, 100_002, &drop_counter));
+    let consumed = Rc::new(std::cell::Cell::new(0));
+    let rx = ConsumedReceiver {
+        inner: TestReceiver {
+            values,
+            consumed: 0,
+        },
+        consumed: consumed.clone(),
+    };
+    let sends: [Sends; 2] = Default::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&sends[0], &sends[1]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+    let sent = |cost: u64| {
+        sends
+            .iter()
+            .map(|sends| sends.borrow().iter().filter(|&&(_, c)| c == cost).count())
+            .sum::<usize>()
+    };
+
+    // While every interface holds a batch, the router reads the fifth batch and keeps it, and
+    // doesn't read the sixth. It tells upstream of each batch it read.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(100_000), 2);
+    assert_eq!(sent(100_001), 0);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 2);
+    assert_eq!(consumed.get(), 4 * 100_000 + 100_001);
+
+    // Once the buckets have paid, the held batches go, and the router routes the kept batch and
+    // then reads the sixth. Each interface holds one of them until it has paid again.
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(100_000), 4);
+    assert_eq!(sent(100_001) + sent(100_002), 0);
+    assert_eq!(consumed.get(), 4 * 100_000 + 100_001 + 100_002);
+
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(sent(100_001), 1);
+    assert_eq!(sent(100_002), 1);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 6);
+    assert_eq!(consumed.get(), 4 * 100_000 + 100_001 + 100_002);
+}
+
+#[test]
+fn interface_paced_pick_two_returns_the_credit_of_a_kept_batch_when_the_worker_is_gone() {
+    const CAP: u64 = 1_000_000;
+    const CREDIT: u64 = 4096;
+
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let pool = crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(CAP)));
+    let mut values = test_items(&test_path_secret_entry(), 5, 100_000, &drop_counter);
+    for item in &mut values {
+        item.flow_credits = CREDIT;
+    }
+    let rx = TestReceiver {
+        values,
+        consumed: 0,
+    };
+    // Each worker takes one batch and is gone after it.
+    let senders = vec![GoneAfter { accepts: 1 }, GoneAfter { accepts: 1 }];
+    let rate = Rate::new(1.0);
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        pool.clone(),
+    );
+
+    // Each interface sends a batch and holds one, and the router keeps the fifth.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 2);
+
+    // The first held batch to go finds its worker gone: the router drops it, the other held
+    // batch and the kept batch, and returns the credit of the three to the pool.
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 5);
+    // The items' credit wasn't drawn from the pool, so the return of three shows as a balance
+    // of `CAP + 3 * CREDIT`.
+    assert_eq!(
+        pool.debug_available() as u64 + pool.debug_returned(),
+        CAP + 3 * CREDIT,
+        "the router didn't return the send credit of each batch it held or kept",
+    );
+}
+
+#[test]
+fn interface_paced_pick_two_without_a_chosen_interface_waits_for_a_free_interface() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    let mut values = test_items(&entry, 4, 100_000, &drop_counter);
+    let mut highest = new_test_item(entry.clone(), drop_counter.clone());
+    highest.byte_cost = 1;
+    highest.highest_priority = true;
+    values.push_back(highest);
+    let consumed = Rc::new(std::cell::Cell::new(0));
+    let rx = ConsumedReceiver {
+        inner: TestReceiver {
+            values,
+            consumed: 0,
+        },
+        consumed: consumed.clone(),
+    };
+    let sends: [Sends; 2] = Default::default();
+    // Without an interface for the highest-priority traffic, the fifth batch goes as any other.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&sends[0], &sends[1]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+    let sent = || {
+        sends
+            .iter()
+            .map(|sends| sends.borrow().len())
+            .sum::<usize>()
+    };
+
+    // While every interface holds a batch, the router doesn't read the fifth.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(), 2);
+    assert_eq!(consumed.get(), 4 * 100_000);
+
+    // Once the buckets have paid, the held batches go, and the router reads the fifth, which
+    // waits until its interface has paid again.
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(), 4);
+    assert_eq!(consumed.get(), 4 * 100_000 + 1);
+
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(sent(), 5);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn interface_paced_pick_two_doesnt_count_a_batch_whose_route_fails() {
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let values = test_items(&test_path_secret_entry(), 1, 100_000, &drop_counter);
+    let consumed = Rc::new(std::cell::Cell::new(0));
+    let rx = ConsumedReceiver {
+        inner: TestReceiver {
+            values,
+            consumed: 0,
+        },
+        consumed: consumed.clone(),
+    };
+    // Both workers are gone, so the route of the one batch fails.
+    let senders = vec![GoneAfter { accepts: 0 }, GoneAfter { accepts: 0 }];
+    let rate = Rate::new(1.0);
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    // The router reads the batch and finds its worker gone: it drops the batch, and doesn't
+    // tell upstream that the batch was consumed.
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        consumed.get(),
+        0,
+        "the router counted a batch whose route failed"
+    );
+}
+
+/// A receiver of test items that the test feeds and closes while the router holds a clone of it.
+/// It answers `Pending` while it doesn't hold an item and the test hasn't closed it, and adds the
+/// bytes each `on_consumed` call reports to a count.
+#[derive(Clone, Default)]
+struct ClosableReceiver {
+    values: Rc<RefCell<VecDeque<TestItem>>>,
+    closed: Rc<std::cell::Cell<bool>>,
+    consumed: Rc<std::cell::Cell<u64>>,
+}
+
+impl Receiver<TestItem> for ClosableReceiver {
+    fn poll_recv(
+        &mut self,
+        _cx: &mut task::Context<'_>,
+        _budget: &mut Budget,
+    ) -> Poll<Option<TestItem>> {
+        match self.values.borrow_mut().pop_front() {
+            Some(value) => Poll::Ready(Some(value)),
+            None if self.closed.get() => Poll::Ready(None),
+            None => Poll::Pending,
+        }
+    }
+
+    fn on_consumed(&mut self, bytes: u64) {
+        self.consumed.set(self.consumed.get() + bytes);
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_sends_its_highest_priority_input_ahead_of_a_waiting_bulk_batch() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    // Five bulk batches, each of more bytes than a burst, in the bulk input, which closes after
+    // them, and an input for the highest priority level, which the test feeds later. The bulk
+    // batches cost 100,000 to 100,004 bytes, in the order the bulk input holds them, so that the
+    // records tell them apart.
+    let rx = ClosableReceiver::default();
+    for byte_cost in 100_000..100_005 {
+        let items = test_items(&entry, 1, byte_cost, &drop_counter);
+        rx.values.borrow_mut().extend(items);
+    }
+    rx.closed.set(true);
+    let highest_rx = ClosableReceiver::default();
+    let sends: [Sends; 2] = Default::default();
+    // The second interface carries the highest-priority traffic.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx.clone(),
+        timed_senders(&clock, &[&sends[0], &sends[1]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+    let costs = |sender: usize| -> Vec<u64> {
+        sends[sender]
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect()
+    };
+    // The byte costs of the bulk batches an interface has sent, in the order it sent them.
+    let bulk = |sender: usize| -> Vec<u64> {
+        costs(sender)
+            .into_iter()
+            .filter(|&cost| cost >= 100_000)
+            .collect()
+    };
+    // Checks that each interface has sent the bulk batches it took in the order the bulk input
+    // held them, and returns the byte costs of the bulk batches sent, in increasing order.
+    let bulk_sent = || -> Vec<u64> {
+        let mut sent = Vec::new();
+        for sender in 0..sends.len() {
+            let taken = bulk(sender);
+            assert!(
+                taken.windows(2).all(|pair| pair[0] < pair[1]),
+                "interface {sender} sent its bulk batches out of order: {taken:?}"
+            );
+            sent.extend(taken);
+        }
+        sent.sort_unstable();
+        sent
+    };
+
+    // Each interface sends one bulk batch and holds the next, so that every interface holds a
+    // batch. The router doesn't read the fifth bulk batch, which waits in the bulk input.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(bulk_sent().len(), 2);
+    assert_eq!(rx.values.borrow().len(), 1);
+    assert_eq!(rx.values.borrow()[0].byte_cost, 100_004);
+    assert_eq!(rx.consumed.get(), 100_000 + 100_001 + 100_002 + 100_003);
+
+    // Two batches reach the input of the highest priority level, the second one not marked as of
+    // that level. Each goes at once to the second interface's worker, ahead of the bulk batch
+    // that waits and of the held ones.
+    let mut highest = new_test_item(entry.clone(), drop_counter.clone());
+    highest.byte_cost = 1;
+    highest.highest_priority = true;
+    let mut unmarked = new_test_item(entry.clone(), drop_counter.clone());
+    unmarked.byte_cost = 2;
+    highest_rx.values.borrow_mut().push_back(highest);
+    highest_rx.values.borrow_mut().push_back(unmarked);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(bulk(1).len(), 1);
+    assert_eq!(costs(1)[1..], [1, 2]);
+    assert_eq!(rx.values.borrow().len(), 1);
+    assert_eq!(highest_rx.consumed.get(), 1 + 2);
+
+    // Once the buckets have paid, the held batches go, and the router reads the fifth bulk
+    // batch, which waits until its interface has paid again. Each interface has sent its bulk
+    // batches in the order the bulk input held them.
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(bulk_sent(), [100_000, 100_001, 100_002, 100_003]);
+    assert_eq!(
+        rx.consumed.get(),
+        100_000 + 100_001 + 100_002 + 100_003 + 100_004
+    );
+
+    // The bulk input is closed and empty, and the router goes on while the input of the highest
+    // priority level is open.
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(bulk_sent(), [100_000, 100_001, 100_002, 100_003, 100_004]);
+
+    highest_rx.closed.set(true);
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 7);
+}
+
+#[test]
+fn interface_paced_pick_two_without_a_chosen_interface_routes_the_highest_input_as_any_other() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    let rx = ClosableReceiver::default();
+    rx.values
+        .borrow_mut()
+        .extend(test_items(&entry, 4, 100_000, &drop_counter));
+    rx.closed.set(true);
+    let highest_rx = ClosableReceiver::default();
+    let sends: [Sends; 2] = Default::default();
+    // Without an interface for the highest-priority traffic, the batches of that level's input
+    // go as any other.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx.clone(),
+        timed_senders(&clock, &[&sends[0], &sends[1]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+    let sent = || {
+        sends
+            .iter()
+            .map(|sends| sends.borrow().len())
+            .sum::<usize>()
+    };
+
+    // Each interface sends one bulk batch and holds the next.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(), 2);
+
+    // A batch of the highest priority level waits in its input while every interface holds a
+    // batch.
+    let mut highest = new_test_item(entry.clone(), drop_counter.clone());
+    highest.byte_cost = 1;
+    highest.highest_priority = true;
+    highest_rx.values.borrow_mut().push_back(highest);
+    highest_rx.closed.set(true);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(), 2);
+    assert_eq!(highest_rx.values.borrow().len(), 1);
+
+    // Once the buckets have paid, the held batches go, and the router reads the batch of the
+    // highest priority level, which waits until its interface has paid again.
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(), 4);
+    assert!(highest_rx.values.borrow().is_empty());
+    assert_eq!(highest_rx.consumed.get(), 1);
+
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(sent(), 5);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn interface_paced_pick_two_reads_ahead_again_once_its_highest_priority_input_closes() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    // The bulk input holds four bulk batches, each of more bytes than a burst, a 1-byte batch of
+    // the highest priority level and a fifth bulk batch, and closes after them. The input of the
+    // highest priority level stays empty until the test closes it.
+    let rx = ClosableReceiver::default();
+    rx.values
+        .borrow_mut()
+        .extend(test_items(&entry, 4, 100_000, &drop_counter));
+    let mut highest = new_test_item(entry.clone(), drop_counter.clone());
+    highest.byte_cost = 1;
+    highest.highest_priority = true;
+    rx.values.borrow_mut().push_back(highest);
+    rx.values
+        .borrow_mut()
+        .extend(test_items(&entry, 1, 100_000, &drop_counter));
+    rx.closed.set(true);
+    let highest_rx = ClosableReceiver::default();
+    let sends: [Sends; 2] = Default::default();
+    // The second interface carries the highest-priority traffic.
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx.clone(),
+        timed_senders(&clock, &[&sends[0], &sends[1]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+    let costs = |sender: usize| -> Vec<u64> {
+        sends[sender]
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect()
+    };
+    let sent = |cost: u64| {
+        sends
+            .iter()
+            .map(|sends| sends.borrow().iter().filter(|&&(_, c)| c == cost).count())
+            .sum::<usize>()
+    };
+
+    // Each interface sends one bulk batch and holds the next. While the input of the highest
+    // priority level is open, the router doesn't read the bulk input ahead, so the 1-byte batch
+    // and the fifth bulk batch wait there.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(100_000), 2);
+    assert_eq!(costs(1), [100_000]);
+    assert_eq!(rx.values.borrow().len(), 2);
+    assert_eq!(rx.consumed.get(), 4 * 100_000);
+
+    // Once that input closes, the router reads the bulk input ahead again while every interface
+    // holds a batch: the 1-byte batch goes at once to the second interface's worker, and the
+    // router keeps the fifth bulk batch.
+    highest_rx.closed.set(true);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(costs(1), [100_000, 1]);
+    assert_eq!(sent(100_000), 2);
+    assert!(rx.values.borrow().is_empty());
+    assert_eq!(rx.consumed.get(), 4 * 100_000 + 1 + 100_000);
+
+    // Once the buckets have paid, the held batches go, and the router routes the fifth bulk
+    // batch, which waits until its interface has paid again.
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(sent(100_000), 4);
+
+    clock.advance(std::time::Duration::from_millis(2));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(sent(100_000), 5);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 6);
+}
+
+/// Routes `items` items of `entry` with pick-two over one test sender for each of the entry's
+/// sender slots, and returns how many items each sender got.
+fn pick_two_calls(entry: &Arc<PathSecretEntry>, items: usize, seed: u64) -> Vec<usize> {
+    let mut senders: Vec<TestSender> = (0..entry.socket_sender_count())
+        .map(|_| TestSender {
+            accept: true,
+            calls: 0,
+        })
+        .collect();
+    let mut rng = crate::xorshift::Rng::with_seed(seed);
+    let mut rr = 0;
+    for _ in 0..items {
+        let item = new_test_item(entry.clone(), Arc::new(AtomicUsize::new(0)));
+        assert!(try_send_pick_two_with_rr(item, &mut senders, &mut rng, &mut rr).is_ok());
+    }
+    senders.iter().map(|sender| sender.calls).collect()
+}
+
+#[test]
+fn pick_two_skips_lost_senders_while_another_delivers() {
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    assert!(entry.set_sender_lost(sender(1), true));
+    assert!(entry.set_sender_lost(sender(3), true));
+
+    let calls = pick_two_calls(&entry, 100, 1);
+    assert_eq!(
+        calls[1] + calls[3],
+        0,
+        "a lost sender got an item: {calls:?}"
+    );
+    assert_eq!(calls[0] + calls[2], 100);
+    assert!(
+        calls[0] > 0 && calls[2] > 0,
+        "a sender that delivers didn't get an item: {calls:?}"
+    );
+
+    // Once the pair of sender 1 delivers again, the router chooses it again.
+    assert!(entry.set_sender_lost(sender(1), false));
+    let calls = pick_two_calls(&entry, 100, 2);
+    assert_eq!(calls[3], 0, "a lost sender got an item: {calls:?}");
+    assert!(calls[1] > 0, "sender 1 didn't get an item: {calls:?}");
+}
+
+#[test]
+fn pick_two_spreads_items_over_every_sender_while_every_pair_is_lost() {
+    let entry = test_path_secret_entry();
+    for idx in 0..2 {
+        assert!(entry.set_sender_lost(LocalSenderId::from_index(idx), true));
+    }
+
+    // Where no pair delivers, the router chooses among every sender, as it does with no lost
+    // pair.
+    let calls = pick_two_calls(&entry, 100, 3);
+    assert_eq!(calls.iter().sum::<usize>(), 100);
+    assert!(
+        calls.iter().all(|&calls| calls > 0),
+        "a sender didn't get an item: {calls:?}"
+    );
+}
+
+/// Returns `highest` items of `entry` that hold a frame of the highest priority level, and then
+/// `other` items that don't. A highest-priority item costs 1 byte and any other item 2, so that
+/// each sender's record tells them apart.
+fn priority_items(
+    entry: &Arc<PathSecretEntry>,
+    drop_counter: &Arc<AtomicUsize>,
+    highest: usize,
+    other: usize,
+) -> VecDeque<TestItem> {
+    let item = |highest_priority: bool| {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = if highest_priority { 1 } else { 2 };
+        item.highest_priority = highest_priority;
+        item
+    };
+    (0..highest)
+        .map(|_| item(true))
+        .chain((0..other).map(|_| item(false)))
+        .collect()
+}
+
+/// Routes `values` with an interface-paced pick-two over four senders, 0 and 1 on the first
+/// interface and 2 and 3 on the second, which carries the highest-priority traffic. Returns, for
+/// each sender, how many highest-priority items and how many other items it got.
+fn route_by_interface(values: VecDeque<TestItem>) -> [[usize; 2]; 4] {
+    let rate = Rate::new(100.0);
+    let clock = test_clock();
+    let sends: [Sends; 4] = Default::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 0, 1, 1]).with_highest_priority(1);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        TestReceiver {
+            values,
+            consumed: 0,
+        },
+        timed_senders(&clock, &[&sends[0], &sends[1], &sends[2], &sends[3]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+
+    let count = |sender: usize, bytes: u64| {
+        sends[sender]
+            .borrow()
+            .iter()
+            .filter(|&&(_, cost)| cost == bytes)
+            .count()
+    };
+    [0, 1, 2, 3].map(|sender| [count(sender, 1), count(sender, 2)])
+}
+
+#[test]
+fn interface_paced_pick_two_skips_lost_pairs_while_another_delivers() {
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    let items = || priority_items(&entry, &drop_counter, 20, 20);
+
+    // While the pair of sender 0 is lost, the other items go to senders 1 to 3, and the
+    // highest-priority items stay on the second interface.
+    assert!(entry.set_sender_lost(sender(0), true));
+    let counts = route_by_interface(items());
+    assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert_eq!(counts[2][0] + counts[3][0], 20);
+    assert_eq!(counts[1][1] + counts[2][1] + counts[3][1], 20);
+
+    // While every pair of the second interface is lost too, every item goes to sender 1, the
+    // highest-priority items among them.
+    assert!(entry.set_sender_lost(sender(2), true));
+    assert!(entry.set_sender_lost(sender(3), true));
+    assert_eq!(
+        route_by_interface(items()),
+        [[0, 0], [20, 20], [0, 0], [0, 0]]
+    );
+
+    // Once the pairs of the second interface deliver again, the highest-priority items go back
+    // to it.
+    assert!(entry.set_sender_lost(sender(2), false));
+    assert!(entry.set_sender_lost(sender(3), false));
+    let counts = route_by_interface(items());
+    assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert_eq!(counts[2][0] + counts[3][0], 20);
+}
+
+#[test]
+fn interface_paced_pick_two_chooses_by_one_read_of_the_lost_marks() {
+    let rate = Rate::new(100.0);
+    let clock = test_clock();
+    let sends: [Sends; 4] = Default::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 0, 1, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        TestReceiver {
+            values: VecDeque::new(),
+            consumed: 0,
+        },
+        timed_senders(&clock, &[&sends[0], &sends[1], &sends[2], &sends[3]]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let sender = LocalSenderId::from_index;
+    assert!(entry.set_sender_lost(sender(0), true));
+
+    // The router reads the marks while sender 0 alone is lost. Senders 1 and 2 are marked lost
+    // after that read and before the router chooses: the router chooses by the marks it read,
+    // among senders 1 to 3, and doesn't panic.
+    let mut chosen = [0usize; 4];
+    for _ in 0..30 {
+        let choice = router
+            .choose_sender_after_read(&entry, false, || {
+                assert!(entry.set_sender_lost(sender(1), true));
+                assert!(entry.set_sender_lost(sender(2), true));
+            })
+            .expect("a sender the router read as delivering is free");
+        chosen[choice.as_usize()] += 1;
+        assert!(entry.set_sender_lost(sender(1), false));
+        assert!(entry.set_sender_lost(sender(2), false));
+    }
+    assert_eq!(
+        chosen[0], 0,
+        "the router chose the lost sender 0: {chosen:?}"
+    );
+    assert!(
+        chosen[1] + chosen[2] > 0,
+        "the router read the marks again after the first read: {chosen:?}",
+    );
+}
+
+/// A receiver of `values` that adds the bytes of each batch its router consumed to `consumed`,
+/// which the test reads while the router holds the receiver.
+struct SharedTestReceiver {
+    values: VecDeque<TestItem>,
+    consumed: Rc<std::cell::Cell<u64>>,
+}
+
+impl Receiver<TestItem> for SharedTestReceiver {
+    fn poll_recv(
+        &mut self,
+        _cx: &mut task::Context<'_>,
+        _budget: &mut Budget,
+    ) -> Poll<Option<TestItem>> {
+        Poll::Ready(self.values.pop_front())
+    }
+
+    fn on_consumed(&mut self, bytes: u64) {
+        self.consumed.set(self.consumed.get() + bytes);
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_holds_a_batch_until_a_sender_that_delivers_is_free() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let entry = test_path_secret_entry();
+    // The pair of the second interface's sender is lost, so the first interface's sender takes
+    // every batch.
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    let consumed = Rc::new(std::cell::Cell::new(0));
+    let rx = SharedTestReceiver {
+        values: test_items(&entry, 3, 100_000, &drop_counter),
+        consumed: Rc::clone(&consumed),
+    };
+    let delivers = Sends::default();
+    let lost = Sends::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&delivers, &lost]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    );
+
+    // Each batch costs more than a burst: the first goes at once, the second waits on the first
+    // interface, and the third waits in the router, though the second interface is free. The
+    // router consumed each of them once.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(delivers.borrow().len(), 1);
+    assert_eq!(consumed.get(), 300_000);
+
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(delivers.borrow().len(), 2);
+
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(delivers.borrow().len(), 3);
+    assert!(lost.borrow().is_empty(), "the lost sender got a batch");
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+    assert_eq!(consumed.get(), 300_000, "the router consumed a batch twice");
+}
+
+/// A sender whose receiver is gone once `gone` is set.
+struct GoneSender {
+    gone: Rc<std::cell::Cell<bool>>,
+}
+
+impl UnboundedSender<TestItem> for GoneSender {
+    fn send(&mut self, value: TestItem) -> Result<(), TestItem> {
+        if self.gone.get() {
+            Err(value)
+        } else {
+            drop(value);
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn interface_paced_pick_two_returns_the_credit_of_a_waiting_batch_when_the_worker_is_gone() {
+    const CAP: u64 = 1_000_000;
+    const CREDIT: u64 = 4096;
+
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let pool = crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(CAP)));
+    let entry = test_path_secret_entry();
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
+    let mut values = test_items(&entry, 3, 100_000, &drop_counter);
+    values[2].flow_credits = CREDIT;
+    let gone = Rc::new(std::cell::Cell::new(false));
+    let senders: Vec<_> = (0..2)
+        .map(|_| GoneSender {
+            gone: Rc::clone(&gone),
+        })
+        .collect();
+    let rate = Rate::new(1.0);
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        TestReceiver {
+            values,
+            consumed: 0,
+        },
+        senders.into(),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        pool.clone(),
+    );
+
+    // The first batch goes, the second waits on the first interface, and the third, which holds
+    // the credit, waits in the router.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+
+    // Once the worker is gone, the router returns the credit of the batch that waits in it too.
+    gone.set(true);
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+    // The credit wasn't drawn from the pool, so its return shows as a balance of `CAP + CREDIT`.
+    assert_eq!(
+        pool.debug_available() as u64 + pool.debug_returned(),
+        CAP + CREDIT,
+        "the router didn't return the waiting batch's send credit to the pool",
+    );
 }

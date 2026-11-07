@@ -11,19 +11,20 @@
 use super::helpers::{test_frame, test_frame_with_payload, TestReceiverExt as _};
 use crate::{
     endpoint::{
-        combinator::FrameBatch,
+        combinator::{FrameBatch, HighestPriority, SendPacing},
         frame::{self, PriorityInput, SubmissionSender},
         tasks, Budgets,
     },
     intrusive::EntryAdapter,
     runtime::bach::Local,
     socket::{
-        channel::{intrusive::unsync, UnboundedSender},
+        channel::{intrusive::unsync, ByteCost, UnboundedSender},
         rate::Rate,
     },
     testing::{ext::*, sim},
     time::bach::Clock,
 };
+use std::sync::{Arc, Mutex};
 
 type WorkerRx = unsync::Receiver<EntryAdapter<FrameBatch>>;
 
@@ -35,6 +36,11 @@ fn setup(num_workers: usize) -> (SubmissionSender, Vec<WorkerRx>) {
 
 /// Like [`setup`] but with a configurable overall send rate.
 fn setup_with_rates(num_workers: usize, overall_rate: Rate) -> (SubmissionSender, Vec<WorkerRx>) {
+    setup_with_pacing(num_workers, SendPacing::single(overall_rate))
+}
+
+/// Like [`setup`] but with a configurable pacing of the workers' send sockets.
+fn setup_with_pacing(num_workers: usize, pacing: SendPacing) -> (SubmissionSender, Vec<WorkerRx>) {
     let (frame_tx, frame_rx) = frame::submission_channel(1);
 
     let mut workers = Vec::with_capacity(num_workers);
@@ -52,7 +58,7 @@ fn setup_with_rates(num_workers: usize, overall_rate: Rate) -> (SubmissionSender
         workers.into(),
         crate::xorshift::Rng::new(),
         Clock::default(),
-        overall_rate,
+        pacing,
         Budgets::default(),
         crate::counter::Registry::default(),
         crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
@@ -240,4 +246,252 @@ fn pacing_delays_frames_beyond_burst() {
         .primary()
         .spawn();
     });
+}
+
+/// With two interfaces, each worker's batches arrive within its interface's rate and burst, and
+/// the worker on the fast interface gets more than the slow interface's rate allows.
+#[test]
+fn two_interfaces_pace_each_worker_to_its_interface_rate() {
+    let _snapshots = crate::testing::without_snapshots();
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let arrivals = Arc::new(Mutex::new(Vec::<(usize, u64, u64)>::new()));
+    let arrivals_in_sim = arrivals.clone();
+
+    sim(move || {
+        let pacing = SendPacing::new(vec![slow, fast], vec![0, 1]);
+        let (mut frame_tx, rxs) = setup_with_pacing(2, pacing);
+
+        // Each frame fills a batch of its own, as in `pacing_delays_frames_beyond_burst`.
+        async move {
+            let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+                .socket_sender_count(2)
+                .build(None);
+            let mut input = PriorityInput::default();
+            for _ in 0..40 {
+                input.push(test_frame_with_payload(&pse, u16::MAX as usize));
+            }
+            frame_tx.send_batch(input).unwrap();
+        }
+        .primary()
+        .spawn();
+
+        for (worker, mut worker_rx) in rxs.into_iter().enumerate() {
+            let arrivals = arrivals_in_sim.clone();
+            async move {
+                while let Some(batch) = worker_rx.recv().await {
+                    let at = bach::time::Instant::now().elapsed_since_start().as_nanos() as u64;
+                    let bytes = batch.byte_cost();
+                    arrivals.lock().unwrap().push((worker, at, bytes));
+                }
+            }
+            .primary()
+            .spawn();
+        }
+    });
+
+    let arrivals = arrivals.lock().unwrap();
+    assert_eq!(arrivals.len(), 40, "one batch for each frame");
+    let mut received = [0u64; 2];
+    for (worker, rate) in [(0, slow), (1, fast)] {
+        let mut sent_before = 0;
+        for &(_, at, bytes) in arrivals.iter().filter(|arrival| arrival.0 == worker) {
+            // The batches before this one fit in the interface's rate and burst, with 2 us
+            // allowed for timer rounding.
+            let allowed = at + rate.burst_nanos() + 2_000;
+            assert!(
+                rate.nanos_for_bytes(sent_before) <= allowed,
+                "worker {worker} got a batch at {at} ns after {sent_before} bytes",
+            );
+            sent_before += bytes;
+        }
+        received[worker] = sent_before;
+    }
+    let [slow_bytes, fast_bytes] = received;
+    assert!(slow_bytes > 0, "the slow worker didn't get a batch");
+    assert!(
+        fast_bytes >= 2 * slow_bytes,
+        "the fast worker got {fast_bytes} bytes, the slow one {slow_bytes}",
+    );
+}
+
+/// With an interface chosen for the highest-priority traffic, each batch whose frames are all of
+/// the highest priority level goes to a worker of that interface, and the other batches still go
+/// to the workers of both interfaces.
+#[test]
+fn highest_priority_batches_go_to_the_chosen_interface() {
+    const PINGS: usize = 20;
+    let _snapshots = crate::testing::without_snapshots();
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let arrivals = Arc::new(Mutex::new(Vec::<(usize, bool, usize)>::new()));
+    let arrivals_in_sim = arrivals.clone();
+
+    sim(move || {
+        // Workers 0 and 1 are on the slow interface, and workers 2 and 3 on the fast one, which
+        // carries the highest-priority traffic.
+        let pacing = SendPacing::new(vec![slow, fast], vec![0, 0, 1, 1]).with_highest_priority(1);
+        let (mut frame_tx, rxs) = setup_with_pacing(4, pacing);
+
+        async move {
+            let peer = |addr: &str| {
+                crate::path::secret::map::Entry::builder(addr.parse().unwrap())
+                    .socket_sender_count(4)
+                    .build(None)
+            };
+            let bulk_peer = peer("127.0.0.1:4433");
+            // The pings go to a peer of their own, so that a batch doesn't hold a ping beside a
+            // bulk frame.
+            let ping_peer = peer("127.0.0.1:4434");
+            for _ in 0..PINGS {
+                let mut input = PriorityInput::default();
+                input.push(test_frame_with_payload(&bulk_peer, u16::MAX as usize));
+                let mut ping = test_frame(&ping_peer);
+                ping.header = frame::Header::Ping;
+                input.push(ping);
+                frame_tx.send_batch(input).unwrap();
+                bach::time::sleep(core::time::Duration::from_micros(50)).await;
+            }
+        }
+        .primary()
+        .spawn();
+
+        for (worker, mut worker_rx) in rxs.into_iter().enumerate() {
+            let arrivals = arrivals_in_sim.clone();
+            async move {
+                while let Some(batch) = worker_rx.recv().await {
+                    let highest = batch.holds_highest_priority();
+                    arrivals
+                        .lock()
+                        .unwrap()
+                        .push((worker, highest, batch.len()));
+                }
+            }
+            .primary()
+            .spawn();
+        }
+    });
+
+    let arrivals = arrivals.lock().unwrap();
+    let frames: usize = arrivals.iter().map(|arrival| arrival.2).sum();
+    assert_eq!(frames, 2 * PINGS, "every frame arrived");
+    let pings: usize = arrivals
+        .iter()
+        .filter(|arrival| arrival.1)
+        .map(|arrival| arrival.2)
+        .sum();
+    assert_eq!(
+        pings, PINGS,
+        "each ping is in a batch of the highest priority level"
+    );
+    for &(worker, highest, _) in arrivals.iter() {
+        assert!(
+            !highest || worker >= 2,
+            "worker {worker} on the slow interface got a ping"
+        );
+    }
+    let bulk_on = |workers: core::ops::Range<usize>| {
+        arrivals
+            .iter()
+            .any(|&(worker, highest, _)| !highest && workers.contains(&worker))
+    };
+    assert!(bulk_on(0..2), "the slow interface didn't get a bulk batch");
+    assert!(bulk_on(2..4), "the fast interface didn't get a bulk batch");
+}
+
+/// A batch is of the highest priority level only where every frame it holds is of that level,
+/// so that a bulk frame batched beside a ping is paced with its interface's bucket.
+#[test]
+fn a_batch_that_mixes_a_ping_with_a_bulk_frame_isnt_of_the_highest_priority() {
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .build(None);
+    let ping = || {
+        let mut ping = test_frame(&pse);
+        ping.header = frame::Header::Ping;
+        ping
+    };
+
+    let mut pings = FrameBatch::single(ping());
+    pings.push(ping());
+    assert!(pings.holds_highest_priority(), "a batch of pings");
+
+    let mut mixed = FrameBatch::single(ping());
+    mixed.push(test_frame_with_payload(&pse, 1000));
+    assert!(
+        !mixed.holds_highest_priority(),
+        "a ping beside a bulk frame"
+    );
+
+    let bulk = FrameBatch::single(test_frame_with_payload(&pse, 1000));
+    assert!(!bulk.holds_highest_priority(), "a bulk frame");
+}
+
+/// With an interface chosen for the highest-priority traffic, frame dispatch batches the frames
+/// of the highest priority level apart from the bulk frames of the same peer, so that each such
+/// frame goes in a batch of that level to a worker of the chosen interface.
+#[test]
+fn highest_priority_frames_beside_bulk_frames_go_to_the_chosen_interface() {
+    const PINGS: usize = 20;
+    let _snapshots = crate::testing::without_snapshots();
+    let slow = Rate::new(1.0);
+    let fast = Rate::new(4.0);
+    let arrivals = Arc::new(Mutex::new(Vec::<(usize, bool, usize)>::new()));
+    let arrivals_in_sim = arrivals.clone();
+
+    sim(move || {
+        // Workers 0 and 1 are on the slow interface, and workers 2 and 3 on the fast one, which
+        // carries the highest-priority traffic.
+        let pacing = SendPacing::new(vec![slow, fast], vec![0, 0, 1, 1]).with_highest_priority(1);
+        let (mut frame_tx, rxs) = setup_with_pacing(4, pacing);
+
+        async move {
+            // Each submission holds a bulk frame and a ping, both for the same peer.
+            let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+                .socket_sender_count(4)
+                .build(None);
+            for _ in 0..PINGS {
+                let mut input = PriorityInput::default();
+                input.push(test_frame_with_payload(&pse, 1000));
+                let mut ping = test_frame(&pse);
+                ping.header = frame::Header::Ping;
+                input.push(ping);
+                frame_tx.send_batch(input).unwrap();
+                bach::time::sleep(core::time::Duration::from_micros(50)).await;
+            }
+        }
+        .primary()
+        .spawn();
+
+        for (worker, mut worker_rx) in rxs.into_iter().enumerate() {
+            let arrivals = arrivals_in_sim.clone();
+            async move {
+                while let Some(batch) = worker_rx.recv().await {
+                    let highest = batch.holds_highest_priority();
+                    arrivals
+                        .lock()
+                        .unwrap()
+                        .push((worker, highest, batch.len()));
+                }
+            }
+            .primary()
+            .spawn();
+        }
+    });
+
+    let arrivals = arrivals.lock().unwrap();
+    let frames: usize = arrivals.iter().map(|arrival| arrival.2).sum();
+    assert_eq!(frames, 2 * PINGS, "every frame arrived");
+    let pings: usize = arrivals
+        .iter()
+        .filter(|arrival| arrival.1)
+        .map(|arrival| arrival.2)
+        .sum();
+    assert_eq!(pings, PINGS, "a ping was batched beside a bulk frame");
+    for &(worker, highest, _) in arrivals.iter() {
+        assert!(
+            !highest || worker >= 2,
+            "worker {worker} on the slow interface got a ping"
+        );
+    }
 }
