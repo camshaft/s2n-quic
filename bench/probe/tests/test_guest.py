@@ -96,7 +96,7 @@ class SimulatedRunner:
         self.size_download = len(ISO)
         self.disk_after_download = None
         self.private_modes = {}
-        self.signal_after_popen = False
+        self.signal_after_popen = None
         self.reap_timeout = False
 
     def clock(self):
@@ -178,7 +178,7 @@ class SimulatedRunner:
         process = Process(self)
         self.processes.append(process)
         if self.signal_after_popen:
-            signal.raise_signal(signal.SIGTERM)
+            signal.raise_signal(self.signal_after_popen)
         return process
 
     def channel(self, directory):
@@ -444,7 +444,7 @@ class BackendTests(unittest.TestCase):
                     guest.check_capacity(runner, self.settings, self.root)
         with mock.patch("guest.os.open", side_effect=PermissionError):
             with self.assertRaisesRegex(guest.GuestError, "no-kvm"):
-                guest.Runner().kvm()
+                guest.Runner(10).kvm()
 
     def test_deadline_settings_private_paths_and_existing_destination(self):
         with self.assertRaises(guest.GuestError):
@@ -500,30 +500,35 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(before, {s: signal.getsignal(s) for s in before})
 
     def test_signal_after_process_creation_still_reaps(self):
-        runner = SimulatedRunner(["prepared"])
-        runner.signal_after_popen = True
-        with self.assertRaisesRegex(guest.GuestError, "interrupted"):
-            self.prepare(runner)
-        self.assertEqual(len(runner.processes), 1)
-        self.assertFalse(self.image.exists())
-        self.assert_clean(runner)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                runner = SimulatedRunner(["prepared"])
+                runner.signal_after_popen = signum
+                with self.assertRaisesRegex(guest.GuestError, "interrupted"):
+                    self.prepare(runner)
+                self.assertEqual(len(runner.processes), 1)
+                self.assertFalse(self.image.exists())
+                self.assert_clean(runner)
 
     def test_signal_during_directory_removal_does_not_stop_cleanup(self):
-        runner = SimulatedRunner(["ready", "stopping"])
-        remove = guest.shutil.rmtree
-        signalled = []
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                runner = SimulatedRunner(["ready", "stopping"])
+                remove = guest.shutil.rmtree
+                signalled = []
 
-        def removal(*args, **kwargs):
-            signalled.append(True)
-            signal.raise_signal(signal.SIGTERM)
-            return remove(*args, **kwargs)
+                def removal(*args, **kwargs):
+                    signalled.append(True)
+                    self.assertFalse(guest._CANCELLATION.get()["interruptible"])
+                    signal.raise_signal(signum)
+                    return remove(*args, **kwargs)
 
-        with mock.patch("guest.shutil.rmtree", side_effect=removal):
-            with self.assertRaisesRegex(guest.GuestError, "interrupted"):
-                self.verify(runner)
-        self.assertTrue(signalled)
-        self.assert_clean(runner)
-        self.assertEqual(self.image.read_bytes(), IMAGE)
+                with mock.patch("guest.shutil.rmtree", side_effect=removal):
+                    with self.assertRaisesRegex(guest.GuestError, "interrupted"):
+                        self.verify(runner)
+                self.assertTrue(signalled)
+                self.assert_clean(runner)
+                self.assertEqual(self.image.read_bytes(), IMAGE)
 
     def test_cleanup_failure_keeps_the_primary_failure(self):
         for operation, phases, failure, expected_stage in (
@@ -540,11 +545,124 @@ class BackendTests(unittest.TestCase):
             self.assertNotIn("SECRET", str(error.exception))
             self.assert_clean(runner)
 
+    def test_signal_interrupts_the_guest_event_wait_before_its_deadline(self):
+        class WaitingChannel(guest.Channel):
+            def __init__(self, directory):
+                super().__init__(directory)
+                self.closed = False
+                self.write_fd = None
+
+            def attach(self, process):
+                self.pidfd, self.write_fd = os.pipe()
+
+            def __exit__(self, *args):
+                try:
+                    super().__exit__(*args)
+                finally:
+                    if self.write_fd is not None:
+                        os.close(self.write_fd)
+                    self.closed = True
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                runner = SimulatedRunner([])
+                started = runner.clock()
+                waiting = []
+
+                def channel(directory):
+                    value = WaitingChannel(directory)
+                    runner.channels.append(value)
+                    return value
+
+                def select_and_signal(readers, writers, errors, timeout):
+                    waiting.append(timeout)
+                    self.assertTrue(guest._CANCELLATION.get()["interruptible"])
+                    self.assertGreater(timeout, 0)
+                    signal.raise_signal(signum)
+                    self.fail("the event wait continued after cancellation")
+
+                runner.channel = channel
+                with mock.patch("guest.select.select", side_effect=select_and_signal):
+                    with self.assertRaisesRegex(guest.GuestError, "interrupted"):
+                        self.verify(runner)
+                self.assertEqual(len(waiting), 1)
+                self.assertLess(runner.clock() - started, self.settings.timeout_seconds)
+                self.assert_clean(runner)
+                self.assertEqual(self.image.read_bytes(), IMAGE)
+
+    def test_runner_protects_creation_and_interrupts_communication(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            for point in ("creation", "communication"):
+                with self.subTest(signum=signum, point=point):
+                    process = mock.Mock(pid=123)
+                    process.poll.return_value = None
+                    process.wait.return_value = -9
+
+                    def spawn(*args, **kwargs):
+                        self.assertFalse(guest._CANCELLATION.get()["interruptible"])
+                        if point == "creation":
+                            signal.raise_signal(signum)
+                        return process
+
+                    def communicate(timeout):
+                        self.assertTrue(guest._CANCELLATION.get()["interruptible"])
+                        signal.raise_signal(signum)
+                        self.fail("the subprocess wait continued after cancellation")
+
+                    process.communicate.side_effect = communicate
+                    with mock.patch("guest.subprocess.Popen", side_effect=spawn) as popen, mock.patch("guest.os.killpg") as kill:
+                        with self.assertRaisesRegex(guest.GuestError, "interrupted"):
+                            with guest.cancellation():
+                                guest.Runner(10).run(["fixture-command"], 600)
+                    self.assertTrue(popen.call_args.kwargs["start_new_session"])
+                    self.assertEqual(process.communicate.call_count, int(point == "communication"))
+                    kill.assert_called_once_with(123, signal.SIGKILL)
+                    process.wait.assert_called_once_with(timeout=10)
+                    process.stdout.close.assert_called_once()
+
+    def test_runner_results_and_timeout_reap_and_close_output(self):
+        for outcome in (0, 7, "timeout"):
+            with self.subTest(outcome=outcome):
+                process = mock.Mock(pid=123, returncode=outcome)
+                process.poll.return_value = None if outcome == "timeout" else outcome
+                process.wait.return_value = outcome
+                if outcome == "timeout":
+                    process.communicate.side_effect = subprocess.TimeoutExpired(["fixture-command"], 600)
+                else:
+                    process.communicate.return_value = (b"result", None)
+                with mock.patch("guest.subprocess.Popen", return_value=process), mock.patch("guest.os.killpg") as kill:
+                    if outcome == 0:
+                        self.assertEqual(guest.Runner(10).run(["fixture-command"], 600), b"result")
+                    else:
+                        with self.assertRaises(guest.GuestError) as error:
+                            with guest.stage("fixture"):
+                                guest.Runner(10).run(["fixture-command"], 600)
+                        self.assertEqual(error.exception.code, "timeout" if outcome == "timeout" else "command-failed")
+                self.assertEqual(kill.call_count, int(outcome == "timeout"))
+                process.wait.assert_called_once_with(timeout=10)
+                process.stdout.close.assert_called_once()
+
+    def test_pending_signal_precedes_a_failed_child_exit(self):
+        process = mock.Mock(pid=123, returncode=1)
+        process.poll.return_value = 1
+
+        def communicate(timeout):
+            guest._CANCELLATION.get()["requested"] = True
+            return b"discarded", None
+
+        process.communicate.side_effect = communicate
+        with mock.patch("guest.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(guest.GuestError, "interrupted"):
+                with guest.cancellation():
+                    guest.Runner(10).run(["fixture-command"], 600)
+        process.wait.assert_called_once_with(timeout=10)
+        process.stdout.close.assert_called_once()
+
     def test_real_reaper_kills_process_group_and_waits(self):
         process = mock.Mock(pid=123)
         process.poll.return_value = None
         with mock.patch("guest.os.killpg") as kill:
-            guest.Runner().reap(process, 10)
+            guest.Runner(10).reap(process, 10)
         kill.assert_called_once_with(123, signal.SIGKILL)
         process.wait.assert_called_once_with(timeout=10)
 

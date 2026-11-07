@@ -39,10 +39,12 @@ requires free space for two virtual-disk lengths for installation plus conversio
 it checks that space again after downloading and inspecting the media. Memory and free disk are read before starting the guest.
 Choose a job deadline that allows the operation and its cleanup allowance.
 The integrating caller must run these synchronous APIs on the main thread so
-SIGINT and SIGTERM can be recorded for cleanup. They end the operation as
-`GuestError` stage `interrupted`, code `signal`, at the next safe checkpoint;
-a running dependency may finish or reach its configured timeout first.
-Signals never raise during resource acquisition or cleanup.
+SIGINT and SIGTERM end the operation as `GuestError` stage `interrupted`, code
+`signal`. Active subprocess communication and guest event/process waits are
+interruptible immediately. Resource acquisition, short updates and cleanup are
+protected: a pending signal is raised after ownership is recorded or cleanup
+finishes. The operation deadline still bounds a dependency that hangs without
+a cancellation signal.
 
 `work_dir` must be owned by the caller, mode 0700, and outside both the image
 cache and uploaded result directories. A new work directory is created with

@@ -128,7 +128,8 @@ class Channel:
     def receive(self, deadline):
         while b"\n" not in self.buffer:
             stream = self.connection or self.server
-            readable, _, _ = select.select([stream, self.pidfd], [], [], deadline.remaining())
+            with interruptible_wait():
+                readable, _, _ = select.select([stream, self.pidfd], [], [], deadline.remaining())
             if not readable:
                 raise GuestError("event", "deadline")
             if stream in readable:
@@ -163,6 +164,9 @@ class Channel:
 class Runner:
     clock = staticmethod(time.monotonic)
 
+    def __init__(self, cleanup_seconds):
+        self.cleanup_seconds = cleanup_seconds
+
     def kvm(self):
         try:
             fd = os.open("/dev/kvm", os.O_RDWR)
@@ -179,10 +183,25 @@ class Runner:
         return shutil.disk_usage(path).free
 
     def run(self, command, timeout):
-        result = subprocess.run(command, check=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, timeout=timeout)
-        check_cancellation()
-        return result.stdout
+        process = None
+
+        def finish():
+            if process is not None:
+                try:
+                    self.reap(process, self.cleanup_seconds)
+                finally:
+                    process.stdout.close()
+
+        with cleanup_scope(finish):
+            # Acquisition cannot raise a signal exception before ownership is recorded.
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+            with interruptible_wait():
+                output, _ = process.communicate(timeout=timeout)
+            check_cancellation()
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, command)
+            return output
 
     def popen(self, command):
         return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -221,18 +240,34 @@ def check_cancellation():
 
 
 @contextlib.contextmanager
-def cancellation():
-    """Remember signals; raise only at checkpoints outside acquisition and cleanup.
+def interruptible_wait():
+    """Allow prompt cancellation only after the caller owns the waited resource."""
+    state = _CANCELLATION.get()
+    if state is None:
+        yield
+        return
+    previous = state["interruptible"]
+    try:
+        state["interruptible"] = True
+        check_cancellation()
+        yield
+    finally:
+        # Once interrupted, further signals only record a request during unwinding.
+        state["interruptible"] = previous and not state["requested"]
 
-    A running dependency can finish or reach its configured timeout before the
-    next checkpoint. A signal during cleanup is reported after cleanup finishes.
-    """
+
+@contextlib.contextmanager
+def cancellation():
+    """Interrupt owned waits; protect acquisition, short updates and all cleanup."""
     previous = {}
-    state = {"requested": False}
+    state = {"requested": False, "interruptible": False}
     token = _CANCELLATION.set(state)
 
     def interrupted(signum, frame):
         state["requested"] = True
+        if state["interruptible"]:
+            state["interruptible"] = False
+            raise GuestError("interrupted", "signal")
 
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -425,13 +460,16 @@ def event(channel, deadline, phase, nonce, edition=None):
 
 
 def clean_exit(process, deadline):
-    if process.wait(timeout=deadline.remaining()) != 0:
+    with interruptible_wait():
+        code = process.wait(timeout=deadline.remaining())
+    if code != 0:
         raise GuestError("shutdown", "qemu-failed")
     check_cancellation()
 
 
 def prepare_image(image_path, work_dir, *, settings=None, runner=None):
-    settings, runner = settings or Settings.from_environment(), runner or Runner()
+    settings = settings or Settings.from_environment()
+    runner = runner or Runner(settings.cleanup_seconds)
     with stage("prepare"), cancellation():
         runner.kvm()
         deadline = Deadline(settings.timeout_seconds, runner.clock)
@@ -500,7 +538,8 @@ def ssh_command(key, hosts, nonce, port, command):
 
 
 def verify_image(image_path, work_dir, *, settings=None, runner=None):
-    settings, runner = settings or Settings.from_environment(), runner or Runner()
+    settings = settings or Settings.from_environment()
+    runner = runner or Runner(settings.cleanup_seconds)
     with stage("verify"), cancellation():
         runner.kvm()
         deadline = Deadline(settings.timeout_seconds, runner.clock)
