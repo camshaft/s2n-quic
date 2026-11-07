@@ -1018,6 +1018,76 @@ pub mod api {
     impl Event for PathSecretMapAddressWriteLock {
         const NAME: &'static str = "path_secret_map:address_cache_write_lock";
     }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a send context marks its interface pair lost"]
+    pub struct PathSecretMapInterfacePairLost<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapInterfacePairLost<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapInterfacePairLost");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapInterfacePairLost<'a> {
+        const NAME: &'static str = "path_secret_map:interface_pair_lost";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a lost interface pair delivers again"]
+    pub struct PathSecretMapInterfacePairDelivering<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapInterfacePairDelivering<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapInterfacePairDelivering");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapInterfacePairDelivering<'a> {
+        const NAME: &'static str = "path_secret_map:interface_pair_delivering";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when a lost interface pair moves its frames to the pairs that deliver"]
+    pub struct PathSecretMapInterfacePairFramesMoved<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub frames: usize,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapInterfacePairFramesMoved<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapInterfacePairFramesMoved");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("frames", &self.frames);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapInterfacePairFramesMoved<'a> {
+        const NAME: &'static str = "path_secret_map:interface_pair_frames_moved";
+    }
+    #[derive(Clone, Debug)]
+    #[non_exhaustive]
+    #[doc = " Emitted when the idle wheel doesn't mark a peer dead because another pair delivers"]
+    pub struct PathSecretMapDeadMarkSkipped<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    #[cfg(any(test, feature = "testing"))]
+    impl<'a> crate::event::snapshot::Fmt for PathSecretMapDeadMarkSkipped<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapDeadMarkSkipped");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.finish()
+        }
+    }
+    impl<'a> Event for PathSecretMapDeadMarkSkipped<'a> {
+        const NAME: &'static str = "path_secret_map:dead_mark_skipped";
+    }
 }
 pub mod tracing {
     #![doc = r" This module contains event integration with [`tracing`](https://docs.rs/tracing)"]
@@ -1621,6 +1691,46 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapAddressWriteLock { acquire, duration } = event;
             tracing :: event ! (target : "path_secret_map_address_write_lock" , parent : parent , tracing :: Level :: DEBUG , { acquire = tracing :: field :: debug (acquire) , duration = tracing :: field :: debug (duration) });
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapInterfacePairLost { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_interface_pair_lost" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapInterfacePairDelivering { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_interface_pair_delivering" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapInterfacePairFramesMoved { peer_address, frames } = event;
+            tracing :: event ! (target : "path_secret_map_interface_pair_frames_moved" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , frames = tracing :: field :: debug (frames) });
+        }
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            let parent = self.parent(meta);
+            let api::PathSecretMapDeadMarkSkipped { peer_address } = event;
+            tracing :: event ! (target : "path_secret_map_dead_mark_skipped" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) });
         }
     }
 }
@@ -2644,6 +2754,70 @@ pub mod builder {
             }
         }
     }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a send context marks its interface pair lost"]
+    pub struct PathSecretMapInterfacePairLost<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapInterfacePairLost<'a>>
+        for PathSecretMapInterfacePairLost<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapInterfacePairLost<'a> {
+            let PathSecretMapInterfacePairLost { peer_address } = self;
+            api::PathSecretMapInterfacePairLost {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a lost interface pair delivers again"]
+    pub struct PathSecretMapInterfacePairDelivering<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapInterfacePairDelivering<'a>>
+        for PathSecretMapInterfacePairDelivering<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapInterfacePairDelivering<'a> {
+            let PathSecretMapInterfacePairDelivering { peer_address } = self;
+            api::PathSecretMapInterfacePairDelivering {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when a lost interface pair moves its frames to the pairs that deliver"]
+    pub struct PathSecretMapInterfacePairFramesMoved<'a> {
+        pub peer_address: SocketAddress<'a>,
+        pub frames: usize,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapInterfacePairFramesMoved<'a>>
+        for PathSecretMapInterfacePairFramesMoved<'a>
+    {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapInterfacePairFramesMoved<'a> {
+            let PathSecretMapInterfacePairFramesMoved { peer_address, frames } = self;
+            api::PathSecretMapInterfacePairFramesMoved {
+                peer_address: peer_address.into_event(),
+                frames: frames.into_event(),
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    #[doc = " Emitted when the idle wheel doesn't mark a peer dead because another pair delivers"]
+    pub struct PathSecretMapDeadMarkSkipped<'a> {
+        pub peer_address: SocketAddress<'a>,
+    }
+    impl<'a> IntoEvent<api::PathSecretMapDeadMarkSkipped<'a>> for PathSecretMapDeadMarkSkipped<'a> {
+        #[inline]
+        fn into_event(self) -> api::PathSecretMapDeadMarkSkipped<'a> {
+            let PathSecretMapDeadMarkSkipped { peer_address } = self;
+            api::PathSecretMapDeadMarkSkipped {
+                peer_address: peer_address.into_event(),
+            }
+        }
+    }
 }
 pub use traits::*;
 mod traits {
@@ -3142,6 +3316,46 @@ mod traits {
             let _ = meta;
             let _ = event;
         }
+        #[doc = "Called when the `PathSecretMapInterfacePairLost` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `PathSecretMapInterfacePairDelivering` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `PathSecretMapInterfacePairFramesMoved` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
+        #[doc = "Called when the `PathSecretMapDeadMarkSkipped` event is triggered"]
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            let _ = meta;
+            let _ = event;
+        }
         #[doc = r" Called for each event that relates to the endpoint and all connections"]
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -3550,6 +3764,42 @@ mod traits {
         ) {
             self.as_ref()
                 .on_path_secret_map_address_write_lock(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_interface_pair_lost(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_interface_pair_delivering(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_interface_pair_frames_moved(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            self.as_ref()
+                .on_path_secret_map_dead_mark_skipped(meta, event);
         }
         #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
@@ -3979,6 +4229,42 @@ mod traits {
             (self.1).on_path_secret_map_address_write_lock(meta, event);
         }
         #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            (self.0).on_path_secret_map_interface_pair_lost(meta, event);
+            (self.1).on_path_secret_map_interface_pair_lost(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            (self.0).on_path_secret_map_interface_pair_delivering(meta, event);
+            (self.1).on_path_secret_map_interface_pair_delivering(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            (self.0).on_path_secret_map_interface_pair_frames_moved(meta, event);
+            (self.1).on_path_secret_map_interface_pair_frames_moved(meta, event);
+        }
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            (self.0).on_path_secret_map_dead_mark_skipped(meta, event);
+            (self.1).on_path_secret_map_dead_mark_skipped(meta, event);
+        }
+        #[inline]
         fn on_event<M: Meta, E: Event>(&self, meta: &M, event: &E) {
             self.0.on_event(meta, event);
             self.1.on_event(meta, event);
@@ -4130,6 +4416,26 @@ mod traits {
         fn on_path_secret_map_address_write_lock(
             &self,
             event: builder::PathSecretMapAddressWriteLock,
+        );
+        #[doc = "Publishes a `PathSecretMapInterfacePairLost` event to the publisher's subscriber"]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            event: builder::PathSecretMapInterfacePairLost,
+        );
+        #[doc = "Publishes a `PathSecretMapInterfacePairDelivering` event to the publisher's subscriber"]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            event: builder::PathSecretMapInterfacePairDelivering,
+        );
+        #[doc = "Publishes a `PathSecretMapInterfacePairFramesMoved` event to the publisher's subscriber"]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            event: builder::PathSecretMapInterfacePairFramesMoved,
+        );
+        #[doc = "Publishes a `PathSecretMapDeadMarkSkipped` event to the publisher's subscriber"]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            event: builder::PathSecretMapDeadMarkSkipped,
         );
         #[doc = r" Returns the QUIC version, if any"]
         fn quic_version(&self) -> Option<u32>;
@@ -4495,6 +4801,46 @@ mod traits {
             self.subscriber.on_event(&self.meta, &event);
         }
         #[inline]
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            event: builder::PathSecretMapInterfacePairLost,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_interface_pair_lost(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            event: builder::PathSecretMapInterfacePairDelivering,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_interface_pair_delivering(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            event: builder::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_interface_pair_frames_moved(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            event: builder::PathSecretMapDeadMarkSkipped,
+        ) {
+            let event = event.into_event();
+            self.subscriber
+                .on_path_secret_map_dead_mark_skipped(&self.meta, &event);
+            self.subscriber.on_event(&self.meta, &event);
+        }
+        #[inline]
         fn quic_version(&self) -> Option<u32> {
             self.quic_version
         }
@@ -4622,6 +4968,10 @@ pub mod testing {
             pub path_secret_map_cleaner_cycled: AtomicU64,
             pub path_secret_map_id_write_lock: AtomicU64,
             pub path_secret_map_address_write_lock: AtomicU64,
+            pub path_secret_map_interface_pair_lost: AtomicU64,
+            pub path_secret_map_interface_pair_delivering: AtomicU64,
+            pub path_secret_map_interface_pair_frames_moved: AtomicU64,
+            pub path_secret_map_dead_mark_skipped: AtomicU64,
         }
         impl Drop for Subscriber {
             fn drop(&mut self) {
@@ -4695,6 +5045,10 @@ pub mod testing {
                     path_secret_map_cleaner_cycled: AtomicU64::new(0),
                     path_secret_map_id_write_lock: AtomicU64::new(0),
                     path_secret_map_address_write_lock: AtomicU64::new(0),
+                    path_secret_map_interface_pair_lost: AtomicU64::new(0),
+                    path_secret_map_interface_pair_delivering: AtomicU64::new(0),
+                    path_secret_map_interface_pair_frames_moved: AtomicU64::new(0),
+                    path_secret_map_dead_mark_skipped: AtomicU64::new(0),
                 }
             }
         }
@@ -5202,6 +5556,54 @@ pub mod testing {
                 let out = format!("{meta:?} {event:?}");
                 self.output.lock().unwrap().push(out);
             }
+            fn on_path_secret_map_interface_pair_lost(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapInterfacePairLost,
+            ) {
+                self.path_secret_map_interface_pair_lost
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_path_secret_map_interface_pair_delivering(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapInterfacePairDelivering,
+            ) {
+                self.path_secret_map_interface_pair_delivering
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_path_secret_map_interface_pair_frames_moved(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapInterfacePairFramesMoved,
+            ) {
+                self.path_secret_map_interface_pair_frames_moved
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
+            fn on_path_secret_map_dead_mark_skipped(
+                &self,
+                meta: &api::EndpointMeta,
+                event: &api::PathSecretMapDeadMarkSkipped,
+            ) {
+                self.path_secret_map_dead_mark_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+                let event = crate::event::snapshot::Fmt::to_snapshot(event);
+                let out = format!("{meta:?} {event:?}");
+                self.output.lock().unwrap().push(out);
+            }
         }
     }
     #[derive(Debug)]
@@ -5252,6 +5654,10 @@ pub mod testing {
         pub path_secret_map_cleaner_cycled: AtomicU64,
         pub path_secret_map_id_write_lock: AtomicU64,
         pub path_secret_map_address_write_lock: AtomicU64,
+        pub path_secret_map_interface_pair_lost: AtomicU64,
+        pub path_secret_map_interface_pair_delivering: AtomicU64,
+        pub path_secret_map_interface_pair_frames_moved: AtomicU64,
+        pub path_secret_map_dead_mark_skipped: AtomicU64,
     }
     impl Drop for Subscriber {
         fn drop(&mut self) {
@@ -5327,6 +5733,10 @@ pub mod testing {
                 path_secret_map_cleaner_cycled: AtomicU64::new(0),
                 path_secret_map_id_write_lock: AtomicU64::new(0),
                 path_secret_map_address_write_lock: AtomicU64::new(0),
+                path_secret_map_interface_pair_lost: AtomicU64::new(0),
+                path_secret_map_interface_pair_delivering: AtomicU64::new(0),
+                path_secret_map_interface_pair_frames_moved: AtomicU64::new(0),
+                path_secret_map_dead_mark_skipped: AtomicU64::new(0),
             }
         }
     }
@@ -5863,6 +6273,54 @@ pub mod testing {
             let out = format!("{meta:?} {event:?}");
             self.output.lock().unwrap().push(out);
         }
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairLost,
+        ) {
+            self.path_secret_map_interface_pair_lost
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairDelivering,
+        ) {
+            self.path_secret_map_interface_pair_delivering
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            self.path_secret_map_interface_pair_frames_moved
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            meta: &api::EndpointMeta,
+            event: &api::PathSecretMapDeadMarkSkipped,
+        ) {
+            self.path_secret_map_dead_mark_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            let meta = crate::event::snapshot::Fmt::to_snapshot(meta);
+            let event = crate::event::snapshot::Fmt::to_snapshot(event);
+            let out = format!("{meta:?} {event:?}");
+            self.output.lock().unwrap().push(out);
+        }
     }
     #[derive(Debug)]
     pub struct Publisher {
@@ -5912,6 +6370,10 @@ pub mod testing {
         pub path_secret_map_cleaner_cycled: AtomicU64,
         pub path_secret_map_id_write_lock: AtomicU64,
         pub path_secret_map_address_write_lock: AtomicU64,
+        pub path_secret_map_interface_pair_lost: AtomicU64,
+        pub path_secret_map_interface_pair_delivering: AtomicU64,
+        pub path_secret_map_interface_pair_frames_moved: AtomicU64,
+        pub path_secret_map_dead_mark_skipped: AtomicU64,
     }
     impl Publisher {
         #[doc = r" Creates a publisher with snapshot assertions enabled"]
@@ -5977,6 +6439,10 @@ pub mod testing {
                 path_secret_map_cleaner_cycled: AtomicU64::new(0),
                 path_secret_map_id_write_lock: AtomicU64::new(0),
                 path_secret_map_address_write_lock: AtomicU64::new(0),
+                path_secret_map_interface_pair_lost: AtomicU64::new(0),
+                path_secret_map_interface_pair_delivering: AtomicU64::new(0),
+                path_secret_map_interface_pair_frames_moved: AtomicU64::new(0),
+                path_secret_map_dead_mark_skipped: AtomicU64::new(0),
             }
         }
     }
@@ -6349,6 +6815,50 @@ pub mod testing {
             event: builder::PathSecretMapAddressWriteLock,
         ) {
             self.path_secret_map_address_write_lock
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_lost(
+            &self,
+            event: builder::PathSecretMapInterfacePairLost,
+        ) {
+            self.path_secret_map_interface_pair_lost
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_delivering(
+            &self,
+            event: builder::PathSecretMapInterfacePairDelivering,
+        ) {
+            self.path_secret_map_interface_pair_delivering
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_interface_pair_frames_moved(
+            &self,
+            event: builder::PathSecretMapInterfacePairFramesMoved,
+        ) {
+            self.path_secret_map_interface_pair_frames_moved
+                .fetch_add(1, Ordering::Relaxed);
+            let event = event.into_event();
+            let event = crate::event::snapshot::Fmt::to_snapshot(&event);
+            let out = format!("{event:?}");
+            self.output.lock().unwrap().push(out);
+        }
+        fn on_path_secret_map_dead_mark_skipped(
+            &self,
+            event: builder::PathSecretMapDeadMarkSkipped,
+        ) {
+            self.path_secret_map_dead_mark_skipped
                 .fetch_add(1, Ordering::Relaxed);
             let event = event.into_event();
             let event = crate::event::snapshot::Fmt::to_snapshot(&event);

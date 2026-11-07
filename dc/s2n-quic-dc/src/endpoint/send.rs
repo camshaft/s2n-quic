@@ -1662,6 +1662,9 @@ pub(crate) struct Cache {
     /// The place of this cache's send socket among the endpoint's interfaces, which pairs its
     /// contexts with the peer's interfaces, or `None` where the endpoint doesn't list any.
     place: Option<crate::socket::interface::SendPlace>,
+    /// The path secret map that publishes the lost-pair events of this cache's contexts, or
+    /// `None` where the cache counts them on its send counters alone.
+    path_secret_map: Option<crate::path::secret::Map>,
 }
 
 impl Cache {
@@ -1677,6 +1680,7 @@ impl Cache {
             sender_idx,
             send_counters,
             place: None,
+            path_secret_map: None,
         }
     }
 
@@ -1726,6 +1730,70 @@ impl Cache {
     #[inline]
     pub fn send_counters(&self) -> &Rc<super::counters::Send> {
         &self.send_counters
+    }
+
+    /// Sets the path secret map that publishes the lost-pair events of this cache's contexts.
+    /// A cache without one counts the events on its send counters alone.
+    pub fn with_path_secret_map(mut self, map: crate::path::secret::Map) -> Self {
+        self.path_secret_map = Some(map);
+        self
+    }
+
+    /// Runs `f` on `ctx`, and records a change of the context's lost mark that `f` makes: a
+    /// pair marked lost, or a lost pair that delivers again.
+    ///
+    /// The probe timeout task and the ACK processor run their calls through it. The clear in
+    /// [`Self::invalidate`] isn't recorded, since the context leaves the cache there.
+    pub fn track_path_lost<R>(&self, ctx: &mut Context, f: impl FnOnce(&mut Context) -> R) -> R {
+        let was_lost = ctx.is_path_lost();
+        let result = f(ctx);
+        match (was_lost, ctx.is_path_lost()) {
+            (false, true) => {
+                self.send_counters.on_interface_pair_lost();
+                if let Some(map) = &self.path_secret_map {
+                    map.on_interface_pair_lost(ctx.path_secret_entry.peer());
+                }
+            }
+            (true, false) => {
+                self.send_counters.on_interface_pair_delivering();
+                if let Some(map) = &self.path_secret_map {
+                    map.on_interface_pair_delivering(ctx.path_secret_entry.peer());
+                }
+            }
+            _ => {}
+        }
+        result
+    }
+
+    /// Moves a lost pair's frames to `output`, as [`Context::move_frames`] does, and records
+    /// the frames it moves. Returns the number of frames moved.
+    pub fn move_frames(
+        &self,
+        ctx: &mut Context,
+        output: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
+    ) -> usize {
+        let moved = ctx.move_frames(output);
+        if moved > 0 {
+            self.send_counters
+                .on_interface_pair_frames_moved(moved as u64);
+            if let Some(map) = &self.path_secret_map {
+                map.on_interface_pair_frames_moved(ctx.path_secret_entry.peer(), moved);
+            }
+        }
+        moved
+    }
+
+    /// True where the idle wheel doesn't mark the peer of `entry` dead: this cache's pair is
+    /// lost and another pair of the peer still delivers. Records each skip.
+    pub fn skips_dead_mark(&self, path_lost: bool, entry: &PathSecretEntry) -> bool {
+        let skips = path_lost && entry.has_delivering_sender();
+        if skips {
+            self.send_counters.on_dead_mark_skipped();
+            if let Some(map) = &self.path_secret_map {
+                map.on_dead_mark_skipped(entry.peer());
+            }
+        }
+        skips
     }
 
     pub fn invalidate(

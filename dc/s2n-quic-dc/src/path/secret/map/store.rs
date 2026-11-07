@@ -207,4 +207,16 @@ pub trait Store: 'static + Send + Sync + time::Clock {
     fn reset_all_senders(&self);
 
     fn on_dc_connection_timeout(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapInterfacePairLost event.
+    fn on_interface_pair_lost(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapInterfacePairDelivering event.
+    fn on_interface_pair_delivering(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapInterfacePairFramesMoved event.
+    fn on_interface_pair_frames_moved(&self, peer_address: &SocketAddr, frames: usize);
+
+    /// Publishes a PathSecretMapDeadMarkSkipped event.
+    fn on_dead_mark_skipped(&self, peer_address: &SocketAddr);
 }

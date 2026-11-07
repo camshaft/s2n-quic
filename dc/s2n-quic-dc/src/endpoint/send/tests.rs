@@ -1279,3 +1279,166 @@ fn a_lost_pair_caps_its_probe_backoff() {
         "a lost pair's backoff stays within one wheel firing of a persistent congestion period"
     );
 }
+
+fn count(counter: &core::sync::atomic::AtomicU64) -> u64 {
+    counter.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Builds a path secret map that publishes its events to a testing subscriber.
+fn make_map_with_subscriber() -> (
+    crate::path::secret::Map,
+    Arc<crate::event::testing::Subscriber>,
+) {
+    let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+    let map = crate::path::secret::Map::builder()
+        .with_signer(crate::path::secret::stateless_reset::Signer::random())
+        .with_capacity(4)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber(subscriber.clone())
+        .build()
+        .unwrap();
+    (map, subscriber)
+}
+
+/// Builds a send cache of sender slot 0 that publishes the lost-pair events of its contexts
+/// through a path secret map.
+fn make_cache_with_events() -> (
+    super::Cache,
+    Registry,
+    Arc<crate::event::testing::Subscriber>,
+) {
+    let registry = Registry::default();
+    let (map, subscriber) = make_map_with_subscriber();
+    let cache = super::Cache::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0))
+        .with_path_secret_map(map);
+    (cache, registry, subscriber)
+}
+
+/// A pair marked lost records the lost event and count once, and an ack of a packet sent
+/// after the mark records the delivering event and count once.
+#[test]
+fn a_lost_mark_and_its_clear_record_their_events_and_counts() {
+    let (cache, registry, subscriber) = make_cache_with_events();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    ctx.next_packet_number = VarInt::from_u8(5);
+
+    cache.track_path_lost(&mut ctx, |ctx| ctx.set_path_lost(true));
+    assert_eq!(count(&subscriber.path_secret_map_interface_pair_lost), 1);
+
+    cache.track_path_lost(&mut ctx, |ctx| {
+        ctx.on_largest_acknowledged(VarInt::from_u8(4))
+    });
+    assert_eq!(count(&subscriber.path_secret_map_interface_pair_lost), 1);
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_delivering),
+        0
+    );
+
+    cache.track_path_lost(&mut ctx, |ctx| {
+        ctx.on_largest_acknowledged(VarInt::from_u8(5))
+    });
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_delivering),
+        1
+    );
+    assert_eq!(count(&subscriber.path_secret_map_interface_pair_lost), 1);
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("tx.interface_pair.lost=1 Variant|send.0"),
+        "got: {line}"
+    );
+    assert!(
+        line.contains("tx.interface_pair.delivering=1 Variant|send.0"),
+        "got: {line}"
+    );
+}
+
+/// A lost pair that moves its frames records the frames it moves, once for each move that
+/// moves a frame.
+#[test]
+fn a_lost_pair_that_moves_its_frames_records_its_event_and_count() {
+    let (cache, registry, subscriber) = make_cache_with_events();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(1000);
+    for _ in 0..2 {
+        let _ = ctx.push_batch(FrameBatch::single(make_frame(64)), &clock);
+    }
+    ctx.set_path_lost(true);
+
+    let mut moved = CollectFrames::default();
+    assert_eq!(cache.move_frames(&mut ctx, &mut moved), 2);
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_frames_moved),
+        1
+    );
+
+    assert_eq!(cache.move_frames(&mut ctx, &mut moved), 0);
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_frames_moved),
+        1,
+        "a move of no frames isn't recorded"
+    );
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("tx.interface_pair.frames_moved=2 Variant|send.0"),
+        "got: {line}"
+    );
+}
+
+/// A lost pair skips the peer's dead mark, and records the skip, only while another sender of
+/// the path secret entry delivers.
+#[test]
+fn a_skipped_dead_mark_records_its_event_and_count() {
+    let (cache, registry, subscriber) = make_cache_with_events();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    ctx.set_path_lost(true);
+
+    assert!(
+        !cache.skips_dead_mark(false, &entry),
+        "a pair that isn't lost doesn't skip"
+    );
+    assert_eq!(count(&subscriber.path_secret_map_dead_mark_skipped), 0);
+
+    assert!(cache.skips_dead_mark(true, &entry));
+    assert_eq!(count(&subscriber.path_secret_map_dead_mark_skipped), 1);
+
+    let (mut only_ctx, only_entry) = make_context_with_sender_slots(1, &Registry::default());
+    only_ctx.set_path_lost(true);
+    assert!(
+        !cache.skips_dead_mark(true, &only_entry),
+        "a lost pair whose peer has no other sender doesn't skip"
+    );
+    assert_eq!(count(&subscriber.path_secret_map_dead_mark_skipped), 1);
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("send.dead_mark_skipped=1 Variant|send.0"),
+        "got: {line}"
+    );
+}
+
+/// A cache without a path secret map still counts a pair marked lost on its send counters.
+#[test]
+fn a_cache_without_a_map_counts_a_lost_mark() {
+    let registry = Registry::default();
+    let cache = super::Cache::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+
+    cache.track_path_lost(&mut ctx, |ctx| ctx.set_path_lost(true));
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("tx.interface_pair.lost=1 Variant|send.0"),
+        "got: {line}"
+    );
+}

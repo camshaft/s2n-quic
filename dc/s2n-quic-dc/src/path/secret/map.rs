@@ -302,6 +302,27 @@ impl Map {
         self.store.on_dc_connection_timeout(peer_address);
     }
 
+    /// Emits a PathSecretMapInterfacePairLost event via the subscriber
+    pub fn on_interface_pair_lost(&self, peer_address: &SocketAddr) {
+        self.store.on_interface_pair_lost(peer_address);
+    }
+
+    /// Emits a PathSecretMapInterfacePairDelivering event via the subscriber
+    pub fn on_interface_pair_delivering(&self, peer_address: &SocketAddr) {
+        self.store.on_interface_pair_delivering(peer_address);
+    }
+
+    /// Emits a PathSecretMapInterfacePairFramesMoved event via the subscriber
+    pub fn on_interface_pair_frames_moved(&self, peer_address: &SocketAddr, frames: usize) {
+        self.store
+            .on_interface_pair_frames_moved(peer_address, frames);
+    }
+
+    /// Emits a PathSecretMapDeadMarkSkipped event via the subscriber
+    pub fn on_dead_mark_skipped(&self, peer_address: &SocketAddr) {
+        self.store.on_dead_mark_skipped(peer_address);
+    }
+
     pub fn handle_control_packet(&self, packet: &control::Packet, peer: &SocketAddr) {
         match packet {
             control::Packet::StaleKey(packet) => {
