@@ -34,6 +34,7 @@ pub mod interface_pacing;
 pub mod interface_pairing;
 pub mod interface_priority;
 pub mod interfaces;
+pub mod moved_off_lost;
 pub mod unidirectional;
 
 #[test]
