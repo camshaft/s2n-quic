@@ -286,15 +286,23 @@ where
     /// `waiting` isn't.
     highest_waiting: HashMap<credentials::Id, HighestWaitingPeer<T>>,
     /// The peers of `highest_waiting` that wait on each interface, by the interface's position:
-    /// the router offers their batches again once that interface frees. A peer's entry stays
-    /// after its batches leave the router, and the router then skips it, or, where the peer waits
-    /// again, offers its batches.
+    /// the router offers their batches again once that interface frees. The list holds each
+    /// peer once, and `highest_listed` says which wait of the peer its entry stands for: an entry
+    /// of an earlier wait stays after that wait ends, and the router then skips it.
     highest_waiters: Vec<VecDeque<credentials::Id>>,
     /// The peers of `highest_waiting` for which each sender is marked lost, by the sender's
-    /// position. While the sender's interface is free, or carries the highest-priority traffic,
-    /// the router reads that mark for each of them at each poll, and offers a peer's batches
-    /// again once it clears.
+    /// position, each peer once. While the sender's interface is free, or carries the
+    /// highest-priority traffic, the router reads that mark at each poll for each of them whose
+    /// entry stands for the wait it waits now, and offers a peer's batches again once it clears.
+    /// It drops each other entry without reading a mark.
     highest_lost: Vec<Vec<credentials::Id>>,
+    /// The wait that each entry of `highest_waiters` and `highest_lost` stands for, by the peer of
+    /// the entry. A peer's record stays while one of its entries is on a list, after its batches
+    /// leave the router, so that the lists hold each peer once whatever its count of waits.
+    highest_listed: HashMap<credentials::Id, HighestListed>,
+    /// The number of the next wait of a peer in `highest_waiting`: the router numbers each time
+    /// a peer's batches of the input of the highest priority level begin to wait in it.
+    highest_next_wait: u64,
     /// The lost mark of each sender of the batch being routed, read once for each batch so that
     /// each pass over the senders sees the same marks.
     lost_marks: Vec<bool>,
@@ -381,6 +389,8 @@ where
                 .map(|_| VecDeque::new())
                 .collect(),
             highest_lost,
+            highest_listed: HashMap::new(),
+            highest_next_wait: 0,
             lost_marks: Vec::new(),
             pick_counters,
             rejected_counters,
@@ -595,10 +605,11 @@ where
         // batch waits in the router until one of them is free.
         match input {
             Input::Highest => {
+                let wait = self.highest_next_wait;
+                self.highest_next_wait += 1;
                 let waiting = HighestWaitingPeer {
                     batches: VecDeque::from([value]),
-                    waits_on: vec![false; self.pacers.len()],
-                    lost_on: vec![false; self.senders.len()],
+                    wait,
                 };
                 self.highest_waiting.insert(peer, waiting);
                 self.highest_wait_on(peer);
@@ -716,10 +727,15 @@ where
                 let Some(peer) = self.highest_waiters[interface].pop_front() else {
                     break;
                 };
-                match self.highest_waiting.get_mut(&peer) {
-                    Some(waiting) => waiting.waits_on[interface] = false,
-                    // The peer's batches left the router after it began to wait here.
-                    None => continue,
+                let entry_wait = HighestListed::unlist(
+                    &mut self.highest_listed,
+                    peer,
+                    HighestList::Waiters(interface),
+                );
+                // The entry stands for an earlier wait of the peer: its batches left the router
+                // since, or wait again on other lists.
+                if entry_wait != self.highest_waiting.get(&peer).map(|waiting| waiting.wait) {
+                    continue;
                 }
                 routed += self.offer_highest_waiting(cx, peer)?;
             }
@@ -776,27 +792,35 @@ where
     }
 
     /// Takes from the lost peers of `sender` each peer for which the lost mark of that sender
-    /// cleared, and returns them in the order they began to wait there. It drops the entries of
-    /// the peers whose batches left the router, and keeps those of the peers for which the sender
-    /// is still lost.
+    /// cleared, and returns them in the order they began to wait there. It keeps the entries of
+    /// the peers for which the sender is still lost, and drops each entry of an earlier wait of
+    /// its peer without reading the mark.
     fn highest_lost_cleared(&mut self, sender: usize) -> Vec<credentials::Id> {
         let mut cleared = Vec::new();
-        let highest_waiting = &mut self.highest_waiting;
-        self.highest_lost[sender].retain(|peer| {
-            // The peer's batches left the router after it began to wait here.
-            let Some(waiting) = highest_waiting.get_mut(peer) else {
-                return false;
-            };
-            let entry = waiting
-                .batches
-                .front()
-                .expect("a peer whose batches wait in the router has one")
-                .path_secret_entry();
-            if entry.is_sender_lost(LocalSenderId::from_index(sender)) {
-                return true;
+        let list = HighestList::Lost(sender);
+        let highest_waiting = &self.highest_waiting;
+        let highest_listed = &mut self.highest_listed;
+        self.highest_lost[sender].retain(|&peer| {
+            let entry_wait = highest_listed
+                .get(&peer)
+                .and_then(|listed| listed.wait_on(list));
+            // Where the entry stands for an earlier wait of the peer, its batches left the
+            // router since, or wait again on other lists.
+            let waiting = highest_waiting
+                .get(&peer)
+                .filter(|waiting| entry_wait == Some(waiting.wait));
+            if let Some(waiting) = waiting {
+                let entry = waiting
+                    .batches
+                    .front()
+                    .expect("a peer whose batches wait in the router has one")
+                    .path_secret_entry();
+                if entry.is_sender_lost(LocalSenderId::from_index(sender)) {
+                    return true;
+                }
+                cleared.push(peer);
             }
-            waiting.lost_on[sender] = false;
-            cleared.push(*peer);
+            HighestListed::unlist(highest_listed, peer, list);
             false
         });
         cleared
@@ -807,24 +831,33 @@ where
     /// lost peers of each sender whose pair is marked lost, where another sender of the peer
     /// delivers, and on the waiters of the interface of each other sender. No sender could take
     /// the batch, so each interface the peer waits on holds a batch. Each list holds the peer
-    /// once.
+    /// once: where an entry of an earlier wait of the peer is still on a list, it stands for
+    /// this wait.
     fn highest_wait_on(&mut self, peer: credentials::Id) {
         let avoid_lost = self.candidates(false).avoid_lost;
-        let waiting = self
+        let wait = self
             .highest_waiting
-            .get_mut(&peer)
-            .expect("the peer's batches wait in the router");
-        for sender in 0..self.senders.len() {
+            .get(&peer)
+            .expect("the peer's batches wait in the router")
+            .wait;
+        let interfaces = self.pacers.len();
+        let senders = self.senders.len();
+        let listed = self
+            .highest_listed
+            .entry(peer)
+            .or_insert_with(|| HighestListed {
+                waits_on: vec![None; interfaces],
+                lost_on: vec![None; senders],
+            });
+        for sender in 0..senders {
             if avoid_lost && self.lost_marks[sender] {
-                if !waiting.lost_on[sender] {
-                    waiting.lost_on[sender] = true;
+                if listed.lost_on[sender].replace(wait).is_none() {
                     self.highest_lost[sender].push(peer);
                 }
                 continue;
             }
             let interface = self.sender_interfaces[LocalSenderId::from_index(sender)];
-            if !waiting.waits_on[interface] {
-                waiting.waits_on[interface] = true;
+            if listed.waits_on[interface].replace(wait).is_none() {
                 self.highest_waiters[interface].push_back(peer);
             }
         }
@@ -873,6 +906,7 @@ where
                 for lost in &mut self.highest_lost {
                     lost.clear();
                 }
+                self.highest_listed.clear();
                 if leaked > 0 {
                     self.send_credit_pool.release(leaked);
                 }
@@ -904,14 +938,65 @@ enum Input {
 }
 
 /// The batches of one peer that wait in [`InterfacePacedPickTwo`] from the input of the highest
-/// priority level, and the lists the router keeps the peer on until a sender may take them.
+/// priority level: one wait of the peer, from the time no sender could take the first of them
+/// until they leave the router.
 struct HighestWaitingPeer<T> {
     /// The peer's waiting batches, in the order the router read them.
     batches: VecDeque<T>,
-    /// Whether the peer is on the waiters of each interface, by the interface's position.
-    waits_on: Vec<bool>,
-    /// Whether the peer is on the lost peers of each sender, by the sender's position.
-    lost_on: Vec<bool>,
+    /// The number of this wait, which each entry of the router's lists that stands for it holds
+    /// in [`HighestListed`].
+    wait: u64,
+}
+
+/// The entries of one peer on the lists of [`InterfacePacedPickTwo`] of the peers whose batches
+/// of the input of the highest priority level wait in it: for each list, the wait of the peer
+/// that its entry stands for, or `None` where the list doesn't hold the peer.
+struct HighestListed {
+    /// The peer's entry on the waiters of each interface, by the interface's position.
+    waits_on: Vec<Option<u64>>,
+    /// The peer's entry on the lost peers of each sender, by the sender's position.
+    lost_on: Vec<Option<u64>>,
+}
+
+impl HighestListed {
+    /// Returns the wait of the peer that its entry on `list` stands for.
+    fn wait_on(&self, list: HighestList) -> Option<u64> {
+        match list {
+            HighestList::Waiters(interface) => self.waits_on[interface],
+            HighestList::Lost(sender) => self.lost_on[sender],
+        }
+    }
+
+    /// Takes the entry of `peer` on `list`, which the router took from that list, and returns
+    /// the wait it stood for. Removes the peer's record once the peer doesn't have an entry on
+    /// any list.
+    fn unlist(
+        listed: &mut HashMap<credentials::Id, Self>,
+        peer: credentials::Id,
+        list: HighestList,
+    ) -> Option<u64> {
+        let record = listed.get_mut(&peer)?;
+        let entry = match list {
+            HighestList::Waiters(interface) => &mut record.waits_on[interface],
+            HighestList::Lost(sender) => &mut record.lost_on[sender],
+        };
+        let wait = entry.take();
+        debug_assert!(wait.is_some(), "a peer on a list has an entry there");
+        if record.waits_on.iter().chain(&record.lost_on).all(Option::is_none) {
+            listed.remove(&peer);
+        }
+        wait
+    }
+}
+
+/// One of the lists of [`InterfacePacedPickTwo`] of the peers whose batches of the input of the
+/// highest priority level wait in it.
+#[derive(Clone, Copy, Debug)]
+enum HighestList {
+    /// The waiters of the interface at this position.
+    Waiters(usize),
+    /// The lost peers of the sender at this position.
+    Lost(usize),
 }
 
 #[cfg(test)]
