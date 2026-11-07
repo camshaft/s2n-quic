@@ -16,8 +16,13 @@
 //! once the client writes on that interface again, which waits for the next probes of its
 //! pairs, the client writes rounds of eight streams until that interface carries more than an
 //! eighth of a round's bytes.
+//!
+//! The endpoints record each acknowledgement and freed batch they route to a send worker. None
+//! may go to a sender whose interface pair its path marks lost while another sender of that path
+//! delivers, and the endpoints must route at least one of each while a pair of its path is lost.
 
 use crate::{
+    endpoint::routing::observe::{self, Kind, Routed},
     socket::{interface, rate::Rate},
     stream::endpoint::testing::sim::{Client, SimEndpointConfig},
     testing::{ext::*, sim, without_snapshots, without_tracing},
@@ -289,8 +294,12 @@ fn traffic_moves_off_a_lost_interface_and_back() {
 
     let shared = Arc::new(Shared::default());
     let in_sim = shared.clone();
+    let routed = Arc::new(Mutex::new(Vec::<Routed>::new()));
+    let routed_in_sim = routed.clone();
 
     sim(move || {
+        // The endpoints route on the thread that runs the sim, which records what they route.
+        observe::record_into(routed_in_sim);
         let monitor = in_sim.clone();
         bach::net::monitor::on_socket_write(move |write| {
             if monitor.recording.load(Ordering::Relaxed) {
@@ -472,4 +481,25 @@ fn traffic_moves_off_a_lost_interface_and_back() {
         restored_share(restored_bytes),
         "the client wrote {restored_bytes:?} bytes on its interfaces in the last round",
     );
+
+    // While a pair of a path was marked lost and another delivered, neither endpoint routed an
+    // acknowledgement or a freed batch of that path to a sender whose pair was marked lost, and
+    // the endpoints routed at least one of each.
+    let routed = routed.lock().unwrap();
+    let (mut acks, mut freed) = (0, 0);
+    for route in routed
+        .iter()
+        .filter(|route| route.path_has_lost && route.path_delivers)
+    {
+        assert!(
+            !route.lost,
+            "{route:?} went to a lost sender while another sender of its path delivers",
+        );
+        match route.kind {
+            Kind::PendingAck => acks += 1,
+            Kind::PendingFreed => freed += 1,
+        }
+    }
+    assert!(acks > 0, "no acknowledgement was routed while a pair was lost");
+    assert!(freed > 0, "no freed batch was routed while a pair was lost");
 }
