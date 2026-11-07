@@ -14,8 +14,8 @@
 //! A [`CreditlessWindow`] holds the bytes of those frames from the moment the priority router
 //! moves them into their lane until a [`WindowSender`] hands their batch to a worker's sender,
 //! and the priority router moves such a frame only once the window admits its bytes. A round of
-//! the window starts each time the priority router moves frames. The window's limit comes from
-//! how fast the workers take the batches:
+//! the window starts at each pass of the priority router over its staged frames, whether or not
+//! the pass moves a frame. The window's limit comes from how fast the workers take the batches:
 //!
 //! - It starts at a minimum, which `frame_dispatch` sets to the batch router's batch target.
 //! - It grows by the bytes of each batch that a worker takes in the round in which the batch
@@ -54,7 +54,8 @@ struct State {
     limit: Cell<u64>,
     /// The least that `limit` halves to.
     minimum: u64,
-    /// The round of the window, which starts each time the priority router moves frames.
+    /// The round of the window, which starts at each pass of the priority router over its
+    /// staged frames, whether or not the pass moves a frame.
     round: Cell<u64>,
     /// The round in which `limit` last halved.
     halved_in: Cell<Option<u64>>,
@@ -87,7 +88,8 @@ impl CreditlessWindow {
         }
     }
 
-    /// Starts a round of the window, as the priority router moves frames.
+    /// Starts a round of the window. The priority router calls it at each pass over its staged
+    /// frames, whether or not the pass moves a frame.
     pub fn start_round(&self) {
         let state = &self.state;
         state.round.set(state.round.get() + 1);
