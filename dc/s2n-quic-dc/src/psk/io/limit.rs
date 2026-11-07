@@ -76,9 +76,29 @@ impl RoundTrips {
     /// for a datagram after the first of a batch. Otherwise it is the least time that the path
     /// took, where the packet waited during the endpoint's last pass alone. Where the packet
     /// arrived after the pass began, the path took more, and a handshake's time read against this
-    /// counts the rest as the endpoint's time.
+    /// counts the rest as the endpoint's time. A measured wait at or above the lowest round trip
+    /// leaves zero, and `path_rtt` and `kept_rtt` read such round trips as `checked` reads them.
     pub(super) fn path(self) -> Duration {
         self.lowest.saturating_sub(self.waited)
+    }
+
+    /// These round trips as `path_rtt` and `kept_rtt` read them. Each round trip holds some time
+    /// on the path, so a measured wait at or above the lowest round trip holds more than the
+    /// part of it that its packet waited, as where the wait counts the endpoint's time on the
+    /// datagrams before the packet's in a batch, or a forward step of the realtime clock between
+    /// the socket's receive time and the endpoint's read. Such round trips read as unmeasured,
+    /// without a wait to take out of the lowest round trip, so that the path doesn't read zero:
+    /// the lowest round trip is the most that the path took.
+    pub(super) fn checked(self) -> Self {
+        if self.measured && self.waited >= self.lowest {
+            Self {
+                lowest: self.lowest,
+                waited: Duration::ZERO,
+                measured: false,
+            }
+        } else {
+            self
+        }
     }
 }
 
@@ -98,8 +118,13 @@ impl RoundTrips {
 /// or a socket that one pass doesn't drain, and this connection's round trips can't tell that
 /// wait from a longer route to the peer. Without an earlier time, `RoundTrips::path` counts, and
 /// without this connection's round trips, the earlier time.
+///
+/// A measured wait at or above the lowest round trip isn't the wait of its reply:
+/// `RoundTrips::checked` reads such round trips as unmeasured, without a wait to take out, so the
+/// lower of the earlier time and the lowest round trip counts, or the lowest round trip without
+/// an earlier time.
 pub(super) fn path_rtt(earlier: Option<Duration>, rtt: Option<RoundTrips>) -> Option<Duration> {
-    match (earlier, rtt) {
+    match (earlier, rtt.map(RoundTrips::checked)) {
         (_, Some(rtt)) if rtt.measured => Some(rtt.path()),
         (Some(earlier), Some(rtt)) => Some(earlier.min(rtt.lowest)),
         (earlier, None) => earlier,
@@ -118,8 +143,13 @@ pub(super) fn path_rtt(earlier: Option<Duration>, rtt: Option<RoundTrips>) -> Op
 /// count time that the reply was still on the path: a kept `RoundTrips::path` could lie below the
 /// path, and since the lower of two times only goes down, every later handshake with the peer
 /// that doesn't measure its reply's wait would read the difference as the endpoint's time.
+///
+/// A measured wait at or above the lowest round trip isn't the wait of its reply:
+/// `RoundTrips::checked` reads such round trips as unmeasured, so the handshake keeps the lower of
+/// `earlier` and the lowest round trip, or the lowest round trip without `earlier`, instead of a
+/// time of zero.
 pub(super) fn kept_rtt(earlier: Option<Duration>, rtt: Option<RoundTrips>) -> Option<Duration> {
-    match (earlier, rtt) {
+    match (earlier, rtt.map(RoundTrips::checked)) {
         (_, Some(rtt)) if rtt.measured => Some(rtt.path()),
         (Some(earlier), Some(rtt)) => Some(earlier.min(rtt.lowest)),
         (earlier, None) => earlier,
@@ -133,7 +163,7 @@ pub(super) fn kept_rtt(earlier: Option<Duration>, rtt: Option<RoundTrips>) -> Op
 /// peer's map entry kept, and `rtt`, the round trips that this handshake's connection measured.
 /// The answer reads the same time for the path as the kept time, except without an earlier time
 /// and without a measured wait: it then reads `RoundTrips::path`, and the entry keeps the whole
-/// lowest round trip.
+/// lowest round trip. Both read `rtt` as `RoundTrips::checked` reads it.
 pub(super) fn read_handshake(
     elapsed: Duration,
     earlier_rtt: Option<Duration>,
@@ -656,6 +686,15 @@ mod tests {
             // counts, whatever the earlier time.
             (ms(103), Some(ms(30)), rtt_measured(50, 10), Answer::Latency(ms(23))),
             (ms(103), Some(ms(45)), rtt_measured(50, 10), Answer::Latency(ms(23))),
+            // A measured wait at or above the lowest round trip reads as unmeasured, without a
+            // wait to take out: the lower of the earlier time and the lowest round trip counts,
+            // or the lowest round trip without an earlier time, so the rest isn't the whole time.
+            // A wait below the lowest round trip leaves the rest of it, whatever the earlier time.
+            (ms(103), None, rtt_measured(5, 9), Answer::Latency(ms(93))),
+            (ms(103), None, rtt_measured(5, 5), Answer::Latency(ms(93))),
+            (ms(103), Some(ms(3)), rtt_measured(5, 9), Answer::Latency(ms(97))),
+            (ms(103), Some(ms(30)), rtt_measured(5, 9), Answer::Latency(ms(93))),
+            (ms(103), Some(ms(30)), rtt_measured(5, 4), Answer::Latency(ms(101))),
             // Without a round-trip time, the rest is the whole time.
             (ms(103), None, None, Answer::Latency(ms(103))),
             // Where the round trips take the whole time, the handshake doesn't show a time to
@@ -797,6 +836,15 @@ mod tests {
             (Some(ms(45)), rtt_measured(50, 10), Some(ms(40))),
             (Some(ms(60)), rtt_measured(50, 10), Some(ms(40))),
             (None, rtt_measured(50, 10), Some(ms(40))),
+            // A measured wait at or above the 5 ms lowest round trip reads as unmeasured, without
+            // a wait to take out: the lower of the earlier time and the 5 ms counts, or the 5 ms
+            // without an earlier time, instead of a path of zero. A wait below the 5 ms leaves
+            // the rest of it, whatever the earlier time.
+            (Some(ms(3)), rtt_measured(5, 9), Some(ms(3))),
+            (Some(ms(30)), rtt_measured(5, 9), Some(ms(5))),
+            (None, rtt_measured(5, 9), Some(ms(5))),
+            (None, rtt_measured(5, 5), Some(ms(5))),
+            (Some(ms(30)), rtt_measured(5, 4), Some(ms(1))),
             // Without an earlier time, the 40 ms counts, and without this connection's round
             // trips, the earlier time.
             (None, rtt_waiting(50, 10), Some(ms(40))),
@@ -820,6 +868,15 @@ mod tests {
             (None, rtt_measured(50, 10), Some(ms(40))),
             (Some(ms(30)), rtt_measured(50, 10), Some(ms(40))),
             (Some(ms(60)), rtt_measured(50, 10), Some(ms(40))),
+            // A measured wait at or above the 5 ms lowest round trip reads as unmeasured: the
+            // handshake keeps the lower of the earlier time and the 5 ms, or the 5 ms without an
+            // earlier time, instead of a time of zero. A wait below the 5 ms leaves the rest of
+            // it, whatever the earlier time.
+            (None, rtt_measured(5, 9), Some(ms(5))),
+            (None, rtt_measured(5, 5), Some(ms(5))),
+            (Some(ms(3)), rtt_measured(5, 9), Some(ms(3))),
+            (Some(ms(30)), rtt_measured(5, 9), Some(ms(5))),
+            (Some(ms(30)), rtt_measured(5, 4), Some(ms(1))),
             (Some(ms(30)), None, Some(ms(30))),
             (None, None, None),
         ] {
@@ -918,6 +975,23 @@ mod tests {
         let mut permits = take_all(&limit).into_iter();
         permits.next().unwrap().release(repeat);
         assert_eq!(limit.current(), 2);
+    }
+
+    #[test]
+    fn a_measured_wait_at_or_above_the_lowest_round_trip_doesnt_keep_a_time_of_zero() {
+        // The socket measured a 9 ms wait for the reply of a 5 ms round trip, more than the reply
+        // waited, as where the endpoint spent time on datagrams of the batch before it. The
+        // handshake reads the round trips as unmeasured: it keeps the 5 ms with the peer's entry,
+        // and answers the 93 ms past two round trips of it.
+        let (kept, answer) = read_handshake(ms(103), None, rtt_measured(5, 9));
+        assert_eq!(kept, Some(ms(5)));
+        assert_eq!(answer, Answer::Latency(ms(93)));
+
+        // The next handshake with the peer doesn't measure its reply's wait, and reads the kept
+        // 5 ms as its earlier time instead of zero.
+        let (kept, answer) = read_handshake(ms(103), kept, rtt(50));
+        assert_eq!(kept, Some(ms(5)));
+        assert_eq!(answer, Answer::Latency(ms(93)));
     }
 
     #[test]
