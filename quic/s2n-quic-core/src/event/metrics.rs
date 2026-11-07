@@ -5,6 +5,9 @@ pub use super::generated::metrics::*;
 
 pub mod aggregate;
 
+#[cfg(test)]
+mod tests;
+
 /// A Recorder should arrange to emit the properties and counters on Drop into some output.
 pub trait Recorder: 'static + Send + Sync {
     /// Registers a counter with the recorder instance

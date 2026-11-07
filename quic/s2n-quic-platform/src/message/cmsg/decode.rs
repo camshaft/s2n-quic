@@ -320,4 +320,83 @@ mod tests {
         assert_eq!(data.receive_wait_nanos, Some(0));
         assert_eq!(reads, 1);
     }
+
+    /// `MAX_LEN` holds every control message one receive can return with receive timestamps on:
+    /// the TOS, the segment offload, the packet info of both address families, and the receive
+    /// time
+    #[test]
+    #[cfg(all(s2n_quic_platform_cmsg, target_os = "linux"))]
+    fn max_len_holds_every_receive_message() {
+        use crate::message::cmsg::MAX_LEN;
+        use s2n_quic_core::inet::{
+            ExplicitCongestionNotification, IpV4Address, IpV6Address, SocketAddress,
+            SocketAddressV4, SocketAddressV6,
+        };
+
+        let mut storage = Storage::<MAX_LEN>::default();
+        let mut encoder = storage.encoder();
+        let mut messages = 0;
+
+        if features::tos_v4::IS_SUPPORTED {
+            let remote = SocketAddressV4::new(IpV4Address::new([192, 0, 2, 1]), 443);
+            encoder
+                .encode_ecn(ExplicitCongestionNotification::Ect0, &SocketAddress::IpV4(remote))
+                .expect("the TOS message fits in MAX_LEN");
+            messages += 1;
+        }
+
+        // `MAX_LEN` keeps the larger of the GSO and GRO spaces, so the GSO message fills that
+        // space where the platform doesn't support GRO
+        if let (Some(level), Some(ty)) = (features::gro::LEVEL, features::gro::TYPE) {
+            encoder
+                .encode_cmsg(level, ty, 1200 as features::gro::Cmsg)
+                .expect("the GRO message fits in MAX_LEN");
+            messages += 1;
+        } else if let (Some(level), Some(ty)) = (features::gso::LEVEL, features::gso::TYPE) {
+            encoder
+                .encode_cmsg(level, ty, 1200 as features::gso::Cmsg)
+                .expect("the GSO message fits in MAX_LEN");
+            messages += 1;
+        }
+
+        // A dual-stack socket returns the packet info of both address families
+        if features::pktinfo_v4::IS_SUPPORTED {
+            let local = SocketAddressV4::new(IpV4Address::new([192, 0, 2, 2]), 4433);
+            encoder
+                .encode_local_address(&SocketAddress::IpV4(local))
+                .expect("the IPv4 packet info fits in MAX_LEN");
+            messages += 1;
+        }
+        if features::pktinfo_v6::IS_SUPPORTED {
+            let ip = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            let local = SocketAddressV6::new(IpV6Address::new(ip), 4433);
+            encoder
+                .encode_local_address(&SocketAddress::IpV6(local))
+                .expect("the IPv6 packet info fits in MAX_LEN");
+            messages += 1;
+        }
+
+        let received = Duration::new(10, 500);
+        let mut time: libc::timespec = unsafe { core::mem::zeroed() };
+        time.tv_sec = received.as_secs() as _;
+        time.tv_nsec = received.subsec_nanos() as _;
+        encoder
+            .encode_cmsg(libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS, time)
+            .expect("the receive time fits in MAX_LEN");
+        messages += 1;
+
+        assert_eq!(encoder.iter().count(), messages);
+
+        let reads = Cell::new(0);
+        let data = collect_at(encoder.iter(), Duration::new(10, 2_000_500), &reads);
+
+        assert_eq!(data.receive_wait_nanos, Some(2_000_000));
+        assert_eq!(reads.get(), 1);
+        if features::tos_v4::IS_SUPPORTED {
+            assert_eq!(data.ecn, ExplicitCongestionNotification::Ect0);
+        }
+        if features::gro::IS_SUPPORTED {
+            assert_eq!(data.segment_size, 1200);
+        }
+    }
 }
