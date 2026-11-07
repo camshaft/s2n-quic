@@ -721,9 +721,11 @@ impl Cache {
 /// Where the endpoint lists interfaces and the peer tags its data addresses, the sender is on
 /// the interface paired with the one the packets came from, so that the acknowledgements go
 /// back along the pair the packets came on and don't cross another interface, which can be
-/// lost while that pair delivers. Otherwise it is the sender that `routing::ack_sender_id`
-/// picks from the one `route` chooses: a sender of the interface for the endpoint's
-/// highest-priority traffic, where `priority_senders` lists that interface's senders.
+/// lost while that pair delivers. Where the peer has more interfaces than the endpoint and no
+/// local interface sends to the one the packets came from, the sender is on the local interface
+/// the packets arrived at. Otherwise it is the sender that `routing::ack_sender_id` picks from
+/// the one `route` chooses: a sender of the interface for the endpoint's highest-priority
+/// traffic, where `priority_senders` lists that interface's senders.
 fn ack_sender_id<Route: super::routing::SenderRoute>(
     send_places: Option<&[SendPlace]>,
     priority_senders: Option<&[LocalSenderId]>,
