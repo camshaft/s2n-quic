@@ -2074,9 +2074,17 @@ fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window
     let window = CreditlessWindow::with_limit(400_000);
     let delivers = Sends::default();
     let lost = Sends::default();
+    // Whether each batch waited in the router, in the order the senders took them.
+    let waited = Rc::new(RefCell::new(Vec::new()));
     let senders: IdMap<LocalSenderId, _> = timed_senders(&clock, &[&delivers, &lost])
         .into_iter()
-        .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
+        .map(|(id, sender)| {
+            let sender = WaitedSender {
+                sender,
+                waited: Rc::clone(&waited),
+            };
+            (id, WindowSender::new(sender, window.clone()))
+        })
         .collect();
     // The priority router admitted each batch's frames, none of which borrows send credit.
     let values = test_items(&entry, 4, 100_000, &drop_counter);
@@ -2124,6 +2132,11 @@ fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window
     assert_eq!(window.held(), 0);
     assert_eq!(window.limit(), 200_000);
     assert!(lost.borrow().is_empty());
+    assert_eq!(
+        *waited.borrow(),
+        [false, false, true, true],
+        "the router marks the batches that waited in it",
+    );
     assert_eq!(drop_counter.load(Ordering::Relaxed), 4);
 }
 
@@ -2322,4 +2335,45 @@ fn creditless_window_settles_at_the_batches_two_paced_interfaces_hold() {
     assert!(settled >= 300_000, "the limit settled at {settled}");
     let most = limits.iter().copied().max().unwrap_or_default();
     assert!(most <= 410_000, "the limit grew to {most}");
+}
+
+/// A worker's sender that records whether each batch waited in the router before it hands the
+/// batch on.
+struct WaitedSender<S> {
+    sender: S,
+    waited: Rc<RefCell<Vec<bool>>>,
+}
+
+impl<S: UnboundedSender<TestItem>> UnboundedSender<TestItem> for WaitedSender<S> {
+    fn send(&mut self, value: TestItem) -> Result<(), TestItem> {
+        self.waited.borrow_mut().push(value.waited);
+        self.sender.send(value)
+    }
+}
+
+/// A reader tells the window that a worker could take a batch where its receiver is `Pending`
+/// while budget is left, which grows the limit of a window that refused a frame and wakes the
+/// priority router, and doesn't tell it where the budget ran out.
+#[test]
+fn window_reader_starves_the_window_only_while_budget_is_left() {
+    let wakes = Arc::new(CountWaker(AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(wakes.clone());
+    let window = CreditlessWindow::new(100);
+    let lanes = WindowLanes::new(window.clone(), VecDeque::new());
+    let mut reader = WindowReader::new(lanes.receiver(), window.clone());
+    assert!(window.admit(1000));
+    assert!(!window.admit(1));
+    window.register(&waker);
+
+    let noop = s2n_quic_core::task::waker::noop();
+    let mut cx = task::Context::from_waker(&noop);
+    let mut exhausted = Budget::new(0);
+    assert!(reader.poll_recv(&mut cx, &mut exhausted).is_pending());
+    assert_eq!(window.limit(), 100, "the limit grew where the budget ran out");
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+
+    let mut budget = Budget::new(1);
+    assert!(reader.poll_recv(&mut cx, &mut budget).is_pending());
+    assert_eq!(window.limit(), 200);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
 }
