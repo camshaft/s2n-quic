@@ -4579,16 +4579,22 @@ fn frame_batch_counts_the_bytes_of_its_frames_without_send_credit() {
 }
 
 /// Records the creditless window's events, each as its kind and its three byte fields in the
-/// order the event lists them.
+/// order the event lists them, and the peer of each frame-refused event.
 #[derive(Default)]
 struct WindowEvents {
     events: std::sync::Mutex<Vec<(&'static str, u64, u64, u64)>>,
+    peers: std::sync::Mutex<Vec<std::net::SocketAddr>>,
 }
 
 impl WindowEvents {
     /// Returns the events recorded since the last call.
     fn take(&self) -> Vec<(&'static str, u64, u64, u64)> {
         core::mem::take(&mut *self.events.lock().unwrap())
+    }
+
+    /// Returns the peers of the frame-refused events recorded since the last call.
+    fn take_peers(&self) -> Vec<std::net::SocketAddr> {
+        core::mem::take(&mut *self.peers.lock().unwrap())
     }
 }
 
@@ -4609,6 +4615,8 @@ impl crate::event::Subscriber for WindowEvents {
     ) {
         let entry = ("frame_refused", event.frame_bytes, event.held_bytes, event.limit_bytes);
         self.events.lock().unwrap().push(entry);
+        let peer = std::net::SocketAddr::from(&event.peer_address);
+        self.peers.lock().unwrap().push(peer);
     }
 
     fn on_creditless_window_limit_grew(
@@ -4651,9 +4659,10 @@ fn creditless_window_with_events(
     CreditlessWindow::with_path_secret_map(minimum, path_secret_map)
 }
 
-/// The window records each frame it refuses, each growth of its limit and each halving, with the
-/// bytes it holds and its limit. It records a halving once a round, also where its minimum keeps
-/// the limit where it is, and doesn't record an event where nothing changes.
+/// The window records each frame it refuses, with the frame's peer, each growth of its limit and
+/// each halving, with the bytes it holds and its limit. It records a halving once a round, also
+/// where its minimum keeps the limit where it is, and doesn't record an event where nothing
+/// changes or where it refuses bytes given without their frame.
 #[test]
 fn creditless_window_records_its_refusals_and_limit_changes_as_events() {
     let events = std::sync::Arc::new(WindowEvents::default());
@@ -4665,9 +4674,18 @@ fn creditless_window_records_its_refusals_and_limit_changes_as_events() {
     window.start_round();
     assert!(window.admit(100));
     assert!(events.take().is_empty());
-    // A refused frame records its bytes, the bytes the window holds and the limit.
+    // A refused frame records its peer, its bytes, the bytes the window holds and the limit.
+    let path_secret_entry = test_path_secret_entry();
+    let peer = *path_secret_entry.peer();
+    let frame = new_test_frame(path_secret_entry, 1);
+    let frame_bytes = frame.byte_cost();
+    assert!(!window.admit_frame(&frame));
+    assert_eq!(events.take(), [("frame_refused", frame_bytes, 100, 64)]);
+    assert_eq!(events.take_peers(), [peer]);
+    // Bytes refused without their frame don't record an event, since the window doesn't know
+    // their peer.
     assert!(!window.admit(1));
-    assert_eq!(events.take(), [("frame_refused", 1, 100, 64)]);
+    assert!(events.take().is_empty());
 
     // A release in the round in which the window refused a frame grows the limit by its bytes.
     window.release(100, window.round());
