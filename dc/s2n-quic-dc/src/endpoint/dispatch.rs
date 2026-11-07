@@ -2004,8 +2004,9 @@ fn send_reset(
 ///
 /// Where the priority router has ended, the submission channel refuses the reset, which then
 /// doesn't leave the router and release the hold: the hold ends before `free` frees the slot, so
-/// that the slot is recorded as freed. No other free of the slot comes between the hold and its
-/// end, since the slot is bound to the stream that `free` disables, or `free` records it.
+/// that the slot is recorded as freed, and the end of the hold is recorded as a further
+/// `SlotHold` with `HoldOutcome::Unheld`. No other free of the slot comes between the hold and
+/// its end, since the slot is bound to the stream that `free` disables, or `free` records it.
 fn reject_init(
     server_view: &crate::queue::ServerView,
     path_secret_entry: &Arc<PathSecretEntry>,
@@ -2038,7 +2039,14 @@ fn reject_init(
             frame_tx,
         )
     {
-        server_view.unhold_freed(incoming_pair.dest_queue_id, binding_id);
+        if server_view.unhold_freed(incoming_pair.dest_queue_id, binding_id) {
+            frame_trace::slot_hold(
+                incoming_pair.dest_queue_id,
+                binding_id,
+                frame_trace::HoldOutcome::Unheld,
+                *path_secret_entry.id(),
+            );
+        }
     }
     free(server_view);
 }

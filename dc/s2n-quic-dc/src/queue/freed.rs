@@ -170,8 +170,8 @@ impl FreedInner {
 
     /// End the hold of `queue_id` for `binding_id`, where its reset doesn't reach the priority
     /// router, before the slot is freed, so that the free records the slot. A hold for another
-    /// binding stays.
-    pub fn unhold(&self, queue_id: VarInt, binding_id: VarInt) {
+    /// binding stays. Returns whether a hold ended.
+    pub fn unhold(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
         let mut state = self.state.lock().unwrap();
         let held = matches!(
             state.held.get(&queue_id.as_u64()),
@@ -180,6 +180,7 @@ impl FreedInner {
         if held {
             state.held.remove(&queue_id.as_u64());
         }
+        held
     }
 
     /// End the hold of `queue_id` for `binding_id` once its reset leaves, and record the slot as
@@ -383,6 +384,24 @@ mod tests {
 
         // The last slot that the freed set records is held.
         assert!(freed.hold(VarInt::from_u32(capacity - 1), VarInt::from_u8(1)));
+    }
+
+    #[test]
+    fn unhold_ends_only_the_hold_of_its_binding() {
+        let freed = FreedInner::new();
+        let slot = VarInt::from_u8(5);
+
+        // A slot that isn't held doesn't have a hold to end.
+        assert!(!freed.unhold(slot, VarInt::from_u8(1)));
+
+        // An unhold for another binding leaves the hold as it is.
+        assert!(freed.hold(slot, VarInt::from_u8(1)));
+        assert!(!freed.unhold(slot, VarInt::from_u8(2)));
+        assert!(!freed.hold(slot, VarInt::from_u8(2)));
+
+        // The held binding's unhold ends the hold, and the slot can be held again.
+        assert!(freed.unhold(slot, VarInt::from_u8(1)));
+        assert!(freed.hold(slot, VarInt::from_u8(3)));
     }
 
     #[test]

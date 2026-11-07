@@ -166,8 +166,8 @@ impl ServerView {
     }
 
     /// End the hold of the slot `queue_id` for the rejected init of `binding_id`, where its reset
-    /// doesn't reach the priority router, before the slot is freed.
-    pub fn unhold_freed(&self, queue_id: VarInt, binding_id: VarInt) {
+    /// doesn't reach the priority router, before the slot is freed. Returns whether a hold ended.
+    pub fn unhold_freed(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
         self.state.freed.unhold(queue_id, binding_id)
     }
 

@@ -874,6 +874,58 @@ fn a_rejected_init_records_what_it_does_with_its_slot() {
     );
 }
 
+/// A rejected init whose reset the ended priority router refuses records its new hold and then
+/// the end of that hold, and its slot is recorded as freed.
+#[test]
+fn a_rejected_init_whose_reset_the_ended_router_refuses_records_the_end_of_its_hold() {
+    use crate::endpoint::frame_trace::{resident_slot_holds, HoldOutcome};
+
+    // The recorder's capture starts off; arm it, as a test process doesn't otherwise.
+    crate::testing::init_tracing();
+
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let view = state.view();
+    // An address no other test uses, so that the records of its credentials in the process-wide
+    // recorder are this test's alone.
+    let path_entry = PathSecretEntry::builder("127.0.0.1:44704".parse().unwrap())
+        .endpoint_type(endpoint::Type::Server)
+        .build(None);
+    let (mut frame_tx, frame_rx) = crate::endpoint::frame::submission_channel(1);
+    // The priority router ends, and its receiver drops, so the channel refuses the reset.
+    drop(frame_rx);
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    let slot = VarInt::from_u8(1);
+    reject_init(
+        &view,
+        &path_entry,
+        QueuePair {
+            source_queue_id: VarInt::from_u8(9),
+            dest_queue_id: slot,
+        },
+        VarInt::from_u8(1),
+        error::ACCEPTOR_NOT_FOUND,
+        &mut frame_tx,
+        |server| server.record_freed(slot, &path_entry, &mut freed_batch_tx),
+    );
+
+    assert_eq!(
+        resident_slot_holds(*path_entry.id()),
+        vec![
+            (1, 1, HoldOutcome::Held as u8),
+            (1, 1, HoldOutcome::Unheld as u8),
+        ],
+        "the reject holds slot 1, and the hold ends where the router refuses its reset"
+    );
+
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state
+        .freed
+        .take(&mut freed)
+        .expect("the slot is recorded as freed at once");
+    assert!(freed.contains(1), "slot 1 is recorded as freed");
+}
+
 /// What the server finds for the acceptor of a rejected init.
 #[derive(Clone, Copy, Debug)]
 enum InitAcceptor {
