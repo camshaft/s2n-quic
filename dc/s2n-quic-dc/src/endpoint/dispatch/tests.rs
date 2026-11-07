@@ -324,6 +324,16 @@ impl FastPathHarness {
     }
 }
 
+/// The server queue state of `harness`'s path secret entry. A stream that `bind_for_msg` binds
+/// records its slot as freed in that state as it is torn down, so a test that reads the frees of
+/// a rejected init's bound stream holds and reads the slot there.
+fn harness_server_state(harness: &FastPathHarness) -> Arc<crate::queue::ServerState> {
+    match harness.path_entry.queue_state() {
+        crate::path::secret::map::entry::QueueState::Server(state) => state.clone(),
+        _ => unreachable!("the harness's path secret entry is a server's"),
+    }
+}
+
 fn single_queue_msg_header(
     packet: &datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
     decrypt_len: usize,
@@ -930,9 +940,9 @@ fn assert_slot_1_waits_on_its_reset(
 #[test]
 fn fast_path_rejected_inits_of_a_bound_slot_leave_one_reset_until_it_leaves() {
     for init_acceptor in [InitAcceptor::Closed, InitAcceptor::WithoutSlots] {
-        let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
-        let mut view = recv::QueueView::Server(state.view());
         let mut harness = FastPathHarness::new();
+        let state = harness_server_state(&harness);
+        let mut view = recv::QueueView::Server(state.view());
         let _registry = use_acceptor(&mut harness, init_acceptor);
 
         let init = |harness: &mut FastPathHarness, view: &mut recv::QueueView, binding: u8| {
@@ -989,8 +999,8 @@ fn slow_path_rejected_inits_leave_one_reset_for_each_slot_until_it_leaves() {
             InitAcceptor::WithoutSlots,
         ] {
             let case = format!("{init:?} with {init_acceptor:?}");
-            let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
             let mut harness = FastPathHarness::new();
+            let state = harness_server_state(&harness);
             let _registry = use_acceptor(&mut harness, init_acceptor);
             let mut peer = server_peer(&harness.path_entry, recv::QueueView::Server(state.view()));
 
@@ -1056,14 +1066,16 @@ fn a_tampered_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
 
 /// Where the priority router has ended, the submission channel refuses the reset of a rejected
 /// init, which then doesn't leave the router and release the slot: the reject releases the hold
-/// itself, so that the slot is recorded as freed at once. For an init without an acceptor, the
-/// reject's free records the slot while it is held, so the release meets a marked hold.
+/// itself, so that the slot is recorded as freed at once. The reject's free records the slot
+/// while it is held, so the release meets a marked hold: for an init without an acceptor, the
+/// reject records it itself, and for a closed acceptor, the stream the reject bound records it
+/// as the reject tears the stream down.
 #[test]
 fn a_rejected_init_whose_reset_the_ended_router_refuses_leaves_the_slot_unheld() {
     for init_acceptor in [InitAcceptor::Missing, InitAcceptor::Closed] {
-        let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
-        let mut view = recv::QueueView::Server(state.view());
         let mut harness = FastPathHarness::new();
+        let state = harness_server_state(&harness);
+        let mut view = recv::QueueView::Server(state.view());
         let _registry = use_acceptor(&mut harness, init_acceptor);
         // The priority router ends, and its receiver drops.
         harness.frame_rx = crate::endpoint::frame::submission_channel(1).1;
