@@ -1304,6 +1304,7 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let ever_responded = ctx.last_peer_activity.nanos != ctx.created_at.nanos;
                 let has_inflight = ctx.inflight.has_inflight();
                 let path_lost = ctx.is_path_lost();
+                let lost_at = ctx.lost_at;
                 let pto_backoff = ctx.pto.backoff;
                 let packets_sent = ctx.next_packet_number.as_u64();
 
@@ -1372,10 +1373,16 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // were never acknowledged — that's evidence the peer is
                 // unreachable. If there are no inflight packets, both sides
                 // simply stopped talking (natural idle) and we must not mark dead.
-                // A lost pair's probes go unacknowledged, so a lost pair marks the peer dead only
-                // once every pair of the peer is lost.
-                let marked_dead = has_inflight
-                    && !(path_lost && path_secret_entry.has_delivering_sender())
+                // A lost pair's probes go unacknowledged, so a lost pair with unacknowledged
+                // packets marks the peer dead only once no other pair of the peer delivers.
+                // A lost pair also marks the peer dead where the peer hasn't sent an
+                // authenticated packet on any interface since the pair was marked lost, with or
+                // without unacknowledged packets and whatever the marks of the peer's other pairs.
+                let unacknowledged =
+                    has_inflight && !(path_lost && path_secret_entry.has_delivering_sender());
+                let peer_silent_since_lost =
+                    lost_at.is_some_and(|since| path_secret_entry.last_activity() < since);
+                let marked_dead = (unacknowledged || peer_silent_since_lost)
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
 
                 let result = send_caches[local_id].borrow_mut().invalidate(
