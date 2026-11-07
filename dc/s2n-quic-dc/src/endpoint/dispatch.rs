@@ -1592,7 +1592,8 @@ fn handle_queue_msg_init(
             binding_id,
             error::ACCEPTOR_NOT_FOUND,
             frame_tx,
-            |view| view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx),
+            freed_batch_tx,
+            |view, tx| view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, tx),
         );
         return;
     };
@@ -1674,7 +1675,8 @@ fn handle_queue_msg_init(
                         binding_id,
                         error::ACCEPTOR_NOT_FOUND,
                         frame_tx,
-                        |_| stream.disable(),
+                        freed_batch_tx,
+                        |_, _| stream.disable(),
                     );
                 }
                 Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
@@ -1692,7 +1694,8 @@ fn handle_queue_msg_init(
                         binding_id,
                         error::SERVER_BUSY,
                         frame_tx,
-                        |_| stream.disable(),
+                        freed_batch_tx,
+                        |_, _| stream.disable(),
                     );
                 }
             }
@@ -1799,7 +1802,8 @@ fn handle_queue_data_init(
             binding_id,
             error::ACCEPTOR_NOT_FOUND,
             frame_tx,
-            |view| view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, freed_batch_tx),
+            freed_batch_tx,
+            |view, tx| view.record_freed(queue_pair.dest_queue_id, &peer.path_entry, tx),
         );
         return;
     };
@@ -1883,7 +1887,8 @@ fn handle_queue_data_init(
                         binding_id,
                         error::ACCEPTOR_NOT_FOUND,
                         frame_tx,
-                        |_| stream.disable(),
+                        freed_batch_tx,
+                        |_, _| stream.disable(),
                     );
                 }
                 Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
@@ -1901,7 +1906,8 @@ fn handle_queue_data_init(
                         binding_id,
                         error::SERVER_BUSY,
                         frame_tx,
-                        |_| stream.disable(),
+                        freed_batch_tx,
+                        |_, _| stream.disable(),
                     );
                 }
             }
@@ -2009,9 +2015,11 @@ fn send_reset(
 /// its queues, whatever the queue and binding ids of its frames.
 ///
 /// Where the priority router has ended, the submission channel refuses the reset, which then
-/// doesn't leave the router and release the hold: the hold ends before `free` frees the slot, so
-/// that the slot is recorded as freed. No other free of the slot comes between the hold and its
-/// end, since the slot is bound to the stream that `free` disables, or `free` records it.
+/// doesn't leave the router to release the hold, so the reject releases it after `free`, as the
+/// router does once a reset leaves: a free that `free` recorded while the slot was held is then
+/// recorded, and a free recorded after the release records the slot itself, so the slot is
+/// recorded as freed once.
+#[allow(clippy::too_many_arguments)]
 fn reject_init(
     server_view: &crate::queue::ServerView,
     path_secret_entry: &Arc<PathSecretEntry>,
@@ -2019,13 +2027,21 @@ fn reject_init(
     binding_id: VarInt,
     error_code: VarInt,
     frame_tx: &mut SubmissionSender,
-    free: impl FnOnce(&crate::queue::ServerView),
+    freed_batch_tx: &mut crate::queue::FreedBatchTx,
+    free: impl FnOnce(&crate::queue::ServerView, &mut crate::queue::FreedBatchTx),
 ) {
     let reset = server_view.hold_freed(incoming_pair.dest_queue_id, binding_id);
-    if reset && !send_reset(path_secret_entry, incoming_pair, binding_id, error_code, frame_tx) {
-        server_view.unhold_freed(incoming_pair.dest_queue_id, binding_id);
+    let sent =
+        reset && send_reset(path_secret_entry, incoming_pair, binding_id, error_code, frame_tx);
+    free(server_view, freed_batch_tx);
+    if reset && !sent {
+        server_view.release_freed(
+            incoming_pair.dest_queue_id,
+            binding_id,
+            path_secret_entry,
+            freed_batch_tx,
+        );
     }
-    free(server_view);
 }
 
 /// Settles an init that the fast path rejected before its packet authenticated. `take` is
@@ -2061,9 +2077,10 @@ fn settle_rejected_init(
         rejected.binding_id,
         rejected.error_code,
         frame_tx,
-        |view| match stream {
+        freed_batch_tx,
+        |view, tx| match stream {
             Some(mut stream) => stream.disable(),
-            None => view.record_freed(queue_pair.dest_queue_id, path_entry, freed_batch_tx),
+            None => view.record_freed(queue_pair.dest_queue_id, path_entry, tx),
         },
     );
 }
@@ -2402,7 +2419,8 @@ fn bind_for_reset(
             binding_id,
             error::ACCEPTOR_NOT_FOUND,
             frame_tx,
-            |view| view.record_freed(dest_queue_id, &peer.path_entry, freed_batch_tx),
+            freed_batch_tx,
+            |view, tx| view.record_freed(dest_queue_id, &peer.path_entry, tx),
         );
         return;
     };
@@ -2473,7 +2491,8 @@ fn bind_for_reset(
                         binding_id,
                         error::ACCEPTOR_NOT_FOUND,
                         frame_tx,
-                        |_| stream.disable(),
+                        freed_batch_tx,
+                        |_, _| stream.disable(),
                     );
                 }
                 Err(acceptor::channel::SendError::NoSlots(mut stream)) => {
@@ -2491,7 +2510,8 @@ fn bind_for_reset(
                         binding_id,
                         error::SERVER_BUSY,
                         frame_tx,
-                        |_| stream.disable(),
+                        freed_batch_tx,
+                        |_, _| stream.disable(),
                     );
                 }
             }
