@@ -3,7 +3,7 @@
 
 use crate::{
     features,
-    message::{cmsg, cmsg::Encoder, Message as MessageTrait},
+    message::{cmsg, cmsg::Encoder, BatchClock, Message as MessageTrait},
 };
 use core::{
     alloc::Layout,
@@ -129,6 +129,17 @@ impl MessageTrait for msghdr {
         &mut self,
         local_address: &path::LocalAddress,
     ) -> Option<super::RxMessage<'_, Self::Handle>> {
+        // A message read on its own is a batch of one, which reads the clock as it reads the
+        // message
+        self.rx_read_at(local_address, &mut BatchClock::new(features::rx_timestamps::now))
+    }
+
+    #[inline]
+    fn rx_read_at<Now: FnMut() -> Option<core::time::Duration>>(
+        &mut self,
+        local_address: &path::LocalAddress,
+        clock: &mut BatchClock<Now>,
+    ) -> Option<super::RxMessage<'_, Self::Handle>> {
         if cfg!(test) {
             assert_eq!(
                 self.msg_flags & libc::MSG_CTRUNC,
@@ -137,7 +148,7 @@ impl MessageTrait for msghdr {
             );
         }
 
-        let (mut header, cmsg) = self.header()?;
+        let (mut header, cmsg) = ext::header_at(self, clock)?;
 
         // only copy the port if we are told the IP address
         if !header.path.local_address.ip().is_unspecified() {

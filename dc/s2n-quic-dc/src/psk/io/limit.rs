@@ -51,11 +51,11 @@ pub(super) struct RoundTrips {
     pub(super) lowest: Duration,
     /// The part of the lowest round trip that the round trip's packet waited in the endpoint's
     /// receive queue. Where `measured`, it is the whole wait from the socket's receive time of
-    /// the packet to the endpoint's read of it, through each pass of the endpoint's event loop
-    /// that ran meanwhile. The endpoint reads its clock once for a batch of datagrams, and reads
-    /// each datagram's wait as it reads that datagram, so the wait of a datagram after the first
-    /// of a batch also counts the time that the endpoint spent on the datagrams before it, which
-    /// the lowest round trip doesn't hold.
+    /// the packet to the endpoint's read of its batch of datagrams, through each pass of the
+    /// endpoint's event loop that ran meanwhile. The endpoint reads its clock once for a batch,
+    /// as it handles the batch's first datagram, and the wait of each datagram of the batch ends
+    /// at one read of the realtime clock just before that, so the wait doesn't count the time
+    /// that the endpoint spent on the datagrams before it.
     ///
     /// Otherwise it is the part of the lowest round trip that the endpoint's pass of its event
     /// loop before the pass that read the round trip's packet ran. The endpoint reads a packet
@@ -72,8 +72,8 @@ pub(super) struct RoundTrips {
 impl RoundTrips {
     /// The lowest round-trip time less the part of it that its packet waited, or could have
     /// waited, in the endpoint's receive queue. Where `measured`, it is the time that the path
-    /// took for that round trip, less the time that `waited` counts past the round trip's end, as
-    /// for a datagram after the first of a batch. Otherwise it is the least time that the path
+    /// took for that round trip, as `waited` ends where the round trip ends, at the endpoint's
+    /// read of the round trip's batch. Otherwise it is the least time that the path
     /// took, where the packet waited during the endpoint's last pass alone. Where the packet
     /// arrived after the pass began, the path took more, and a handshake's time read against this
     /// counts the rest as the endpoint's time.

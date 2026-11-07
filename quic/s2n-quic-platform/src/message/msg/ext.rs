@@ -19,24 +19,7 @@ impl Ext for msghdr {
 
     #[inline]
     fn header(&self) -> Option<(datagram::Header<Handle>, datagram::AncillaryData)> {
-        let addr = self.remote_address()?;
-        let mut path = Handle::from_remote_address(addr.into());
-
-        let ancillary_data = unsafe { cmsg::decode::Iter::from_msghdr(self) }.collect();
-        let ecn = ancillary_data.ecn;
-        let receive_wait = ancillary_data
-            .receive_wait_nanos
-            .map(core::time::Duration::from_nanos);
-
-        path.with_ancillary_data(ancillary_data);
-
-        let header = datagram::Header {
-            path,
-            ecn,
-            receive_wait,
-        };
-
-        Some((header, ancillary_data))
+        header_with(self, |iter| iter.collect())
     }
 
     #[inline]
@@ -85,6 +68,45 @@ impl Ext for msghdr {
             }
         }
     }
+}
+
+/// Decodes the header of `msghdr`, as `Ext::header` does, where the message is one of a batch
+/// that `clock` reads the realtime clock for, so that its receive wait ends at `clock`'s reading
+#[inline]
+pub(super) fn header_at<Now: FnMut() -> Option<core::time::Duration>>(
+    msghdr: &msghdr,
+    clock: &mut BatchClock<Now>,
+) -> Option<(datagram::Header<Handle>, datagram::AncillaryData)> {
+    header_with(msghdr, |iter| iter.collect_with_clock(|| clock.now()))
+}
+
+/// Decodes the header of `msghdr`, with its control messages decoded by `decode`
+#[inline]
+fn header_with<Decode>(
+    msghdr: &msghdr,
+    decode: Decode,
+) -> Option<(datagram::Header<Handle>, datagram::AncillaryData)>
+where
+    Decode: FnOnce(cmsg::decode::Iter<'_>) -> datagram::AncillaryData,
+{
+    let addr = msghdr.remote_address()?;
+    let mut path = Handle::from_remote_address(addr.into());
+
+    let ancillary_data = decode(unsafe { cmsg::decode::Iter::from_msghdr(msghdr) });
+    let ecn = ancillary_data.ecn;
+    let receive_wait = ancillary_data
+        .receive_wait_nanos
+        .map(core::time::Duration::from_nanos);
+
+    path.with_ancillary_data(ancillary_data);
+
+    let header = datagram::Header {
+        path,
+        ecn,
+        receive_wait,
+    };
+
+    Some((header, ancillary_data))
 }
 
 pub struct MsghdrEncoder<'a> {

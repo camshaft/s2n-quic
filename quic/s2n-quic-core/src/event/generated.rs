@@ -2768,7 +2768,7 @@ pub mod api {
     }
     #[derive(Clone, Debug)]
     #[non_exhaustive]
-    #[doc = " The time a datagram waited between the socket's receive and the endpoint's read of it,"]
+    #[doc = " The time a datagram waited between the socket's receive and the endpoint's read of its batch,"]
     #[doc = " published only for a datagram whose receive time the IO provider reports"]
     pub struct DatagramReceiveWait {
         pub wait: Duration,
@@ -6679,7 +6679,7 @@ pub mod builder {
         }
     }
     #[derive(Clone, Debug)]
-    #[doc = " The time a datagram waited between the socket's receive and the endpoint's read of it,"]
+    #[doc = " The time a datagram waited between the socket's receive and the endpoint's read of its batch,"]
     #[doc = " published only for a datagram whose receive time the IO provider reports"]
     pub struct DatagramReceiveWait {
         pub wait: Duration,

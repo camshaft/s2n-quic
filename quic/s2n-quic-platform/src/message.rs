@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use core::{alloc::Layout, ptr::NonNull};
+use core::{alloc::Layout, ptr::NonNull, time::Duration};
 use s2n_quic_core::{inet::datagram, io::tx, path};
 
 #[cfg(s2n_quic_platform_cmsg)]
@@ -127,6 +127,21 @@ pub trait Message: 'static + Copy {
         local_address: &path::LocalAddress,
     ) -> Option<RxMessage<'_, Self::Handle>>;
 
+    /// Reads the message as an RX packet, as `rx_read` does, where the message is one of a
+    /// batch that `clock` reads the realtime clock for, so that its receive wait ends at
+    /// `clock`'s reading
+    ///
+    /// The default reads it as `rx_read` does, for a message that doesn't hold a receive time
+    #[inline]
+    fn rx_read_at<Now: FnMut() -> Option<Duration>>(
+        &mut self,
+        local_address: &path::LocalAddress,
+        clock: &mut BatchClock<Now>,
+    ) -> Option<RxMessage<'_, Self::Handle>> {
+        let _ = clock;
+        self.rx_read(local_address)
+    }
+
     /// Writes the message into the TX packet
     fn tx_write<M: tx::Message<Handle = Self::Handle>>(
         &mut self,
@@ -154,6 +169,53 @@ impl<Handle: Copy> RxMessage<'_, Handle> {
         for segment in self.payload.chunks_mut(self.segment_size) {
             on_packet(self.header, segment);
         }
+    }
+}
+
+/// The reading of the realtime clock that the receive waits of one batch of messages end at
+///
+/// The endpoint reads its own clock once for a batch of messages, as it handles the batch's
+/// first datagram, for the time that each datagram of the batch arrived. The batch reads the
+/// realtime clock once too, as it reads its first message that holds the time the socket
+/// received it, just before the endpoint's read, so that the wait of a datagram after the first
+/// of the batch doesn't count the time that the endpoint spent on the datagrams before it.
+pub struct BatchClock<Now> {
+    now: Now,
+    time: Option<Option<Duration>>,
+    delivered: bool,
+}
+
+impl<Now: FnMut() -> Option<Duration>> BatchClock<Now> {
+    /// A clock for a batch, which reads `now` for the batch's reading
+    #[inline]
+    pub fn new(now: Now) -> Self {
+        Self {
+            now,
+            time: None,
+            delivered: false,
+        }
+    }
+
+    /// The batch's reading of the realtime clock, which the first call reads
+    ///
+    /// Where a datagram of the batch went to the endpoint before the first call, the endpoint
+    /// read its own clock at that datagram, and a read now would count the time that the
+    /// endpoint spent since then, so the batch doesn't hold a reading.
+    #[inline]
+    pub fn now(&mut self) -> Option<Duration> {
+        if let Some(time) = self.time {
+            return time;
+        }
+
+        let time = if self.delivered { None } else { (self.now)() };
+        self.time = Some(time);
+        time
+    }
+
+    /// Records that a datagram of the batch went to the endpoint
+    #[inline]
+    pub fn on_delivered(&mut self) {
+        self.delivered = true;
     }
 }
 
@@ -193,5 +255,27 @@ mod tests {
                     assert!(segment.len() <= segment_size);
                 })
             })
+    }
+
+    /// The batch reads its clock at its first reading alone, and a datagram that goes to the
+    /// endpoint before that reading leaves the batch without a reading
+    #[test]
+    fn batch_clock_test() {
+        let reads = core::cell::Cell::new(0);
+        let now = || {
+            reads.set(reads.get() + 1);
+            Some(Duration::from_secs(10))
+        };
+
+        let mut clock = BatchClock::new(now);
+        assert_eq!(clock.now(), Some(Duration::from_secs(10)));
+        clock.on_delivered();
+        assert_eq!(clock.now(), Some(Duration::from_secs(10)));
+        assert_eq!(reads.get(), 1);
+
+        let mut clock = BatchClock::new(now);
+        clock.on_delivered();
+        assert_eq!(clock.now(), None);
+        assert_eq!(reads.get(), 1);
     }
 }
