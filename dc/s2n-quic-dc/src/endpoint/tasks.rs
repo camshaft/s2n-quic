@@ -20,7 +20,11 @@ use crate::{
     runtime::Spawner,
     socket::{
         channel::{
-            intrusive::{self, sharded::{Input as _, Storage as _}, unsync},
+            intrusive::{
+                self,
+                sharded::{Input as _, Storage as _},
+                unsync,
+            },
             Budget, FilterMap, Flatten, FlattenList, FlattenSegments, InspectErr, Map, Paced,
             Priority as PriorityRx, PrioritySelect, Receiver, ReceiverExt as _, RouterAdapter,
             SocketReceiver, SocketSender, UnboundedSender,

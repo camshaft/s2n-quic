@@ -922,7 +922,8 @@ fn send_idle_wheel_marks_dead_a_peer_silent_since_its_pair_was_lost() {
         async move {
             // At t=1s the pair is marked lost, after the peer's last packet at t=0.
             1.s().sleep().await;
-            ctx.borrow_mut().mark_path_lost(precision::Clock::now(&clock));
+            ctx.borrow_mut()
+                .mark_path_lost(precision::Clock::now(&clock));
             assert!(
                 pse.has_delivering_sender(),
                 "the peer's other sender slots aren't marked lost"
@@ -975,7 +976,8 @@ fn send_idle_wheel_keeps_alive_a_peer_heard_from_since_its_pair_was_lost() {
         let pse = pse.clone();
         async move {
             1.s().sleep().await;
-            ctx.borrow_mut().mark_path_lost(precision::Clock::now(&clock));
+            ctx.borrow_mut()
+                .mark_path_lost(precision::Clock::now(&clock));
 
             // At t=2s the peer sends a packet on another interface.
             1.s().sleep().await;
@@ -1093,7 +1095,8 @@ fn send_idle_wheel_marks_dead_a_peer_whose_lost_pairs_expire_at_the_same_tick() 
             // At t=1s both pairs are marked lost, after the peer's last packet at t=0.
             1.s().sleep().await;
             for ctx in &contexts {
-                ctx.borrow_mut().mark_path_lost(precision::Clock::now(&clock));
+                ctx.borrow_mut()
+                    .mark_path_lost(precision::Clock::now(&clock));
             }
 
             // At t=31s both contexts have expired at the same tick.

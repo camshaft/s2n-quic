@@ -332,8 +332,7 @@ fn send_pto_timeout_records_a_lost_mark_and_the_frames_it_moves() {
 
         let (tx_wheel_tx, _tx_wheel_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
         let (pto_wheel_tx, _pto_wheel_rx) = unsync::new_with_adapter::<send::PtoWheelAdapter>();
-        let (idle_wheel_tx, _idle_wheel_rx) =
-            unsync::new_with_adapter::<send::IdleWheelAdapter>();
+        let (idle_wheel_tx, _idle_wheel_rx) = unsync::new_with_adapter::<send::IdleWheelAdapter>();
         let (immediate_tx_raw, _immediate_rx) =
             unsync::new_with_adapter::<send::TxImmediateAdapter>();
         let socket_immediate_txs: crate::endpoint::id::IdMap<
@@ -367,7 +366,10 @@ fn send_pto_timeout_records_a_lost_mark_and_the_frames_it_moves() {
             10.s().sleep().await;
             rx.drain_budgeted(Some(32)).await;
 
-            assert!(ctx.borrow().is_path_lost(), "the silent pair is marked lost");
+            assert!(
+                ctx.borrow().is_path_lost(),
+                "the silent pair is marked lost"
+            );
             assert!(
                 retransmit_rx.recv().await.is_some(),
                 "the lost pair's frame moves to the pairs that deliver"
@@ -437,8 +439,7 @@ fn send_ack_processor_records_a_lost_pair_that_delivers_again() {
         let (mut ack_tx, ack_rx) = unsync::new::<msg::Sender>();
         let (tx_wheel_tx, _tx_wheel_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
         let (pto_wheel_tx, _pto_wheel_rx) = unsync::new_with_adapter::<send::PtoWheelAdapter>();
-        let (idle_wheel_tx, _idle_wheel_rx) =
-            unsync::new_with_adapter::<send::IdleWheelAdapter>();
+        let (idle_wheel_tx, _idle_wheel_rx) = unsync::new_with_adapter::<send::IdleWheelAdapter>();
         let (completed_tx, _completed_rx) = unsync::new::<frame::Frame>();
         let (cancelled_tx, _cancelled_rx) = unsync::new::<frame::Frame>();
         let (frame_tx, _frame_rx) = frame::submission_channel(1);
@@ -493,7 +494,10 @@ fn send_ack_processor_records_a_lost_pair_that_delivers_again() {
         async move {
             rx.drain_budgeted(Some(32)).await;
 
-            assert!(!ctx.borrow().is_path_lost(), "the acknowledgement clears the lost mark");
+            assert!(
+                !ctx.borrow().is_path_lost(),
+                "the acknowledgement clears the lost mark"
+            );
             assert_eq!(
                 event_count(&subscriber.path_secret_map_interface_pair_delivering),
                 1
@@ -636,7 +640,10 @@ fn send_worker_publishes_the_lost_mark_of_a_pair_that_sends_acknowledgements_alo
         async move {
             let entry = super::helpers::test_entry_at("server:4433").await;
             let fresh = build_send_context(&entry, 0, &registry, &clock);
-            let threshold = fresh.borrow().rtt_estimator.persistent_congestion_threshold();
+            let threshold = fresh
+                .borrow()
+                .rtt_estimator
+                .persistent_congestion_threshold();
             let step = threshold / 10;
 
             // The socket's place counts two interfaces, so that a pair that sends

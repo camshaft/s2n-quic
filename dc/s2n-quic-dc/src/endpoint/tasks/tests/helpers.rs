@@ -308,8 +308,8 @@ pub fn insert_inflight_packet(ctx: &mut send::Context, pse: &Arc<PathSecretEntry
     let cc_info = ctx.cca.on_packet_sent(now, 200, false, &rtt);
     let mut frames = crate::intrusive::Queue::new();
     frames.push_back(test_frame(pse));
-    let pn = s2n_quic_core::packet::number::PacketNumberSpace::Initial
-        .new_packet_number(VarInt::ZERO);
+    let pn =
+        s2n_quic_core::packet::number::PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
     ctx.inflight.insert(
         pn,
         crate::endpoint::inflight::Packet::new(

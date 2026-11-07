@@ -1266,8 +1266,7 @@ fn make_cache_with_a_lost_context() -> (super::Cache, Arc<PathSecretEntry>, Arc<
         .socket_sender_count(2)
         .build(None);
     let (map, _subscriber, events) = make_map_with_subscriber();
-    let mut cache = super::Cache::new(&registry, sender)
-        .with_path_secret_map(map);
+    let mut cache = super::Cache::new(&registry, sender).with_path_secret_map(map);
     let ctx = cache
         .get_or_insert(&entry, &crate::time::bach::Clock::default())
         .expect("Context::new should succeed with peer_data_addrs populated");

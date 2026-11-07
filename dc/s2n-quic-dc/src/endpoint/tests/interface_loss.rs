@@ -663,7 +663,10 @@ fn run(recover: bool) {
             }
         }
     }
-    assert!(acks > 0, "no acknowledgement was routed while a pair was lost");
+    assert!(
+        acks > 0,
+        "no acknowledgement was routed while a pair was lost"
+    );
     assert!(freed > 0, "no freed batch was routed while a pair was lost");
     assert!(
         acks_since > 0,
@@ -819,7 +822,9 @@ fn acknowledgements_move_to_a_priority_sender_that_delivers() {
     let mut moved = 0;
     for route in while_lost {
         assert!(!route.lost, "{route:?} went to a sender marked lost");
-        let remote = route.remote.expect("an acknowledgement records its peer sender");
+        let remote = route
+            .remote
+            .expect("an acknowledgement records its peer sender");
         let remote = remote.as_varint().as_u64() as usize;
         if CLIENT_INTERFACE[remote] == HIGHEST_PRIORITY {
             assert_eq!(
@@ -832,5 +837,8 @@ fn acknowledgements_move_to_a_priority_sender_that_delivers() {
             moved += 1;
         }
     }
-    assert!(moved > 0, "no acknowledgement of a peer's senders 4 to 6 moved off a lost sender");
+    assert!(
+        moved > 0,
+        "no acknowledgement of a peer's senders 4 to 6 moved off a lost sender"
+    );
 }

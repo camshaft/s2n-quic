@@ -1782,7 +1782,10 @@ pub mod tracing {
             event: &api::PathSecretMapInterfacePairFramesMoved,
         ) {
             let parent = self.parent(meta);
-            let api::PathSecretMapInterfacePairFramesMoved { peer_address, frames } = event;
+            let api::PathSecretMapInterfacePairFramesMoved {
+                peer_address,
+                frames,
+            } = event;
             tracing :: event ! (target : "path_secret_map_interface_pair_frames_moved" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , frames = tracing :: field :: debug (frames) });
         }
         #[inline]
@@ -2864,9 +2867,7 @@ pub mod builder {
     pub struct PathSecretMapInterfacePairLost<'a> {
         pub peer_address: SocketAddress<'a>,
     }
-    impl<'a> IntoEvent<api::PathSecretMapInterfacePairLost<'a>>
-        for PathSecretMapInterfacePairLost<'a>
-    {
+    impl<'a> IntoEvent<api::PathSecretMapInterfacePairLost<'a>> for PathSecretMapInterfacePairLost<'a> {
         #[inline]
         fn into_event(self) -> api::PathSecretMapInterfacePairLost<'a> {
             let PathSecretMapInterfacePairLost { peer_address } = self;
@@ -2902,7 +2903,10 @@ pub mod builder {
     {
         #[inline]
         fn into_event(self) -> api::PathSecretMapInterfacePairFramesMoved<'a> {
-            let PathSecretMapInterfacePairFramesMoved { peer_address, frames } = self;
+            let PathSecretMapInterfacePairFramesMoved {
+                peer_address,
+                frames,
+            } = self;
             api::PathSecretMapInterfacePairFramesMoved {
                 peer_address: peer_address.into_event(),
                 frames: frames.into_event(),
