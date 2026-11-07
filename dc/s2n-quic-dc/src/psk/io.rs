@@ -1344,6 +1344,47 @@ mod tests {
         assert_eq!(round_trips.flight_passes, [ms(2), ms(5)]);
     }
 
+    /// Verifies that each of the handshake's round trips reads the part of the endpoint's last
+    /// pass that ran after its flight's send and the path's least time, the lowest round trip
+    /// less the part of it that its packet could have waited, and not the part after its flight's
+    /// send and the whole lowest round trip.
+    #[test]
+    fn a_connection_reads_each_part_of_the_last_pass_after_the_lowest_round_trip_less_its_wait() {
+        fn pass(woke: u64, slept: u64) -> Pass {
+            Pass {
+                woke: ms(woke),
+                slept: ms(slept),
+            }
+        }
+
+        // The lowest round trip is 2 ms, 1 ms of which its packet could have waited, so the
+        // path's least time is 1 ms.
+        let mut context = PathRttContext {
+            min_rtt: Some(ms(2)),
+            waited: ms(1),
+            ..Default::default()
+        };
+        let before = context.round_trips().unwrap();
+        assert_eq!((before.lowest, before.path()), (ms(2), ms(1)));
+
+        // The first flight goes out at 10 ms, and its reply is read at 14 ms, in the pass after
+        // one that woke at 9 ms and slept at 13 ms: 2 ms of that pass ran after 11 ms, when the
+        // reply could first have reached the endpoint. From 12 ms, the flight's send and the
+        // whole lowest round trip, the part would be 1 ms.
+        context.on_sent(ms(10));
+        context.on_received(ms(14), pass(9, 13));
+
+        // The second flight goes out at 17 ms, and dc.complete comes at 24 ms, in the pass after
+        // one that woke at 16 ms and slept at 23 ms: 5 ms of that pass ran after 18 ms, and 4 ms
+        // after 19 ms.
+        context.on_secrets_ready();
+        context.on_sent(ms(17));
+        context.on_complete(ms(24), pass(16, 23));
+        let round_trips = context.round_trips().unwrap();
+        assert_eq!(round_trips.flights, [ms(4), ms(7)]);
+        assert_eq!(round_trips.flight_passes, [ms(2), ms(5)]);
+    }
+
     /// Verifies that the connection's subscriber reads the endpoint's last pass for each of the
     /// handshake's two round trips: at the first packet it receives, and at dc.complete.
     #[test]
