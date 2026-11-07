@@ -926,3 +926,213 @@ fn ack_processor_drops_message_with_out_of_range_sender_idx() {
     let result = with_noop_context(|cx| router.poll_recv(cx, &mut Budget::new(usize::MAX)));
     assert_eq!(result, Poll::Ready(None));
 }
+
+// ── StreamPriorityLane tests ──────────────────────────────────────────────
+
+/// A data frame of a stream at `priority`, told apart from the others by `offset`.
+fn new_test_data_frame(
+    path_secret_entry: Arc<PathSecretEntry>,
+    priority: crate::credit::Priority,
+    offset: u8,
+) -> Entry<Frame> {
+    new_test_frame_with_header(
+        path_secret_entry,
+        16,
+        Header::QueueData {
+            queue_pair: crate::packet::datagram::QueuePair {
+                source_queue_id: VarInt::from_u8(0),
+                dest_queue_id: VarInt::from_u8(1),
+            },
+            binding_id: VarInt::from_u8(0),
+            offset: VarInt::from_u8(offset),
+            largest_offset: VarInt::from_u8(offset),
+            is_fin: false,
+            blocked: false,
+            dest_acceptor_id: None,
+            priority,
+        },
+    )
+}
+
+fn data_queue(frames: impl IntoIterator<Item = Entry<Frame>>) -> Queue<Frame> {
+    let mut queue = Queue::new();
+    for frame in frames {
+        queue.push_back(frame);
+    }
+    queue
+}
+
+/// Polls `lane` once, and returns the stream priority and offset of the frame it yields.
+fn poll_lane<R: Receiver<Queue<Frame>>>(
+    lane: &mut StreamPriorityLane<R>,
+) -> Poll<Option<(crate::credit::Priority, u64)>> {
+    with_noop_context(|cx| lane.poll_recv(cx, &mut Budget::new(usize::MAX))).map(|next| {
+        next.map(|mut next| {
+            assert_eq!(next.len(), 1, "the lane yields one frame at a time");
+            let frame = next.pop_front().expect("the lane yielded a frame");
+            let Header::QueueData { offset, .. } = frame.header else {
+                panic!("expected a data frame, got {:?}", frame.header);
+            };
+            (frame.stream_priority(), offset.as_u64())
+        })
+    })
+}
+
+#[test]
+fn stream_priority_lane_yields_higher_priority_frames_first() {
+    use crate::credit::Priority::{Background, Highest, Medium};
+
+    let path = test_path_secret_entry();
+    let frames = [
+        (Background, 0),
+        (Background, 1),
+        (Highest, 2),
+        (Medium, 3),
+        (Highest, 4),
+    ]
+    .map(|(priority, offset)| new_test_data_frame(path.clone(), priority, offset));
+    let mut lane = StreamPriorityLane::new(TestReceiver {
+        values: VecDeque::from([data_queue(frames)]),
+        consumed: 0,
+    });
+
+    let mut order = vec![];
+    while let Poll::Ready(Some(frame)) = poll_lane(&mut lane) {
+        order.push(frame);
+    }
+    // Higher priorities first; first come, first served within a priority.
+    assert_eq!(
+        order,
+        [
+            (Highest, 2),
+            (Highest, 4),
+            (Medium, 3),
+            (Background, 0),
+            (Background, 1),
+        ]
+    );
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(None));
+}
+
+/// A frame of a higher-priority stream that arrives behind a backlog of lower-priority frames
+/// goes ahead of the rest of that backlog.
+#[test]
+fn stream_priority_lane_puts_a_late_higher_priority_frame_ahead_of_the_backlog() {
+    use crate::credit::Priority::{Background, Highest};
+
+    let path = test_path_secret_entry();
+    let backlog = [0, 1, 2].map(|offset| new_test_data_frame(path.clone(), Background, offset));
+    let late = new_test_data_frame(path.clone(), Highest, 3);
+    let mut lane = StreamPriorityLane::new(TestReceiver {
+        values: VecDeque::from([data_queue(backlog), data_queue([late])]),
+        consumed: 0,
+    });
+
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(Some((Background, 0))));
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(Some((Highest, 3))));
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(Some((Background, 1))));
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(Some((Background, 2))));
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(None));
+}
+
+/// Over the unsync lane frame dispatch builds it on, the lane waits while it has nothing to
+/// yield, and closes once the router's sender is gone and every frame has left.
+#[test]
+fn stream_priority_lane_over_an_unsync_lane() {
+    use crate::credit::Priority::{Background, Highest};
+
+    let (tx, rx) = unsync::new::<Frame>();
+    let mut tx = tx.into_list_sender();
+    let mut lane = StreamPriorityLane::new(rx.into_list_receiver());
+    assert_eq!(poll_lane(&mut lane), Poll::Pending);
+
+    let path = test_path_secret_entry();
+    let backlog = [0, 1].map(|offset| new_test_data_frame(path.clone(), Background, offset));
+    assert!(UnboundedSender::send(&mut tx, data_queue(backlog)).is_ok());
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(Some((Background, 0))));
+
+    let late = new_test_data_frame(path.clone(), Highest, 2);
+    assert!(UnboundedSender::send(&mut tx, data_queue([late])).is_ok());
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(Some((Highest, 2))));
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(Some((Background, 1))));
+    assert_eq!(poll_lane(&mut lane), Poll::Pending);
+
+    drop(tx);
+    assert_eq!(poll_lane(&mut lane), Poll::Ready(None));
+}
+
+/// Concurrent writers submit frames of different stream priorities through the sharded
+/// submission channel while its receiver drains it. Every frame reaches the lane exactly once,
+/// and once the lane holds them all, the highest-priority frame leaves first.
+#[test]
+fn loom_concurrent_writers_through_the_stream_priority_lane() {
+    use crate::credit::Priority::{self, Background, Highest};
+    use crate::testing::loom;
+
+    fn spawn_writer(
+        mut tx: frame::SubmissionSender,
+        path: Arc<PathSecretEntry>,
+        frames: Vec<(Priority, u8)>,
+    ) -> loom::thread::JoinHandle<()> {
+        loom::thread::spawn(move || {
+            for (priority, offset) in frames {
+                let mut input = frame::PriorityInput::default();
+                input.push(new_test_data_frame(path.clone(), priority, offset));
+                tx.send_batch(input).expect("the receiver is alive");
+            }
+        })
+    }
+
+    fn drain(
+        rx: &mut frame::SubmissionReceiver,
+        staging: &mut frame::PriorityStorage,
+        arrived: &mut Queue<Frame>,
+    ) -> Poll<Option<()>> {
+        let polled = with_noop_context(|cx| rx.poll_swap(cx, staging));
+        if let Poll::Ready(Some(())) = polled {
+            for (_class, mut queue) in staging.drain() {
+                arrived.append(&mut queue);
+            }
+        }
+        polled
+    }
+
+    loom::model(|| {
+        let path = test_path_secret_entry();
+        let (tx, mut rx) = frame::submission_channel(2);
+        let bulk = spawn_writer(
+            tx.clone(),
+            path.clone(),
+            vec![(Background, 0), (Background, 1)],
+        );
+        let control = spawn_writer(tx, path, vec![(Highest, 2)]);
+
+        let mut staging = frame::PriorityStorage::default();
+        let mut arrived = Queue::new();
+        // One drain while the writers run, then the rest once both are done.
+        let _ = drain(&mut rx, &mut staging, &mut arrived);
+        bulk.join().unwrap();
+        control.join().unwrap();
+        while let Poll::Ready(Some(())) = drain(&mut rx, &mut staging, &mut arrived) {}
+
+        let mut lane = StreamPriorityLane::new(TestReceiver {
+            values: VecDeque::from([arrived]),
+            consumed: 0,
+        });
+        let mut order = vec![];
+        while let Poll::Ready(Some(frame)) = poll_lane(&mut lane) {
+            order.push(frame);
+        }
+        assert_eq!(order.len(), 3, "every frame arrives exactly once: {order:?}");
+        assert_eq!(order[0], (Highest, 2));
+        let mut backlog: Vec<_> = order[1..]
+            .iter()
+            .map(|&(priority, offset)| {
+                assert_eq!(priority, Background);
+                offset
+            })
+            .collect();
+        backlog.sort_unstable();
+        assert_eq!(backlog, [0, 1]);
+    });
+}

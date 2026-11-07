@@ -39,6 +39,14 @@ pub const MAX_QUEUE_DATA_HEADER_OVERHEAD: u16 = 119;
 /// compared to QueueData, plus the `largest_offset` delta VarInt, in the worst case.
 pub const MAX_QUEUE_MSG_HEADER_OVERHEAD: u16 = 152;
 
+/// A frame's class: the send pipeline keeps the frames of each class apart.
+///
+/// Where frames wait to be sent, in front of the endpoint's pacer and in each peer's send
+/// context, the `QueueInit` and `QueueData` classes order their queued frames by the priority of
+/// the stream that sent them ([`Header::stream_priority`]), highest first, and frames of one
+/// stream priority keep their arrival order. A frame of a higher-priority stream therefore goes
+/// ahead of the queued frames of lower-priority streams to the same peer, whatever the send
+/// credit pool has admitted.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
@@ -406,8 +414,10 @@ pub enum Header {
     /// `priority` is encoded on the wire only for init frames; it tells the server
     /// which credit tier the inbound stream should park on. The peer remembers the
     /// priority after binding so subsequent frames carry no priority on the wire.
-    /// On non-init frames this field is informational only and is set to a default
-    /// after decode.
+    /// The sender keeps its stream's priority here on every frame, init or not: the send
+    /// pipeline orders the queued frames of each class by it (see
+    /// [`Header::stream_priority`]). Decode sets the default on non-init frames, since the
+    /// encoder leaves the field out there.
     QueueData {
         queue_pair: QueuePair,
         binding_id: VarInt,
@@ -514,6 +524,7 @@ pub enum Header {
         blocked: bool,
         dest_acceptor_id: Option<VarInt>,
         /// Encoded on the wire only when `dest_acceptor_id.is_some()`. See `QueueData`.
+        /// The sender keeps its stream's priority here on every frame, as for `QueueData`.
         priority: crate::credit::Priority,
     },
     /// Minimal ack-eliciting frame with no payload or fields.
@@ -604,6 +615,20 @@ impl Header {
         }
     }
 
+    /// The priority of the stream that sent this frame, which orders a queued frame among the
+    /// queued frames of its class (see [`Priority`]).
+    ///
+    /// Data and message frames carry their stream's priority, which the encoder writes only on
+    /// init frames. Every other frame reports the default priority, so the reset and control
+    /// classes keep their arrival order.
+    #[inline]
+    pub fn stream_priority(&self) -> crate::credit::Priority {
+        match self {
+            Self::QueueData { priority, .. } | Self::QueueMsg { priority, .. } => *priority,
+            _ => crate::credit::Priority::default(),
+        }
+    }
+
     /// Returns the wire-canonical form of `self`: clears fields that the encoder
     /// drops when their qualifying flag is absent, so that `encode-then-decode` is
     /// equality-preserving. Affects `priority` (encoded only on init frames) and
@@ -611,7 +636,8 @@ impl Header {
     /// on non-init FIN frames — both cases lose any sub-base value).
     ///
     /// This exists primarily for fuzz/property tests that synthesize arbitrary
-    /// `Header` values; production code never produces a non-canonical header.
+    /// `Header` values. A production header differs from its canonical form only in
+    /// `priority`, which the sender keeps on every data and message frame to order its queues.
     #[inline]
     pub fn canonicalize_for_wire(self) -> Self {
         match self {
@@ -1273,6 +1299,12 @@ impl Frame {
         self.header.priority()
     }
 
+    /// The priority of the stream that sent this frame. See [`Header::stream_priority`].
+    #[inline]
+    pub fn stream_priority(&self) -> crate::credit::Priority {
+        self.header.stream_priority()
+    }
+
     #[inline]
     pub fn payload_len(&self) -> usize {
         self.payload.len()
@@ -1842,6 +1874,84 @@ mod tests {
             "MAX_QUEUE_MSG_HEADER_OVERHEAD ({MAX_QUEUE_MSG_HEADER_OVERHEAD}) does not match \
              computed worst-case ({computed})"
         );
+    }
+
+    #[test]
+    fn stream_priority_reads_the_data_and_msg_priority() {
+        let queue_pair = QueuePair {
+            source_queue_id: VarInt::from_u8(1),
+            dest_queue_id: VarInt::from_u8(2),
+        };
+        for priority in crate::credit::Priority::ALL {
+            for dest_acceptor_id in [None, Some(VarInt::from_u8(7))] {
+                let data = Header::QueueData {
+                    queue_pair,
+                    binding_id: VarInt::from_u8(3),
+                    offset: VarInt::ZERO,
+                    largest_offset: VarInt::ZERO,
+                    is_fin: false,
+                    blocked: false,
+                    dest_acceptor_id,
+                    priority,
+                };
+                assert_eq!(data.stream_priority(), priority);
+
+                let msg = Header::QueueMsg {
+                    queue_pair,
+                    binding_id: VarInt::from_u8(3),
+                    msg_id: VarInt::ZERO,
+                    stream_offset: VarInt::ZERO,
+                    largest_offset: VarInt::ZERO,
+                    message_size: VarInt::from_u8(16),
+                    chunk_size: VarInt::from_u8(16),
+                    chunk_index: VarInt::ZERO,
+                    is_fin: false,
+                    is_wakeup: false,
+                    blocked: false,
+                    dest_acceptor_id,
+                    priority,
+                };
+                assert_eq!(msg.stream_priority(), priority);
+            }
+        }
+
+        let control = Header::QueueControl {
+            queue_pair,
+            binding_id: VarInt::from_u8(3),
+        };
+        assert_eq!(control.stream_priority(), crate::credit::Priority::default());
+    }
+
+    /// A non-init frame keeps its stream's priority for the send pipeline, and the wire format
+    /// doesn't change: the encoder writes the priority only on init frames.
+    #[test]
+    fn non_init_priority_stays_off_the_wire() {
+        fn encode(header: Header) -> Vec<u8> {
+            use s2n_codec::EncoderBuffer;
+
+            let mut buf = vec![0u8; header.encoding_size()];
+            let mut encoder = EncoderBuffer::new(&mut buf);
+            header.encode(&mut encoder);
+            buf
+        }
+
+        let data = |priority: crate::credit::Priority| Header::QueueData {
+            queue_pair: QueuePair {
+                source_queue_id: VarInt::from_u8(1),
+                dest_queue_id: VarInt::from_u8(2),
+            },
+            binding_id: VarInt::from_u8(3),
+            offset: VarInt::from_u8(4),
+            largest_offset: VarInt::from_u8(8),
+            is_fin: false,
+            blocked: false,
+            dest_acceptor_id: None,
+            priority,
+        };
+        let default = encode(data(crate::credit::Priority::default()));
+        for priority in crate::credit::Priority::ALL {
+            assert_eq!(encode(data(priority)), default);
+        }
     }
 
     #[test]
