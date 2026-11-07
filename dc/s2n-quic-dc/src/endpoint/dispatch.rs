@@ -2012,7 +2012,7 @@ fn send_reset(
 /// doesn't leave the router and release the hold: the hold ends before `free` frees the slot, so
 /// that the slot is recorded as freed. No other free of the slot comes between the hold and its
 /// end, since the slot is bound to the stream that `free` disables, or `free` records it.
-fn reject_init(
+pub(super) fn reject_init(
     server_view: &crate::queue::ServerView,
     path_secret_entry: &Arc<PathSecretEntry>,
     incoming_pair: QueuePair,
