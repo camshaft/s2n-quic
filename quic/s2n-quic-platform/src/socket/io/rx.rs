@@ -191,27 +191,59 @@ mod tests {
         path::{Handle as _, RemoteAddress},
     };
 
-    /// A message whose control messages are written in a `msghdr`
-    trait Msghdr: Message {
-        fn msghdr(&mut self) -> &mut libc::msghdr;
+    /// A message that the socket can hand to the receive queue with the time it received the
+    /// datagram
+    trait Received: Message {
+        /// Writes `received` as the time that the socket received the message's datagram
+        fn set_received(&mut self, received: Duration);
+
+        /// Leaves the message as the socket's receive leaves it, where that differs from a write
+        fn as_received(&mut self) {}
     }
 
-    impl Msghdr for libc::msghdr {
-        fn msghdr(&mut self) -> &mut libc::msghdr {
-            self
+    /// Writes `received` in `msghdr`'s control messages as an `SCM_TIMESTAMPNS` message
+    fn encode_received(msghdr: &mut libc::msghdr, received: Duration) {
+        let mut time: libc::timespec = unsafe { core::mem::zeroed() };
+        time.tv_sec = received.as_secs() as _;
+        time.tv_nsec = received.subsec_nanos() as _;
+        let (level, ty) = (libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS);
+        let mut encoder = msghdr.cmsg_encoder();
+        assert!(encoder.encode_cmsg(level, ty, time).is_ok());
+    }
+
+    impl Received for libc::msghdr {
+        fn set_received(&mut self, received: Duration) {
+            encode_received(self, received);
         }
     }
 
     #[cfg(s2n_quic_platform_socket_mmsg)]
-    impl Msghdr for libc::mmsghdr {
-        fn msghdr(&mut self) -> &mut libc::msghdr {
-            &mut self.msg_hdr
+    impl Received for libc::mmsghdr {
+        fn set_received(&mut self, received: Duration) {
+            encode_received(&mut self.msg_hdr, received);
+        }
+
+        fn as_received(&mut self) {
+            // `recvmmsg` writes the datagram's length in `msg_len`, and leaves the buffer's
+            // length in `msg_hdr` as `reset` set it
+            unsafe {
+                self.msg_hdr.set_payload_len(MaxMtu::default().into());
+            }
         }
     }
 
+    impl Received for crate::message::simple::Message {
+        fn set_received(&mut self, _received: Duration) {
+            unreachable!("a simple message doesn't hold the time the socket received it");
+        }
+    }
+
+    /// The payload of each datagram that `send` writes
+    const PAYLOAD: [u8; 4] = [1; 4];
+
     /// Writes a datagram into `producer` for each of `received`, which holds the time that the
     /// socket received the datagram where the socket reported one
-    fn send<T: Msghdr>(producer: &mut ring::Producer<T>, received: &[Option<Duration>]) {
+    fn send<T: Received>(producer: &mut ring::Producer<T>, received: &[Option<Duration>]) {
         let count = received.len() as u32;
         assert!(producer.acquire(count) >= count);
 
@@ -223,17 +255,13 @@ mod tests {
             let remote_address = RemoteAddress::from(SocketAddress::default());
             let handle = <T as Message>::Handle::from_remote_address(remote_address);
             let ecn = ExplicitCongestionNotification::default();
-            let payload = [1u8; 4];
-            entry.tx_write((handle, ecn, &payload[..])).unwrap();
+            entry.tx_write((handle, ecn, &PAYLOAD[..])).unwrap();
 
             if let Some(received) = received {
-                let mut time: libc::timespec = unsafe { core::mem::zeroed() };
-                time.tv_sec = received.as_secs() as _;
-                time.tv_nsec = received.subsec_nanos() as _;
-                let (level, ty) = (libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS);
-                let mut encoder = entry.msghdr().cmsg_encoder();
-                assert!(encoder.encode_cmsg(level, ty, time).is_ok());
+                entry.set_received(*received);
             }
+
+            entry.as_received();
         }
 
         producer.release(count);
@@ -261,7 +289,8 @@ mod tests {
                 reads.set(reads.get() + 1);
                 Some(clock.get())
             },
-            |header, _payload| {
+            |header, payload| {
+                assert_eq!(&*payload, &PAYLOAD[..]);
                 waits.push(header.receive_wait);
                 clock.set(clock.get() + spent);
             },
@@ -272,7 +301,7 @@ mod tests {
 
     /// The receive wait of each datagram of a batch ends at the batch's one read of the clock,
     /// and doesn't count the time that the endpoint spent on the datagrams before it
-    fn batch_test<T: Msghdr>() {
+    fn batch_test<T: Received>() {
         let (mut producer, consumer) = ring::pair::<T>(4, u16::from(MaxMtu::default()) as _);
         let mut channels = vec![consumer];
         let ms = Duration::from_millis;
@@ -297,7 +326,7 @@ mod tests {
     /// Where a datagram without a receive time goes to the endpoint before the batch reads the
     /// clock, the endpoint reads its own clock at that datagram, so a later datagram of the
     /// batch doesn't hold a wait, and the batch doesn't read the clock
-    fn batch_without_first_receive_time_test<T: Msghdr>() {
+    fn batch_without_first_receive_time_test<T: Received>() {
         let (mut producer, consumer) = ring::pair::<T>(4, u16::from(MaxMtu::default()) as _);
         let mut channels = vec![consumer];
         let ms = Duration::from_millis;
@@ -308,6 +337,52 @@ mod tests {
         let (waits, reads) = read(&mut channels, &clock, ms(5));
         assert_eq!(waits, [None::<Duration>, None]);
         assert_eq!(reads, 0);
+    }
+
+    /// A message type that doesn't report the time the socket received a datagram reads each
+    /// message as its `rx_read` does, so the batch's datagrams don't hold a wait, and the batch
+    /// doesn't read the clock
+    #[test]
+    fn simple_batch_test() {
+        type Simple = crate::message::simple::Message;
+        let (mut producer, consumer) = ring::pair::<Simple>(4, u16::from(MaxMtu::default()) as _);
+        let mut channels = vec![consumer];
+        let clock = Cell::new(Duration::from_secs(10));
+
+        send(&mut producer, &[None, None]);
+        let (waits, reads) = read(&mut channels, &clock, Duration::from_millis(5));
+        assert_eq!(waits, [None::<Duration>, None]);
+        assert_eq!(reads, 0);
+    }
+
+    /// The receive queue reads the realtime clock once for a batch, so two datagrams that the
+    /// socket received at the same time hold the same wait, though the endpoint spends time on
+    /// the first before it handles the second
+    fn realtime_batch_test<T: Received>() {
+        let (mut producer, consumer) = ring::pair::<T>(4, u16::from(MaxMtu::default()) as _);
+        let mut channels = vec![consumer];
+        let received = Duration::from_secs(1);
+        send(&mut producer, &[Some(received), Some(received)]);
+
+        let local_address = LocalAddress::from(SocketAddress::default());
+        let mut queue = RxQueue {
+            channels: &mut channels[..],
+            max_mtu: MaxMtu::default(),
+            local_address: &local_address,
+        };
+
+        let mut waits = vec![];
+        rx::Queue::for_each(&mut queue, |header, payload| {
+            assert_eq!(&*payload, &PAYLOAD[..]);
+            waits.push(header.receive_wait);
+            // The sleep moves the realtime clock on, so a read of the clock for each datagram
+            // would answer a longer wait for the second datagram
+            std::thread::sleep(Duration::from_millis(1));
+        });
+
+        assert_eq!(waits.len(), 2);
+        assert!(waits[0].is_some());
+        assert_eq!(waits[0], waits[1]);
     }
 
     #[test]
@@ -321,6 +396,11 @@ mod tests {
     }
 
     #[test]
+    fn msg_realtime_batch_test() {
+        realtime_batch_test::<crate::message::msg::Message>();
+    }
+
+    #[test]
     #[cfg(s2n_quic_platform_socket_mmsg)]
     fn mmsg_batch_test() {
         batch_test::<crate::message::mmsg::Message>();
@@ -330,5 +410,11 @@ mod tests {
     #[cfg(s2n_quic_platform_socket_mmsg)]
     fn mmsg_batch_without_first_receive_time_test() {
         batch_without_first_receive_time_test::<crate::message::mmsg::Message>();
+    }
+
+    #[test]
+    #[cfg(s2n_quic_platform_socket_mmsg)]
+    fn mmsg_realtime_batch_test() {
+        realtime_batch_test::<crate::message::mmsg::Message>();
     }
 }
