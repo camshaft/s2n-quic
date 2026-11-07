@@ -84,6 +84,9 @@ struct Shared {
     losing: AtomicBool,
     /// The client's addresses on the interface the test loses.
     lost_addrs: Mutex<Vec<SocketAddr>>,
+    /// Whether the network drops only the packets from `lost_addrs`, and delivers the packets
+    /// to them.
+    only_from_lost: AtomicBool,
     /// The packets the network dropped.
     dropped: AtomicU64,
     /// The bytes the server read.
@@ -115,6 +118,15 @@ impl Shared {
             .filter(|&(_, interface)| interface == LOST)
             .map(|(&addr, _)| addr)
             .collect();
+        *self.client_addrs.lock().unwrap() = addrs.to_vec();
+    }
+
+    /// Keeps the client's addresses, as `set_client_addrs` does, and makes the network drop the
+    /// packets that the client's sockets `lost` lists send, and deliver the packets sent to
+    /// them, instead of losing the packets to and from its interface `LOST`.
+    fn set_client_addrs_losing_sends(&self, addrs: &[SocketAddr], lost: &[usize]) {
+        *self.lost_addrs.lock().unwrap() = lost.iter().map(|&socket| addrs[socket]).collect();
+        self.only_from_lost.store(true, Ordering::Relaxed);
         *self.client_addrs.lock().unwrap() = addrs.to_vec();
     }
 
@@ -154,6 +166,9 @@ impl Shared {
             return false;
         }
         let lost_addrs = self.lost_addrs.lock().unwrap();
+        if self.only_from_lost.load(Ordering::Relaxed) {
+            return lost_addrs.contains(&source);
+        }
         lost_addrs.contains(&source) || lost_addrs.contains(&destination)
     }
 
@@ -547,4 +562,131 @@ fn run(recover: bool) {
         restored_share(restored_bytes),
         "the client wrote {restored_bytes:?} bytes on its interfaces in the last round",
     );
+}
+
+/// The client sockets whose packets `acknowledgements_move_to_a_priority_sender_that_delivers`
+/// drops: three of the four sockets of the interface that `interfaces` flags for the
+/// highest-priority traffic.
+const PRIORITY_LOST: [usize; 3] = [4, 5, 6];
+/// The interface that `interfaces` flags for the highest-priority traffic.
+const HIGHEST_PRIORITY: usize = 1;
+
+/// While client senders 4 to 6, of the interface for the highest-priority traffic, are marked
+/// lost and client sender 7 delivers, no acknowledgement goes to a sender marked lost, each
+/// acknowledgement of a peer sender on that interface goes to a sender of that interface, and at
+/// least one acknowledgement of server senders 4 to 6 moves off its own client sender. Both
+/// endpoints put their sockets on their interfaces as `CLIENT_INTERFACE` does, so that each
+/// endpoint's sender `i` is paired with the other endpoint's socket `i`. The network drops the
+/// packets that client sockets 4 to 6 send and delivers the packets sent to them, so that the
+/// client acknowledges the packets of server senders 4 to 6 while its own senders 4 to 6 are
+/// marked lost.
+#[test]
+fn acknowledgements_move_to_a_priority_sender_that_delivers() {
+    let _snapshots = without_snapshots();
+    let _tracing = without_tracing();
+
+    let shared = Arc::new(Shared::default());
+    let in_sim = shared.clone();
+    let routed = Arc::new(Mutex::new(Vec::<Routed>::new()));
+    let routed_in_sim = routed.clone();
+
+    sim(move || {
+        // The endpoints route on the thread that runs the sim, which records what they route.
+        observe::record_into(routed_in_sim);
+
+        let network = in_sim.clone();
+        bach::net::monitor::on_packet_sent(move |packet| {
+            if network.drops(packet.source(), packet.destination()) {
+                network.dropped.fetch_add(1, Ordering::Relaxed);
+                return bach::net::monitor::Command::Drop;
+            }
+            bach::net::monitor::Command::Pass
+        });
+
+        let server_side = in_sim.clone();
+        async move {
+            let server = SimEndpointConfig::default()
+                .interfaces(interfaces(&CLIENT_INTERFACE))
+                .server();
+            let mut acceptor = server
+                .register_acceptor_channel(ACCEPTOR_ID, STREAMS)
+                .expect("acceptor registration");
+            while let Some(stream) = acceptor.recv().await {
+                let shared = server_side.clone();
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut request = Data::new(STREAM_LEN);
+                    loop {
+                        let len = reader.read_into(&mut request).await.expect("server read");
+                        if len == 0 {
+                            break;
+                        }
+                        shared.on_read(len as u64);
+                    }
+                    assert!(request.is_finished(), "a request ended early");
+                    let mut reply = Data::new(REPLY_LEN);
+                    writer
+                        .write_all_from_fin(&mut reply)
+                        .await
+                        .expect("server write");
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        let client_side = in_sim;
+        async move {
+            let mut client = SimEndpointConfig::default()
+                .interfaces(interfaces(&CLIENT_INTERFACE))
+                .client();
+            client_side.set_client_addrs_losing_sends(client.data_addrs(), &PRIORITY_LOST);
+
+            // The network drops what the three sockets send while the server reads these streams.
+            timeout(
+                ROUND_TIMEOUT,
+                exchange(&mut client, STREAMS, "the round", &client_side),
+            )
+            .await
+            .expect("the streams finish while three sockets' packets are dropped");
+            assert!(
+                client_side.losing.load(Ordering::Relaxed),
+                "the sockets weren't lost",
+            );
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    let dropped = shared.dropped.load(Ordering::Relaxed);
+    assert!(dropped > 0, "the network didn't drop a packet");
+
+    // While a sender of the path was marked lost and another delivered, no acknowledgement that
+    // either endpoint routed went to a sender marked lost, each acknowledgement of a peer sender
+    // of the interface for the highest-priority traffic went to a sender of that interface, and
+    // at least one acknowledgement of a peer's senders 4 to 6 moved off its own sender.
+    let routes = routed.lock().unwrap();
+    let while_lost = routes.iter().filter(|route| {
+        route.kind == Kind::PendingAck && route.path_has_lost && route.path_delivers
+    });
+    let mut moved = 0;
+    for route in while_lost {
+        assert!(!route.lost, "{route:?} went to a sender marked lost");
+        let remote = route.remote.expect("an acknowledgement records its peer sender");
+        let remote = remote.as_varint().as_u64() as usize;
+        if CLIENT_INTERFACE[remote] == HIGHEST_PRIORITY {
+            assert_eq!(
+                CLIENT_INTERFACE[route.sender.as_usize()],
+                HIGHEST_PRIORITY,
+                "{route:?} left its peer sender's interface",
+            );
+        }
+        if PRIORITY_LOST.contains(&remote) && route.sender.as_usize() != remote {
+            moved += 1;
+        }
+    }
+    assert!(moved > 0, "no acknowledgement of a peer's senders 4 to 6 moved off a lost sender");
 }
