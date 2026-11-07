@@ -806,4 +806,53 @@ mod tests {
         assert_eq!(derived, LocalSenderId::from_index(2));
         assert_eq!(replaced, LocalSenderId::from_index(2));
     }
+
+    /// Schedules `ctx` to acknowledge the packets it holds, and returns the sender that the
+    /// acknowledgements it then submits go to.
+    fn submission_sender(ctx: &mut Context) -> LocalSenderId {
+        ctx.ack_state = AckState::Scheduled;
+        ctx.encode_and_flush(RecvDispatchWorkerId::new(0))
+            .expect("the context holds a packet to acknowledge")
+            .local_sender_id
+    }
+
+    #[test]
+    fn acknowledgements_leave_a_sender_whose_pair_is_lost() {
+        let peer: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let map = path::secret::map::testing::new(16);
+        map.test_stop_cleaner();
+        // The peer's entry keeps a slot for each of four senders.
+        map.set_socket_sender_count(4);
+        map.test_insert(peer, Type::Server);
+        let id = *map
+            .get_raw(peer)
+            .expect("the map holds the peer's entry")
+            .id();
+        // The route sends the acknowledgements of the peer's sender 6 to sender 2.
+        let route = ModuloRoute::new(4);
+        let remote_sender_id = RemoteSenderId::new(VarInt::from_u8(6));
+        let mut cache = Cache::new(RecvDispatchWorkerId::new(0));
+        let (ctx, _hit) = receive(&mut cache, &map, peer, id, 0, remote_sender_id, &route);
+        let mut ctx = ctx.borrow_mut();
+        let sender = LocalSenderId::from_index;
+        assert_eq!(ctx.local_sender_id, sender(2));
+        assert_eq!(ctx.path_entry.socket_sender_count(), 4);
+        let now = unsafe {
+            s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::from_millis(1))
+        };
+        ctx.ack_ranges.on_packet_received(VarInt::from_u8(0), now);
+
+        assert_eq!(submission_sender(&mut ctx), sender(2));
+        // While the pair of sender 2 is marked lost, the acknowledgements go to the next sender
+        // whose pair delivers, past each sender whose pair is marked lost too.
+        assert!(ctx.path_entry.set_sender_lost(sender(2), true));
+        assert_eq!(submission_sender(&mut ctx), sender(3));
+        assert!(ctx.path_entry.set_sender_lost(sender(3), true));
+        assert_eq!(submission_sender(&mut ctx), sender(0));
+        // Once the pair of sender 2 delivers again, the acknowledgements go back to it, and the
+        // context keeps its sender throughout.
+        assert!(ctx.path_entry.set_sender_lost(sender(2), false));
+        assert_eq!(submission_sender(&mut ctx), sender(2));
+        assert_eq!(ctx.local_sender_id, sender(2));
+    }
 }
