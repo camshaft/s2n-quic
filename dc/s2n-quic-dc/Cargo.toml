@@ -45,8 +45,10 @@ arrayvec = "0.7"
 atomic-waker = "1"
 aws-lc-rs = "1.12"
 # Flight recorder backing the frame/packet trace (see endpoint::frame_trace). The `capture` runtime
-# is always compiled in; emission is gated at the call sites behind `endpoint::dbg::on_enabled`, so a
-# release build that never enables the diagnostic constructs nothing and spawns no dumper thread.
+# is always compiled in; emission is gated at the call sites behind `endpoint::dbg::on_enabled`,
+# except for `frame_trace::slot_hold`, which records in every build: a release build's first slot
+# hold record builds the recorder and spawns its dumper thread, and capture stays off until
+# something enables it, such as `BACKBEAT_ENABLE`.
 backbeat = "0.1"
 bach = { version = "0.1.0", features = ["net", "net-monitor", "tokio-compat"], optional = true }
 bitflags = "2"

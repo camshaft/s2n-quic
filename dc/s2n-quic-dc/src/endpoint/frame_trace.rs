@@ -43,10 +43,13 @@
 //! *one* stuck frame end-to-end — this records *all* frames, so the dump shows the surrounding
 //! history. Each `QueueDbg` we receive [triggers](trigger) an asynchronous dump of the rings to disk.
 //!
-//! The whole facility is gated behind [`super::dbg::ENABLED`]: in plain release builds every record
-//! entry point folds to nothing — the event is never constructed and the [`backbeat::global`]
-//! recorder (and its dumper thread) is never built. It is active under `test`, the `testing`
-//! feature, or the `queue-dbg` feature — the same builds that already speak `QueueDbg`.
+//! The facility is gated behind [`super::dbg::ENABLED`]: in plain release builds each record entry
+//! point folds to nothing, so the event is never constructed. It is active under `test`, the
+//! `testing` feature, or the `queue-dbg` feature, the same builds that already speak `QueueDbg`.
+//! `slot_hold` is the one exception: it records in every build, so that a release build keeps what
+//! a server does with a held slot. Its first record builds the [`backbeat::global`] recorder and
+//! spawns its dumper thread, and the recorder captures only once something enables it, such as
+//! `BACKBEAT_ENABLE` in production.
 //!
 //! Dumps are self-describing `.bb` files written by `backbeat::global`'s background dumper, named by
 //! UTC timestamp under `BACKBEAT_PATH` (default `${TMPDIR}/backbeat.<pid>.bb`). Read them with the
@@ -733,9 +736,9 @@ fn canonicalize_cred(mut cred_id: [u8; 16]) -> [u8; 16] {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────────
-// Recording API. Each entry point is gated by `super::dbg::on_enabled` (a `false` const in plain
-// release builds, so the whole body — including event construction — is stripped). Call sites pass
-// plain values; no closures or imports needed.
+// Recording API. Each entry point but `slot_hold` is gated by `super::dbg::on_enabled` (a `false`
+// const in plain release builds, so the whole body, event construction included, is stripped).
+// Call sites pass plain values; no closures or imports needed.
 // ──────────────────────────────────────────────────────────────────────────────────────────────
 
 /// Records a wire frame (one with a packet number) at lifecycle `lifecycle`. The frame kind and all
@@ -923,6 +926,9 @@ pub(crate) fn server_bind(
 
 /// Records a [`SlotHold`]: what a server did with its slot `queue_id` as it rejected an init of
 /// `binding_id`, or the end of the slot's hold as its reset leaves the priority router.
+///
+/// Unlike the other entry points, this one isn't gated by `super::dbg::on_enabled`: a release build
+/// records each outcome too, once something enables the global recorder's capture.
 #[inline]
 pub(crate) fn slot_hold(
     queue_id: VarInt,
@@ -930,14 +936,12 @@ pub(crate) fn slot_hold(
     outcome: HoldOutcome,
     cred_id: CredId,
 ) {
-    super::dbg::on_enabled(|| {
-        backbeat::global::record(&SlotHold {
-            queue_id: queue_id.as_u64(),
-            binding_id: binding_id.as_u64(),
-            cred_id: canonicalize_cred(*cred_id),
-            outcome,
-            _pad: [0; 7],
-        })
+    backbeat::global::record(&SlotHold {
+        queue_id: queue_id.as_u64(),
+        binding_id: binding_id.as_u64(),
+        cred_id: canonicalize_cred(*cred_id),
+        outcome,
+        _pad: [0; 7],
     });
 }
 
@@ -1430,4 +1434,38 @@ pub(crate) fn resident_slot_holds(cred_id: CredId) -> Vec<(u64, u64, u8)> {
     }
     holds.sort_unstable();
     holds
+}
+
+/// `slot_hold` records each [`HoldOutcome`] with the slot and the binding it is given, under the
+/// credentials it is given.
+#[test]
+fn slot_hold_records_each_outcome() {
+    crate::testing::init_tracing();
+
+    // An address no other test uses, so that the records of its credentials in the process-wide
+    // recorder are this test's alone.
+    let entry = crate::path::secret::map::Entry::builder("127.0.0.1:44703".parse().unwrap())
+        .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+        .build(None);
+    let cred_id = *entry.id();
+    let outcomes = [
+        HoldOutcome::Held,
+        HoldOutcome::AlreadyHeld,
+        HoldOutcome::PastQueues,
+        HoldOutcome::Released,
+    ];
+    for (slot, outcome) in (1u8..).zip(outcomes) {
+        slot_hold(VarInt::from_u8(slot), VarInt::from_u8(slot + 4), outcome, cred_id);
+    }
+
+    assert_eq!(
+        resident_slot_holds(cred_id),
+        vec![
+            (1, 5, HoldOutcome::Held as u8),
+            (2, 6, HoldOutcome::AlreadyHeld as u8),
+            (3, 7, HoldOutcome::PastQueues as u8),
+            (4, 8, HoldOutcome::Released as u8),
+        ],
+        "each outcome is recorded with its slot and its binding"
+    );
 }
