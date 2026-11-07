@@ -3054,3 +3054,98 @@ fn interface_paced_pick_two_routes_another_peers_highest_input_batch_without_a_c
         "the router consumed a batch twice"
     );
 }
+
+#[test]
+fn interface_paced_pick_two_without_a_chosen_interface_routes_a_batch_once_its_mark_clears() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    // The pacing doesn't have an interface for the highest-priority traffic, so the router routes
+    // the batches of that level's input as any other, while an interface doesn't hold a batch.
+    // The pair of the second interface's sender is lost for the first peer, until the test clears
+    // that mark.
+    let waits = test_path_secret_entry();
+    assert!(waits.set_sender_lost(LocalSenderId::from_index(1), true));
+    let other = PathSecretEntry::builder("127.0.0.1:4434".parse().unwrap())
+        .socket_sender_count(2)
+        .build(None);
+    // The input of the highest priority level holds three batches of the first peer, each of
+    // more bytes than a burst and a byte more than the one before it, so that the sender's
+    // record shows their order, then a batch of the other peer and a fourth batch of the first
+    // peer. The bulk input is closed and empty.
+    let highest_rx = ClosableReceiver::default();
+    for (entry, byte_cost) in [
+        (&waits, 100_000),
+        (&waits, 100_001),
+        (&waits, 100_002),
+        (&other, 1_000),
+        (&waits, 100_003),
+    ] {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = byte_cost;
+        item.highest_priority = true;
+        highest_rx.values.borrow_mut().push_back(item);
+    }
+    let rx = ClosableReceiver::default();
+    rx.closed.set(true);
+    let first = Sends::default();
+    let second = Sends::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&first, &second]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+    let costs = |sends: &Sends| {
+        sends
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect::<Vec<_>>()
+    };
+
+    // The first peer's first batch goes at once to the first interface, and its second waits on
+    // that interface. Its third and fourth wait in the router, though the second interface is
+    // free, since that interface's sender is lost for that peer. The other peer's batch goes at
+    // once to the second interface.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(costs(&first), [100_000]);
+    assert_eq!(costs(&second), [1_000]);
+    assert!(highest_rx.values.borrow().is_empty());
+    assert_eq!(highest_rx.consumed.get(), 401_006);
+
+    // The input of the highest priority level closes, and the router doesn't end while the first
+    // peer's batches wait in it.
+    highest_rx.closed.set(true);
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(costs(&first), [100_000]);
+    assert_eq!(costs(&second), [1_000]);
+
+    // Once the pair of the second interface's sender delivers to the first peer again, that
+    // peer's waiting batches go to the free second interface, as any other batch would, though
+    // the clock didn't move: the third at once, since that interface's bucket still holds
+    // tokens, and the fourth waits on that interface for the tokens the third spent.
+    assert!(waits.set_sender_lost(LocalSenderId::from_index(1), false));
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert_eq!(costs(&first), [100_000]);
+    assert_eq!(costs(&second), [1_000, 100_002]);
+
+    // Once each bucket has paid for the batches sent before, the batch each interface holds goes,
+    // and the router ends, since no batch waits in it.
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(costs(&first), [100_000, 100_001]);
+    assert_eq!(costs(&second), [1_000, 100_002, 100_003]);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 5);
+    assert_eq!(
+        highest_rx.consumed.get(),
+        401_006,
+        "the router consumed a batch twice"
+    );
+}
