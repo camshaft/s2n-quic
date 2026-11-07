@@ -38,7 +38,7 @@ queue-dbg = ["tracing"]
 io-dbg = []
 # Enables loom-instrumented concurrency models. Crate-scoped (a cargo feature, not a global
 # `--cfg loom`), so it does not leak into dependencies like concurrent-queue.
-loom = ["dep:loom"]
+loom = ["dep:loom", "dep:generator"]
 
 [dependencies]
 arrayvec = "0.7"
@@ -82,6 +82,8 @@ parking_lot = "0.12"
 bitvec = { version = "1.0.1", default-features = false }
 nix = { version = "0.31.1", features = ["socket", "uio", "fs", "time"] }
 loom = { version = "0.7", features = ["checkpoint", "futures"], optional = true }
+# Check-only: loom's generator 0.8.12 needs rustc 1.95, past the toolchain the clippy job runs.
+generator = { version = "=0.8.11", optional = true }
 
 # io_uring is Linux-only; the storage scheduler's uring backend (fs::backend::uring) is gated on
 # target_os = "linux" and absent on every other platform.

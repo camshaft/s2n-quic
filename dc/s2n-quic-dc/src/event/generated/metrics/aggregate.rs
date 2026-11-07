@@ -14,7 +14,7 @@ use crate::event::{
 };
 #[allow(unused_imports)]
 use core::sync::atomic::{AtomicU64, Ordering};
-static INFO: &[Info; 132usize] = &[
+static INFO: &[Info; 154usize] = &[
     info::Builder {
         id: 0usize,
         name: Str::new("stream_write_key_updated\0"),
@@ -807,6 +807,138 @@ static INFO: &[Info; 132usize] = &[
         units: Units::Duration,
     }
     .build(),
+    info::Builder {
+        id: 132usize,
+        name: Str::new("path_secret_map_interface_pair_lost\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 133usize,
+        name: Str::new("path_secret_map_interface_pair_delivering\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 134usize,
+        name: Str::new("path_secret_map_interface_pair_frames_moved\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 135usize,
+        name: Str::new("path_secret_map_interface_pair_frames_moved.frames\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 136usize,
+        name: Str::new("path_secret_map_dead_mark_skipped\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 137usize,
+        name: Str::new("creditless_window_frame_refused\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 138usize,
+        name: Str::new("creditless_window_frame_refused.frame_bytes\0"),
+        units: Units::Bytes,
+    }
+    .build(),
+    info::Builder {
+        id: 139usize,
+        name: Str::new("creditless_window_frame_refused.held_bytes\0"),
+        units: Units::Bytes,
+    }
+    .build(),
+    info::Builder {
+        id: 140usize,
+        name: Str::new("creditless_window_frame_refused.limit_bytes\0"),
+        units: Units::Bytes,
+    }
+    .build(),
+    info::Builder {
+        id: 141usize,
+        name: Str::new("creditless_window_limit_grew\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 142usize,
+        name: Str::new("creditless_window_limit_grew.released_bytes\0"),
+        units: Units::Bytes,
+    }
+    .build(),
+    info::Builder {
+        id: 143usize,
+        name: Str::new("creditless_window_limit_grew.held_bytes\0"),
+        units: Units::Bytes,
+    }
+    .build(),
+    info::Builder {
+        id: 144usize,
+        name: Str::new("creditless_window_limit_grew.limit_bytes\0"),
+        units: Units::Bytes,
+    }
+    .build(),
+    info::Builder {
+        id: 145usize,
+        name: Str::new("creditless_window_limit_halved\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 146usize,
+        name: Str::new("creditless_window_limit_halved.held_bytes\0"),
+        units: Units::Bytes,
+    }
+    .build(),
+    info::Builder {
+        id: 147usize,
+        name: Str::new("creditless_window_limit_halved.previous_limit_bytes\0"),
+        units: Units::Bytes,
+    }
+    .build(),
+    info::Builder {
+        id: 148usize,
+        name: Str::new("creditless_window_limit_halved.limit_bytes\0"),
+        units: Units::Bytes,
+    }
+    .build(),
+    info::Builder {
+        id: 149usize,
+        name: Str::new("path_secret_map_interface_pair_preference_ended\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 150usize,
+        name: Str::new("path_secret_map_sender_counted_lost\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 151usize,
+        name: Str::new("path_secret_map_sender_counted_lost_cleared\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 152usize,
+        name: Str::new("path_secret_map_acknowledgement_moved\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 153usize,
+        name: Str::new("path_secret_map_freed_batch_moved\0"),
+        units: Units::None,
+    }
+    .build(),
 ];
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -815,7 +947,7 @@ pub struct ConnectionContext {
 }
 pub struct Subscriber<R: Registry> {
     #[allow(dead_code)]
-    counters: Box<[R::Counter; 44usize]>,
+    counters: Box<[R::Counter; 56usize]>,
     #[allow(dead_code)]
     bool_counters: Box<[R::BoolCounter; 4usize]>,
     #[allow(dead_code)]
@@ -823,7 +955,7 @@ pub struct Subscriber<R: Registry> {
     #[allow(dead_code)]
     nominal_counter_offsets: Box<[usize; 32usize]>,
     #[allow(dead_code)]
-    measures: Box<[R::Measure; 52usize]>,
+    measures: Box<[R::Measure; 62usize]>,
     #[allow(dead_code)]
     gauges: Box<[R::Gauge; 0usize]>,
     #[allow(dead_code)]
@@ -850,11 +982,11 @@ impl<R: Registry> Subscriber<R> {
     #[allow(unused_mut)]
     #[inline]
     pub fn new(registry: R) -> Self {
-        let mut counters = Vec::with_capacity(44usize);
+        let mut counters = Vec::with_capacity(56usize);
         let mut bool_counters = Vec::with_capacity(4usize);
         let mut nominal_counters = Vec::with_capacity(32usize);
         let mut nominal_counter_offsets = Vec::with_capacity(32usize);
-        let mut measures = Vec::with_capacity(52usize);
+        let mut measures = Vec::with_capacity(62usize);
         let mut gauges = Vec::with_capacity(0usize);
         let mut timers = Vec::with_capacity(0usize);
         let mut nominal_timers = Vec::with_capacity(0usize);
@@ -903,6 +1035,18 @@ impl<R: Registry> Subscriber<R> {
         counters.push(registry.register_counter(&INFO[109usize]));
         counters.push(registry.register_counter(&INFO[126usize]));
         counters.push(registry.register_counter(&INFO[129usize]));
+        counters.push(registry.register_counter(&INFO[132usize]));
+        counters.push(registry.register_counter(&INFO[133usize]));
+        counters.push(registry.register_counter(&INFO[134usize]));
+        counters.push(registry.register_counter(&INFO[136usize]));
+        counters.push(registry.register_counter(&INFO[137usize]));
+        counters.push(registry.register_counter(&INFO[141usize]));
+        counters.push(registry.register_counter(&INFO[145usize]));
+        counters.push(registry.register_counter(&INFO[149usize]));
+        counters.push(registry.register_counter(&INFO[150usize]));
+        counters.push(registry.register_counter(&INFO[151usize]));
+        counters.push(registry.register_counter(&INFO[152usize]));
+        counters.push(registry.register_counter(&INFO[153usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[5usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[6usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[101usize]));
@@ -1315,6 +1459,16 @@ impl<R: Registry> Subscriber<R> {
         measures.push(registry.register_measure(&INFO[128usize]));
         measures.push(registry.register_measure(&INFO[130usize]));
         measures.push(registry.register_measure(&INFO[131usize]));
+        measures.push(registry.register_measure(&INFO[135usize]));
+        measures.push(registry.register_measure(&INFO[138usize]));
+        measures.push(registry.register_measure(&INFO[139usize]));
+        measures.push(registry.register_measure(&INFO[140usize]));
+        measures.push(registry.register_measure(&INFO[142usize]));
+        measures.push(registry.register_measure(&INFO[143usize]));
+        measures.push(registry.register_measure(&INFO[144usize]));
+        measures.push(registry.register_measure(&INFO[146usize]));
+        measures.push(registry.register_measure(&INFO[147usize]));
+        measures.push(registry.register_measure(&INFO[148usize]));
         {
             #[allow(unused_imports)]
             use api::*;
@@ -1393,6 +1547,18 @@ impl<R: Registry> Subscriber<R> {
                 41usize => (&INFO[109usize], entry),
                 42usize => (&INFO[126usize], entry),
                 43usize => (&INFO[129usize], entry),
+                44usize => (&INFO[132usize], entry),
+                45usize => (&INFO[133usize], entry),
+                46usize => (&INFO[134usize], entry),
+                47usize => (&INFO[136usize], entry),
+                48usize => (&INFO[137usize], entry),
+                49usize => (&INFO[141usize], entry),
+                50usize => (&INFO[145usize], entry),
+                51usize => (&INFO[149usize], entry),
+                52usize => (&INFO[150usize], entry),
+                53usize => (&INFO[151usize], entry),
+                54usize => (&INFO[152usize], entry),
+                55usize => (&INFO[153usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -1697,6 +1863,16 @@ impl<R: Registry> Subscriber<R> {
                 49usize => (&INFO[128usize], entry),
                 50usize => (&INFO[130usize], entry),
                 51usize => (&INFO[131usize], entry),
+                52usize => (&INFO[135usize], entry),
+                53usize => (&INFO[138usize], entry),
+                54usize => (&INFO[139usize], entry),
+                55usize => (&INFO[140usize], entry),
+                56usize => (&INFO[142usize], entry),
+                57usize => (&INFO[143usize], entry),
+                58usize => (&INFO[144usize], entry),
+                59usize => (&INFO[146usize], entry),
+                60usize => (&INFO[147usize], entry),
+                61usize => (&INFO[148usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -2358,6 +2534,160 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
         self.count(129usize, 43usize, 1usize);
         self.measure(130usize, 50usize, event.acquire);
         self.measure(131usize, 51usize, event.duration);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_interface_pair_lost(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapInterfacePairLost,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(132usize, 44usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_interface_pair_delivering(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapInterfacePairDelivering,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(133usize, 45usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_interface_pair_frames_moved(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapInterfacePairFramesMoved,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(134usize, 46usize, 1usize);
+        self.measure(135usize, 52usize, event.frames);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_dead_mark_skipped(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapDeadMarkSkipped,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(136usize, 47usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_creditless_window_frame_refused(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::CreditlessWindowFrameRefused,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(137usize, 48usize, 1usize);
+        self.measure(138usize, 53usize, event.frame_bytes);
+        self.measure(139usize, 54usize, event.held_bytes);
+        self.measure(140usize, 55usize, event.limit_bytes);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_creditless_window_limit_grew(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::CreditlessWindowLimitGrew,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(141usize, 49usize, 1usize);
+        self.measure(142usize, 56usize, event.released_bytes);
+        self.measure(143usize, 57usize, event.held_bytes);
+        self.measure(144usize, 58usize, event.limit_bytes);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_creditless_window_limit_halved(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::CreditlessWindowLimitHalved,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(145usize, 50usize, 1usize);
+        self.measure(146usize, 59usize, event.held_bytes);
+        self.measure(147usize, 60usize, event.previous_limit_bytes);
+        self.measure(148usize, 61usize, event.limit_bytes);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_interface_pair_preference_ended(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapInterfacePairPreferenceEnded,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(149usize, 51usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_sender_counted_lost(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapSenderCountedLost,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(150usize, 52usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_sender_counted_lost_cleared(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapSenderCountedLostCleared,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(151usize, 53usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_acknowledgement_moved(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapAcknowledgementMoved,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(152usize, 54usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_freed_batch_moved(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapFreedBatchMoved,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(153usize, 55usize, 1usize);
         let _ = event;
         let _ = meta;
     }

@@ -32,7 +32,7 @@ use super::{
     slot::BindState,
     Error,
 };
-use crate::{endpoint::msg, intrusive};
+use crate::{bitset::HierarchicalBitSet, endpoint::msg, intrusive};
 use s2n_quic_core::varint::VarInt;
 use std::sync::Arc;
 
@@ -78,10 +78,13 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new(max_queues: VarInt, initial_recv_window: u64) -> Self {
+        // The freed set records a slot's free only below its capacity, so the server doesn't
+        // bind a slot at or past it, and the free of each slot it binds reaches its client.
+        let max_queues = max_queues.as_u64().min(HierarchicalBitSet::MAX_CAPACITY as u64);
         Self {
             pages: PageTable::new(),
             freed: FreedInner::new(),
-            max_queue_id: max_queues.as_u64().saturating_sub(1),
+            max_queue_id: max_queues.saturating_sub(1),
             initial_recv_window,
         }
     }
@@ -131,6 +134,33 @@ impl ServerView {
         endpoint_tx: &mut FreedBatchTx,
     ) {
         self.state.freed.record(queue_id, path_entry, endpoint_tx);
+    }
+
+    /// Hold the slot `queue_id` for the rejected init of `binding_id` until its reset leaves the
+    /// priority router, so that the slot is recorded as freed only then. Returns false where the
+    /// slot is held already, for a slot past the peer's queues, which `bind_for_msg` rejects
+    /// without a reset, and for a slot that the freed set can't record, at or past its capacity,
+    /// which `FreedInner::hold` refuses.
+    pub fn hold_freed(&self, queue_id: VarInt, binding_id: VarInt) -> bool {
+        if queue_id.as_u64() > self.state.max_queue_id {
+            return false;
+        }
+        self.state.freed.hold(queue_id, binding_id)
+    }
+
+    /// End the hold of the slot `queue_id` for the rejected init of `binding_id`, where its reset
+    /// doesn't reach the priority router to release it, as that release does: where the slot was
+    /// recorded as freed while it was held, it is recorded now.
+    pub fn release_freed(
+        &self,
+        queue_id: VarInt,
+        binding_id: VarInt,
+        path_entry: &Arc<PathSecretEntry>,
+        endpoint_tx: &mut FreedBatchTx,
+    ) {
+        self.state
+            .freed
+            .release(queue_id, binding_id, path_entry, endpoint_tx);
     }
 
     /// Attempt to bind a slot and push the first stream entry.
@@ -467,6 +497,50 @@ mod tests {
     }
 
     #[test]
+    fn hold_freed_refuses_a_slot_the_freed_set_cant_record() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // The peer's queues reach past the slots that the freed set records.
+        let (server, _path_entry, _tx, _rx) = test_server(capacity + 1);
+
+        // The last slot that the freed set records is held for its rejected init.
+        assert!(server.hold_freed(v(capacity - 1), v(1)));
+        // The slot at the freed set's capacity is one of the peer's queues, and isn't held.
+        assert!(!server.hold_freed(v(capacity), v(1)));
+    }
+
+    #[test]
+    fn max_queue_id_is_bounded_at_the_freed_set_capacity() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // Up to the freed set's capacity, the last queue id is the peer's last queue.
+        assert_eq!(ServerState::new(v(10), 0).max_queue_id, 9);
+        assert_eq!(ServerState::new(v(capacity), 0).max_queue_id, capacity - 1);
+        // Past it, the last queue id is the freed set's last slot.
+        assert_eq!(ServerState::new(v(capacity + 1), 0).max_queue_id, capacity - 1);
+        assert_eq!(ServerState::new(VarInt::MAX, 0).max_queue_id, capacity - 1);
+    }
+
+    #[test]
+    fn a_slot_the_freed_set_cant_record_isnt_bound() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // The peer's queues reach past the slots that the freed set records.
+        let (mut server, path_entry, mut tx, _rx) = test_server(capacity + 1);
+        assert_eq!(server.state.max_queue_id, capacity - 1);
+
+        // The slot at the freed set's capacity is one of the peer's queues, and the server
+        // doesn't bind it, since the freed set doesn't record its free.
+        let result = server.bind_and_send_stream(
+            v(capacity),
+            v(1),
+            make_stream_entry(),
+            &path_entry,
+            &mut tx,
+        );
+        assert!(matches!(result, Err(Error::CapExceeded(_))));
+        let result = server.bind_for_msg(v(capacity), v(1), &path_entry, &mut tx);
+        assert!(matches!(result, Err(Error::CapExceeded(_))));
+    }
+
+    #[test]
     fn send_stream_after_bind() {
         let (mut server, path_entry, mut tx, _rx) = test_server(10);
         let result =
@@ -644,5 +718,36 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Ok(BindResult::NewBinding { .. })));
+    }
+
+    /// A free recorded while a rejected init holds its slot waits on the hold, and is recorded
+    /// once the hold ends without its reset leaving the priority router, as the release of a
+    /// reset that leaves records it. An end for another binding leaves the hold in place.
+    #[test]
+    fn a_free_that_waited_on_a_hold_is_recorded_as_the_hold_ends_without_its_reset() {
+        let (server, path_entry, mut tx, _rx) = test_server(10);
+        let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+
+        assert!(server.hold_freed(v(1), v(1)));
+        server.record_freed(v(1), &path_entry, &mut tx);
+        assert!(
+            server.state.freed.take(&mut freed).is_none(),
+            "the free waits on the hold"
+        );
+
+        server.release_freed(v(1), v(2), &path_entry, &mut tx);
+        assert!(
+            server.state.freed.take(&mut freed).is_none(),
+            "an end for another binding leaves the hold"
+        );
+
+        server.release_freed(v(1), v(1), &path_entry, &mut tx);
+        server
+            .state
+            .freed
+            .take(&mut freed)
+            .expect("the free that waited on the hold is recorded");
+        assert!(freed.contains(1), "slot 1 is recorded as freed");
+        assert!(server.hold_freed(v(1), v(3)), "the slot isn't held");
     }
 }
