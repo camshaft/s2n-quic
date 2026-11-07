@@ -808,9 +808,9 @@ where
 
     /// Lets `peer` wait on each interface whose senders could take its first waiting batch by
     /// the marks [`Self::read_lost_marks`] read for that batch: the interfaces of the senders
-    /// those marks don't count as lost where another sender of the peer delivers, and else the
-    /// interfaces of every sender. No sender could take the batch, so each of those interfaces
-    /// holds a batch.
+    /// those marks leave clear, where they count some sender as lost and leave another clear,
+    /// and else the interfaces of every sender. No sender could take the batch, so each of those
+    /// interfaces holds a batch.
     fn wait_on_interfaces(&mut self, peer: credentials::Id) {
         let avoid_lost = self.candidates(false).avoid_lost;
         let waiting = self
