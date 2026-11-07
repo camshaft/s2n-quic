@@ -76,6 +76,11 @@ thread_local! {
     static SIM_ADDR_REGISTRY: RefCell<HashMap<SocketAddr, Vec<SocketAddr>>> =
         RefCell::new(HashMap::new());
 
+    // The interface of each address `SIM_ADDR_REGISTRY` holds, in its order, or empty where
+    // the endpoint doesn't list an interface.
+    static SIM_INTERFACE_REGISTRY: RefCell<HashMap<SocketAddr, Vec<Option<u16>>>> =
+        RefCell::new(HashMap::new());
+
     static SIM_ENDPOINT_BY_GROUP: RefCell<HashMap<u64, Weak<Endpoint>>> =
         RefCell::new(HashMap::new());
 
@@ -83,7 +88,12 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-fn register_endpoint_map(data_addrs: &[SocketAddr], map: PathSecretMap, params: ApplicationParams) {
+fn register_endpoint_map(
+    data_addrs: &[SocketAddr],
+    map: PathSecretMap,
+    params: ApplicationParams,
+    data_interfaces: Vec<Option<u16>>,
+) {
     SIM_MAP_REGISTRY.with(|r| {
         let mut reg = r.borrow_mut();
         for &addr in data_addrs {
@@ -95,6 +105,12 @@ fn register_endpoint_map(data_addrs: &[SocketAddr], map: PathSecretMap, params: 
         let addrs = data_addrs.to_vec();
         for &addr in data_addrs {
             reg.insert(addr, addrs.clone());
+        }
+    });
+    SIM_INTERFACE_REGISTRY.with(|r| {
+        let mut reg = r.borrow_mut();
+        for &addr in data_addrs {
+            reg.insert(addr, data_interfaces.clone());
         }
     });
     SIM_PARAMS_REGISTRY.with(|r| {
@@ -113,6 +129,12 @@ fn lookup_peer_data_addrs(any_addr: SocketAddr) -> Vec<SocketAddr> {
     SIM_ADDR_REGISTRY
         .with(|r| r.borrow().get(&any_addr).cloned())
         .unwrap_or_else(|| vec![any_addr])
+}
+
+fn lookup_peer_data_interfaces(any_addr: SocketAddr) -> Vec<Option<u16>> {
+    SIM_INTERFACE_REGISTRY
+        .with(|r| r.borrow().get(&any_addr).cloned())
+        .unwrap_or_default()
 }
 
 /// Well-known server identifier port used by sim endpoint discovery.
@@ -269,6 +291,10 @@ pub struct SimEndpointConfig {
 
     /// Send credit pool config. Defaults to [`crate::credit::Config::default`].
     pub send_credit_pool_config: crate::credit::Config,
+
+    /// The endpoint's local interfaces. Defaults to none, which puts every socket on the
+    /// default interface.
+    pub interfaces: Vec<crate::socket::interface::Config>,
 }
 
 impl Default for SimEndpointConfig {
@@ -294,6 +320,7 @@ impl Default for SimEndpointConfig {
             dead_peer_cooldown: crate::stream::endpoint::DEFAULT_DEAD_PEER_COOLDOWN,
             recv_credit_pool_config: crate::credit::Config::default(),
             send_credit_pool_config: crate::credit::Config::default(),
+            interfaces: Vec::new(),
         }
     }
 }
@@ -321,6 +348,11 @@ impl SimEndpointConfig {
 
     pub fn send_credit_pool_config(mut self, config: crate::credit::Config) -> Self {
         self.send_credit_pool_config = config;
+        self
+    }
+
+    pub fn interfaces(mut self, interfaces: Vec<crate::socket::interface::Config>) -> Self {
+        self.interfaces = interfaces;
         self
     }
 
@@ -371,6 +403,7 @@ pub fn setup_sim_endpoint(
         dead_peer_cooldown,
         recv_credit_pool_config,
         send_credit_pool_config,
+        interfaces,
     } = config;
 
     assert!(
@@ -490,6 +523,7 @@ pub fn setup_sim_endpoint(
         gso,
         acceptor_registry,
         overall_send_rate,
+        interfaces,
         budgets,
         submission_shards,
         ups_rate,
@@ -530,8 +564,19 @@ pub fn setup_sim_endpoint(
         params.remote_max_data = window;
     }
 
-    // Register in the thread-local registry so `connect` can find it.
-    register_endpoint_map(&endpoint.data_addrs, path_secret_map, params);
+    // Register in the thread-local registry so `connect` can find it, with the interface of
+    // each recv socket where the config lists interfaces.
+    let data_interfaces: Vec<Option<u16>> = endpoint
+        .interfaces
+        .advertised_recv_interfaces()
+        .map(|ids| ids.into_iter().map(Some).collect())
+        .unwrap_or_default();
+    register_endpoint_map(
+        &endpoint.data_addrs,
+        path_secret_map,
+        params,
+        data_interfaces,
+    );
 
     endpoint
 }
@@ -638,17 +683,21 @@ pub fn insert_fake_path_pair(
     // Each side's `peer_data_addrs` is the full recv-socket address list the *other*
     // endpoint advertises, mirroring what the `DcDataAddresses` transport parameter
     // supplies at handshake completion. The local-side entry (keyed by peer_addr) targets
-    // the peer's addrs; the peer-side entry (keyed by local_addr) targets ours.
+    // the peer's addrs; the peer-side entry (keyed by local_addr) targets ours. Each entry also
+    // holds the interface of each of those addresses, where the other endpoint lists
+    // interfaces, as the transport parameter's interface entries supply them.
     let mut local_builder = Entry::builder(peer_addr)
         .local(local_addr)
-        .peer_data_addrs(lookup_peer_data_addrs(peer_addr));
+        .peer_data_addrs(lookup_peer_data_addrs(peer_addr))
+        .peer_data_interfaces(lookup_peer_data_interfaces(peer_addr));
     if let Some(params) = lookup_sim_params(local_addr) {
         local_builder = local_builder.params(params);
     }
 
     let mut peer_builder = Entry::builder(local_addr)
         .local(peer_addr)
-        .peer_data_addrs(lookup_peer_data_addrs(local_addr));
+        .peer_data_addrs(lookup_peer_data_addrs(local_addr))
+        .peer_data_interfaces(lookup_peer_data_interfaces(local_addr));
     if let Some(params) = lookup_sim_params(peer_addr) {
         peer_builder = peer_builder.params(params);
     }

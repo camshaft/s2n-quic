@@ -108,6 +108,9 @@ pub trait Store: 'static + Send + Sync + time::Clock {
 
     fn advertised_data_addrs(&self) -> Option<bytes::Bytes>;
 
+    /// Tags each advertised data address with the interface of the local socket it matches.
+    fn set_advertised_data_interfaces(&self, local: &[(SocketAddr, u16)]);
+
     fn check_dedup(
         &self,
         entry: &Entry,
@@ -204,4 +207,16 @@ pub trait Store: 'static + Send + Sync + time::Clock {
     fn reset_all_senders(&self);
 
     fn on_dc_connection_timeout(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapInterfacePairLost event.
+    fn on_interface_pair_lost(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapInterfacePairDelivering event.
+    fn on_interface_pair_delivering(&self, peer_address: &SocketAddr);
+
+    /// Publishes a PathSecretMapInterfacePairFramesMoved event.
+    fn on_interface_pair_frames_moved(&self, peer_address: &SocketAddr, frames: usize);
+
+    /// Publishes a PathSecretMapDeadMarkSkipped event.
+    fn on_dead_mark_skipped(&self, peer_address: &SocketAddr);
 }

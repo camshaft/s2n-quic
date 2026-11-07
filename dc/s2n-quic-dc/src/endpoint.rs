@@ -104,6 +104,15 @@ impl Endpoint {
             counters,
             next_binding_id: AtomicU64::new(0),
             data_addrs: Vec::new(),
+            // The endpoint doesn't hold a socket, so the table holds the default interface
+            // alone, and nothing reads its send rate.
+            interfaces: crate::socket::interface::Table::resolve(
+                &[],
+                crate::socket::rate::Rate::new(100.0),
+                &[],
+                &[],
+                &crate::socket::interface::System,
+            ),
             dead_peer_cooldown,
             clock,
             reader_metrics,
@@ -132,6 +141,11 @@ pub struct Endpoint {
     /// Recv socket addresses advertised to peers during handshake.
     /// Each recv worker has its own distinct address.
     pub data_addrs: Vec<std::net::SocketAddr>,
+    /// The endpoint's local interfaces, and the interface of each send socket and recv socket.
+    /// The recv socket at position `i` of [`Table::recv_sockets`] is the one at `data_addrs[i]`.
+    ///
+    /// [`Table::recv_sockets`]: crate::socket::interface::Table::recv_sockets
+    pub interfaces: crate::socket::interface::Table,
     /// Cooldown period during which new flows are rejected after a peer is marked dead.
     pub dead_peer_cooldown: Duration,
     /// Clock created once at endpoint construction — bach-aware in test contexts.
@@ -409,14 +423,28 @@ pub struct Config {
     pub gso: s2n_quic_platform::features::Gso,
     /// Server-side acceptor registry.
     pub acceptor_registry: acceptor::Registry<Stream>,
-    /// Overall bandwidth cap applied by the frame-dispatch pacing stage.
+    /// The send rate of the default interface, and of each listed interface (see
+    /// [`interfaces`](Self::interfaces)) whose link speed the operating system doesn't report
+    /// and whose rate the configuration doesn't set.
     ///
-    /// The [`Paced`] combinator in the dispatch pipeline enforces this rate across all
-    /// send sockets combined. Set to a very high value (e.g. `Rate::new(100.0)` for
-    /// 100 Gbps) to effectively disable pacing when the network is not a bottleneck.
+    /// Where every send socket is on one interface, the [`Paced`] combinator in the dispatch
+    /// pipeline holds the send sockets combined to that interface's send rate. Where they are on
+    /// several interfaces, the pipeline paces the send sockets of each interface together, at
+    /// that interface's send rate. Set it to a very high value, such as `Rate::new(100.0)` for
+    /// 100 Gbps, so that pacing doesn't limit sends where the network isn't the bottleneck.
     ///
     /// [`Paced`]: crate::socket::channel::Paced
     pub overall_send_rate: crate::socket::rate::Rate,
+    /// The local network interfaces the endpoint sends and receives on.
+    ///
+    /// Leave it empty to put every socket on one interface whose send rate is
+    /// `overall_send_rate`, as an endpoint without interfaces sends. Otherwise the endpoint
+    /// numbers the listed interfaces from 1, beside the default interface 0, and puts each socket
+    /// that no interface lists on the listed interface whose name its local address is on, or on
+    /// the default interface. Frame dispatch paces the send sockets of each interface together,
+    /// at that interface's send rate, and the send and receive credit pools refill at the sum of
+    /// the send rates of the interfaces that hold a send socket. See [`crate::socket::interface`].
+    pub interfaces: Vec<crate::socket::interface::Config>,
     /// Per-poll budgets for each pipeline task.
     pub budgets: Budgets,
     /// Number of shards for the frame submission channel.
@@ -570,6 +598,7 @@ where
         gso,
         acceptor_registry,
         overall_send_rate,
+        interfaces: interface_configs,
         budgets,
         submission_shards,
         ups_rate,
@@ -625,6 +654,40 @@ where
         .collect();
     let source_control_port = data_addrs.first().map_or(0, |a| a.port());
 
+    // Put each socket on a local interface, and resolve each interface's send rate. A config
+    // that doesn't list an interface puts every socket on the default interface at
+    // `overall_send_rate`, and nothing is read from the operating system.
+    let send_addrs: Vec<std::net::SocketAddr> = send_sockets
+        .iter()
+        .map(|(_, s)| {
+            s.local_addr()
+                .expect("send socket must have a local address")
+        })
+        .collect();
+    let interfaces = crate::socket::interface::Table::resolve(
+        &interface_configs,
+        overall_send_rate,
+        &send_addrs,
+        &data_addrs,
+        &crate::socket::interface::System,
+    );
+    if !interface_configs.is_empty() {
+        debug!(?interfaces, "resolved local interfaces");
+    }
+
+    // Tag each advertised data address with the interface of its recv socket, so that a peer
+    // learns the interface of each address. A config that doesn't list an interface leaves
+    // the addresses untagged.
+    if let Some(recv_interfaces) = interfaces.advertised_recv_interfaces() {
+        let local: Vec<(std::net::SocketAddr, u16)> =
+            data_addrs.iter().copied().zip(recv_interfaces).collect();
+        path_secret_map.set_advertised_data_interfaces(&local);
+    }
+
+    // Frame dispatch paces the send sockets of each interface together, at that interface's
+    // send rate. Where every send socket is on one interface, one rate paces them all.
+    let pacing = combinator::SendPacing::from_interfaces(&interfaces, overall_send_rate);
+
     // Frame submission channel: all writers share one sharded sender; one dispatch task drains it.
     let (frame_tx, frame_rx) = frame::submission_channel(submission_shards);
 
@@ -643,7 +706,7 @@ where
     // placeholder rate); here we substitute the real rate. A caller that explicitly *disabled*
     // refill (`refill: None`, via `Config::without_refill`) is preserved — `.map` only rewrites the
     // rate of an already-enabled refill, it never re-enables a disabled one.
-    let refill_rate = overall_send_rate;
+    let refill_rate = pacing.total_rate();
     let send_credit_pool_config = crate::credit::Config {
         refill: send_credit_pool_config
             .refill
@@ -765,6 +828,17 @@ where
         v
     };
 
+    // Each send socket's place among the interfaces, which pairs its contexts with the peer's
+    // interfaces. A config that doesn't list an interface leaves every socket without a place.
+    let send_places = interfaces.send_places();
+
+    // The send sockets of the interface that carries the highest-priority traffic, which the
+    // freed batches and a peer's acknowledgements go to, where the config flags one and at least
+    // one other interface holds a send socket too.
+    let priority_senders: Option<Vec<LocalSenderId>> = interfaces
+        .highest_priority_send_sockets()
+        .map(|sockets| sockets.into_iter().map(LocalSenderId::from_index).collect());
+
     // Distribute send sockets across send workers round-robin.
     for (socket_id, socket) in send_sockets.into_iter() {
         let raw_idx = socket_id.as_usize();
@@ -782,6 +856,7 @@ where
             pool: send_pool.clone(),
             clock: clock.clone(),
             initial_tx_descriptor_allocs,
+            interface_place: send_places.as_ref().map(|places| places[raw_idx]),
         });
     }
 
@@ -828,7 +903,7 @@ where
         frame_rx,
         socket_senders,
         clock: clock.clone(),
-        overall_send_rate,
+        pacing,
         send_credit_distributor,
         recv_credit_distributor,
         send_credit_waker_sink: send_credit_distributor_waker_sink,
@@ -902,6 +977,7 @@ where
             reader_metrics: reader_metrics.clone(),
             writer_metrics: writer_metrics.clone(),
             send_credit_pool: send_credit_pool.clone(),
+            path_secret_map: path_secret_map.clone(),
         });
     }
 
@@ -951,6 +1027,7 @@ where
             clock: clock.clone(),
             stream_clock: stream_clock.clone(),
             route: ack_route,
+            priority_senders: priority_senders.clone(),
             waker_sink,
             ups_tx: ups_tx.clone(),
             invalidation_rx,
@@ -1037,6 +1114,7 @@ where
         send_txs: invalidation_send_txs,
         recv_txs: invalidation_recv_txs,
         sender_id_to_worker,
+        priority_senders,
         ups_rx,
         ups_queue_gauge: counter_registry.register_queue_gauge("q.ups"),
         ups_socket,
@@ -1059,6 +1137,7 @@ where
         counters: counter_registry,
         next_binding_id: AtomicU64::new(0),
         data_addrs,
+        interfaces,
         dead_peer_cooldown,
         clock: stream_clock,
         reader_metrics,
@@ -1079,8 +1158,8 @@ struct FrameDispatchParts<Clk> {
     socket_senders: IdMap<LocalSenderId, BatchSender>,
     /// Clock used by the pacing stage.
     clock: Clk,
-    /// Overall bandwidth cap for the pacing stage.
-    overall_send_rate: crate::socket::rate::Rate,
+    /// How the pacing stage paces the send sockets of each interface.
+    pacing: combinator::SendPacing,
     /// Send-direction credit-pool distributor. Spawned alongside the frame-dispatch
     /// task on the same worker so distribution and submission share a thread.
     send_credit_distributor: crate::credit::Distributor,
@@ -1115,6 +1194,7 @@ struct SendWorkerParts {
     reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    path_secret_map: crate::path::secret::Map,
 }
 
 /// Per-socket ingredients for the socket send task.
@@ -1126,6 +1206,9 @@ pub(crate) struct SendSocketParts<Socket, Clk> {
     pool: crate::socket::pool::Pool,
     clock: Clk,
     initial_tx_descriptor_allocs: usize,
+    /// The socket's place among the endpoint's interfaces, which pairs its contexts with the
+    /// peer's interfaces, or `None` where the endpoint doesn't list any.
+    interface_place: Option<crate::socket::interface::SendPlace>,
 }
 
 type PacketSender = GaugedSender<
@@ -1159,6 +1242,9 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     /// Concrete clock used for stream construction (checked once at endpoint startup).
     stream_clock: crate::time::DefaultClock,
     route: Route,
+    /// The send sockets of the interface for the highest-priority traffic, which a peer's
+    /// acknowledgements go to, where the endpoint has one.
+    priority_senders: Option<Vec<LocalSenderId>>,
     waker_sink: waker::Sink,
     ups_tx: UpsSender,
     invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
@@ -1186,6 +1272,9 @@ struct BackgroundParts<UpsSocket> {
     send_txs: IdMap<id::SendWorkerId, InvalidationSender>,
     recv_txs: IdMap<id::RecvDispatchWorkerId, InvalidationSender>,
     sender_id_to_worker: IdMap<LocalSenderId, id::SendWorkerId>,
+    /// The send sockets of the interface for the highest-priority traffic, which the freed
+    /// batches go to, where the endpoint has one.
+    priority_senders: Option<Vec<LocalSenderId>>,
     ups_rx: ups::PendingReceiver<sync_queue::Receiver<ups::Response>>,
     ups_queue_gauge: crate::counter::QueueGauge,
     ups_socket: UpsSocket,
@@ -1304,7 +1393,7 @@ where
                     fd.socket_senders,
                     crate::xorshift::Rng::new(),
                     fd.clock,
-                    fd.overall_send_rate,
+                    fd.pacing,
                     budgets,
                     counter_registry.clone(),
                     fd.send_credit_pool,
@@ -1364,6 +1453,7 @@ where
                     sw.reader_metrics,
                     sw.writer_metrics,
                     sw.send_credit_pool,
+                    sw.path_secret_map,
                 );
             }
 
@@ -1449,7 +1539,8 @@ where
                 );
                 let recv_dispatch_idx = rd.recv_dispatch_idx;
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx),
+                    crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx)
+                        .with_priority_senders(rd.priority_senders),
                 ));
                 let (ack_burst_tx, ack_burst_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<
@@ -1699,31 +1790,22 @@ where
                     use crate::socket::channel::{ReceiverExt as _, UnboundedSender as _};
                     let mut ack_sender = bg.ack_sender;
                     let socket_count = total_sender_ids;
+                    let priority_senders = bg.priority_senders;
                     let mut rng = crate::xorshift::Rng::new();
                     let rx = crate::socket::channel::Map::new(
                         bg.freed_batch_rx,
                         move |mut entry: crate::intrusive::Entry<msg::Sender>| {
-                            // Pick-two LB using sender_load_score atomics
-                            let chosen = if socket_count <= 1 {
-                                LocalSenderId::from_index(0)
-                            } else {
-                                let path_entry = entry.path_secret_entry().clone();
-                                let idx1 = LocalSenderId::from_index(rng.next_usize(socket_count));
-                                let idx2 = {
-                                    let mut raw = rng.next_usize(socket_count - 1);
-                                    if raw >= idx1.as_usize() {
-                                        raw += 1;
-                                    }
-                                    LocalSenderId::from_index(raw)
-                                };
-                                let s1 = path_entry.sender_load_score(idx1);
-                                let s2 = path_entry.sender_load_score(idx2);
-                                if s1 <= s2 {
-                                    idx1
-                                } else {
-                                    idx2
-                                }
-                            };
+                            // Pick-two LB using sender_load_score atomics, among the senders of
+                            // the interface for the highest-priority traffic where there is one.
+                            // A sender whose interface pair is marked lost loses the draw, and
+                            // where both drawn senders' pairs are lost, the batch goes to a
+                            // sender whose pair delivers.
+                            let chosen = routing::path_freed_batch_sender_id(
+                                entry.path_secret_entry(),
+                                priority_senders.as_deref(),
+                                socket_count,
+                                &mut rng,
+                            );
 
                             // Set the chosen sender and forward
                             if let msg::Sender::PendingFreed {
