@@ -656,9 +656,17 @@ impl Entry {
     /// from the clock of the map that holds it (`Map::entry_age`).
     ///
     /// Only an authenticated packet from the peer clears the dead mark
-    /// ([`touch_activity`](Self::touch_activity)), and every flow that goes unanswered marks it
-    /// again, so a peer whose cached path secret stops getting answers stays refused for as long
-    /// as the process keeps this entry. The callers that open flows treat this as the signal to
+    /// ([`touch_activity`](Self::touch_activity)), so a peer whose cached path secret stops
+    /// getting answers stays refused for as long as the process keeps this entry. Once the
+    /// cooldown has passed, a send context's idle expiry renews the mark where the context has
+    /// packets that wait for an acknowledgement, unless its pair is marked lost and either the
+    /// peer hasn't sent an authenticated packet since that lost mark or another pair of the peer
+    /// delivers. A lost pair's expiry while the peer stays silent since the pair's lost mark
+    /// marks the entry only where the entry doesn't hold a mark. In the endpoint a context
+    /// reaches its expiry with such packets only after its pair is marked lost, so a context
+    /// whose pair is marked lost after the peer's last packet doesn't renew the mark, and each
+    /// other context renews it at most once, as `send_idle_wheel_drain` says: the mark stops
+    /// moving, and the cooldown ends. The callers that open flows treat this as the signal to
     /// evict the entry and handshake again, which builds fresh keys, queue state and send and
     /// receive contexts for the peer. Within the cooldown they keep refusing flows, as before.
     #[inline]
