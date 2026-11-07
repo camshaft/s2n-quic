@@ -2395,6 +2395,42 @@ fn creditless_window_stays_bounded_while_a_peers_batches_wait_for_one_interface(
     assert!(most <= 410_000, "the limit grew to {most}");
 }
 
+/// The interface-paced router tells its window that a sender could take a batch where its
+/// receiver is `Pending` while budget is left and no batch waits in it, which grows the limit of
+/// a window that refused a frame, and doesn't tell it where the budget ran out.
+#[test]
+fn interface_paced_pick_two_starves_its_window_only_while_budget_is_left() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let window = CreditlessWindow::new(100);
+    let lanes = WindowLanes::new(window.clone(), VecDeque::new());
+    let first = Sends::default();
+    let second = Sends::default();
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::<TestItem, _, _, _>::new(
+        lanes.receiver(),
+        timed_senders(&clock, &[&first, &second]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &SendPacing::new(vec![rate, rate], vec![0, 1]),
+        &registry,
+        test_pool(),
+    )
+    .with_window(window.clone());
+    assert!(window.admit(1000));
+    assert!(!window.admit(1));
+
+    let noop = s2n_quic_core::task::waker::noop();
+    let mut cx = task::Context::from_waker(&noop);
+    let mut exhausted = Budget::new(0);
+    assert!(router.poll_recv(&mut cx, &mut exhausted).is_pending());
+    assert_eq!(window.limit(), 100, "the limit grew where the budget ran out");
+
+    let mut budget = Budget::new(1);
+    assert!(router.poll_recv(&mut cx, &mut budget).is_pending());
+    assert_eq!(window.limit(), 200);
+}
+
 /// A worker's sender that records whether each batch waited in the router before it hands the
 /// batch on.
 struct WaitedSender<S> {
