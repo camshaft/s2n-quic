@@ -977,6 +977,7 @@ where
             reader_metrics: reader_metrics.clone(),
             writer_metrics: writer_metrics.clone(),
             send_credit_pool: send_credit_pool.clone(),
+            path_secret_map: path_secret_map.clone(),
         });
     }
 
@@ -1193,6 +1194,7 @@ struct SendWorkerParts {
     reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    path_secret_map: crate::path::secret::Map,
 }
 
 /// Per-socket ingredients for the socket send task.
@@ -1451,6 +1453,7 @@ where
                     sw.reader_metrics,
                     sw.writer_metrics,
                     sw.send_credit_pool,
+                    sw.path_secret_map,
                 );
             }
 

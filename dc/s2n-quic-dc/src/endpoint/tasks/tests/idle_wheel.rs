@@ -41,17 +41,28 @@ fn setup_send() -> SetupSend {
 }
 
 fn setup_send_recording(rehandshakes: Rehandshakes) -> SetupSend {
+    setup_send_with_caches(1, rehandshakes)
+}
+
+/// Builds the send idle wheel drain over `count` send caches: the cache of sender slot `i`
+/// sends on local send socket `i`, for each `i` below `count`. `rehandshakes` records each
+/// peer that the test's `peer_dead_broadcast` asks a background handshake for.
+fn setup_send_with_caches(count: usize, rehandshakes: Rehandshakes) -> SetupSend {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
-    let send_caches: IdMap<LocalSendSocketId, _> = vec![Rc::new(RefCell::new(send::Cache::new(
-        &registry,
-        LocalSenderId::from_index(0),
-    )))]
-    .into();
-    let sender_idx_to_local =
-        IdMap::<LocalSenderId, LocalSendSocketId>::new(1, LocalSendSocketId::new(0));
-    let sender_local_addrs =
-        IdMap::<LocalSendSocketId, std::net::SocketAddr>::new(1, "127.0.0.1:0".parse().unwrap());
+    let send_caches: IdMap<LocalSendSocketId, _> = (0..count)
+        .map(|idx| send::Cache::new(&registry, LocalSenderId::from_index(idx)))
+        .map(|cache| Rc::new(RefCell::new(cache)))
+        .collect::<Vec<_>>()
+        .into();
+    let sender_idx_to_local: IdMap<LocalSenderId, LocalSendSocketId> = (0..count)
+        .map(LocalSendSocketId::new)
+        .collect::<Vec<_>>()
+        .into();
+    let sender_local_addrs = IdMap::<LocalSendSocketId, std::net::SocketAddr>::new(
+        count,
+        "127.0.0.1:0".parse().unwrap(),
+    );
 
     let (idle_wheel_tx, idle_wheel_rx) = unsync::new_with_adapter::<send::IdleWheelAdapter>();
     let (completed_tx, completed_rx) = unsync::new::<Frame>();
@@ -859,6 +870,174 @@ fn send_idle_wheel_expiry_without_inflight_doesnt_request_a_rehandshake() {
             assert!(
                 rehandshakes.borrow().is_empty(),
                 "an expiry with no unacknowledged packet doesn't ask for a handshake"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A lost pair marks the peer dead at its idle expiry where the peer hasn't sent an
+/// authenticated packet on any interface since the pair was marked lost, though the context
+/// doesn't wait for an acknowledgement and the peer's other sender slots aren't marked lost.
+#[test]
+fn send_idle_wheel_marks_dead_a_peer_silent_since_its_pair_was_lost() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        assert!(!ctx.borrow().inflight.has_inflight());
+
+        {
+            let mut c = ctx.borrow_mut();
+            let timeout = c.path_secret_entry.idle_timeout();
+            c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
+        }
+        let _ = idle_wheel_tx.send(ctx.clone());
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            // At t=1s the pair is marked lost, after the peer's last packet at t=0.
+            1.s().sleep().await;
+            ctx.borrow_mut().mark_path_lost(precision::Clock::now(&clock));
+            assert!(
+                pse.has_delivering_sender(),
+                "the peer's other sender slots aren't marked lost"
+            );
+
+            // At t=31s the context has expired, and the peer stayed silent since the mark.
+            30.s().sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should be evicted after idle timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a peer silent since its pair was marked lost is marked dead"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A lost pair doesn't mark the peer dead at its idle expiry where the peer sent an
+/// authenticated packet after the pair was marked lost, while no packet waits for an ack.
+#[test]
+fn send_idle_wheel_keeps_alive_a_peer_heard_from_since_its_pair_was_lost() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+
+        {
+            let mut c = ctx.borrow_mut();
+            let timeout = c.path_secret_entry.idle_timeout();
+            c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
+        }
+        let _ = idle_wheel_tx.send(ctx.clone());
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            1.s().sleep().await;
+            ctx.borrow_mut().mark_path_lost(precision::Clock::now(&clock));
+
+            // At t=2s the peer sends a packet on another interface.
+            1.s().sleep().await;
+            pse.touch_activity(precision::Clock::now(&clock));
+
+            // At t=34s the context has expired: the peer's packet at t=2s moved its expiry
+            // to t=32s.
+            32.s().sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should expire after path activity + idle_timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                !pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a peer heard from since its pair was marked lost isn't marked dead"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// Two lost pairs of one peer whose contexts expire at the same wheel tick mark the peer
+/// dead, though the first expiry's invalidation clears its pair's lost mark before the
+/// second expiry runs.
+#[test]
+fn send_idle_wheel_marks_dead_a_peer_whose_lost_pairs_expire_at_the_same_tick() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
+            setup_send_with_caches(2, Rehandshakes::default());
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+
+        let contexts: Vec<_> = (0..2)
+            .map(|idx| {
+                send_caches[LocalSendSocketId::new(idx)]
+                    .borrow_mut()
+                    .get_or_insert(&pse, &clock)
+                    .unwrap()
+            })
+            .collect();
+        let target = precision::Clock::now(&clock) + pse.idle_timeout();
+        for ctx in &contexts {
+            ctx.borrow_mut().idle_wheel.target_time = Some(target);
+            let _ = idle_wheel_tx.send(ctx.clone());
+        }
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            // At t=1s both pairs are marked lost, after the peer's last packet at t=0.
+            1.s().sleep().await;
+            for ctx in &contexts {
+                ctx.borrow_mut().mark_path_lost(precision::Clock::now(&clock));
+            }
+
+            // At t=31s both contexts have expired at the same tick.
+            30.s().sleep().await;
+            for idx in 0..2 {
+                assert_eq!(
+                    send_caches[LocalSendSocketId::new(idx)]
+                        .borrow()
+                        .context_count(),
+                    0,
+                    "each lost context should be evicted after idle timeout"
+                );
+            }
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "the lost pairs that expire at the same tick mark the peer dead"
             );
         }
         .primary()

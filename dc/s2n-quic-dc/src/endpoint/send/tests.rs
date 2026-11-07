@@ -1144,6 +1144,95 @@ fn a_pair_with_nothing_to_acknowledge_is_not_marked_lost() {
     assert!(!ctx.is_path_lost());
 }
 
+/// Records a packet of `frame` as sent and unacknowledged, the way the assembler records a
+/// packet it sends.
+fn send_unacknowledged(ctx: &mut Context, clock: &Clock, frame: crate::intrusive::Entry<Frame>) {
+    let now = clock.get_time();
+    let time_sent: s2n_quic_core::time::Timestamp = now.into();
+    let sent_bytes = 64;
+    let rtt_estimator = ctx.rtt_estimator;
+    let cc_info = ctx
+        .cca
+        .on_packet_sent(time_sent, sent_bytes, false, &rtt_estimator);
+    if !ctx.inflight.has_inflight() {
+        ctx.last_peer_activity = now;
+    }
+    let space = s2n_quic_core::packet::number::PacketNumberSpace::Initial;
+    let packet_number = space.new_packet_number(ctx.next_packet_number);
+    ctx.next_packet_number += 1;
+    let mut frames = crate::intrusive::Queue::new();
+    frames.push_back(frame);
+    let info = crate::endpoint::inflight::TransmissionInfo {
+        cc_info,
+        time_sent,
+        sent_bytes,
+    };
+    let packet = crate::endpoint::inflight::Packet::new(frames, info);
+    ctx.inflight.insert(packet_number, packet);
+    ctx.pto.on_packet_sent(now);
+}
+
+/// A pair whose packet the peer doesn't acknowledge for a persistent congestion period has
+/// stopped delivering, and its probe timeout then marks it lost from its next packet number.
+#[test]
+fn an_unacknowledged_packet_marks_its_pair_lost_after_a_persistent_congestion_period() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(1000);
+    send_unacknowledged(&mut ctx, &clock, make_frame(64));
+    let _ = ctx.wheel_interest(&clock);
+    assert!(ctx.ack_wait_since == Some(clock.get_time()));
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    let next = ctx.next_packet_number;
+
+    clock.advance(threshold - Duration::from_nanos(1));
+    assert!(!ctx.has_stopped_delivering(clock.get_time()));
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(!ctx.is_path_lost());
+    assert!(!entry.is_sender_lost(sender));
+
+    clock.advance(Duration::from_nanos(1));
+    assert!(ctx.has_stopped_delivering(clock.get_time()));
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(ctx.is_path_lost());
+    assert_eq!(ctx.lost_from, Some(next));
+    assert!(entry.is_sender_lost(sender));
+}
+
+/// An acknowledgement of another packet restarts the period after which a pair with an
+/// unacknowledged packet has stopped delivering.
+#[test]
+fn an_acknowledgement_restarts_the_period_that_marks_a_pair_lost() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(1000);
+    send_unacknowledged(&mut ctx, &clock, make_frame(64));
+    let _ = ctx.wheel_interest(&clock);
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    let half = threshold / 2;
+
+    clock.advance(half);
+    // The peer acknowledges another packet, which records its activity on the pair.
+    ctx.last_peer_activity = clock.get_time();
+
+    clock.advance(threshold - half);
+    assert!(!ctx.has_stopped_delivering(clock.get_time()));
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(
+        !ctx.is_path_lost(),
+        "the acknowledgement restarts the period"
+    );
+
+    clock.advance(half);
+    assert!(ctx.has_stopped_delivering(clock.get_time()));
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(
+        ctx.is_path_lost(),
+        "a whole period passed since the acknowledgement"
+    );
+}
+
 /// A new context of a sender slot clears the lost mark that an earlier context of the slot
 /// left on the path secret entry.
 #[test]
@@ -1168,44 +1257,50 @@ fn a_new_context_clears_the_lost_mark_of_its_sender_slot() {
 }
 
 /// Builds a send cache of sender slot 0 holding one context, marked lost, for a path secret
-/// entry with two sender slots.
-fn make_cache_with_a_lost_context() -> (super::Cache, Arc<PathSecretEntry>) {
+/// entry with two sender slots. The cache publishes its lost-pair events through a path
+/// secret map to the returned recorder.
+fn make_cache_with_a_lost_context() -> (super::Cache, Arc<PathSecretEntry>, Arc<PairEvents>) {
     let registry = Registry::default();
     let sender = crate::endpoint::id::LocalSenderId::from_index(0);
     let entry = PathSecretEntry::builder("127.0.0.1:9999".parse().unwrap())
         .socket_sender_count(2)
         .build(None);
-    let mut cache = super::Cache::new(&registry, sender);
+    let (map, _subscriber, events) = make_map_with_subscriber();
+    let mut cache = super::Cache::new(&registry, sender)
+        .with_path_secret_map(map);
     let ctx = cache
         .get_or_insert(&entry, &crate::time::bach::Clock::default())
         .expect("Context::new should succeed with peer_data_addrs populated");
     ctx.borrow_mut().set_path_lost(true);
     assert!(entry.is_sender_lost(sender));
-    (cache, entry)
+    (cache, entry, events)
 }
 
 /// A cache that drops a lost pair's context clears the pair's lost mark on the path secret
-/// entry, since none of the dropped context's probes can clear it.
+/// entry, since none of the dropped context's probes can clear it, and doesn't record the
+/// clear as a pair that delivers again.
 #[test]
 fn an_invalidated_context_clears_its_lost_mark() {
-    let (mut cache, entry) = make_cache_with_a_lost_context();
+    let (mut cache, entry, events) = make_cache_with_a_lost_context();
     let reason = crate::endpoint::frame::FailureReason::PeerDead;
     let mut cancelled = CollectFrames::default();
     let removed = cache.invalidate(entry.id(), reason, &mut cancelled);
     assert!(removed.is_some());
     assert!(!entry.is_sender_lost(crate::endpoint::id::LocalSenderId::from_index(0)));
+    assert!(events.delivering.lock().unwrap().is_empty());
 }
 
 /// A cache that drops a lost pair's context for a rejected key clears the pair's lost mark
-/// on the path secret entry too.
+/// on the path secret entry too, and doesn't record the clear as a pair that delivers again.
 #[test]
 fn a_context_dropped_for_a_rejected_key_clears_its_lost_mark() {
-    let (mut cache, entry) = make_cache_with_a_lost_context();
+    let (mut cache, entry, events) = make_cache_with_a_lost_context();
     let sender = crate::endpoint::id::LocalSenderId::from_index(0);
     let mut retransmit = CollectFrames::default();
     let removed = cache.invalidate_stale_key(entry.id(), sender, VarInt::MAX, &mut retransmit);
     assert!(removed.is_some());
     assert!(!entry.is_sender_lost(sender));
+    assert!(events.delivering.lock().unwrap().is_empty());
 }
 
 /// A pair whose context sends acknowledgements alone stops delivering once its last
@@ -1278,5 +1373,315 @@ fn an_acknowledgement_only_context_probes_once_the_peer_is_quiet() {
     assert!(
         !ctx.needs_delivery_probe(clock.get_time()),
         "the peer acknowledged a packet less than a persistent congestion period ago"
+    );
+}
+
+/// A lost mark records when it was set, and a delivering mark clears that time.
+#[test]
+fn a_lost_mark_records_when_it_was_set() {
+    let registry = Registry::default();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let clock = make_clock(100);
+    let now = clock.get_time();
+    assert!(ctx.lost_at.is_none());
+
+    ctx.mark_path_lost(now);
+    assert!(ctx.is_path_lost());
+    assert!(entry.is_sender_lost(sender));
+    assert_eq!(ctx.lost_at.map(|at| at.nanos), Some(now.nanos));
+
+    ctx.set_path_lost(false);
+    assert!(ctx.lost_at.is_none(), "a delivering mark clears the time");
+    assert!(!entry.is_sender_lost(sender));
+}
+
+/// A lost pair's probe backoff stops at a cap, so that the pair is probed within one wheel
+/// firing of each persistent congestion period, and grows up to that cap.
+#[test]
+fn pto_cap_lost_backoff_probes_about_once_a_persistent_congestion_period() {
+    let rtt = make_rtt(10);
+    let base_period = Pto::base_period(&rtt).as_nanos();
+    let threshold = rtt.persistent_congestion_threshold().as_nanos();
+    // The cap lies above the initial backoff and below the largest one, so the test reads
+    // the cap and not one of those bounds.
+    assert!(u128::from(INITIAL_PTO_BACKOFF) * base_period < threshold);
+    assert!(u128::from(Pto::MAX_BACKOFF - 1) * base_period >= threshold);
+
+    let mut pto = Pto::default();
+    for _ in 0..200 {
+        pto.on_timeout();
+        pto.cap_lost_backoff(&rtt);
+        assert!(
+            u128::from(pto.backoff - 1) * base_period < threshold,
+            "a lost pair is probed within one wheel firing of a persistent congestion period"
+        );
+        assert!(pto.firings_remaining < pto.backoff);
+    }
+    assert!(
+        u128::from(pto.backoff) * base_period >= threshold,
+        "the backoff grows up to the cap"
+    );
+}
+
+/// A lost pair's probe timeout caps its probe backoff, so that the first probe after the pair
+/// delivers again doesn't wait about as long as the outage lasted.
+#[test]
+fn a_lost_pair_caps_its_probe_backoff() {
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(100);
+    let base_period = Pto::base_period(&ctx.rtt_estimator).as_nanos();
+    let threshold = ctx
+        .rtt_estimator
+        .persistent_congestion_threshold()
+        .as_nanos();
+    assert!(u128::from(Pto::MAX_BACKOFF - 1) * base_period >= threshold);
+
+    ctx.set_path_lost(true);
+    for _ in 0..200 {
+        let _ = ctx.on_pto_timeout(&clock);
+    }
+    assert!(
+        u128::from(ctx.pto.backoff - 1) * base_period < threshold,
+        "a lost pair's backoff stays within one wheel firing of a persistent congestion period"
+    );
+}
+
+fn count(counter: &core::sync::atomic::AtomicU64) -> u64 {
+    counter.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Records the peer address of each lost-pair event that a path secret map publishes, with
+/// the frames each frames-moved event counts.
+#[derive(Default)]
+struct PairEvents {
+    lost: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+    delivering: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+    frames_moved: std::sync::Mutex<Vec<(std::net::SocketAddr, usize)>>,
+    dead_mark_skipped: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+}
+
+fn socket_addr(address: &crate::event::api::SocketAddress) -> std::net::SocketAddr {
+    match address {
+        crate::event::api::SocketAddress::IpV4 { ip, port, .. } => (**ip, *port).into(),
+        crate::event::api::SocketAddress::IpV6 { ip, port, .. } => (**ip, *port).into(),
+        #[allow(unreachable_patterns)]
+        _ => panic!("the event holds an address of another kind"),
+    }
+}
+
+impl crate::event::Subscriber for PairEvents {
+    type ConnectionContext = ();
+
+    fn create_connection_context(
+        &self,
+        _meta: &crate::event::api::ConnectionMeta,
+        _info: &crate::event::api::ConnectionInfo,
+    ) -> Self::ConnectionContext {
+    }
+
+    fn on_path_secret_map_interface_pair_lost(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::PathSecretMapInterfacePairLost,
+    ) {
+        let peer = socket_addr(&event.peer_address);
+        self.lost.lock().unwrap().push(peer);
+    }
+
+    fn on_path_secret_map_interface_pair_delivering(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::PathSecretMapInterfacePairDelivering,
+    ) {
+        let peer = socket_addr(&event.peer_address);
+        self.delivering.lock().unwrap().push(peer);
+    }
+
+    fn on_path_secret_map_interface_pair_frames_moved(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::PathSecretMapInterfacePairFramesMoved,
+    ) {
+        let peer = socket_addr(&event.peer_address);
+        let frames = event.frames;
+        self.frames_moved.lock().unwrap().push((peer, frames));
+    }
+
+    fn on_path_secret_map_dead_mark_skipped(
+        &self,
+        _meta: &crate::event::api::EndpointMeta,
+        event: &crate::event::api::PathSecretMapDeadMarkSkipped,
+    ) {
+        let peer = socket_addr(&event.peer_address);
+        self.dead_mark_skipped.lock().unwrap().push(peer);
+    }
+}
+
+/// Builds a path secret map that publishes its events to a testing subscriber, which counts
+/// each event, and to a recorder of the lost-pair events' fields.
+fn make_map_with_subscriber() -> (
+    crate::path::secret::Map,
+    Arc<crate::event::testing::Subscriber>,
+    Arc<PairEvents>,
+) {
+    let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+    let events = Arc::new(PairEvents::default());
+    let map = crate::path::secret::Map::builder()
+        .with_signer(crate::path::secret::stateless_reset::Signer::random())
+        .with_capacity(4)
+        .with_clock(s2n_quic_core::time::NoopClock)
+        .with_subscriber((subscriber.clone(), events.clone()))
+        .build()
+        .unwrap();
+    (map, subscriber, events)
+}
+
+/// Builds a send cache of sender slot 0 that publishes the lost-pair events of its contexts
+/// through a path secret map.
+fn make_cache_with_events() -> (
+    super::Cache,
+    Registry,
+    Arc<crate::event::testing::Subscriber>,
+    Arc<PairEvents>,
+) {
+    let registry = Registry::default();
+    let (map, subscriber, events) = make_map_with_subscriber();
+    let cache = super::Cache::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0))
+        .with_path_secret_map(map);
+    (cache, registry, subscriber, events)
+}
+
+/// A pair marked lost records the lost event and count once, and an ack of a packet sent
+/// after the mark records the delivering event and count once.
+#[test]
+fn a_lost_mark_and_its_clear_record_their_events_and_counts() {
+    let (cache, registry, subscriber, events) = make_cache_with_events();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    ctx.next_packet_number = VarInt::from_u8(5);
+
+    cache.track_path_lost(&mut ctx, |ctx| ctx.set_path_lost(true));
+    assert_eq!(count(&subscriber.path_secret_map_interface_pair_lost), 1);
+    assert_eq!(*events.lost.lock().unwrap(), [*entry.peer()]);
+
+    cache.track_path_lost(&mut ctx, |ctx| {
+        ctx.on_largest_acknowledged(VarInt::from_u8(4))
+    });
+    assert_eq!(count(&subscriber.path_secret_map_interface_pair_lost), 1);
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_delivering),
+        0
+    );
+
+    cache.track_path_lost(&mut ctx, |ctx| {
+        ctx.on_largest_acknowledged(VarInt::from_u8(5))
+    });
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_delivering),
+        1
+    );
+    assert_eq!(count(&subscriber.path_secret_map_interface_pair_lost), 1);
+    assert_eq!(*events.delivering.lock().unwrap(), [*entry.peer()]);
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("tx.interface_pair.lost=1 Variant|send.0"),
+        "got: {line}"
+    );
+    assert!(
+        line.contains("tx.interface_pair.delivering=1 Variant|send.0"),
+        "got: {line}"
+    );
+}
+
+/// A lost pair that moves its frames records the frames it moves, once for each move that
+/// moves a frame.
+#[test]
+fn a_lost_pair_that_moves_its_frames_records_its_event_and_count() {
+    let (cache, registry, subscriber, events) = make_cache_with_events();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(1000);
+    for _ in 0..2 {
+        let _ = ctx.push_batch(FrameBatch::single(make_frame(64)), &clock);
+    }
+    ctx.set_path_lost(true);
+
+    let mut moved = CollectFrames::default();
+    assert_eq!(cache.move_frames(&mut ctx, &mut moved), 2);
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_frames_moved),
+        1
+    );
+    assert_eq!(*events.frames_moved.lock().unwrap(), [(*entry.peer(), 2)]);
+
+    assert_eq!(cache.move_frames(&mut ctx, &mut moved), 0);
+    assert_eq!(
+        count(&subscriber.path_secret_map_interface_pair_frames_moved),
+        1,
+        "a move of no frames isn't recorded"
+    );
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("tx.interface_pair.frames_moved=2 Variant|send.0"),
+        "got: {line}"
+    );
+}
+
+/// A lost pair skips the peer's dead mark, and records the skip, only while another sender of
+/// the path secret entry delivers.
+#[test]
+fn a_skipped_dead_mark_records_its_event_and_count() {
+    let (cache, registry, subscriber, events) = make_cache_with_events();
+    let (mut ctx, entry) = make_context_with_sender_slots(2, &registry);
+    ctx.set_path_lost(true);
+
+    assert!(
+        !cache.skips_dead_mark(false, &entry),
+        "a pair that isn't lost doesn't skip"
+    );
+    assert_eq!(count(&subscriber.path_secret_map_dead_mark_skipped), 0);
+
+    assert!(cache.skips_dead_mark(true, &entry));
+    assert_eq!(count(&subscriber.path_secret_map_dead_mark_skipped), 1);
+    assert_eq!(*events.dead_mark_skipped.lock().unwrap(), [*entry.peer()]);
+
+    let (mut only_ctx, only_entry) = make_context_with_sender_slots(1, &Registry::default());
+    only_ctx.set_path_lost(true);
+    assert!(
+        !cache.skips_dead_mark(true, &only_entry),
+        "a lost pair whose peer has no other sender doesn't skip"
+    );
+    assert_eq!(count(&subscriber.path_secret_map_dead_mark_skipped), 1);
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("send.dead_mark_skipped=1 Variant|send.0"),
+        "got: {line}"
+    );
+}
+
+/// A cache without a path secret map still counts a pair marked lost on its send counters.
+#[test]
+fn a_cache_without_a_map_counts_a_lost_mark() {
+    let registry = Registry::default();
+    let cache = super::Cache::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0));
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+
+    cache.track_path_lost(&mut ctx, |ctx| ctx.set_path_lost(true));
+
+    let line = registry
+        .take_current_metrics_line()
+        .expect("metrics were recorded");
+    assert!(
+        line.contains("tx.interface_pair.lost=1 Variant|send.0"),
+        "got: {line}"
     );
 }

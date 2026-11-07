@@ -1635,3 +1635,75 @@ fn ack_only_segment_must_not_consume_pto_probe_budget() {
         pn0.as_u64(),
     );
 }
+
+/// The first packet a context sends while no earlier packet waits for an acknowledgement
+/// starts the wait for one, so that the context's pair is marked lost once a persistent
+/// congestion period has passed since that packet.
+#[test]
+fn the_first_unacknowledged_packet_starts_the_wait_for_an_acknowledgement() {
+    let mtu = 1500;
+    let registry = Registry::new();
+    let (mut context, entry) = make_context(mtu, &registry);
+
+    let clock = Clock::new(Duration::from_millis(10));
+    let gso = make_gso(1);
+    let pool = pool::Pool::new(u16::MAX);
+    let mut header_buf = Vec::new();
+    let mut cancelled = Queue::new();
+    let mut ack_completions = Queue::new();
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    let send_counters = crate::endpoint::counters::Send::new(
+        &crate::counter::Registry::default(),
+        crate::endpoint::id::LocalSenderId::from_index(0),
+    );
+    let source_sender_id = crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1));
+    let source_control_port = 443;
+
+    let credit_pool = unused_credit_pool();
+
+    macro_rules! run_assemble {
+        () => {
+            assemble::<SyncRecycler, _>(
+                &mut context,
+                ImmediateQueueStatus::Empty,
+                &clock,
+                source_sender_id,
+                source_control_port,
+                &gso,
+                pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
+                &mut header_buf,
+                &mut cancelled,
+                &mut ack_completions,
+                &mut freed_batch_tx,
+                &AssemblerCounters::new(&registry),
+                &send_counters,
+                &credit_pool,
+            )
+        };
+    }
+
+    assert!(context.ack_wait_since.is_none());
+    let sent_at = clock.get_time();
+    context.push_back_frame(make_sized_data_frame(&entry, 100));
+    let _ = run_assemble!().expect("the data frame should assemble");
+    assert!(context.inflight.has_inflight());
+    assert_eq!(
+        context.ack_wait_since.map(|since| since.nanos),
+        Some(sent_at.nanos),
+        "the first unacknowledged packet starts the wait"
+    );
+
+    clock.advance(context.rtt_estimator.persistent_congestion_threshold());
+    let marked_at = clock.get_time();
+    let _ = context.on_pto_timeout(&clock);
+    assert!(
+        context.is_path_lost(),
+        "a persistent congestion period after the packet, the pair is marked lost"
+    );
+    assert_eq!(
+        context.lost_at.map(|at| at.nanos),
+        Some(marked_at.nanos),
+        "the mark records when it was set"
+    );
+}
