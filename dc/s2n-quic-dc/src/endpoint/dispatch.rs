@@ -106,14 +106,16 @@ struct RejectedInit {
     /// The stream `bind_for_msg` bound the slot to, which `disable` tears down, where the slot
     /// is bound; `None` where the slot isn't bound, which records the slot as freed.
     stream: Option<Stream>,
+    /// The tombstone the slot held before the bind, which a reject the endpoint doesn't take puts
+    /// back once it tears the stream down; 0 where the slot isn't bound.
+    tombstone: u64,
 }
 
 impl Drop for RejectedInit {
-    /// Disables a stream the reject still holds, however the reject ends: settled without the
-    /// packet, or dropped where the path secret map refuses the packet after the decrypt. A
-    /// stream dropped without `disable` resets its binding as its reader drops, and that reset
-    /// would release the hold of the slot's genuine rejected init as it leaves the priority
-    /// router.
+    /// Disables a stream the reject still holds, as where the path secret map refuses the packet
+    /// after the decrypt. A stream dropped without `disable` resets its binding as its reader
+    /// drops, and that reset would release the hold of the slot's genuine rejected init as it
+    /// leaves the priority router.
     fn drop(&mut self) {
         if let Some(mut stream) = self.stream.take() {
             stream.disable();
@@ -183,21 +185,25 @@ fn decrypt_fast_path(
                 binding_id,
                 error_code: error::ACCEPTOR_NOT_FOUND,
                 stream: None,
+                tombstone: 0,
             }));
         };
 
-        match server_view.bind_for_msg(
+        match server_view.bind_for_init(
             queue_pair.dest_queue_id,
             binding_id,
             path_entry,
             freed_batch_tx,
         ) {
-            Ok(crate::queue::BindResult::NewBinding {
-                waker,
-                stream,
-                control,
-                release_bytes,
-            }) => {
+            Ok((
+                crate::queue::BindResult::NewBinding {
+                    waker,
+                    stream,
+                    control,
+                    release_bytes,
+                },
+                tombstone,
+            )) => {
                 // `bind_for_msg` only allocates the slot, so this waker is empty
                 // and `release_bytes` zero today; the real wake/release comes from
                 // the `send_msg` below. Unlike the slow path there is no waker sink
@@ -263,6 +269,7 @@ fn decrypt_fast_path(
                             binding_id,
                             error_code: error::ACCEPTOR_NOT_FOUND,
                             stream: Some(s),
+                            tombstone,
                         }));
                     }
                     Err(acceptor::channel::SendError::NoSlots(s)) => {
@@ -280,14 +287,18 @@ fn decrypt_fast_path(
                             binding_id,
                             error_code: error::SERVER_BUSY,
                             stream: Some(s),
+                            tombstone,
                         }));
                     }
                 }
             }
-            Ok(crate::queue::BindResult::Bound {
-                waker,
-                release_bytes,
-            }) => {
+            Ok((
+                crate::queue::BindResult::Bound {
+                    waker,
+                    release_bytes,
+                },
+                _,
+            )) => {
                 trace_server_bind(
                     *path_entry.id(),
                     queue_pair,
@@ -2035,8 +2046,9 @@ fn reject_init(
 /// they take the packet's cleartext routing fields as given, so a tampered or forged init, or a
 /// replayed copy of an authentic one, would otherwise hold the slot for its binding, and the
 /// reset of the client's genuine rejected init on that slot wouldn't be sent. For a packet the
-/// endpoint doesn't take, the reject's drop tears down a slot that `bind_for_msg` bound for it,
-/// and nothing else changes: the slot isn't held, recorded as freed or reset.
+/// endpoint doesn't take, the reject tears down a stream that `bind_for_init` bound the slot to
+/// and puts back the slot's tombstone from before the bind, so that the genuine init of the same
+/// binding isn't refused as stale; the slot isn't held or reset.
 fn settle_rejected_init(
     mut rejected: RejectedInit,
     take: bool,
@@ -2046,6 +2058,19 @@ fn settle_rejected_init(
     freed_batch_tx: &mut crate::queue::FreedBatchTx,
 ) {
     if !take {
+        if let Some(mut stream) = rejected.stream.take() {
+            stream.disable();
+            // The stream's receivers drop here, which marks the slot unallocated with this
+            // binding as its tombstone, before the tombstone from before the bind is put back.
+            drop(stream);
+            if let Some(server_view) = queue_view.as_server_mut() {
+                server_view.restore_tombstone(
+                    rejected.queue_pair.dest_queue_id,
+                    rejected.binding_id,
+                    rejected.tombstone,
+                );
+            }
+        }
         return;
     }
 
