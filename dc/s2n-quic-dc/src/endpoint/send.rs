@@ -965,18 +965,17 @@ impl Context {
             false
         };
 
-        let pto = if !self.is_pto_scheduled()
-            && (self.inflight.has_inflight() || self.is_path_lost())
-        {
-            if let Some(target) = self.pto.next_target(clock, &self.rtt_estimator) {
-                self.pto_wheel.target_time = Some(target);
-                true
+        let pto =
+            if !self.is_pto_scheduled() && (self.inflight.has_inflight() || self.is_path_lost()) {
+                if let Some(target) = self.pto.next_target(clock, &self.rtt_estimator) {
+                    self.pto_wheel.target_time = Some(target);
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
-            }
-        } else {
-            false
-        };
+            };
 
         let idle_timeout = if !self.is_idle_scheduled() {
             let timeout = self.path_secret_entry.idle_timeout();
@@ -1293,7 +1292,9 @@ impl Context {
     /// that packet or a later one shows that the pair delivers again.
     pub fn set_path_lost(&mut self, lost: bool) {
         self.lost_from = lost.then_some(self.next_packet_number);
-        let _ = self.path_secret_entry.set_sender_lost(self.sender_idx, lost);
+        let _ = self
+            .path_secret_entry
+            .set_sender_lost(self.sender_idx, lost);
     }
 
     /// Clears the lost mark once the peer acknowledges a packet sent after the mark was set.

@@ -699,8 +699,10 @@ crate::context_wheel_adapter!(IdleWheelAdapter, Context, idle_wheel);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoint::id::Id;
-    use crate::endpoint::routing::{ModuloRoute, SenderRoute};
+    use crate::endpoint::{
+        id::Id,
+        routing::{ModuloRoute, SenderRoute},
+    };
     use s2n_quic_core::endpoint::Type;
     use std::net::SocketAddr;
 
@@ -709,7 +711,10 @@ mod tests {
         let map = path::secret::map::testing::new(16);
         map.test_stop_cleaner();
         map.test_insert(peer, Type::Server);
-        let id = *map.get_raw(peer).expect("the map holds the peer's entry").id();
+        let id = *map
+            .get_raw(peer)
+            .expect("the map holds the peer's entry")
+            .id();
         (map, id)
     }
 
@@ -757,7 +762,10 @@ mod tests {
         // Four senders: the route sends the acknowledgements of the peer's sender 6 to sender 2.
         let route = ModuloRoute::new(4);
         let remote_sender_id = RemoteSenderId::new(VarInt::from_u8(6));
-        assert_eq!(route.sender_id_for_ack(remote_sender_id), LocalSenderId::from_index(2));
+        assert_eq!(
+            route.sender_id_for_ack(remote_sender_id),
+            LocalSenderId::from_index(2)
+        );
         let mut cache =
             Cache::new(RecvDispatchWorkerId::new(0)).with_priority_senders(priority_senders);
 

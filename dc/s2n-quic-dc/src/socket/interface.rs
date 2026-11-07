@@ -99,8 +99,7 @@ impl LinkSpeed {
     /// Returns a link speed of `bits_per_second`, the unit macOS reports, or `None` for 0.
     #[inline]
     pub fn from_bits_per_second(bits_per_second: u64) -> Option<Self> {
-        NonZeroU64::new(bits_per_second)
-            .map(|bits_per_second| Self { bits_per_second })
+        NonZeroU64::new(bits_per_second).map(|bits_per_second| Self { bits_per_second })
     }
 
     /// Returns a link speed of `megabits_per_second`, the unit Linux reports, or `None` for 0.
@@ -333,9 +332,7 @@ where
                 );
             };
             if let Some(other) = slot.replace(id) {
-                panic!(
-                    "interfaces {other} and {id} both list {socket_kind} socket {socket}"
-                );
+                panic!("interfaces {other} and {id} both list {socket_kind} socket {socket}");
             }
         }
     }

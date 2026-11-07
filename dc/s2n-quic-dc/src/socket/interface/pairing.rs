@@ -166,11 +166,17 @@ mod tests {
         assert_eq!(paired_peer_addr(&peer, &tags, 7, Some(two(1, 0))), peer[2]);
         assert_eq!(paired_peer_addr(&peer, &tags, 7, Some(two(1, 3))), peer[3]);
         // A third local interface starts again from the peer's first interface.
-        assert_eq!(paired_peer_addr(&peer, &tags, 7, Some(place(2, 0))), peer[0]);
+        assert_eq!(
+            paired_peer_addr(&peer, &tags, 7, Some(place(2, 0))),
+            peer[0]
+        );
         // An address without a tag among tagged ones isn't paired with any interface.
         let gap = [Some(1), None, Some(2), Some(2)];
         for index in 0..3 {
-            assert_eq!(paired_peer_addr(&peer, &gap, 7, Some(two(0, index))), peer[0]);
+            assert_eq!(
+                paired_peer_addr(&peer, &gap, 7, Some(two(0, index))),
+                peer[0]
+            );
         }
     }
 
@@ -182,9 +188,15 @@ mod tests {
 
         // The peer doesn't tag its addresses.
         assert_eq!(paired_peer_addr(&peer, &[], 5, Some(place(1, 0))), unpaired);
-        assert_eq!(paired_peer_addr(&peer, &[None; 4], 5, Some(place(1, 0))), unpaired);
+        assert_eq!(
+            paired_peer_addr(&peer, &[None; 4], 5, Some(place(1, 0))),
+            unpaired
+        );
         // The tags don't match the addresses.
-        assert_eq!(paired_peer_addr(&peer, &tags[..3], 5, Some(place(1, 0))), unpaired);
+        assert_eq!(
+            paired_peer_addr(&peer, &tags[..3], 5, Some(place(1, 0))),
+            unpaired
+        );
         // The endpoint doesn't list interfaces.
         assert_eq!(paired_peer_addr(&peer, &tags, 5, None), unpaired);
         // The endpoint has one interface that holds a send socket.
@@ -195,7 +207,10 @@ mod tests {
         };
         assert_eq!(paired_peer_addr(&peer, &tags, 5, Some(one)), unpaired);
         // The peer has one interface.
-        assert_eq!(paired_peer_addr(&peer, &[Some(1); 4], 5, Some(place(1, 0))), unpaired);
+        assert_eq!(
+            paired_peer_addr(&peer, &[Some(1); 4], 5, Some(place(1, 0))),
+            unpaired
+        );
     }
 
     #[test]

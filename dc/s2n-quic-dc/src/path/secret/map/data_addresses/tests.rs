@@ -124,10 +124,7 @@ fn untagged_payload_decodes_untagged() {
     assert_eq!(&bytes[..], &expected[..]);
     assert_eq!(
         decode(&bytes).unwrap(),
-        vec![
-            untagged("10.0.0.1:9000"),
-            untagged("[2001:db8::1]:9001"),
-        ]
+        vec![untagged("10.0.0.1:9000"), untagged("[2001:db8::1]:9001"),]
     );
     // Untagged addresses encode as they did before interface entries.
     assert_eq!(

@@ -352,17 +352,29 @@ mod tests {
     #[test]
     fn acknowledgements_keep_the_routed_sender_without_priority_senders() {
         assert_eq!(ack_sender_id(sender(2), remote(5), None), sender(2));
-        assert_eq!(ack_sender_id(sender(2), remote(5), Some(&[][..])), sender(2));
+        assert_eq!(
+            ack_sender_id(sender(2), remote(5), Some(&[][..])),
+            sender(2)
+        );
     }
 
     #[test]
     fn acknowledgements_go_to_a_sender_of_the_highest_priority_interface() {
         let priority = [sender(1), sender(3)];
         // The route's sender is on that interface already.
-        assert_eq!(ack_sender_id(sender(3), remote(4), Some(&priority[..])), sender(3));
+        assert_eq!(
+            ack_sender_id(sender(3), remote(4), Some(&priority[..])),
+            sender(3)
+        );
         // Otherwise the peer's sender picks one of the interface's senders.
-        assert_eq!(ack_sender_id(sender(2), remote(4), Some(&priority[..])), sender(1));
-        assert_eq!(ack_sender_id(sender(2), remote(5), Some(&priority[..])), sender(3));
+        assert_eq!(
+            ack_sender_id(sender(2), remote(4), Some(&priority[..])),
+            sender(1)
+        );
+        assert_eq!(
+            ack_sender_id(sender(2), remote(5), Some(&priority[..])),
+            sender(3)
+        );
     }
 
     #[test]
@@ -371,7 +383,10 @@ mod tests {
         // Scored by index, the higher of two different senders never wins, so sender 7 doesn't.
         for _ in 0..256 {
             let chosen = freed_batch_sender_id(None, 8, &mut rng, |id| id.as_usize());
-            assert!(chosen.as_usize() < 7, "{chosen} won over a sender of a lower score");
+            assert!(
+                chosen.as_usize() < 7,
+                "{chosen} won over a sender of a lower score"
+            );
         }
         // One sender, or none, takes every freed batch.
         for socket_count in [0, 1] {

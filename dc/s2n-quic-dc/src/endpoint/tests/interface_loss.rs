@@ -123,9 +123,11 @@ impl Shared {
     fn wrote_on_lost_interface(&self) -> bool {
         let lost_addrs = self.lost_addrs.lock().unwrap();
         let server_addrs = self.server_addrs.lock().unwrap();
-        self.writes.lock().unwrap().iter().any(|write| {
-            lost_addrs.contains(&write.local) && server_addrs.contains(&write.peer)
-        })
+        self.writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|write| lost_addrs.contains(&write.local) && server_addrs.contains(&write.peer))
     }
 }
 
@@ -179,7 +181,9 @@ async fn exchange(client: &mut Client, count: usize) {
         handles.push(handle);
     }
     for handle in handles {
-        handle.await.expect("a stream's task ended before its answer");
+        handle
+            .await
+            .expect("a stream's task ended before its answer");
     }
 }
 

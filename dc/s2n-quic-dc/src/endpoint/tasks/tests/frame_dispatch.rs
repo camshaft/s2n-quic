@@ -361,7 +361,10 @@ fn highest_priority_batches_go_to_the_chosen_interface() {
             async move {
                 while let Some(batch) = worker_rx.recv().await {
                     let highest = batch.holds_highest_priority();
-                    arrivals.lock().unwrap().push((worker, highest, batch.len()));
+                    arrivals
+                        .lock()
+                        .unwrap()
+                        .push((worker, highest, batch.len()));
                 }
             }
             .primary()
@@ -372,10 +375,20 @@ fn highest_priority_batches_go_to_the_chosen_interface() {
     let arrivals = arrivals.lock().unwrap();
     let frames: usize = arrivals.iter().map(|arrival| arrival.2).sum();
     assert_eq!(frames, 2 * PINGS, "every frame arrived");
-    let pings: usize = arrivals.iter().filter(|arrival| arrival.1).map(|arrival| arrival.2).sum();
-    assert_eq!(pings, PINGS, "each ping is in a batch of the highest priority level");
+    let pings: usize = arrivals
+        .iter()
+        .filter(|arrival| arrival.1)
+        .map(|arrival| arrival.2)
+        .sum();
+    assert_eq!(
+        pings, PINGS,
+        "each ping is in a batch of the highest priority level"
+    );
     for &(worker, highest, _) in arrivals.iter() {
-        assert!(!highest || worker >= 2, "worker {worker} on the slow interface got a ping");
+        assert!(
+            !highest || worker >= 2,
+            "worker {worker} on the slow interface got a ping"
+        );
     }
     let bulk_on = |workers: core::ops::Range<usize>| {
         arrivals
@@ -405,7 +418,10 @@ fn a_batch_that_mixes_a_ping_with_a_bulk_frame_isnt_of_the_highest_priority() {
 
     let mut mixed = FrameBatch::single(ping());
     mixed.push(test_frame_with_payload(&pse, 1000));
-    assert!(!mixed.holds_highest_priority(), "a ping beside a bulk frame");
+    assert!(
+        !mixed.holds_highest_priority(),
+        "a ping beside a bulk frame"
+    );
 
     let bulk = FrameBatch::single(test_frame_with_payload(&pse, 1000));
     assert!(!bulk.holds_highest_priority(), "a bulk frame");
@@ -452,7 +468,10 @@ fn highest_priority_frames_beside_bulk_frames_go_to_the_chosen_interface() {
             async move {
                 while let Some(batch) = worker_rx.recv().await {
                     let highest = batch.holds_highest_priority();
-                    arrivals.lock().unwrap().push((worker, highest, batch.len()));
+                    arrivals
+                        .lock()
+                        .unwrap()
+                        .push((worker, highest, batch.len()));
                 }
             }
             .primary()
@@ -463,9 +482,16 @@ fn highest_priority_frames_beside_bulk_frames_go_to_the_chosen_interface() {
     let arrivals = arrivals.lock().unwrap();
     let frames: usize = arrivals.iter().map(|arrival| arrival.2).sum();
     assert_eq!(frames, 2 * PINGS, "every frame arrived");
-    let pings: usize = arrivals.iter().filter(|arrival| arrival.1).map(|arrival| arrival.2).sum();
+    let pings: usize = arrivals
+        .iter()
+        .filter(|arrival| arrival.1)
+        .map(|arrival| arrival.2)
+        .sum();
     assert_eq!(pings, PINGS, "a ping was batched beside a bulk frame");
     for &(worker, highest, _) in arrivals.iter() {
-        assert!(!highest || worker >= 2, "worker {worker} on the slow interface got a ping");
+        assert!(
+            !highest || worker >= 2,
+            "worker {worker} on the slow interface got a ping"
+        );
     }
 }

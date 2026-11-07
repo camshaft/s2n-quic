@@ -1418,7 +1418,10 @@ fn interface_paced_pick_two_charges_highest_priority_batches_and_paces_mixed_one
     // the other one, the only interface that doesn't hold a batch.
     let mut bulk_batches = 0;
     while router.debt_nanos(0) == 0 || router.debt_nanos(1) == 0 {
-        assert!(bulk_batches < 3, "three bulk batches didn't put both interfaces in debt");
+        assert!(
+            bulk_batches < 3,
+            "three bulk batches didn't put both interfaces in debt"
+        );
         input.borrow_mut().push_back(bulk());
         bulk_batches += 1;
         assert_eq!(poll_until_idle(&mut router), Poll::Pending);
@@ -1435,8 +1438,16 @@ fn interface_paced_pick_two_charges_highest_priority_batches_and_paces_mixed_one
     let debts = [router.debt_nanos(0), router.debt_nanos(1)];
     input.borrow_mut().push_back(pings);
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(arrived(1, (true, PINGS)), 1, "the pings didn't reach the chosen interface");
-    assert_eq!(arrived(0, (true, PINGS)), 0, "the pings reached the other interface");
+    assert_eq!(
+        arrived(1, (true, PINGS)),
+        1,
+        "the pings didn't reach the chosen interface"
+    );
+    assert_eq!(
+        arrived(0, (true, PINGS)),
+        0,
+        "the pings reached the other interface"
+    );
     assert_eq!(router.debt_nanos(1), debts[1] + cost);
     assert_eq!(router.debt_nanos(0), debts[0]);
 
@@ -1455,10 +1466,18 @@ fn interface_paced_pick_two_charges_highest_priority_batches_and_paces_mixed_one
     let (first, last) = (debts[0].min(debts[1]), debts[0].max(debts[1]));
     clock.advance(std::time::Duration::from_nanos(first - 1));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(mixed_arrivals(), 0, "the mixed batch went before its interface's timer");
+    assert_eq!(
+        mixed_arrivals(),
+        0,
+        "the mixed batch went before its interface's timer"
+    );
     clock.advance(std::time::Duration::from_nanos(last - first + 1));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
-    assert_eq!(mixed_arrivals(), 1, "the mixed batch didn't go once its interface's timer fired");
+    assert_eq!(
+        mixed_arrivals(),
+        1,
+        "the mixed batch didn't go once its interface's timer fired"
+    );
 }
 
 /// A receiver of test items that adds the bytes each `on_consumed` call reports to a count the
@@ -1529,7 +1548,11 @@ fn interface_paced_pick_two_sends_a_highest_priority_batch_while_every_interface
         test_pool(),
     );
     let costs = |sender: usize| -> Vec<u64> {
-        sends[sender].borrow().iter().map(|&(_, cost)| cost).collect()
+        sends[sender]
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect()
     };
 
     // Each interface sends one bulk batch at once and holds the next until its bucket has paid
@@ -1690,7 +1713,12 @@ fn interface_paced_pick_two_without_a_chosen_interface_waits_for_a_free_interfac
         &registry,
         test_pool(),
     );
-    let sent = || sends.iter().map(|sends| sends.borrow().len()).sum::<usize>();
+    let sent = || {
+        sends
+            .iter()
+            .map(|sends| sends.borrow().len())
+            .sum::<usize>()
+    };
 
     // While every interface holds a batch, the router doesn't read the fifth.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
@@ -1742,7 +1770,11 @@ fn interface_paced_pick_two_doesnt_count_a_batch_whose_route_fails() {
     // tell upstream that the batch was consumed.
     assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
     assert_eq!(drop_counter.load(Ordering::Relaxed), 1);
-    assert_eq!(consumed.get(), 0, "the router counted a batch whose route failed");
+    assert_eq!(
+        consumed.get(),
+        0,
+        "the router counted a batch whose route failed"
+    );
 }
 
 /// A receiver of test items that the test feeds and closes while the router holds a clone of it.
@@ -1805,7 +1837,11 @@ fn interface_paced_pick_two_sends_its_highest_priority_input_ahead_of_a_waiting_
     )
     .with_highest_priority_input(highest_rx.clone());
     let costs = |sender: usize| -> Vec<u64> {
-        sends[sender].borrow().iter().map(|&(_, cost)| cost).collect()
+        sends[sender]
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect()
     };
     // The byte costs of the bulk batches an interface has sent, in the order it sent them.
     let bulk = |sender: usize| -> Vec<u64> {
@@ -1860,7 +1896,10 @@ fn interface_paced_pick_two_sends_its_highest_priority_input_ahead_of_a_waiting_
     clock.advance(std::time::Duration::from_millis(2));
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(bulk_sent(), [100_000, 100_001, 100_002, 100_003]);
-    assert_eq!(rx.consumed.get(), 100_000 + 100_001 + 100_002 + 100_003 + 100_004);
+    assert_eq!(
+        rx.consumed.get(),
+        100_000 + 100_001 + 100_002 + 100_003 + 100_004
+    );
 
     // The bulk input is closed and empty, and the router goes on while the input of the highest
     // priority level is open.
@@ -1880,7 +1919,9 @@ fn interface_paced_pick_two_without_a_chosen_interface_routes_the_highest_input_
     let drop_counter = Arc::new(AtomicUsize::new(0));
     let entry = test_path_secret_entry();
     let rx = ClosableReceiver::default();
-    rx.values.borrow_mut().extend(test_items(&entry, 4, 100_000, &drop_counter));
+    rx.values
+        .borrow_mut()
+        .extend(test_items(&entry, 4, 100_000, &drop_counter));
     rx.closed.set(true);
     let highest_rx = ClosableReceiver::default();
     let sends: [Sends; 2] = Default::default();
@@ -1898,7 +1939,12 @@ fn interface_paced_pick_two_without_a_chosen_interface_routes_the_highest_input_
         test_pool(),
     )
     .with_highest_priority_input(highest_rx.clone());
-    let sent = || sends.iter().map(|sends| sends.borrow().len()).sum::<usize>();
+    let sent = || {
+        sends
+            .iter()
+            .map(|sends| sends.borrow().len())
+            .sum::<usize>()
+    };
 
     // Each interface sends one bulk batch and holds the next.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
@@ -1939,12 +1985,16 @@ fn interface_paced_pick_two_reads_ahead_again_once_its_highest_priority_input_cl
     // the highest priority level and a fifth bulk batch, and closes after them. The input of the
     // highest priority level stays empty until the test closes it.
     let rx = ClosableReceiver::default();
-    rx.values.borrow_mut().extend(test_items(&entry, 4, 100_000, &drop_counter));
+    rx.values
+        .borrow_mut()
+        .extend(test_items(&entry, 4, 100_000, &drop_counter));
     let mut highest = new_test_item(entry.clone(), drop_counter.clone());
     highest.byte_cost = 1;
     highest.highest_priority = true;
     rx.values.borrow_mut().push_back(highest);
-    rx.values.borrow_mut().extend(test_items(&entry, 1, 100_000, &drop_counter));
+    rx.values
+        .borrow_mut()
+        .extend(test_items(&entry, 1, 100_000, &drop_counter));
     rx.closed.set(true);
     let highest_rx = ClosableReceiver::default();
     let sends: [Sends; 2] = Default::default();
@@ -1962,7 +2012,11 @@ fn interface_paced_pick_two_reads_ahead_again_once_its_highest_priority_input_cl
     )
     .with_highest_priority_input(highest_rx.clone());
     let costs = |sender: usize| -> Vec<u64> {
-        sends[sender].borrow().iter().map(|&(_, cost)| cost).collect()
+        sends[sender]
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect()
     };
     let sent = |cost: u64| {
         sends
@@ -2030,7 +2084,11 @@ fn pick_two_skips_lost_senders_while_another_delivers() {
     assert!(entry.set_sender_lost(sender(3), true));
 
     let calls = pick_two_calls(&entry, 100, 1);
-    assert_eq!(calls[1] + calls[3], 0, "a lost sender got an item: {calls:?}");
+    assert_eq!(
+        calls[1] + calls[3],
+        0,
+        "a lost sender got an item: {calls:?}"
+    );
     assert_eq!(calls[0] + calls[2], 100);
     assert!(
         calls[0] > 0 && calls[2] > 0,
@@ -2191,7 +2249,10 @@ fn interface_paced_pick_two_chooses_by_one_read_of_the_lost_marks() {
         assert!(entry.set_sender_lost(sender(1), false));
         assert!(entry.set_sender_lost(sender(2), false));
     }
-    assert_eq!(chosen[0], 0, "the router chose the lost sender 0: {chosen:?}");
+    assert_eq!(
+        chosen[0], 0,
+        "the router chose the lost sender 0: {chosen:?}"
+    );
     assert!(
         chosen[1] + chosen[2] > 0,
         "the router read the marks again after the first read: {chosen:?}",

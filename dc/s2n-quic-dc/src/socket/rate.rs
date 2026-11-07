@@ -115,7 +115,10 @@ impl TokenBucket {
     /// sends already charged are paid for, or 0 where the bucket holds tokens.
     pub fn debt_nanos(&self, now: Timestamp) -> u64 {
         let elapsed = now.nanos_since(self.last_refill) as i64;
-        self.tokens_nanos.saturating_add(elapsed).min(0).unsigned_abs()
+        self.tokens_nanos
+            .saturating_add(elapsed)
+            .min(0)
+            .unsigned_abs()
     }
 }
 

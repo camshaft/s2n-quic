@@ -571,7 +571,12 @@ pub fn setup_sim_endpoint(
         .advertised_recv_interfaces()
         .map(|ids| ids.into_iter().map(Some).collect())
         .unwrap_or_default();
-    register_endpoint_map(&endpoint.data_addrs, path_secret_map, params, data_interfaces);
+    register_endpoint_map(
+        &endpoint.data_addrs,
+        path_secret_map,
+        params,
+        data_interfaces,
+    );
 
     endpoint
 }

@@ -488,5 +488,8 @@ fn an_endpoint_tags_its_advertised_addresses_with_their_interfaces() {
             interface: Some(interface),
         })
         .collect();
-    assert_eq!(decode(&map.advertised_data_addrs().unwrap()).unwrap(), tagged);
+    assert_eq!(
+        decode(&map.advertised_data_addrs().unwrap()).unwrap(),
+        tagged
+    );
 }

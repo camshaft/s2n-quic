@@ -537,8 +537,10 @@ mod tests {
     /// split, to the path secret entry, which keeps each interface in the order of its address.
     #[test]
     fn a_tagged_payload_reaches_the_entry_with_each_interface_on_its_address() {
-        use super::super::data_addresses::{decode, encode_tagged};
-        use super::Entry;
+        use super::{
+            super::data_addresses::{decode, encode_tagged},
+            Entry,
+        };
 
         let peer = addr("[2001:db8::1]:443");
         let advertised = [
@@ -560,7 +562,10 @@ mod tests {
             .peer_data_interfaces(peer_data_interfaces)
             .build(None);
 
-        assert_eq!(entry.peer_data_interfaces().len(), entry.peer_data_addrs().len());
+        assert_eq!(
+            entry.peer_data_interfaces().len(),
+            entry.peer_data_addrs().len()
+        );
         let pairs: Vec<(SocketAddr, Option<u16>)> = entry
             .peer_data_addrs()
             .iter()
