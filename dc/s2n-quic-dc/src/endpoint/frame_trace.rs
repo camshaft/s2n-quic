@@ -49,9 +49,9 @@
 //! `slot_hold` is the one exception: a plain release build records it too where `BACKBEAT_ENABLE`
 //! arms capture, or where an application that arms capture through backbeat's API calls
 //! [`arm_slot_holds`], so that a release build can keep what a server does with a held slot.
-//! Where neither arms it, `slot_hold` returns before it records, so it doesn't build the
-//! [`backbeat::global`] recorder or spawn its dumper thread. [`slot_hold`] says what an armed
-//! release build pays.
+//! In a plain release build where neither arms it, `slot_hold` returns before it records, so it
+//! doesn't build the [`backbeat::global`] recorder or spawn its dumper thread. [`slot_hold`] says
+//! what an armed release build pays.
 //!
 //! Dumps are self-describing `.bb` files written by `backbeat::global`'s background dumper, named by
 //! UTC timestamp under `BACKBEAT_PATH` (default `${TMPDIR}/backbeat.<pid>.bb`). Read them with the
