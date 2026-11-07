@@ -1239,3 +1239,9 @@ fn send_idle_wheel_silence_doesnt_renew_a_dead_mark() {
                 !pse.is_dead_during_cooldown(now, cooldown),
                 "the expiry of a pair lost after the dead mark doesn't renew the mark"
             );
+            assert!(pse.is_marked_dead(), "the mark stays until the peer is heard from");
+        }
+        .primary()
+        .spawn();
+    });
+}
