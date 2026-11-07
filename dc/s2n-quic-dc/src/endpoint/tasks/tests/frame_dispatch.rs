@@ -919,3 +919,69 @@ fn the_priority_router_releases_the_slots_of_its_waiting_resets_as_it_ends() {
     state.freed.take(&mut freed).expect("the slots are recorded as freed");
     assert!(freed.contains(1) && freed.contains(2));
 }
+
+/// Loom models of the priority router's end.
+mod loom {
+    use crate::{
+        packet::datagram::QueuePair,
+        path::secret::map::entry::QueueState,
+        testing::loom::{model, thread},
+    };
+    use s2n_quic_core::varint::VarInt;
+
+    /// The server rejects an init of binding 1 on its slot 1 on one thread while the priority
+    /// router ends on another. In every order of the two, the slot is recorded as freed and
+    /// isn't held once both end: the reset reaches the submission channel before the router
+    /// closes it, and the close releases the hold, or the channel refuses the reset, and
+    /// `reject_init` releases the hold after the reject's free.
+    #[test]
+    fn a_reset_sent_as_the_priority_router_ends_is_released_or_refused_and_unheld() {
+        model(|| {
+            let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+                .socket_sender_count(1)
+                .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+                .build(None);
+            let QueueState::Server(state) = pse.queue_state() else {
+                unreachable!("a server entry has a server queue state");
+            };
+            let state = state.clone();
+            let window = crate::endpoint::combinator::CreditlessWindow::default();
+            let (mut frame_tx, router, _lanes) = super::priority_router(window);
+
+            let rejecter = {
+                let pse = pse.clone();
+                let state = state.clone();
+                thread::spawn(move || {
+                    let view = state.view();
+                    let (mut freed_tx, _freed_rx) = crate::queue::freed_batch_channel();
+                    // The client's init came from its slot 2 for the server's slot 1.
+                    let incoming_pair = QueuePair {
+                        source_queue_id: VarInt::from_u8(2),
+                        dest_queue_id: VarInt::from_u8(1),
+                    };
+                    crate::endpoint::dispatch::reject_init(
+                        &view,
+                        &pse,
+                        incoming_pair,
+                        VarInt::from_u8(1),
+                        VarInt::from_u8(1),
+                        &mut frame_tx,
+                        &mut freed_tx,
+                        |view, freed_tx| view.record_freed(VarInt::from_u8(1), &pse, freed_tx),
+                    );
+                })
+            };
+
+            drop(router);
+            rejecter.join().unwrap();
+
+            let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+            state.freed.take(&mut freed).expect("the slot is recorded as freed");
+            assert!(freed.contains(1));
+            assert!(
+                state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)),
+                "the slot isn't held"
+            );
+        });
+    }
+}

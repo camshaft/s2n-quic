@@ -2020,7 +2020,7 @@ fn send_reset(
 /// recorded, and a free recorded after the release records the slot itself, so the slot is
 /// recorded as freed once.
 #[allow(clippy::too_many_arguments)]
-fn reject_init(
+pub(super) fn reject_init(
     server_view: &crate::queue::ServerView,
     path_secret_entry: &Arc<PathSecretEntry>,
     incoming_pair: QueuePair,
