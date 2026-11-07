@@ -1353,20 +1353,22 @@ where
 
                 let wheel_interest = {
                     let mut ctx = ctx_rc.borrow_mut();
-                    let interest = ctx.process_ack(
-                        *largest_acknowledged,
-                        *ack_range,
-                        payload,
-                        *ecn_counts,
-                        *ack_delay,
-                        &counters,
-                        &mut self.completed_tx,
-                        &mut lost_queue,
-                        &mut self.cancelled_tx,
-                        &self.clock,
-                        &mut self.random,
-                        &mut self.deferred,
-                    );
+                    let interest = cache.borrow().track_path_lost(&mut ctx, |ctx| {
+                        ctx.process_ack(
+                            *largest_acknowledged,
+                            *ack_range,
+                            payload,
+                            *ecn_counts,
+                            *ack_delay,
+                            &counters,
+                            &mut self.completed_tx,
+                            &mut lost_queue,
+                            &mut self.cancelled_tx,
+                            &self.clock,
+                            &mut self.random,
+                            &mut self.deferred,
+                        )
+                    });
                     counters.on_rtt(ctx.rtt_estimator.smoothed_rtt());
                     interest
                 };

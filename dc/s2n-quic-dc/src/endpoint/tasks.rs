@@ -282,6 +282,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    path_secret_map: crate::path::secret::Map,
 ) where
     Socket: crate::socket::send::Socket + 'static,
     Clk: precision::Clock + s2n_quic_core::time::Clock + Clone + 'static,
@@ -340,7 +341,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             sender_idx_to_local[st.sender_idx] = local_id;
 
             let cache = Rc::new(RefCell::new(
-                send::Cache::new(&counter_registry, st.sender_idx).with_place(st.interface_place),
+                send::Cache::new(&counter_registry, st.sender_idx)
+                    .with_place(st.interface_place)
+                    .with_path_secret_map(path_secret_map.clone()),
             ));
 
             (local_id, cache)
@@ -979,12 +982,12 @@ where
             tx_pto_check.add(1);
             let wheel_interest = {
                 let mut ctx = context.borrow_mut();
+                let local_idx = sender_idx_to_local[ctx.sender_idx];
+                let cache = send_caches[local_idx].borrow();
                 let requested = ctx.pto.probe_state.is_requested();
-                let interest = ctx.on_pto_timeout(&clock);
+                let interest = cache.track_path_lost(&mut ctx, |ctx| ctx.on_pto_timeout(&clock));
                 if !requested && ctx.pto.probe_state.is_requested() {
                     tx_pto_requested.add(1);
-                    let local_idx = sender_idx_to_local[ctx.sender_idx];
-                    let cache = send_caches[local_idx].borrow();
                     let counters = cache.send_counters();
                     counters
                         .tx_probe_backoff
@@ -994,7 +997,7 @@ where
                     }
                 }
                 if ctx.should_move_frames() {
-                    let moved = ctx.move_frames(&mut retransmit_tx);
+                    let moved = cache.move_frames(&mut ctx, &mut retransmit_tx);
                     debug!(
                         moved,
                         sender_idx = ?ctx.sender_idx,
@@ -1378,10 +1381,13 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // A lost pair also marks the peer dead where the peer hasn't sent an
                 // authenticated packet on any interface since the pair was marked lost, with or
                 // without unacknowledged packets and whatever the marks of the peer's other pairs.
-                let unacknowledged =
-                    has_inflight && !(path_lost && path_secret_entry.has_delivering_sender());
                 let peer_silent_since_lost =
                     lost_at.is_some_and(|since| path_secret_entry.last_activity() < since);
+                let unacknowledged = has_inflight
+                    && !peer_silent_since_lost
+                    && !send_caches[local_id]
+                        .borrow()
+                        .skips_dead_mark(path_lost, &path_secret_entry);
                 let marked_dead = (unacknowledged || peer_silent_since_lost)
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
 

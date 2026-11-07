@@ -14,7 +14,7 @@ use crate::event::{
 };
 #[allow(unused_imports)]
 use core::sync::atomic::{AtomicU64, Ordering};
-static INFO: &[Info; 132usize] = &[
+static INFO: &[Info; 137usize] = &[
     info::Builder {
         id: 0usize,
         name: Str::new("stream_write_key_updated\0"),
@@ -807,6 +807,36 @@ static INFO: &[Info; 132usize] = &[
         units: Units::Duration,
     }
     .build(),
+    info::Builder {
+        id: 132usize,
+        name: Str::new("path_secret_map_interface_pair_lost\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 133usize,
+        name: Str::new("path_secret_map_interface_pair_delivering\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 134usize,
+        name: Str::new("path_secret_map_interface_pair_frames_moved\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 135usize,
+        name: Str::new("path_secret_map_interface_pair_frames_moved.frames\0"),
+        units: Units::None,
+    }
+    .build(),
+    info::Builder {
+        id: 136usize,
+        name: Str::new("path_secret_map_dead_mark_skipped\0"),
+        units: Units::None,
+    }
+    .build(),
 ];
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -815,7 +845,7 @@ pub struct ConnectionContext {
 }
 pub struct Subscriber<R: Registry> {
     #[allow(dead_code)]
-    counters: Box<[R::Counter; 44usize]>,
+    counters: Box<[R::Counter; 48usize]>,
     #[allow(dead_code)]
     bool_counters: Box<[R::BoolCounter; 4usize]>,
     #[allow(dead_code)]
@@ -823,7 +853,7 @@ pub struct Subscriber<R: Registry> {
     #[allow(dead_code)]
     nominal_counter_offsets: Box<[usize; 32usize]>,
     #[allow(dead_code)]
-    measures: Box<[R::Measure; 52usize]>,
+    measures: Box<[R::Measure; 53usize]>,
     #[allow(dead_code)]
     gauges: Box<[R::Gauge; 0usize]>,
     #[allow(dead_code)]
@@ -850,11 +880,11 @@ impl<R: Registry> Subscriber<R> {
     #[allow(unused_mut)]
     #[inline]
     pub fn new(registry: R) -> Self {
-        let mut counters = Vec::with_capacity(44usize);
+        let mut counters = Vec::with_capacity(48usize);
         let mut bool_counters = Vec::with_capacity(4usize);
         let mut nominal_counters = Vec::with_capacity(32usize);
         let mut nominal_counter_offsets = Vec::with_capacity(32usize);
-        let mut measures = Vec::with_capacity(52usize);
+        let mut measures = Vec::with_capacity(53usize);
         let mut gauges = Vec::with_capacity(0usize);
         let mut timers = Vec::with_capacity(0usize);
         let mut nominal_timers = Vec::with_capacity(0usize);
@@ -903,6 +933,10 @@ impl<R: Registry> Subscriber<R> {
         counters.push(registry.register_counter(&INFO[109usize]));
         counters.push(registry.register_counter(&INFO[126usize]));
         counters.push(registry.register_counter(&INFO[129usize]));
+        counters.push(registry.register_counter(&INFO[132usize]));
+        counters.push(registry.register_counter(&INFO[133usize]));
+        counters.push(registry.register_counter(&INFO[134usize]));
+        counters.push(registry.register_counter(&INFO[136usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[5usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[6usize]));
         bool_counters.push(registry.register_bool_counter(&INFO[101usize]));
@@ -1315,6 +1349,7 @@ impl<R: Registry> Subscriber<R> {
         measures.push(registry.register_measure(&INFO[128usize]));
         measures.push(registry.register_measure(&INFO[130usize]));
         measures.push(registry.register_measure(&INFO[131usize]));
+        measures.push(registry.register_measure(&INFO[135usize]));
         {
             #[allow(unused_imports)]
             use api::*;
@@ -1393,6 +1428,10 @@ impl<R: Registry> Subscriber<R> {
                 41usize => (&INFO[109usize], entry),
                 42usize => (&INFO[126usize], entry),
                 43usize => (&INFO[129usize], entry),
+                44usize => (&INFO[132usize], entry),
+                45usize => (&INFO[133usize], entry),
+                46usize => (&INFO[134usize], entry),
+                47usize => (&INFO[136usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -1697,6 +1736,7 @@ impl<R: Registry> Subscriber<R> {
                 49usize => (&INFO[128usize], entry),
                 50usize => (&INFO[130usize], entry),
                 51usize => (&INFO[131usize], entry),
+                52usize => (&INFO[135usize], entry),
                 _ => unsafe { core::hint::unreachable_unchecked() },
             })
     }
@@ -2358,6 +2398,55 @@ impl<R: Registry> event::Subscriber for Subscriber<R> {
         self.count(129usize, 43usize, 1usize);
         self.measure(130usize, 50usize, event.acquire);
         self.measure(131usize, 51usize, event.duration);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_interface_pair_lost(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapInterfacePairLost,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(132usize, 44usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_interface_pair_delivering(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapInterfacePairDelivering,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(133usize, 45usize, 1usize);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_interface_pair_frames_moved(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapInterfacePairFramesMoved,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(134usize, 46usize, 1usize);
+        self.measure(135usize, 52usize, event.frames);
+        let _ = event;
+        let _ = meta;
+    }
+    #[inline]
+    fn on_path_secret_map_dead_mark_skipped(
+        &self,
+        meta: &api::EndpointMeta,
+        event: &api::PathSecretMapDeadMarkSkipped,
+    ) {
+        #[allow(unused_imports)]
+        use api::*;
+        self.count(136usize, 47usize, 1usize);
         let _ = event;
         let _ = meta;
     }

@@ -454,3 +454,34 @@ struct PathSecretMapAddressWriteLock {
     #[measure("duration", Duration)]
     duration: core::time::Duration,
 }
+
+#[event("path_secret_map:interface_pair_lost")]
+#[subject(endpoint)]
+/// Emitted when a send context marks its interface pair lost
+struct PathSecretMapInterfacePairLost<'a> {
+    peer_address: SocketAddress<'a>,
+}
+
+#[event("path_secret_map:interface_pair_delivering")]
+#[subject(endpoint)]
+/// Emitted when a lost interface pair delivers again
+struct PathSecretMapInterfacePairDelivering<'a> {
+    peer_address: SocketAddress<'a>,
+}
+
+#[event("path_secret_map:interface_pair_frames_moved")]
+#[subject(endpoint)]
+/// Emitted when a lost interface pair moves its frames to the pairs that deliver
+struct PathSecretMapInterfacePairFramesMoved<'a> {
+    peer_address: SocketAddress<'a>,
+
+    #[measure("frames")]
+    frames: usize,
+}
+
+#[event("path_secret_map:dead_mark_skipped")]
+#[subject(endpoint)]
+/// Emitted when the idle wheel doesn't mark a peer dead because another pair delivers
+struct PathSecretMapDeadMarkSkipped<'a> {
+    peer_address: SocketAddress<'a>,
+}

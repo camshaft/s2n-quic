@@ -1467,6 +1467,41 @@ where
                 peer_address: SocketAddress::from(*peer_address).into_event(),
             });
     }
+
+    fn on_interface_pair_lost(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_interface_pair_lost(
+            event::builder::PathSecretMapInterfacePairLost {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
+
+    fn on_interface_pair_delivering(&self, peer_address: &SocketAddr) {
+        self.subscriber()
+            .on_path_secret_map_interface_pair_delivering(
+                event::builder::PathSecretMapInterfacePairDelivering {
+                    peer_address: SocketAddress::from(*peer_address).into_event(),
+                },
+            );
+    }
+
+    fn on_interface_pair_frames_moved(&self, peer_address: &SocketAddr, frames: usize) {
+        self.subscriber()
+            .on_path_secret_map_interface_pair_frames_moved(
+                event::builder::PathSecretMapInterfacePairFramesMoved {
+                    peer_address: SocketAddress::from(*peer_address).into_event(),
+                    frames,
+                },
+            );
+    }
+
+    fn on_dead_mark_skipped(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_dead_mark_skipped(
+            event::builder::PathSecretMapDeadMarkSkipped {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
 }
 
 impl<C, S> Drop for State<C, S>

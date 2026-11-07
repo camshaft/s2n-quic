@@ -181,11 +181,16 @@ fn send_pto_timeout_routes_pending_context_to_tx_wheel() {
             idle_wheel_tx,
             registry.register("tx.pto_check"),
             registry.register("tx.pto_requested"),
-            crate::endpoint::id::IdMap::<crate::endpoint::id::LocalSendSocketId, _>::from(vec![]),
+            crate::endpoint::id::IdMap::<crate::endpoint::id::LocalSendSocketId, _>::from(vec![
+                Rc::new(RefCell::new(send::Cache::new(
+                    &registry,
+                    crate::endpoint::id::LocalSenderId::from_index(0),
+                ))),
+            ]),
             crate::endpoint::id::IdMap::<
                 crate::endpoint::id::LocalSenderId,
                 crate::endpoint::id::LocalSendSocketId,
-            >::new(0, crate::endpoint::id::LocalSendSocketId::new(0)),
+            >::new(1, crate::endpoint::id::LocalSendSocketId::new(0)),
             retransmit_tx,
         );
 
