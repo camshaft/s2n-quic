@@ -663,9 +663,10 @@ impl Entry {
     /// peer hasn't sent an authenticated packet since that lost mark or another pair of the peer
     /// delivers. A lost pair's expiry while the peer stays silent since the pair's lost mark
     /// marks the entry only where the entry doesn't hold a mark. In the endpoint a context
-    /// reaches its expiry with such packets only after its pair is marked lost, so a context
-    /// whose pair is marked lost after the peer's last packet doesn't renew the mark, and each
-    /// other context renews it at most once, as `send_idle_wheel_drain` says: the mark stops
+    /// reaches its expiry with such packets only after its pair is marked lost, while four probe
+    /// timeout periods of its RTT estimate are shorter than the idle timeout less a second, so a
+    /// context whose pair is marked lost after the peer's last packet doesn't renew the mark, and
+    /// each other context renews it at most once, as `send_idle_wheel_drain` says: the mark stops
     /// moving, and the cooldown ends. The callers that open flows treat this as the signal to
     /// evict the entry and handshake again, which builds fresh keys, queue state and send and
     /// receive contexts for the peer. Within the cooldown they keep refusing flows, as before.
