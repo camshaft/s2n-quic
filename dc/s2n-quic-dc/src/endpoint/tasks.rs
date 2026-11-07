@@ -85,6 +85,7 @@ pub fn frame_dispatch<S, Clk>(
     pacing: SendPacing,
     budgets: Budgets,
     counter_registry: counter::Registry,
+    path_secret_map: Option<crate::path::secret::Map>,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
 ) where
     S: UnboundedSender<Entry<FrameBatch>> + 'static,
@@ -95,7 +96,14 @@ pub fn frame_dispatch<S, Clk>(
     // the send credit pool bounds the other frames. The window starts at the batch router's
     // batch target, so that it admits a full batch, and grows and shrinks with how fast the
     // workers take the batches.
-    let window = CreditlessWindow::new(BATCH_TARGET_BYTES);
+    // Where the endpoint passes its path secret map, the window records each frame it refuses
+    // and each change of its limit as an event of the map's subscriber.
+    let window = match path_secret_map {
+        Some(path_secret_map) => {
+            CreditlessWindow::with_path_secret_map(BATCH_TARGET_BYTES, path_secret_map)
+        }
+        None => CreditlessWindow::new(BATCH_TARGET_BYTES),
+    };
     frame_dispatch_over(
         spawner,
         frame_rx,
