@@ -1091,22 +1091,24 @@ pub mod api {
     #[derive(Clone, Debug)]
     #[non_exhaustive]
     #[doc = " Emitted when the creditless window refuses a frame without send credit"]
-    pub struct CreditlessWindowFrameRefused {
+    pub struct CreditlessWindowFrameRefused<'a> {
+        pub peer_address: SocketAddress<'a>,
         pub frame_bytes: u64,
         pub held_bytes: u64,
         pub limit_bytes: u64,
     }
     #[cfg(any(test, feature = "testing"))]
-    impl crate::event::snapshot::Fmt for CreditlessWindowFrameRefused {
+    impl<'a> crate::event::snapshot::Fmt for CreditlessWindowFrameRefused<'a> {
         fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
             let mut fmt = fmt.debug_struct("CreditlessWindowFrameRefused");
+            fmt.field("peer_address", &self.peer_address);
             fmt.field("frame_bytes", &self.frame_bytes);
             fmt.field("held_bytes", &self.held_bytes);
             fmt.field("limit_bytes", &self.limit_bytes);
             fmt.finish()
         }
     }
-    impl Event for CreditlessWindowFrameRefused {
+    impl<'a> Event for CreditlessWindowFrameRefused<'a> {
         const NAME: &'static str = "creditless_window:frame_refused";
     }
     #[derive(Clone, Debug)]
@@ -1806,11 +1808,12 @@ pub mod tracing {
         ) {
             let parent = self.parent(meta);
             let api::CreditlessWindowFrameRefused {
+                peer_address,
                 frame_bytes,
                 held_bytes,
                 limit_bytes,
             } = event;
-            tracing :: event ! (target : "creditless_window_frame_refused" , parent : parent , tracing :: Level :: DEBUG , { frame_bytes = tracing :: field :: debug (frame_bytes) , held_bytes = tracing :: field :: debug (held_bytes) , limit_bytes = tracing :: field :: debug (limit_bytes) });
+            tracing :: event ! (target : "creditless_window_frame_refused" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , frame_bytes = tracing :: field :: debug (frame_bytes) , held_bytes = tracing :: field :: debug (held_bytes) , limit_bytes = tracing :: field :: debug (limit_bytes) });
         }
         #[inline]
         fn on_creditless_window_limit_grew(
@@ -2929,20 +2932,23 @@ pub mod builder {
     }
     #[derive(Clone, Debug)]
     #[doc = " Emitted when the creditless window refuses a frame without send credit"]
-    pub struct CreditlessWindowFrameRefused {
+    pub struct CreditlessWindowFrameRefused<'a> {
+        pub peer_address: SocketAddress<'a>,
         pub frame_bytes: u64,
         pub held_bytes: u64,
         pub limit_bytes: u64,
     }
-    impl IntoEvent<api::CreditlessWindowFrameRefused> for CreditlessWindowFrameRefused {
+    impl<'a> IntoEvent<api::CreditlessWindowFrameRefused<'a>> for CreditlessWindowFrameRefused<'a> {
         #[inline]
-        fn into_event(self) -> api::CreditlessWindowFrameRefused {
+        fn into_event(self) -> api::CreditlessWindowFrameRefused<'a> {
             let CreditlessWindowFrameRefused {
+                peer_address,
                 frame_bytes,
                 held_bytes,
                 limit_bytes,
             } = self;
             api::CreditlessWindowFrameRefused {
+                peer_address: peer_address.into_event(),
                 frame_bytes: frame_bytes.into_event(),
                 held_bytes: held_bytes.into_event(),
                 limit_bytes: limit_bytes.into_event(),

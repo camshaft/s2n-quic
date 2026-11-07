@@ -326,12 +326,17 @@ impl Map {
     /// Emits a CreditlessWindowFrameRefused event via the subscriber
     pub fn on_creditless_window_frame_refused(
         &self,
+        peer_address: &SocketAddr,
         frame_bytes: u64,
         held_bytes: u64,
         limit_bytes: u64,
     ) {
-        self.store
-            .on_creditless_window_frame_refused(frame_bytes, held_bytes, limit_bytes);
+        self.store.on_creditless_window_frame_refused(
+            peer_address,
+            frame_bytes,
+            held_bytes,
+            limit_bytes,
+        );
     }
 
     /// Emits a CreditlessWindowLimitGrew event via the subscriber

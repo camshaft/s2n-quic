@@ -223,6 +223,7 @@ pub trait Store: 'static + Send + Sync + time::Clock {
     /// Publishes a CreditlessWindowFrameRefused event.
     fn on_creditless_window_frame_refused(
         &self,
+        peer_address: &SocketAddr,
         frame_bytes: u64,
         held_bytes: u64,
         limit_bytes: u64,
