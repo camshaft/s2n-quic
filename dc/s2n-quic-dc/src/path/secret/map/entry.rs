@@ -493,13 +493,26 @@ impl Entry {
         sender_idx: LocalSenderId,
         at: crate::time::precision::Timestamp,
     ) -> bool {
+        let until = self.senders_preferred_until.load(Ordering::Acquire);
+        self.record_sender_delivered_until(sender_idx, at, until)
+    }
+
+    /// [`Self::record_sender_delivered`] against `until`, the end of the preference as u64
+    /// nanoseconds that it loaded once. Each check of the end reads that one bound, so that
+    /// another sender's mark that extends the preference meanwhile doesn't make an
+    /// acknowledgement after the old end and within the new one report an end.
+    fn record_sender_delivered_until(
+        &self,
+        sender_idx: LocalSenderId,
+        at: crate::time::precision::Timestamp,
+        until: u64,
+    ) -> bool {
         let Some(sender_idx) = self.sender_index(sender_idx) else {
             return false;
         };
-        let until = self.senders_preferred_until.load(Ordering::Acquire);
         let ends_preference = at.nanos > until
             && self.sender_delivered_at[sender_idx].load(Ordering::Acquire) <= until
-            && self.prefers_senders_delivering_since_lost();
+            && self.prefers_senders_delivering_since_lost_until(until);
         self.sender_delivered_at[sender_idx].fetch_max(at.nanos, Ordering::AcqRel);
         ends_preference && self.record_preference_end(until)
     }
@@ -556,6 +569,12 @@ impl Entry {
     /// gets items again.
     pub fn prefers_senders_delivering_since_lost(&self) -> bool {
         let until = self.senders_preferred_until.load(Ordering::Acquire);
+        self.prefers_senders_delivering_since_lost_until(until)
+    }
+
+    /// [`Self::prefers_senders_delivering_since_lost`] against `until`, the end of the
+    /// preference as u64 nanoseconds that its caller loaded.
+    fn prefers_senders_delivering_since_lost_until(&self, until: u64) -> bool {
         self.has_sender_delivering_since_lost()
             && self
                 .sender_delivered_at

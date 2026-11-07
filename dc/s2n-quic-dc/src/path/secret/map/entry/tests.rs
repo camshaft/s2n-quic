@@ -527,3 +527,32 @@ fn an_end_of_the_preference_is_reported_once() {
         "a later end is reported once too"
     );
 }
+
+/// An acknowledgement checks the end of the routers' preference against the one bound it
+/// loaded, so that another sender's mark that extends the preference after that load doesn't
+/// make it report an end while the routers prefer the senders under the new bound.
+#[test]
+fn an_acknowledgement_checks_the_end_of_the_preference_against_the_bound_it_loaded() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let entry = test_entry_with_senders(3);
+    let sender = crate::endpoint::id::LocalSenderId::from_index;
+    let at = |nanos| PreciseTimestamp { nanos };
+
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    assert!(entry.set_sender_lost(sender(0), true));
+    entry.record_sender_delivered(sender(1), at(300));
+
+    // Another sender's mark extends the preference to 2_000, and sender 1 acknowledges after
+    // the old end and within the new one.
+    entry.set_senders_preferred_until(at(2_000));
+    assert!(!entry.record_sender_delivered(sender(1), at(1_200)));
+    assert!(entry.prefers_senders_delivering_since_lost());
+
+    // Sender 2's acknowledgement loaded the end before the extension, as on another thread.
+    assert!(
+        !entry.record_sender_delivered_until(sender(2), at(1_500), 1_000),
+        "the routers still prefer the senders, so it doesn't report an end"
+    );
+    assert!(entry.prefers_senders_delivering_since_lost());
+}
