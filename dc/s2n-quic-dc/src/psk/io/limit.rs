@@ -802,6 +802,10 @@ mod tests {
         let grown = rtt_waits(1, 0, [(1, 0), (5, 4)]).unwrap();
         assert_eq!(grown.spread(), Duration::ZERO);
         assert_eq!(grown.flights_time(), ms(2));
+        // A far path's round trips, each less its reply's wait, keep their spread.
+        let far = rtt_waits(60, 10, [(60, 10), (79, 10)]).unwrap();
+        assert_eq!(far.spread(), ms(19));
+        assert_eq!(far.flights_time(), ms(119));
         // A wait at or above its round trip, as where the socket over-counted it, leaves the
         // round trips as the connection measured them, and so does a wait that reaches the
         // lowest round trip.

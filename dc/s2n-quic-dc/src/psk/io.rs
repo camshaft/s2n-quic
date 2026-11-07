@@ -201,24 +201,20 @@ impl PathRttContext {
     }
 
     /// The connection's round trips, or `None` before its first recovery metrics. Until both of
-    /// the handshake's round trips are timed, as before dc.complete, each reads as the lowest
-    /// without a wait, which leaves the spread out.
+    /// the handshake's round trips are timed, as before dc.complete, each reads as the lowest,
+    /// which leaves the spread out.
     fn round_trips(&self) -> Option<limit::RoundTrips> {
         let lowest = self.min_rtt?;
         let flights = match (self.first_flight, self.second_flight) {
             (Some(first), Some(second)) => [first, second],
             _ => [lowest, lowest],
         };
-        let flight_waits = match (self.first_flight, self.second_flight) {
-            (Some(_), Some(_)) => [self.first_wait, self.second_wait],
-            _ => [None, None],
-        };
         Some(limit::RoundTrips {
             lowest,
             waited: self.waited,
             measured: self.measured,
             flights,
-            flight_waits,
+            flight_waits: [self.first_wait, self.second_wait],
         })
     }
 }
