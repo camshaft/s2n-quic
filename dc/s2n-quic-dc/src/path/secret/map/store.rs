@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ApplicationData, ApplicationDataError, Entry};
+use super::{ApplicationData, ApplicationDataError, Entry, PeerKey};
 use crate::{
     credentials::{Credentials, Id},
     packet::{secret_control as control, Packet, WireVersion},
@@ -10,7 +10,7 @@ use crate::{
 };
 use s2n_codec::EncoderBuffer;
 use s2n_quic_core::{time, varint::VarInt};
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use tokio::task::JoinHandle;
 
 /// Determines how the map delivers a control response (e.g. UnknownPathSecret)
@@ -199,6 +199,23 @@ pub trait Store: 'static + Send + Sync + time::Clock {
         &self,
         request: super::ApplicationDataRequest,
     ) -> Result<Option<ApplicationData>, ApplicationDataError>;
+
+    /// Reads the key of the certificate the peer presented, as a handshake readies its path
+    /// secret, and checks it against the list of accepted keys. Returns the key where the list
+    /// holds it, `None` where no list is set, and why it refuses the peer otherwise.
+    fn verify_peer_key(
+        &self,
+        tls: &dyn s2n_quic_core::crypto::tls::TlsSession,
+    ) -> Result<Option<PeerKey>, &'static str>;
+
+    /// Sets the list of accepted keys, and evicts each entry whose peer's key it doesn't hold.
+    fn set_peer_keys(&self, keys: HashSet<PeerKey>);
+
+    /// Adds a key to the list of accepted keys, where one is set.
+    fn insert_peer_key(&self, key: PeerKey) -> bool;
+
+    /// Takes a key out of the list of accepted keys, and evicts each entry whose peer has it.
+    fn remove_peer_key(&self, key: &PeerKey) -> bool;
 
     #[cfg(test)]
     fn reset_all_senders(&self);

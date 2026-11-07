@@ -22,6 +22,7 @@ pub(crate) mod data_addresses;
 pub(crate) mod entry;
 mod handshake;
 mod peer;
+mod peer_key;
 mod rehandshake;
 mod size_of;
 mod state;
@@ -52,6 +53,7 @@ pub use entry::{
 };
 pub use handshake::HandshakingPath;
 pub use peer::Peer;
+pub use peer_key::PeerKey;
 pub use state::{State, StateBuilder, StateBuilderError};
 
 pub(crate) use size_of::SizeOf;
@@ -527,6 +529,33 @@ impl Map {
         >,
     ) {
         self.store.register_make_application_data(cb);
+    }
+
+    /// Accepts, from this call on, only the peers whose key `keys` lists, on the client and on the
+    /// server side, and evicts each cached path secret of a peer whose key it doesn't list.
+    ///
+    /// A peer's key is the key of the leaf certificate it presents in the handshake (see
+    /// [`PeerKey::from_certificate_der`]), so a server's TLS provider must ask for the client's
+    /// certificate. Once the TLS provider has verified that the peer holds the private key of that
+    /// certificate, the handshake refuses the peer where the list doesn't hold its key, or where it
+    /// didn't present a certificate. A map without a list, as [`Map::builder`] builds it, accepts
+    /// each peer its TLS provider accepts.
+    pub fn set_peer_keys(&self, keys: impl IntoIterator<Item = PeerKey>) {
+        self.store.set_peer_keys(keys.into_iter().collect());
+    }
+
+    /// Adds `key` to the list of accepted keys that [`Map::set_peer_keys`] set. Returns whether the
+    /// list didn't hold it yet; where no list is set, it changes nothing and returns false.
+    pub fn insert_peer_key(&self, key: PeerKey) -> bool {
+        self.store.insert_peer_key(key)
+    }
+
+    /// Takes `key` out of the list of accepted keys that [`Map::set_peer_keys`] set, and evicts
+    /// each cached path secret of a peer with that key: the map then answers a packet on one of
+    /// them as a packet on an unknown path secret, and refuses the peer's next handshake. Returns
+    /// whether the list held `key`.
+    pub fn remove_peer_key(&self, key: &PeerKey) -> bool {
+        self.store.remove_peer_key(key)
     }
 }
 

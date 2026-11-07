@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{entry::ApplicationData, Entry, Map};
+use super::{entry::ApplicationData, Entry, Map, PeerKey};
 use crate::{
     packet::secret_control as control,
     path::secret::{receiver, schedule, sender},
@@ -39,6 +39,9 @@ struct HandshakingPathInner {
     /// Decoded and validated peer data addresses, populated by
     /// `validate_peer_data_addrs` and consumed by `on_peer_stateless_reset_tokens`.
     peer_data_addrs: Option<Vec<SocketAddr>>,
+    /// The key the peer presented, read in `on_path_secrets_ready` where the map holds a list of
+    /// accepted keys, and carried to the map entry.
+    peer_key: Option<PeerKey>,
     map: Map,
 
     error: Option<Box<dyn Error + Send + Sync>>,
@@ -66,6 +69,7 @@ impl HandshakingPath {
                 peer_info,
                 peer_data_addrs_bytes,
                 peer_data_addrs: None,
+                peer_key: None,
                 map,
                 error: None,
             })),
@@ -269,6 +273,16 @@ impl HandshakingPathInner {
         // handshake fast rather than after deriving secrets.
         self.validate_peer_data_addrs()?;
 
+        // Refuse a peer whose key the map's list of accepted keys doesn't hold, before the
+        // application sees the connection.
+        self.peer_key = self
+            .map
+            .store
+            .verify_peer_key(session)
+            .map_err(|reason| {
+                s2n_quic_core::transport::Error::APPLICATION_ERROR.with_reason(reason)
+            })?;
+
         let request = super::ApplicationDataRequest {
             tls: session,
             peer_info: self.peer_info.as_ref(),
@@ -346,7 +360,8 @@ impl HandshakingPathInner {
             self.application_data.take(),
             peer_data_addrs.unwrap_or_default().into(),
             socket_sender_count,
-        );
+        )
+        .with_peer_key(self.peer_key.take());
         let entry = Arc::new(entry);
         self.entry = Some(entry.clone());
         self.map.store.on_new_path_secrets(entry);

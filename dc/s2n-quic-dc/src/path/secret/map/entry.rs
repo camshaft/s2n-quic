@@ -4,6 +4,7 @@ use super::{
     size_of::SizeOf,
     status::{Dedup, IsRetired},
     Map,
+    PeerKey,
 };
 use crate::{
     credentials::{self, Credentials},
@@ -95,6 +96,9 @@ pub struct Entry {
     sender_load_scores: Box<[AtomicU64]>,
     /// Per-peer queue state — client or server depending on role.
     queue_state: QueueState,
+    /// The key the peer presented, where the map checked it against its list of accepted keys
+    /// (see [`Map::set_peer_keys`]).
+    peer_key: Option<PeerKey>,
 }
 
 /// Per-peer queue slot state, determined by role (derived from credential_id).
@@ -123,6 +127,7 @@ impl SizeOf for Entry {
             peer_data_addrs,
             sender_load_scores,
             queue_state: _,
+            peer_key,
         } = self;
         creation_time.size()
             + peer.size()
@@ -140,6 +145,8 @@ impl SizeOf for Entry {
             + std::mem::size_of::<Box<[AtomicU64]>>()
             + sender_load_scores.len() * std::mem::size_of::<AtomicU64>()
             + std::mem::size_of::<QueueState>()
+            + std::mem::size_of::<Option<PeerKey>>()
+            + peer_key.as_ref().map_or(0, |key| key.as_spki_der().len())
     }
 }
 
@@ -241,6 +248,7 @@ impl Entry {
             peer_data_addrs,
             sender_load_scores: Self::init_load_scores(socket_sender_count),
             queue_state,
+            peer_key: None,
         }
     }
 
@@ -609,6 +617,18 @@ impl Entry {
         &self.application_data
     }
 
+    /// Sets the key the peer presented, as the handshake read it.
+    pub(crate) fn with_peer_key(mut self, peer_key: Option<PeerKey>) -> Self {
+        self.peer_key = peer_key;
+        self
+    }
+
+    /// The key the peer presented, where the map checked it against its list of accepted keys
+    /// (see [`Map::set_peer_keys`]).
+    pub fn peer_key(&self) -> Option<&PeerKey> {
+        self.peer_key.as_ref()
+    }
+
     #[cfg(test)]
     pub fn reset_sender_counter(&self) {
         self.sender.reset_counter();
@@ -625,6 +645,7 @@ pub struct TestEntryBuilder {
     params: Option<dc::ApplicationParams>,
     application_data: Option<ApplicationData>,
     peer_data_addrs: Arc<[SocketAddr]>,
+    peer_key: Option<PeerKey>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -641,6 +662,7 @@ impl TestEntryBuilder {
             // Default to the single peer address so the common test entry can resolve a
             // send context without extra setup. Override via `peer_data_addrs`.
             peer_data_addrs: Arc::from([peer]),
+            peer_key: None,
         }
     }
 
@@ -680,6 +702,13 @@ impl TestEntryBuilder {
     /// validated `DcDataAddresses` transport parameter would supply at handshake time.
     pub fn peer_data_addrs(mut self, addrs: impl Into<Arc<[SocketAddr]>>) -> Self {
         self.peer_data_addrs = addrs.into();
+        self
+    }
+
+    /// Set the key of the peer the built `Entry` will carry, as the handshake would read it from
+    /// the peer's certificate.
+    pub fn peer_key(mut self, peer_key: Option<PeerKey>) -> Self {
+        self.peer_key = peer_key;
         self
     }
 
@@ -724,7 +753,7 @@ impl TestEntryBuilder {
 
         let stateless_reset = signer.sign(secret.id());
 
-        Arc::new(Entry::new_with_socket_senders(
+        let entry = Entry::new_with_socket_senders(
             self.peer,
             secret,
             sender::State::new(stateless_reset),
@@ -734,7 +763,9 @@ impl TestEntryBuilder {
             self.application_data.clone(),
             self.peer_data_addrs.clone(),
             self.socket_sender_count,
-        ))
+        )
+        .with_peer_key(self.peer_key.clone());
+        Arc::new(entry)
     }
 
     fn deterministic_secret(

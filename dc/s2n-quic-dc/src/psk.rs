@@ -4,3 +4,6 @@
 pub mod client;
 pub mod io;
 pub mod server;
+
+#[cfg(all(test, unix))]
+mod peer_key_tests;
