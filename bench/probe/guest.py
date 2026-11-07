@@ -568,7 +568,7 @@ def verify_image(image_path, work_dir, *, settings=None, runner=None):
                 reservation.bind(("127.0.0.1", 0))
                 port = reservation.getsockname()[1]
             with virtual_machine(runner, deadline, settings, directory, overlay, seed, port=port) as (process, channel):
-                event(channel, deadline, "ready", nonce)
+                ready = event(channel, deadline, "ready", nonce)
                 with stage("ssh"):
                     reply = runner.run(ssh_command(client, hosts, nonce, port,
                         'powershell.exe -NoProfile -NonInteractive -Command "Write-Output BENCH_SSH_OK"'), deadline.remaining())
@@ -583,3 +583,4 @@ def verify_image(image_path, work_dir, *, settings=None, runner=None):
                 # Shutdown may close SSH first; require its independent event and QEMU exit.
                 event(channel, deadline, "stopping", nonce)
                 clean_exit(process, deadline)
+    return ready

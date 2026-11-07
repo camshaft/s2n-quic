@@ -16,8 +16,9 @@ the image for benchmarks.
   run's result record; the image also contains its source evidence. Returned
   guest evidence contains only declared fields, excluding extra guest text and
   the per-run protocol nonce.
-- `verify_image(image_path, work_dir)` returns `None` only after authenticated SSH,
-  the guest's shutdown event, QEMU exit, and temporary-file cleanup.
+- `verify_image(image_path, work_dir)` returns the validated `ready` evidence only
+  after authenticated SSH, the guest's shutdown event, QEMU exit, and temporary-file
+  cleanup. The result excludes the protocol nonce and arbitrary guest fields.
 - Failures raise `GuestError` with `stage` and `code`; these fields contain neither
   subprocess output nor credentials. If cleanup also fails, `cleanup` preserves
   its closed error codes beside the original stage and code.
