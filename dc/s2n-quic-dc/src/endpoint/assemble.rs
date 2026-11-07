@@ -296,10 +296,23 @@ where
                         // A lost pair has no packet that waits for an acknowledgement once its
                         // frames moved to the pairs that deliver; a Ping probes it, and its
                         // acknowledgement shows that the pair delivers again.
-                        if context.pto.probe_state.is_probe_once() || context.is_path_lost() {
+                        let wants_ping =
+                            context.pto.probe_state.is_probe_once() || context.is_path_lost();
+                        // The Ping goes only in a segment with room for it: a later segment of
+                        // a batch is as long as the first one at most, so where the Ping doesn't
+                        // fit, the probe waits for the next assembly, as `DoesNotFit` does.
+                        let ping_metadata = metadata.with_frame_parts(&frame::Header::Ping, 0);
+                        let ping_len = ping_metadata.estimate_packet_len(
+                            source_sender_id,
+                            source_control_port,
+                            &context.credentials,
+                            seal::Application::tag_len(&context.sealer),
+                        );
+                        if wants_ping && ping_len <= max_segment_len {
                             // Already sent one probe — emit Ping for the second segment.
                             // Don't clear probe_state here; the general on_transmit()
                             // fires after the Ping segment is encoded (ProbeOnce → Idle).
+                            metadata = ping_metadata;
                             let ping = crate::intrusive::Entry::new(Frame {
                                 header: frame::Header::Ping,
                                 payload: crate::byte_vec::ByteVec::default(),
@@ -319,7 +332,7 @@ where
                                 credentials = %context.credentials.id,
                                 "PTO probe: emitting Ping as second segment"
                             );
-                        } else {
+                        } else if !wants_ping {
                             // No inflight entries and no prior probe sent — clear to Idle.
                             let _ = context.pto.probe_state.on_all_acked();
                             trace!(

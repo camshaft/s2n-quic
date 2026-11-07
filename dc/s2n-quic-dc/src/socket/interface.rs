@@ -554,7 +554,9 @@ mod platform {
     /// address.
     pub(super) fn link_speed(name: &str) -> Option<LinkSpeed> {
         let list = ifaddrs::IfAddrs::new().ok()?;
-        list.iter().find_map(|entry| {
+        // Bind the speed before returning it, so that the iterator, which borrows `list`, is
+        // dropped before `list` is.
+        let speed = list.iter().find_map(|entry| {
             if ifaddrs::name(entry)? != name || ifaddrs::family(entry)? != libc::AF_LINK {
                 return None;
             }
@@ -562,7 +564,8 @@ mod platform {
             // `if_data`, which lives as long as the entry.
             let data = unsafe { entry.ifa_data.cast::<libc::if_data>().as_ref() }?;
             baudrate_speed(data.ifi_baudrate)
-        })
+        });
+        speed
     }
 }
 

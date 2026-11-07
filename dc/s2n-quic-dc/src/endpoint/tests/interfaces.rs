@@ -10,6 +10,9 @@ use crate::{
     },
     testing::{ext::*, sim},
 };
+use s2n_quic_core::varint::VarInt;
+
+const ACCEPTOR_ID: VarInt = VarInt::from_u32(1);
 
 /// Two interfaces of four sockets each: the server's sockets 0 to 3 are on the first, and its
 /// sockets 4 to 7 are on the second.
@@ -35,10 +38,15 @@ fn server_interfaces() -> Vec<interface::Config> {
 fn a_client_learns_the_interface_of_each_server_address() {
     sim(|| {
         async move {
-            let _server = SimEndpointConfig::default()
+            let server = SimEndpointConfig::default()
                 .interfaces(server_interfaces())
                 .server();
-            core::future::pending::<()>().await;
+            // The acceptor's wait keeps the server's task alive, with a waker, until the
+            // client's task ends the sim.
+            let mut acceptor = server
+                .register_acceptor_channel(ACCEPTOR_ID, 1)
+                .expect("acceptor registration");
+            while acceptor.recv().await.is_some() {}
         }
         .group("server")
         .spawn();
