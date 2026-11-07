@@ -1025,6 +1025,64 @@ mod tests {
     }
 
     #[test]
+    fn a_far_handshake_whose_lower_round_trip_lies_above_the_kept_lowest_doesnt_lower_the_limit() {
+        let limit = Limit::new();
+        // A near peer's handshake runs alone: its route takes 1 ms, the socket measured that
+        // its reply didn't wait, and the 1 ms past its two round trips is the base. It keeps the
+        // 1 ms with the peer's entry.
+        let (near_kept, near) = read_handshake(ms(3), None, rtt_measured(1, 0));
+        assert_eq!(near, Answer::Latency(ms(1)));
+        assert_eq!(near_kept, Some(ms(1)));
+        round(&limit, near);
+        assert_eq!(limit.current(), 2);
+
+        // A first handshake with a far peer, whose route takes 50 ms, keeps the 50 ms with the
+        // peer's entry.
+        let (far_kept, _) = read_handshake(ms(101), None, rtt_measured(50, 0));
+        assert_eq!(far_kept, Some(ms(50)));
+
+        // The far path's round trips vary. The next handshake with the far peer times its two
+        // round trips at 53 ms and 60 ms, its lowest round trip takes 53 ms, 3 ms above the kept
+        // 50 ms, the socket measured that its replies didn't wait, and it takes 114 ms. Past two
+        // round trips of its 53 ms path and the 7 ms spread of its longer round trip, 1 ms is
+        // left, the time that the endpoint added. Beside the near peer's handshake, the limit
+        // grows, and the handshake keeps its 53 ms.
+        let varied = Some(RoundTrips {
+            measured: true,
+            ..flights(53, 53, 60).unwrap()
+        });
+        let (kept, far) = read_handshake(ms(114), far_kept, varied);
+        assert_eq!(far, Answer::Latency(ms(1)));
+        assert_eq!(kept, Some(ms(53)));
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(far);
+        permits.next().unwrap().release(near);
+        assert_eq!(limit.current(), 4);
+
+        // Read against the kept 50 ms, as a handshake without a measured wait reads it, the same
+        // handshake counts twice the 3 ms that its lowest round trip lies above that time, and
+        // its 7 ms is past twice the base, which halves the limit.
+        let against_the_kept = Answer::for_handshake(ms(114), far_kept, flights(53, 53, 60));
+        assert_eq!(against_the_kept, Answer::Latency(ms(7)));
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(against_the_kept);
+        assert_eq!(limit.current(), 2);
+        drop(permits);
+
+        // While the endpoint is busy, its receive queue holds each packet of the next handshake
+        // with the near peer for 4 ms, as the socket measured it, so that handshake's connection
+        // measures a 5 ms round trip, and its two round trips take 10 ms of its 11 ms. Less the
+        // measured wait, its path takes 1 ms, and the 9 ms past two round trips of it is past
+        // twice the base, which halves the limit.
+        let (kept, late) = read_handshake(ms(11), near_kept, rtt_measured(5, 4));
+        assert_eq!(late, Answer::Latency(ms(9)));
+        assert_eq!(kept, Some(ms(1)));
+        let mut permits = take_all(&limit).into_iter();
+        permits.next().unwrap().release(late);
+        assert_eq!(limit.current(), 1);
+    }
+
+    #[test]
     fn work_that_doesnt_fill_the_limit_doesnt_grow_it() {
         let limit = Limit::new();
         round(&limit, Answer::Finished);
