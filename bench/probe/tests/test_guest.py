@@ -590,6 +590,45 @@ class BackendTests(unittest.TestCase):
                 self.assert_clean(runner)
                 self.assertEqual(self.image.read_bytes(), IMAGE)
 
+    def test_signal_interrupts_the_qemu_exit_wait(self):
+        for operation, phases in (("prepare", ["prepared"]), ("verify", ["ready", "stopping"])):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(operation=operation, signum=signum):
+                    runner = SimulatedRunner(phases)
+                    inject = runner.inject
+                    remove = guest.shutil.rmtree
+                    removals = []
+
+                    def inject_and_signal(name):
+                        if name == "wait":
+                            self.assertTrue(guest._CANCELLATION.get()["interruptible"])
+                            signal.raise_signal(signum)
+                            self.fail("the QEMU exit wait continued after cancellation")
+                        inject(name)
+
+                    def removal(*args, **kwargs):
+                        # After the interrupted wait, a second signal is only recorded.
+                        removals.append(True)
+                        self.assertFalse(guest._CANCELLATION.get()["interruptible"])
+                        signal.raise_signal(signum)
+                        return remove(*args, **kwargs)
+
+                    runner.inject = inject_and_signal
+                    with mock.patch("guest.shutil.rmtree", side_effect=removal):
+                        with self.assertRaises(guest.GuestError) as error:
+                            getattr(self, operation)(runner)
+                    self.assertEqual((error.exception.stage, error.exception.code), ("interrupted", "signal"))
+                    self.assertEqual(error.exception.cleanup, ())
+                    self.assertEqual(len(runner.processes), 1)
+                    self.assertEqual(len(runner.processes[0].waits), 1)
+                    self.assertGreater(runner.processes[0].waits[0], 0)
+                    self.assertTrue(removals)
+                    self.assert_clean(runner)
+                    if operation == "prepare":
+                        self.assertFalse(self.image.exists())
+                    else:
+                        self.assertEqual(self.image.read_bytes(), IMAGE)
+
     def test_runner_protects_creation_and_interrupts_communication(self):
         for signum in (signal.SIGINT, signal.SIGTERM):
             for point in ("creation", "communication"):
