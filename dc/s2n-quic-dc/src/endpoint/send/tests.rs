@@ -1416,6 +1416,57 @@ fn a_lost_pair_caps_its_probe_backoff() {
     );
 }
 
+/// A delivering pair's probe backoff isn't capped: while a packet waits for an acknowledgement
+/// and the pair isn't marked lost, the backoff doubles up to `Pto::MAX_BACKOFF`.
+#[test]
+fn a_delivering_pair_keeps_its_probe_backoff_uncapped() {
+    use crate::endpoint::inflight::{Packet, TransmissionInfo};
+    use s2n_quic_core::packet::number::PacketNumberSpace;
+
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(2, &registry);
+    let clock = make_clock(100);
+    let base_period = Pto::base_period(&ctx.rtt_estimator).as_nanos();
+    let threshold = ctx
+        .rtt_estimator
+        .persistent_congestion_threshold()
+        .as_nanos();
+    // A lost pair's cap lies below the largest backoff, so a capped backoff stays below it.
+    assert!(u128::from(Pto::MAX_BACKOFF - 1) * base_period >= threshold);
+
+    // A packet waits for an acknowledgement, so the wheel interest doesn't reset the backoff
+    // to the initial one, as it does where nothing waits.
+    let now: s2n_quic_core::time::Timestamp = clock.get_time().into();
+    let rtt = ctx.rtt_estimator;
+    let cc_info = ctx.cca.on_packet_sent(now, 200, false, &rtt);
+    let mut frames = crate::intrusive::Queue::new();
+    frames.push_back(make_frame(64));
+    let pn = PacketNumberSpace::Initial.new_packet_number(VarInt::ZERO);
+    ctx.inflight.insert(
+        pn,
+        Packet::new(
+            frames,
+            TransmissionInfo {
+                cc_info,
+                time_sent: now,
+                sent_bytes: 200,
+            },
+        ),
+    );
+    ctx.next_packet_number = VarInt::from_u8(1);
+
+    for _ in 0..200 {
+        let _ = ctx.on_pto_timeout(&clock);
+    }
+    assert!(ctx.inflight.has_inflight());
+    assert!(!ctx.is_path_lost(), "the pair still delivers");
+    assert_eq!(
+        ctx.pto.backoff,
+        Pto::MAX_BACKOFF,
+        "a delivering pair's backoff grows past a lost pair's cap"
+    );
+}
+
 fn count(counter: &core::sync::atomic::AtomicU64) -> u64 {
     counter.load(core::sync::atomic::Ordering::Relaxed)
 }

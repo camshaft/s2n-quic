@@ -1731,9 +1731,9 @@ impl Pto {
             .max(Duration::from_millis(2))
     }
 
-    /// Caps the backoff of a lost pair's probes, so that the pair is probed at least once a
+    /// Caps the backoff of a lost pair's probes, so that the pair is probed about once a
     /// persistent congestion period of `rtt_estimator` (RFC 9002, section 7.6.1), rounded up to
-    /// whole wheel firings.
+    /// whole wheel firings, and one firing more where a probe carries a retransmitted packet.
     ///
     /// A lost pair's probes go unacknowledged, so without the cap its backoff doubles up to
     /// `Self::MAX_BACKOFF`, and the first probe after the pair delivers again can wait about

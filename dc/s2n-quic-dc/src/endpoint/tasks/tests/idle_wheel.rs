@@ -1002,6 +1002,64 @@ fn send_idle_wheel_keeps_alive_a_peer_heard_from_since_its_pair_was_lost() {
     });
 }
 
+/// A lost pair doesn't mark the peer dead at its idle expiry where the peer's last
+/// authenticated packet came at the same instant as the pair's lost mark.
+#[test]
+fn send_idle_wheel_keeps_alive_a_peer_heard_from_at_the_instant_its_pair_was_lost() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) = setup_send();
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+
+        {
+            let mut c = ctx.borrow_mut();
+            let timeout = c.path_secret_entry.idle_timeout();
+            c.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
+        }
+        let _ = idle_wheel_tx.send(ctx.clone());
+
+        let send_caches = send_caches.clone();
+        let pse = pse.clone();
+        async move {
+            // At t=1s the peer sends a packet, and the pair is marked lost at the same instant.
+            1.s().sleep().await;
+            let now = precision::Clock::now(&clock);
+            pse.touch_activity(now);
+            ctx.borrow_mut().mark_path_lost(now);
+            assert_eq!(
+                ctx.borrow().lost_at.map(|at| at.nanos),
+                Some(pse.last_activity().nanos),
+                "the peer's packet and the lost mark share one instant"
+            );
+
+            // At t=33s the context has expired: the peer's packet at t=1s moved its expiry
+            // to t=31s.
+            32.s().sleep().await;
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "context should expire after path activity + idle_timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                !pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a peer heard from at the instant its pair was marked lost isn't marked dead"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
 /// Two lost pairs of one peer whose contexts expire at the same wheel tick mark the peer
 /// dead, though the first expiry's invalidation clears its pair's lost mark before the
 /// second expiry runs.
