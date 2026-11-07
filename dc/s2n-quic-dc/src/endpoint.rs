@@ -104,6 +104,15 @@ impl Endpoint {
             counters,
             next_binding_id: AtomicU64::new(0),
             data_addrs: Vec::new(),
+            // The endpoint doesn't hold a socket, so the table holds the default interface
+            // alone, and nothing reads its send rate.
+            interfaces: crate::socket::interface::Table::resolve(
+                &[],
+                crate::socket::rate::Rate::new(100.0),
+                &[],
+                &[],
+                &crate::socket::interface::System,
+            ),
             dead_peer_cooldown,
             clock,
             reader_metrics,

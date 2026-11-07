@@ -20,7 +20,7 @@ use super::{AssignSender, FlowCredits, HighestPriority, PathSecretMapEntry};
 use crate::{
     endpoint::{
         edt::pick_two_worse_probability,
-        id::{IdMap, LocalSenderId},
+        id::{Id, IdMap, LocalSenderId},
     },
     path::secret::map::Entry as PathSecretEntry,
     socket::{
