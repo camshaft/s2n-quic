@@ -102,6 +102,10 @@ impl FreedInner {
     /// allocate an entry and submit it to the freed channel.
     ///
     /// Where `hold` holds the slot, the record waits until `release` ends the hold.
+    ///
+    /// A queue id at or past the freed set's capacity, `HierarchicalBitSet::MAX_CAPACITY`, isn't
+    /// recorded. The check reads the whole queue id, so that a queue id of 2^32 or more isn't
+    /// recorded as the slot of its low 32 bits.
     pub fn record(
         &self,
         queue_id: VarInt,
@@ -115,10 +119,10 @@ impl FreedInner {
             return;
         }
 
-        let id = queue_id.as_u64() as u32;
-        if id as u64 >= HierarchicalBitSet::MAX_CAPACITY as u64 {
+        if queue_id.as_u64() >= HierarchicalBitSet::MAX_CAPACITY as u64 {
             return;
         }
+        let id = queue_id.as_u64() as u32;
         let needed = id + 1;
         if needed > state.freed.capacity() {
             state.freed.grow(needed);
@@ -363,6 +367,34 @@ mod tests {
 
         // The last slot that the freed set records is held.
         assert!(freed.hold(VarInt::from_u32(capacity - 1), VarInt::from_u8(1)));
+    }
+
+    #[test]
+    fn a_queue_id_past_the_freed_set_isnt_recorded() {
+        sim(|| {
+            let (path_entry, freed, mut tx, rx) = test_setup();
+
+            async move {
+                let _rx = rx;
+                let capacity = HierarchicalBitSet::MAX_CAPACITY;
+
+                // A queue id of 2^32 + 5 isn't recorded as slot 5, its low 32 bits, and
+                // the slot at the freed set's capacity isn't recorded.
+                freed.record(VarInt::new((1u64 << 32) + 5).unwrap(), &path_entry, &mut tx);
+                freed.record(VarInt::from_u32(capacity), &path_entry, &mut tx);
+                assert!(!freed.has_pending_work());
+
+                // The last slot that the freed set records is recorded.
+                freed.record(VarInt::from_u32(capacity - 1), &path_entry, &mut tx);
+                let mut dest = HierarchicalBitSet::new(1);
+                freed.take(&mut dest).unwrap();
+                assert!(dest.contains(capacity - 1));
+                assert!(!dest.contains(5));
+                assert_eq!(dest.len(), 1);
+            }
+            .primary()
+            .spawn();
+        });
     }
 
     #[test]
