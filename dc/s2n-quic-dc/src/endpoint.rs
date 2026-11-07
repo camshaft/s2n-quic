@@ -87,6 +87,11 @@ pub struct Endpoint {
     /// Recv socket addresses advertised to peers during handshake.
     /// Each recv worker has its own distinct address.
     pub data_addrs: Vec<std::net::SocketAddr>,
+    /// The endpoint's local interfaces, and the interface of each send socket and recv socket.
+    /// The recv socket at position `i` of [`Table::recv_sockets`] is the one at `data_addrs[i]`.
+    ///
+    /// [`Table::recv_sockets`]: crate::socket::interface::Table::recv_sockets
+    pub interfaces: crate::socket::interface::Table,
     /// Cooldown period during which new flows are rejected after a peer is marked dead.
     pub dead_peer_cooldown: Duration,
     /// Clock created once at endpoint construction — bach-aware in test contexts.
@@ -370,8 +375,21 @@ pub struct Config {
     /// send sockets combined. Set to a very high value (e.g. `Rate::new(100.0)` for
     /// 100 Gbps) to effectively disable pacing when the network is not a bottleneck.
     ///
+    /// It is also the send rate of the default interface, and of each listed interface (see
+    /// [`interfaces`](Self::interfaces)) whose link speed the operating system doesn't report
+    /// and whose rate the configuration doesn't set.
+    ///
     /// [`Paced`]: crate::socket::channel::Paced
     pub overall_send_rate: crate::socket::rate::Rate,
+    /// The local network interfaces the endpoint sends and receives on.
+    ///
+    /// Leave it empty to put every socket on one interface whose send rate is
+    /// `overall_send_rate`, as an endpoint without interfaces sends. Otherwise the endpoint
+    /// numbers the listed interfaces from 1, beside the default interface 0, and puts each socket
+    /// that no interface lists on the listed interface whose name its local address is on, or on
+    /// the default interface. Pacing still holds every send socket to `overall_send_rate`
+    /// combined. See [`crate::socket::interface`].
+    pub interfaces: Vec<crate::socket::interface::Config>,
     /// Per-poll budgets for each pipeline task.
     pub budgets: Budgets,
     /// Number of shards for the frame submission channel.
@@ -525,6 +543,7 @@ where
         gso,
         acceptor_registry,
         overall_send_rate,
+        interfaces: interface_configs,
         budgets,
         submission_shards,
         ups_rate,
@@ -579,6 +598,27 @@ where
         })
         .collect();
     let source_control_port = data_addrs.first().map_or(0, |a| a.port());
+
+    // Put each socket on a local interface, and resolve each interface's send rate. A config
+    // that doesn't list an interface puts every socket on the default interface at
+    // `overall_send_rate`, and nothing is read from the operating system.
+    let send_addrs: Vec<std::net::SocketAddr> = send_sockets
+        .iter()
+        .map(|(_, s)| {
+            s.local_addr()
+                .expect("send socket must have a local address")
+        })
+        .collect();
+    let interfaces = crate::socket::interface::Table::resolve(
+        &interface_configs,
+        overall_send_rate,
+        &send_addrs,
+        &data_addrs,
+        &crate::socket::interface::System,
+    );
+    if !interface_configs.is_empty() {
+        debug!(?interfaces, "resolved local interfaces");
+    }
 
     // Frame submission channel: all writers share one sharded sender; one dispatch task drains it.
     let (frame_tx, frame_rx) = frame::submission_channel(submission_shards);
@@ -1006,6 +1046,7 @@ where
         counters: counter_registry,
         next_binding_id: AtomicU64::new(0),
         data_addrs,
+        interfaces,
         dead_peer_cooldown,
         clock: stream_clock,
         reader_metrics,

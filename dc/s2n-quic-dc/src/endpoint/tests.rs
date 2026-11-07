@@ -61,6 +61,7 @@ fn topology_snapshot_uses_dc_tester_layout() {
             gso: endpoint::Gso::default(),
             acceptor_registry: acceptor::Registry::new(),
             overall_send_rate: Rate::new(25.0),
+            interfaces: Vec::new(),
             budgets: endpoint::Budgets::default(),
             submission_shards: 128,
             ups_rate: Rate::new(0.001),
