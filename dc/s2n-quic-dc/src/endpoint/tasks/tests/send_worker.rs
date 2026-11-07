@@ -598,3 +598,138 @@ fn context_resolver_moves_a_batch_pushed_to_a_lost_pair() {
         .spawn();
     });
 }
+
+/// Accepts each value and drops it, for the send worker's outputs that a test doesn't read.
+#[derive(Clone)]
+struct DropSender;
+
+impl<T> crate::socket::channel::UnboundedSender<T> for DropSender {
+    fn send(&mut self, _value: T) -> Result<(), T> {
+        Ok(())
+    }
+}
+
+/// The send worker passes the endpoint's path secret map to each socket's assembler, which
+/// publishes through that map the lost mark of a pair that sends acknowledgements alone, once
+/// the pair's probe waits a persistent congestion period without an acknowledgement.
+#[test]
+fn send_worker_publishes_the_lost_mark_of_a_pair_that_sends_acknowledgements_alone() {
+    use crate::endpoint::id::{
+        IdMap, LocalSendSocketId, LocalSenderId, RecvDispatchWorkerId, RemoteSenderId, SendWorkerId,
+    };
+
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let registry = crate::counter::Registry::default();
+        let clock = Clock::default();
+        let (map, subscriber) = test_map_with_subscriber();
+
+        // The peer receives each packet and doesn't acknowledge any of them.
+        async {
+            let socket = bach::net::UdpSocket::bind("0.0.0.0:4433").await.unwrap();
+            let mut buf = vec![0u8; 1500];
+            while socket.recv_from(&mut buf).await.is_ok() {}
+        }
+        .group("server")
+        .spawn();
+
+        async move {
+            let entry = super::helpers::test_entry_at("server:4433").await;
+            let fresh = build_send_context(&entry, 0, &registry, &clock);
+            let threshold = fresh.borrow().rtt_estimator.persistent_congestion_threshold();
+            let step = threshold / 10;
+
+            // The socket's place counts two interfaces, so that a pair that sends
+            // acknowledgements alone probes the peer and is marked lost once the probe waits a
+            // persistent congestion period.
+            let place = crate::socket::interface::SendPlace {
+                rank: 0,
+                count: 2,
+                index: 0,
+            };
+            let parts = crate::endpoint::SendSocketParts {
+                socket: bach::net::UdpSocket::bind("0.0.0.0:0").await.unwrap(),
+                sender_idx: LocalSenderId::from_index(0),
+                source_control_port: 0,
+                gso: s2n_quic_platform::features::Gso::default(),
+                pool: crate::socket::pool::Pool::new(u16::MAX),
+                clock: clock.clone(),
+                initial_tx_descriptor_allocs: 0,
+                interface_place: Some(place),
+            };
+            let send_sockets: IdMap<LocalSendSocketId, _> = vec![parts].into();
+
+            let (_batch_tx, batch_rx) = unsync::new::<crate::endpoint::combinator::FrameBatch>();
+            let (mut ack_tx, ack_rx) = unsync::new::<msg::Sender>();
+            let (_invalidation_tx, invalidation_rx) = unsync::new::<tasks::Invalidation>();
+            let (frame_tx, _frame_rx) = frame::submission_channel(1);
+            let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+            let reader_metrics = std::sync::Arc::new(crate::stream::metrics::ReaderMetrics::new(
+                &registry,
+                "stream.reader",
+            ));
+            let writer_metrics = std::sync::Arc::new(crate::stream::metrics::WriterMetrics::new(
+                &registry,
+                "stream.writer",
+            ));
+            let send_credit_pool = crate::sync::Arc::new(crate::credit::Pool::new(
+                crate::credit::Config::new(1_000_000),
+            ));
+            tasks::send_worker(
+                &mut crate::runtime::bach::Local::new(0),
+                SendWorkerId::new(0),
+                batch_rx,
+                ack_rx,
+                invalidation_rx,
+                1,
+                send_sockets,
+                clock.clone(),
+                Rng::new(),
+                frame_tx,
+                DropSender,
+                freed_batch_tx,
+                DropSender,
+                DropSender,
+                Duration::from_secs(1),
+                crate::endpoint::Budgets::default(),
+                registry.clone(),
+                crate::time::DefaultClock::default(),
+                reader_metrics,
+                writer_metrics,
+                send_credit_pool,
+                map,
+            );
+
+            // The pair sends an acknowledgement each step, and the first one is its probe.
+            for packet_number in 0..20u8 {
+                if packet_number == 5 {
+                    assert_eq!(
+                        event_count(&subscriber.path_secret_map_interface_pair_lost),
+                        0,
+                        "the probe hasn't waited a persistent congestion period yet"
+                    );
+                }
+                let ack = crate::stream::endpoint::ack::state::Submission {
+                    largest_acknowledged: VarInt::from_u8(packet_number),
+                    ack_range: VarInt::ZERO,
+                    extra_ranges: bytes::Bytes::new(),
+                    ecn_counts: Default::default(),
+                    largest_recv_time: precision::Clock::now(&clock),
+                    path_secret_entry: entry.clone(),
+                    local_sender_id: LocalSenderId::from_index(0),
+                    remote_sender_id: RemoteSenderId::new(VarInt::ZERO),
+                    recv_worker_id: RecvDispatchWorkerId::new(0),
+                };
+                let _ = ack_tx.send(crate::intrusive::Entry::new(msg::Sender::PendingAck(ack)));
+                step.sleep().await;
+            }
+            assert_eq!(
+                event_count(&subscriber.path_secret_map_interface_pair_lost),
+                1,
+                "the send worker publishes the lost mark through the endpoint's path secret map"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
