@@ -1250,6 +1250,12 @@ mod tests {
             .query_event_context(|context: &HandshakeWaitsContext| context.waits)
             .expect("the client counts what each handshake waited");
         assert_eq!(waits, limit::Waits::default());
+        // The client's record read the server's stateless reset tokens, so the check of `lost`
+        // above covers the server's 1-RTT packets before them.
+        let tokens_received = connection
+            .query_event_context(|context: &HandshakeWaitsContext| context.tokens.received)
+            .expect("the client counts what each handshake waited");
+        assert!(tokens_received);
         match answer {
             limit::Answer::Latency(time) => {
                 assert!(time >= elapsed - before * 2, "{time:?}, {before:?}");
@@ -1784,6 +1790,12 @@ mod tests {
             .query_event_context(|context: &HandshakeWaitsContext| context.waits)
             .expect("the client counts what each handshake waited");
         assert_eq!((waits.round_trips, waits.lost), (1, false));
+        // The client's record read the server's stateless reset tokens, so the check of `lost`
+        // above covers the server's 1-RTT packets before them.
+        let tokens_received = connection
+            .query_event_context(|context: &HandshakeWaitsContext| context.tokens.received)
+            .expect("the client counts what each handshake waited");
+        assert!(tokens_received);
 
         let min_rtt = || {
             connection
