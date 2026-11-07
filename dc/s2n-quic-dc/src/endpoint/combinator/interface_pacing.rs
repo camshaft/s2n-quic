@@ -37,6 +37,15 @@ use core::{
 };
 use std::collections::{HashMap, VecDeque};
 
+/// The batches of one peer that [`InterfacePacedPickTwo`] read from `rx` and that wait in it.
+struct WaitingPeer<T> {
+    /// The peer's batches, in the order the router read them.
+    batches: VecDeque<T>,
+    /// Whether the peer waits on each interface, by the interface's position in the pacers: an
+    /// entry of the peer in that interface's waiters stands while it is set.
+    waits_on: Vec<bool>,
+}
+
 /// How frame dispatch paces the send sockets: the send rate of each interface that holds a send
 /// socket, and the interface of each send socket.
 #[derive(Clone, Debug, PartialEq)]
@@ -274,9 +283,14 @@ where
     /// [`CreditlessWindow`](super::CreditlessWindow) bounds the bytes of those without send
     /// credit, which stay in the window until the router delivers their batch through a
     /// [`WindowSender`](super::WindowSender).
-    waiting: HashMap<credentials::Id, VecDeque<T>>,
-    /// The peers of `waiting`, which the router offers to the free senders in turn.
-    waiting_order: VecDeque<credentials::Id>,
+    waiting: HashMap<credentials::Id, WaitingPeer<T>>,
+    /// The peers of `waiting` that wait on each interface, by the interface's position in
+    /// `pacers`, in the order they began to wait on it: a peer waits on each interface whose
+    /// senders could take its first waiting batch, and the router offers that peer's batches
+    /// again only once one of those interfaces frees. An entry of a peer whose batches left stays
+    /// until its interface frees, and the router then skips it, or, where the peer waits again,
+    /// offers its batches.
+    waiters: Vec<VecDeque<credentials::Id>>,
     /// The batches of `highest_rx` that no sender that delivers to their peer may take yet, by
     /// the path secret of their peer, each peer's in the order the router read them, as `waiting`
     /// holds those of `rx`. Where the router has an interface for the highest-priority traffic,
@@ -363,7 +377,9 @@ where
             closed: false,
             pending: None,
             waiting: HashMap::new(),
-            waiting_order: VecDeque::new(),
+            waiters: (0..pacing.interface_count())
+                .map(|_| VecDeque::new())
+                .collect(),
             highest_waiting: HashMap::new(),
             highest_waiting_order: VecDeque::new(),
             lost_marks: Vec::new(),
@@ -559,42 +575,6 @@ where
         self.highest_priority.is_some() && value.holds_highest_priority()
     }
 
-    /// Returns whether the router offers `value`, read from `input`, to the interface for the
-    /// highest-priority traffic, even while every interface holds a batch: each batch of the
-    /// input of the highest priority level, where the router has that interface, and each batch
-    /// of the other input that [`Self::is_highest`] returns `true` for.
-    fn goes_to_highest_interface(&self, value: &T, input: Input) -> bool {
-        match input {
-            Input::Highest => self.highest_priority.is_some(),
-            Input::Other => self.is_highest(value),
-        }
-    }
-
-    /// The batches of `input` that wait in the router, by the path secret of their peer.
-    fn waiting_of(&self, input: Input) -> &HashMap<credentials::Id, VecDeque<T>> {
-        match input {
-            Input::Highest => &self.highest_waiting,
-            Input::Other => &self.waiting,
-        }
-    }
-
-    /// The batches of `input` that wait in the router, by the path secret of their peer.
-    fn waiting_of_mut(&mut self, input: Input) -> &mut HashMap<credentials::Id, VecDeque<T>> {
-        match input {
-            Input::Highest => &mut self.highest_waiting,
-            Input::Other => &mut self.waiting,
-        }
-    }
-
-    /// The peers of the batches of `input` that wait in the router, in the order the router
-    /// offers them to the senders.
-    fn waiting_order_of_mut(&mut self, input: Input) -> &mut VecDeque<credentials::Id> {
-        match input {
-            Input::Highest => &mut self.highest_waiting_order,
-            Input::Other => &mut self.waiting_order,
-        }
-    }
-
     /// Routes `value` as [`Self::dispatch`] does, and else keeps it for its `input` until a
     /// sender may take it. A batch whose peer has batches of the same input that wait in the
     /// router waits behind them, so that each peer's batches of an input go in the order the
@@ -602,9 +582,19 @@ where
     /// highest-priority traffic. Returns `false` where the sender's receiver is gone.
     fn route(&mut self, cx: &mut task::Context<'_>, value: T, highest: bool, input: Input) -> bool {
         let peer = *value.path_secret_entry().id();
-        if let Some(waiting) = self.waiting_of_mut(input).get_mut(&peer) {
-            waiting.push_back(value);
-            return true;
+        match input {
+            Input::Highest => {
+                if let Some(waiting) = self.highest_waiting.get_mut(&peer) {
+                    waiting.push_back(value);
+                    return true;
+                }
+            }
+            Input::Other => {
+                if let Some(waiting) = self.waiting.get_mut(&peer) {
+                    waiting.batches.push_back(value);
+                    return true;
+                }
+            }
         }
         let value = match self.dispatch(cx, value, highest) {
             Ok(routed) => return routed,
@@ -612,9 +602,20 @@ where
         };
         // Each sender that delivers to the batch's peer is on an interface that holds a batch: the
         // batch waits in the router until one of them is free.
-        let waiting = self.waiting_of_mut(input);
-        waiting.insert(peer, VecDeque::from([value]));
-        self.waiting_order_of_mut(input).push_back(peer);
+        match input {
+            Input::Highest => {
+                self.highest_waiting.insert(peer, VecDeque::from([value]));
+                self.highest_waiting_order.push_back(peer);
+            }
+            Input::Other => {
+                let waiting = WaitingPeer {
+                    batches: VecDeque::from([value]),
+                    waits_on: vec![false; self.pacers.len()],
+                };
+                self.waiting.insert(peer, waiting);
+                self.wait_on_interfaces(peer);
+            }
+        }
         true
     }
 
@@ -654,29 +655,80 @@ where
         }
     }
 
-    /// Offers the batches of `input` that wait in the router to the senders: the waiting peers
-    /// in turn, and each peer's batches in the order the router read them, so that a batch that
-    /// no sender may take yet keeps the later batches of its peer behind it. A batch goes while
-    /// an interface doesn't hold a batch, or at once where it goes to the interface for the
-    /// highest-priority traffic, as [`Self::goes_to_highest_interface`] says. Returns how many
-    /// batches it sent or held on an interface, or `None` where a sender's receiver is gone.
-    fn route_waiting(&mut self, cx: &mut task::Context<'_>, input: Input) -> Option<usize> {
+    /// Offers the batches of `rx` that wait in the router to the senders. For each interface that
+    /// doesn't hold a batch, it offers the batches of the peers that wait on it, in the order
+    /// they began to wait, and each peer's batches in the order the router read them, so that a
+    /// batch that no sender may take yet keeps the later batches of its peer behind it. A peer
+    /// whose batches stay waits again on the interfaces that hold a batch, so the router doesn't
+    /// offer its batches again before one of those interfaces frees, whether or not they go only
+    /// to the interface for the highest-priority traffic. Returns how many batches it sent or
+    /// held on an interface, or `None` where a sender's receiver is gone.
+    fn route_waiting(&mut self, cx: &mut task::Context<'_>) -> Option<usize> {
         let mut routed = 0;
-        for _ in 0..self.waiting_order_of_mut(input).len() {
+        for interface in 0..self.pacers.len() {
+            // A peer whose batches stay doesn't come back to this interface's waiters while the
+            // interface is free: it waits only on interfaces that hold a batch.
+            while self.pacers[interface].held.is_none() {
+                let Some(peer) = self.waiters[interface].pop_front() else {
+                    break;
+                };
+                match self.waiting.get_mut(&peer) {
+                    Some(waiting) => waiting.waits_on[interface] = false,
+                    // The peer's batches left the router after it began to wait here.
+                    None => continue,
+                }
+                loop {
+                    let waiting = self
+                        .waiting
+                        .get_mut(&peer)
+                        .expect("the peer has waiting batches");
+                    let Some(value) = waiting.batches.pop_front() else {
+                        self.waiting.remove(&peer);
+                        break;
+                    };
+                    let highest = self.is_highest(&value);
+                    match self.dispatch(cx, value, highest) {
+                        Ok(true) => routed += 1,
+                        Ok(false) => return None,
+                        Err(value) => {
+                            self.waiting
+                                .get_mut(&peer)
+                                .expect("the peer has waiting batches")
+                                .batches
+                                .push_front(value);
+                            self.wait_on_interfaces(peer);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Some(routed)
+    }
+
+    /// Offers the batches of `highest_rx` that wait in the router to the senders: the waiting
+    /// peers in turn, and each peer's batches in the order the router read them, so that a batch
+    /// that no sender may take yet keeps the later batches of its peer behind it. A batch goes
+    /// while an interface doesn't hold a batch, or at once where the router has an interface for
+    /// the highest-priority traffic. Returns how many batches it sent or held on an interface, or
+    /// `None` where a sender's receiver is gone.
+    fn route_highest_waiting(&mut self, cx: &mut task::Context<'_>) -> Option<usize> {
+        let mut routed = 0;
+        for _ in 0..self.highest_waiting_order.len() {
             let peer = self
-                .waiting_order_of_mut(input)
+                .highest_waiting_order
                 .pop_front()
                 .expect("the order holds each waiting peer");
             loop {
-                let highest = match self.waiting_of(input)[&peer].front() {
-                    Some(value) => self.goes_to_highest_interface(value, input),
+                let highest = match self.highest_waiting[&peer].front() {
+                    Some(_) => self.highest_priority.is_some(),
                     None => break,
                 };
                 if !highest && !self.has_free_sender() {
                     break;
                 }
                 let value = self
-                    .waiting_of_mut(input)
+                    .highest_waiting
                     .get_mut(&peer)
                     .expect("each peer of the order has waiting batches")
                     .pop_front()
@@ -685,7 +737,7 @@ where
                     Ok(true) => routed += 1,
                     Ok(false) => return None,
                     Err(value) => {
-                        self.waiting_of_mut(input)
+                        self.highest_waiting
                             .get_mut(&peer)
                             .expect("each peer of the order has waiting batches")
                             .push_front(value);
@@ -693,13 +745,42 @@ where
                     }
                 }
             }
-            if self.waiting_of(input)[&peer].is_empty() {
-                self.waiting_of_mut(input).remove(&peer);
+            if self.highest_waiting[&peer].is_empty() {
+                self.highest_waiting.remove(&peer);
             } else {
-                self.waiting_order_of_mut(input).push_back(peer);
+                self.highest_waiting_order.push_back(peer);
             }
         }
         Some(routed)
+    }
+
+    /// Lets `peer` wait on each interface whose senders could take its first waiting batch by
+    /// the marks [`Self::read_lost_marks`] read for that batch: the interfaces of the senders
+    /// whose pairs aren't marked lost where another sender of the peer delivers, and else the
+    /// interfaces of every sender. No sender could take the batch, so each of those interfaces
+    /// holds a batch.
+    fn wait_on_interfaces(&mut self, peer: credentials::Id) {
+        let avoid_lost = self.candidates(false).avoid_lost;
+        let waiting = self
+            .waiting
+            .get_mut(&peer)
+            .expect("the peer has waiting batches");
+        for sender in 0..self.senders.len() {
+            if avoid_lost && self.lost_marks[sender] {
+                continue;
+            }
+            let interface = self.sender_interfaces[LocalSenderId::from_index(sender)];
+            if !waiting.waits_on[interface] {
+                waiting.waits_on[interface] = true;
+                self.waiters[interface].push_back(peer);
+            }
+        }
+    }
+
+    /// Returns how many entries the waiters of every interface hold.
+    #[cfg(test)]
+    pub(super) fn waiter_entries(&self) -> usize {
+        self.waiters.iter().map(VecDeque::len).sum()
     }
 
     /// Sends `value` to `sender`, and charges the token bucket of its `interface` for it. Where
@@ -728,10 +809,16 @@ where
                 if let Some(pending) = self.pending.take() {
                     leaked += pending.total_flow_credits();
                 }
-                for waiting_batch in self.waiting.drain().flat_map(|(_, waiting)| waiting) {
+                for waiting_batch in self
+                    .waiting
+                    .drain()
+                    .flat_map(|(_, waiting)| waiting.batches)
+                {
                     leaked += waiting_batch.total_flow_credits();
                 }
-                self.waiting_order.clear();
+                for waiters in &mut self.waiters {
+                    waiters.clear();
+                }
                 for waiting_batch in self.highest_waiting.drain().flat_map(|(_, queue)| queue) {
                     leaked += waiting_batch.total_flow_credits();
                 }
@@ -811,7 +898,7 @@ where
             // The batches of that input that wait in the router go before the router reads it
             // again. A batch whose peer has batches that wait there waits behind them, and the
             // router reads and routes the batches of other peers meanwhile.
-            match self.route_waiting(cx, Input::Highest) {
+            match self.route_highest_waiting(cx) {
                 None => return Poll::Ready(None),
                 Some(0) => {}
                 Some(_) => return Poll::Ready(Some(())),
@@ -840,7 +927,7 @@ where
 
         // The batches of the other input that wait in the router go before the router routes
         // the batch it read ahead or reads the next one.
-        match self.route_waiting(cx, Input::Other) {
+        match self.route_waiting(cx) {
             None => return Poll::Ready(None),
             Some(0) => {}
             Some(_) => return Poll::Ready(Some(())),
