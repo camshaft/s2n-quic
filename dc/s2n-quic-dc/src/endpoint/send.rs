@@ -1690,6 +1690,38 @@ impl Pto {
     }
 }
 
+/// Runs `f` on `ctx`, and records a change of the context's lost mark that `f` makes: a pair
+/// marked lost, or a lost pair that delivers again. It counts the change on `send_counters`,
+/// and publishes its event through `path_secret_map` where one is set.
+///
+/// [`Cache::track_path_lost`] runs its calls through it. The assembler, which doesn't hold the
+/// cache, runs its lost mark of a pair that sends acknowledgements alone through it.
+pub(crate) fn track_path_lost<R>(
+    ctx: &mut Context,
+    send_counters: &super::counters::Send,
+    path_secret_map: Option<&crate::path::secret::Map>,
+    f: impl FnOnce(&mut Context) -> R,
+) -> R {
+    let was_lost = ctx.is_path_lost();
+    let result = f(ctx);
+    match (was_lost, ctx.is_path_lost()) {
+        (false, true) => {
+            send_counters.on_interface_pair_lost();
+            if let Some(map) = path_secret_map {
+                map.on_interface_pair_lost(ctx.path_secret_entry.peer());
+            }
+        }
+        (true, false) => {
+            send_counters.on_interface_pair_delivering();
+            if let Some(map) = path_secret_map {
+                map.on_interface_pair_delivering(ctx.path_secret_entry.peer());
+            }
+        }
+        _ => {}
+    }
+    result
+}
+
 /// Per-socket cache of send contexts, keyed by credentials ID.
 ///
 /// Each send socket has its own Cache. A single peer always routes through the same
@@ -1781,30 +1813,14 @@ impl Cache {
         self
     }
 
-    /// Runs `f` on `ctx`, and records a change of the context's lost mark that `f` makes: a
-    /// pair marked lost, or a lost pair that delivers again.
+    /// Runs `f` on `ctx`, and records a change of the context's lost mark that `f` makes, as
+    /// the function `track_path_lost` of this module does, with this cache's send counters
+    /// and path secret map.
     ///
     /// The probe timeout task and the ACK processor run their calls through it. The clear in
     /// [`Self::invalidate`] isn't recorded, since the context leaves the cache there.
     pub fn track_path_lost<R>(&self, ctx: &mut Context, f: impl FnOnce(&mut Context) -> R) -> R {
-        let was_lost = ctx.is_path_lost();
-        let result = f(ctx);
-        match (was_lost, ctx.is_path_lost()) {
-            (false, true) => {
-                self.send_counters.on_interface_pair_lost();
-                if let Some(map) = &self.path_secret_map {
-                    map.on_interface_pair_lost(ctx.path_secret_entry.peer());
-                }
-            }
-            (true, false) => {
-                self.send_counters.on_interface_pair_delivering();
-                if let Some(map) = &self.path_secret_map {
-                    map.on_interface_pair_delivering(ctx.path_secret_entry.peer());
-                }
-            }
-            _ => {}
-        }
-        result
+        track_path_lost(ctx, &self.send_counters, self.path_secret_map.as_ref(), f)
     }
 
     /// Moves a lost pair's frames to `output`, as [`Context::move_frames`] does, and records

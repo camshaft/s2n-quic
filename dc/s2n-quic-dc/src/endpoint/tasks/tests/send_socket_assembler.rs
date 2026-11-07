@@ -111,6 +111,7 @@ fn assembler_channels(registry: &crate::counter::Registry) -> AssemblerChannels 
 /// Binds an ephemeral UDP socket, runs `send_socket_assembler` with fixed test defaults
 /// (source sender ID 0, port 0, `Gso::default()`, `Pool::new(u16::MAX)`),
 /// and drains the pipeline to completion.
+/// The pipeline publishes its lost-pair events through `path_secret_map`, where one is set.
 ///
 /// Use this as the body of a spawned assembler task.  Callers pass the pipeline-side
 /// fields extracted from an [`AssemblerChannels`] destructuring; the assertion-side
@@ -126,6 +127,7 @@ async fn assembler_pipeline(
     pto_wheel_tx: unsync::Sender<send::PtoWheelAdapter>,
     idle_wheel_tx: unsync::Sender<send::IdleWheelAdapter>,
     clock: Clock,
+    path_secret_map: Option<crate::path::secret::Map>,
 ) {
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let send_counters = crate::endpoint::counters::Send::new(
@@ -148,6 +150,7 @@ async fn assembler_pipeline(
         freed_batch_tx,
         asm_counters,
         send_counters,
+        path_secret_map,
         socket,
         immediate_tx,
         tx_wheel_tx,
@@ -221,6 +224,7 @@ fn sends_encrypted_packet_to_peer() {
                 pto_wheel_tx,
                 idle_wheel_tx,
                 asm_clock,
+                None,
             )
             .await;
 
@@ -335,6 +339,7 @@ fn reassembles_context_to_tx_wheel_when_data_remains() {
                 pto_wheel_tx,
                 idle_wheel_tx,
                 asm_clock,
+                None,
             )
             .await;
 
@@ -451,6 +456,7 @@ fn cancelled_frame_emitted_when_completion_is_cancelled() {
                 pto_wheel_tx,
                 idle_wheel_tx,
                 asm_clock,
+                None,
             )
             .await;
 
@@ -564,8 +570,104 @@ fn shuts_down_on_closed_input() {
                 pto_wheel_tx,
                 idle_wheel_tx,
                 clock,
+                None,
             )
             .await;
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A context that sends acknowledgements alone, whose ACK-only probe waited a persistent
+/// congestion period without an acknowledgement, is marked lost by the assembler, and the
+/// pipeline publishes the lost-pair event through the path secret map it was given.
+#[test]
+fn publishes_the_lost_mark_of_a_pair_that_sends_acknowledgements_alone() {
+    sim(|| {
+        let registry = crate::counter::Registry::default();
+        let clock = Clock::default();
+        let subscriber = std::sync::Arc::new(crate::event::testing::Subscriber::no_snapshot());
+        let path_secret_map = crate::path::secret::Map::builder()
+            .with_signer(crate::path::secret::stateless_reset::Signer::random())
+            .with_capacity(4)
+            .with_clock(s2n_quic_core::time::NoopClock)
+            .with_subscriber(subscriber.clone())
+            .build()
+            .unwrap();
+
+        let AssemblerChannels {
+            mut ctx_tx,
+            ctx_rx,
+            immediate_rx,
+            immediate_tx,
+            cancelled_tx,
+            ack_completions_tx,
+            asm_counters,
+            tx_wheel_tx,
+            pto_wheel_tx,
+            idle_wheel_tx,
+            tx_wheel_rx,
+            pto_wheel_rx,
+            idle_wheel_rx,
+            cancelled_rx,
+            ack_completions_rx,
+        } = assembler_channels(&registry);
+
+        async move {
+            // Keeps the output receivers open while the pipeline routes the context.
+            let _receivers = (
+                tx_wheel_rx,
+                pto_wheel_rx,
+                idle_wheel_rx,
+                cancelled_rx,
+                ack_completions_rx,
+            );
+
+            let entry = super::helpers::test_entry();
+            let ctx = build_send_context(&entry, 0, &registry, &clock);
+            let threshold = {
+                let mut ctx = ctx.borrow_mut();
+                ctx.last_peer_activity = clock.now();
+                ctx.ack_only_probe_sent = Some(clock.now());
+                ctx.rtt_estimator.persistent_congestion_threshold()
+            };
+            bach::time::sleep(threshold).await;
+            let marked_at = clock.now();
+            let _ = ctx_tx.send(ctx.clone());
+            drop(ctx_tx);
+
+            assembler_pipeline(
+                immediate_rx,
+                ctx_rx,
+                cancelled_tx,
+                ack_completions_tx,
+                asm_counters,
+                immediate_tx,
+                tx_wheel_tx,
+                pto_wheel_tx,
+                idle_wheel_tx,
+                clock,
+                Some(path_secret_map),
+            )
+            .await;
+
+            assert!(
+                ctx.borrow().is_path_lost(),
+                "the assembler marks the pair lost"
+            );
+            assert_eq!(
+                ctx.borrow().lost_at.map(|at| at.nanos),
+                Some(marked_at.nanos),
+                "the mark records when it was set"
+            );
+            assert_eq!(
+                subscriber
+                    .path_secret_map_interface_pair_lost
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                1,
+                "the pipeline publishes the lost event through its path secret map"
+            );
         }
         .primary()
         .spawn();
