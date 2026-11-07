@@ -109,16 +109,29 @@ struct RejectedInit {
     /// The tombstone the slot held before the bind, which a reject the endpoint doesn't take puts
     /// back once it tears the stream down; 0 where the slot isn't bound.
     tombstone: u64,
+    /// The server state of the view that bound the slot, through which the drop puts the
+    /// tombstone back.
+    server: Arc<crate::queue::ServerState>,
 }
 
 impl Drop for RejectedInit {
-    /// Disables a stream the reject still holds, as where the path secret map refuses the packet
-    /// after the decrypt. A stream dropped without `disable` resets its binding as its reader
-    /// drops, and that reset would release the hold of the slot's genuine rejected init as it
-    /// leaves the priority router.
+    /// Tears down a stream the reject still holds, for a packet the endpoint doesn't take or one
+    /// the path secret map refuses after the decrypt, and then puts back the slot's tombstone from
+    /// before the bind, so that the genuine init of the same binding isn't refused as stale. The
+    /// stream is disabled first: a stream dropped without `disable` resets its binding as its
+    /// reader drops, and that reset would release the hold of the slot's genuine rejected init as
+    /// it leaves the priority router.
     fn drop(&mut self) {
         if let Some(mut stream) = self.stream.take() {
             stream.disable();
+            // The stream's receivers drop here, which marks the slot unallocated with this
+            // binding as its tombstone, before the tombstone from before the bind is put back.
+            drop(stream);
+            self.server.view().restore_tombstone(
+                self.queue_pair.dest_queue_id,
+                self.binding_id,
+                self.tombstone,
+            );
         }
     }
 }
@@ -186,6 +199,7 @@ fn decrypt_fast_path(
                 error_code: error::ACCEPTOR_NOT_FOUND,
                 stream: None,
                 tombstone: 0,
+                server: server_view.state().clone(),
             }));
         };
 
@@ -270,6 +284,7 @@ fn decrypt_fast_path(
                             error_code: error::ACCEPTOR_NOT_FOUND,
                             stream: Some(s),
                             tombstone,
+                            server: server_view.state().clone(),
                         }));
                     }
                     Err(acceptor::channel::SendError::NoSlots(s)) => {
@@ -288,6 +303,7 @@ fn decrypt_fast_path(
                             error_code: error::SERVER_BUSY,
                             stream: Some(s),
                             tombstone,
+                            server: server_view.state().clone(),
                         }));
                     }
                 }
@@ -2046,9 +2062,9 @@ fn reject_init(
 /// they take the packet's cleartext routing fields as given, so a tampered or forged init, or a
 /// replayed copy of an authentic one, would otherwise hold the slot for its binding, and the
 /// reset of the client's genuine rejected init on that slot wouldn't be sent. For a packet the
-/// endpoint doesn't take, the reject tears down a stream that `bind_for_init` bound the slot to
-/// and puts back the slot's tombstone from before the bind, so that the genuine init of the same
-/// binding isn't refused as stale; the slot isn't held or reset.
+/// endpoint doesn't take, the reject's drop tears down a stream that `bind_for_init` bound the
+/// slot to and puts back the slot's tombstone from before the bind, so that the genuine init of
+/// the same binding isn't refused as stale; the slot isn't held or reset.
 fn settle_rejected_init(
     mut rejected: RejectedInit,
     take: bool,
@@ -2058,19 +2074,7 @@ fn settle_rejected_init(
     freed_batch_tx: &mut crate::queue::FreedBatchTx,
 ) {
     if !take {
-        if let Some(mut stream) = rejected.stream.take() {
-            stream.disable();
-            // The stream's receivers drop here, which marks the slot unallocated with this
-            // binding as its tombstone, before the tombstone from before the bind is put back.
-            drop(stream);
-            if let Some(server_view) = queue_view.as_server_mut() {
-                server_view.restore_tombstone(
-                    rejected.queue_pair.dest_queue_id,
-                    rejected.binding_id,
-                    rejected.tombstone,
-                );
-            }
-        }
+        // The reject's drop tears down the stream it holds and puts back the slot's tombstone.
         return;
     }
 

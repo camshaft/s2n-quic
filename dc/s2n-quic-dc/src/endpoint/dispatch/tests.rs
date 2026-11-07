@@ -1106,6 +1106,97 @@ fn a_tampered_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
     }
 }
 
+/// A rejected init of a bound slot whose packet the path secret map refuses after the decrypt
+/// ends in the reject's drop, which disables the stream it bound and puts back the slot's
+/// tombstone from before the bind, so that the client's genuine init of the same binding then
+/// gets its one reset.
+#[test]
+fn a_dropped_rejected_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
+    for init_acceptor in [InitAcceptor::Closed, InitAcceptor::WithoutSlots] {
+        let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+        let mut view = recv::QueueView::Server(state.view());
+        let mut harness = FastPathHarness::new();
+        let _registry = use_acceptor(&mut harness, init_acceptor);
+
+        // Binding 1 of slot 1 ends, so the slot's tombstone is 1.
+        let bound = view
+            .as_server_mut()
+            .expect("server view")
+            .bind_for_msg(
+                VarInt::from_u8(1),
+                VarInt::from_u8(1),
+                &harness.path_entry,
+                &mut harness.freed_batch_tx,
+            )
+            .expect("slot 1 binds for binding 1");
+        assert!(
+            matches!(bound, crate::queue::BindResult::NewBinding { .. }),
+            "{init_acceptor:?}: binding 1 binds slot 1"
+        );
+        drop(bound);
+        assert!(
+            matches!(
+                view.slot_diag(VarInt::from_u8(1)),
+                Some(diag) if diag.unallocated && diag.stored_binding == 1
+            ),
+            "{init_acceptor:?}: binding 1's receivers drop, so slot 1's tombstone is 1"
+        );
+
+        // An init on slot 1 for binding 2 whose packet the path secret map refuses after the
+        // decrypt: the refusal drops the reject that the decrypt returned.
+        let (packet, opener, decrypt_len) =
+            sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(2), VarInt::from_u8(9));
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("{init_acceptor:?}: the server rejects the init");
+        };
+        assert!(
+            rejected.stream.is_some(),
+            "{init_acceptor:?}: the reject holds the stream it bound"
+        );
+        drop(rejected);
+        assert!(
+            take_resets(&mut harness.frame_rx).is_empty(),
+            "{init_acceptor:?}: a dropped reject doesn't send a reset"
+        );
+        assert!(
+            matches!(
+                view.slot_diag(VarInt::from_u8(1)),
+                Some(diag) if diag.unallocated && diag.stored_binding == 1
+            ),
+            "{init_acceptor:?}: the reject's drop puts back the tombstone 1"
+        );
+        assert!(
+            state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)),
+            "{init_acceptor:?}: a dropped reject doesn't hold its slot"
+        );
+        state.freed.unhold(VarInt::from_u8(1), VarInt::from_u8(2));
+
+        // The client's genuine init on slot 1 for binding 2 then gets its one reset.
+        let (mut packet, opener, decrypt_len) =
+            sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(2), VarInt::from_u8(9));
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("{init_acceptor:?}: the server rejects the genuine init");
+        };
+        assert!(
+            rejected.stream.is_some(),
+            "{init_acceptor:?}: the genuine init binds the slot"
+        );
+        assert!(
+            harness.authenticate(rejected, &mut packet, &opener, &mut view, true),
+            "{init_acceptor:?}: the genuine init authenticates"
+        );
+        assert_eq!(
+            take_resets(&mut harness.frame_rx),
+            vec![(1, 2)],
+            "{init_acceptor:?}: the genuine init gets its one reset"
+        );
+    }
+}
+
 /// Where the priority router has ended, the submission channel refuses the reset of a rejected
 /// init, which then doesn't leave the router and release the slot: the reject doesn't hold the
 /// slot, so that the slot is recorded as freed at once.

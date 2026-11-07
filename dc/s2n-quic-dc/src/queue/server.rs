@@ -346,6 +346,12 @@ impl ServerView {
         }
     }
 
+    /// The shared state this view reads, for a teardown that outlives this view and puts a
+    /// tombstone back through a view of its own.
+    pub(crate) fn state(&self) -> &Arc<ServerState> {
+        &self.state
+    }
+
     #[inline]
     pub fn send_control(
         &mut self,
