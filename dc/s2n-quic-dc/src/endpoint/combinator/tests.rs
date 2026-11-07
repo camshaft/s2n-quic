@@ -2867,8 +2867,8 @@ fn interface_paced_pick_two_offers_a_waiting_highest_priority_batch_as_an_interf
     let second = Sends::default();
     // The second interface sends a hundredth as fast, so it holds its batch while the first
     // interface frees.
-    let pacing = SendPacing::new(vec![Rate::new(1.0), Rate::new(0.01)], vec![0, 1])
-        .with_highest_priority(1);
+    let pacing =
+        SendPacing::new(vec![Rate::new(1.0), Rate::new(0.01)], vec![0, 1]).with_highest_priority(1);
     let registry = crate::counter::Registry::default();
     let mut router = InterfacePacedPickTwo::new(
         rx,
@@ -4353,8 +4353,14 @@ fn creditless_window_admits_a_frame_while_empty_and_grows_by_its_releases() {
     // A clone stands for the batch router's, so that the window counts the frames.
     let _router = window.clone();
     window.start_round();
-    assert!(window.admit(1000), "the window refused a frame while it held nothing");
-    assert!(!window.admit(1), "the window admitted a frame past its limit of 0");
+    assert!(
+        window.admit(1000),
+        "the window refused a frame while it held nothing"
+    );
+    assert!(
+        !window.admit(1),
+        "the window admitted a frame past its limit of 0"
+    );
     assert_eq!(window.held(), 1000);
 
     window.release(1000, window.round());
@@ -4362,7 +4368,10 @@ fn creditless_window_admits_a_frame_while_empty_and_grows_by_its_releases() {
     assert_eq!(window.limit(), 1000);
     assert!(window.admit(600));
     assert!(window.admit(400));
-    assert!(!window.admit(1), "the window admitted a frame past its limit of 1000");
+    assert!(
+        !window.admit(1),
+        "the window admitted a frame past its limit of 1000"
+    );
 
     // A batch released in a round in which the window didn't refuse a frame leaves the limit
     // as it is.
@@ -4408,7 +4417,10 @@ fn creditless_window_starts_at_its_minimum_and_doesnt_halve_below_it() {
     let read_in = window.round();
     assert!(window.admit(600));
     assert!(window.admit(400));
-    assert!(!window.admit(1), "the window admitted a frame past its minimum");
+    assert!(
+        !window.admit(1),
+        "the window admitted a frame past its minimum"
+    );
 
     window.start_round();
     window.release(1000, read_in);
@@ -4480,7 +4492,9 @@ fn creditless_window_releases_a_batch_that_the_workers_receiver_refuses() {
     assert!(window.admit(item.creditless_bytes()));
     assert!(!window.admit(1));
     window.register(&waker);
-    let refused = sender.send(item).expect_err("the worker's receiver took the batch");
+    let refused = sender
+        .send(item)
+        .expect_err("the worker's receiver took the batch");
     assert_eq!(refused.byte_cost, 1000);
     assert_eq!(window.held(), 0, "the window kept a refused batch's bytes");
     assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
@@ -4534,7 +4548,11 @@ fn interface_paced_pick_two_holds_a_waiting_peers_creditless_bytes_in_the_window
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(delivers.borrow().len(), 1);
     // The router read each batch out of its input, so the third and fourth wait in the router.
-    assert_eq!(consumed.get(), 400_000, "the third and fourth batches didn't leave the input");
+    assert_eq!(
+        consumed.get(),
+        400_000,
+        "the third and fourth batches didn't leave the input"
+    );
     assert_eq!(window.held(), 300_000);
     assert!(!window.admit(100_001));
 
@@ -4607,7 +4625,12 @@ impl crate::event::Subscriber for WindowEvents {
         _meta: &crate::event::api::EndpointMeta,
         event: &crate::event::api::CreditlessWindowFrameRefused,
     ) {
-        let entry = ("frame_refused", event.frame_bytes, event.held_bytes, event.limit_bytes);
+        let entry = (
+            "frame_refused",
+            event.frame_bytes,
+            event.held_bytes,
+            event.limit_bytes,
+        );
         self.events.lock().unwrap().push(entry);
     }
 
@@ -4616,7 +4639,12 @@ impl crate::event::Subscriber for WindowEvents {
         _meta: &crate::event::api::EndpointMeta,
         event: &crate::event::api::CreditlessWindowLimitGrew,
     ) {
-        let entry = ("limit_grew", event.released_bytes, event.held_bytes, event.limit_bytes);
+        let entry = (
+            "limit_grew",
+            event.released_bytes,
+            event.held_bytes,
+            event.limit_bytes,
+        );
         self.events.lock().unwrap().push(entry);
     }
 

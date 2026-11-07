@@ -292,7 +292,10 @@ pub(crate) fn path_freed_batch_sender_id(
     rng: &mut crate::xorshift::Rng,
 ) -> LocalSenderId {
     let chosen = freed_batch_sender_id(priority_senders, socket_count, rng, |sender| {
-        (entry.is_sender_lost(sender), entry.sender_load_score(sender))
+        (
+            entry.is_sender_lost(sender),
+            entry.sender_load_score(sender),
+        )
     });
     entry.delivering_sender(chosen)
 }
