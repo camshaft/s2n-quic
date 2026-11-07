@@ -61,6 +61,7 @@ fn setup() -> Harness {
     let (idle_wheel_tx, _) = unsync::new_with_adapter::<send::IdleWheelAdapter>();
 
     let (batch_tx, batch_rx) = unsync::new::<FrameBatch>();
+    let (retransmit_tx, retransmit_rx) = unsync::new::<frame::Frame>();
 
     let rx = tasks::context_resolver(
         batch_rx,
@@ -73,10 +74,15 @@ fn setup() -> Harness {
         pto_wheel_tx,
         idle_wheel_tx,
         Arc::new(Pool::new(Config::new(1_000_000))),
+        retransmit_tx,
     );
-    async move { rx.drain_budgeted(Some(32)).await }
-        .primary()
-        .spawn();
+    async move {
+        // The resolver moves a lost context's frames to this channel, so keep it open.
+        let _retransmit_rx = retransmit_rx;
+        rx.drain_budgeted(Some(32)).await
+    }
+    .primary()
+    .spawn();
 
     Harness {
         batch_tx,
@@ -371,6 +377,7 @@ fn context_not_ready_releases_flow_credits() {
         let (idle_wheel_tx, _) = unsync::new_with_adapter::<send::IdleWheelAdapter>();
 
         let (mut batch_tx, batch_rx) = unsync::new::<FrameBatch>();
+        let (retransmit_tx, retransmit_rx) = unsync::new::<frame::Frame>();
 
         let rx = tasks::context_resolver(
             batch_rx,
@@ -383,10 +390,15 @@ fn context_not_ready_releases_flow_credits() {
             pto_wheel_tx,
             idle_wheel_tx,
             pool.clone(),
+            retransmit_tx,
         );
-        async move { rx.drain_budgeted(Some(32)).await }
-            .primary()
-            .spawn();
+        async move {
+            // The resolver moves a lost context's frames to this channel, so keep it open.
+            let _retransmit_rx = retransmit_rx;
+            rx.drain_budgeted(Some(32)).await
+        }
+        .primary()
+        .spawn();
 
         // Route the credit-bearing batch to a peer with no data addrs → context can't be
         // created → batch dropped.

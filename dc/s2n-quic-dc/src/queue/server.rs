@@ -32,7 +32,7 @@ use super::{
     slot::BindState,
     Error,
 };
-use crate::{endpoint::msg, intrusive};
+use crate::{bitset::HierarchicalBitSet, endpoint::msg, intrusive};
 use s2n_quic_core::varint::VarInt;
 use std::sync::Arc;
 
@@ -78,10 +78,13 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new(max_queues: VarInt, initial_recv_window: u64) -> Self {
+        // The freed set records a slot's free only below its capacity, so the server doesn't
+        // bind a slot at or past it, and the free of each slot it binds reaches its client.
+        let max_queues = max_queues.as_u64().min(HierarchicalBitSet::MAX_CAPACITY as u64);
         Self {
             pages: PageTable::new(),
             freed: FreedInner::new(),
-            max_queue_id: max_queues.as_u64().saturating_sub(1),
+            max_queue_id: max_queues.saturating_sub(1),
             initial_recv_window,
         }
     }
@@ -119,6 +122,17 @@ pub struct ServerView {
     view: SenderView,
 }
 
+/// What [`ServerView::hold_freed`] did with a rejected init's slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// The slot is held for the init's binding from now on.
+    New,
+    /// The slot is held already, for the binding of an earlier rejected init.
+    Already,
+    /// The slot is past the peer's queues, or at or past the freed set's capacity, and isn't held.
+    PastQueues,
+}
+
 impl ServerView {
     /// Record a queue_id as freed without binding it.
     ///
@@ -131,6 +145,24 @@ impl ServerView {
         endpoint_tx: &mut FreedBatchTx,
     ) {
         self.state.freed.record(queue_id, path_entry, endpoint_tx);
+    }
+
+    /// Hold the slot `queue_id` for the rejected init of `binding_id` until its reset leaves the
+    /// priority router, so that the slot is recorded as freed only then. Returns whether the hold
+    /// is new, the slot is held already, or the slot is past the peer's queues, which
+    /// `bind_for_msg` rejects without a reset. A slot at or past the freed set's capacity is past
+    /// `max_queue_id`, which `ServerState::new` bounds at the capacity's last slot, so it returns
+    /// `Hold::PastQueues`: `FreedInner::hold` refuses such a slot too, which would read as
+    /// `Hold::Already`, but `hold_freed` doesn't reach that refusal.
+    pub fn hold_freed(&self, queue_id: VarInt, binding_id: VarInt) -> Hold {
+        if queue_id.as_u64() > self.state.max_queue_id {
+            return Hold::PastQueues;
+        }
+        if self.state.freed.hold(queue_id, binding_id) {
+            Hold::New
+        } else {
+            Hold::Already
+        }
     }
 
     /// Attempt to bind a slot and push the first stream entry.
@@ -467,6 +499,51 @@ mod tests {
     }
 
     #[test]
+    fn hold_freed_refuses_a_slot_the_freed_set_cant_record() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // The peer's queues reach past the slots that the freed set records.
+        let (server, _path_entry, _tx, _rx) = test_server(capacity + 1);
+
+        // The last slot that the freed set records is held for its rejected init.
+        assert_eq!(server.hold_freed(v(capacity - 1), v(1)), Hold::New);
+        // The slot at the freed set's capacity is one of the peer's queues, but it is past
+        // `max_queue_id`, so it isn't held.
+        assert_eq!(server.hold_freed(v(capacity), v(1)), Hold::PastQueues);
+    }
+
+    #[test]
+    fn max_queue_id_is_bounded_at_the_freed_set_capacity() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // Up to the freed set's capacity, the last queue id is the peer's last queue.
+        assert_eq!(ServerState::new(v(10), 0).max_queue_id, 9);
+        assert_eq!(ServerState::new(v(capacity), 0).max_queue_id, capacity - 1);
+        // Past it, the last queue id is the freed set's last slot.
+        assert_eq!(ServerState::new(v(capacity + 1), 0).max_queue_id, capacity - 1);
+        assert_eq!(ServerState::new(VarInt::MAX, 0).max_queue_id, capacity - 1);
+    }
+
+    #[test]
+    fn a_slot_the_freed_set_cant_record_isnt_bound() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // The peer's queues reach past the slots that the freed set records.
+        let (mut server, path_entry, mut tx, _rx) = test_server(capacity + 1);
+        assert_eq!(server.state.max_queue_id, capacity - 1);
+
+        // The slot at the freed set's capacity is one of the peer's queues, and the server
+        // doesn't bind it, since the freed set doesn't record its free.
+        let result = server.bind_and_send_stream(
+            v(capacity),
+            v(1),
+            make_stream_entry(),
+            &path_entry,
+            &mut tx,
+        );
+        assert!(matches!(result, Err(Error::CapExceeded(_))));
+        let result = server.bind_for_msg(v(capacity), v(1), &path_entry, &mut tx);
+        assert!(matches!(result, Err(Error::CapExceeded(_))));
+    }
+
+    #[test]
     fn send_stream_after_bind() {
         let (mut server, path_entry, mut tx, _rx) = test_server(10);
         let result =
@@ -644,5 +721,15 @@ mod tests {
         let result =
             server.bind_and_send_stream(v(0), v(2), make_stream_entry(), &path_entry, &mut tx);
         assert!(matches!(result, Ok(BindResult::NewBinding { .. })));
+    }
+
+    #[test]
+    fn hold_freed_tells_a_new_hold_from_a_held_slot_and_a_slot_past_the_queues() {
+        let (server, _path_entry, _tx, _rx) = test_server(4);
+
+        assert_eq!(server.hold_freed(v(1), v(1)), Hold::New);
+        assert_eq!(server.hold_freed(v(1), v(2)), Hold::Already, "slot 1 is held for binding 1");
+        assert_eq!(server.hold_freed(v(3), v(2)), Hold::New);
+        assert_eq!(server.hold_freed(v(4), v(1)), Hold::PastQueues, "the peer has 4 queues");
     }
 }
