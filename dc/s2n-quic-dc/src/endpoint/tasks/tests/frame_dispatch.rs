@@ -1122,6 +1122,86 @@ fn the_priority_router_releases_the_slot_of_a_reset_that_leaves_for_its_lane() {
     assert_eq!(poll_router(&mut router), Poll::Ready(None));
 }
 
+/// A reset of a held slot's queue and binding that a producer waits on, or that borrows send
+/// credit, doesn't end the slot's hold as it leaves for its lane: only a reset without either,
+/// as the endpoint sends one for a rejected init, does. While the hold stays, the slot isn't
+/// recorded as freed, and another rejected init can't hold it.
+#[test]
+fn the_priority_router_keeps_the_hold_of_a_slot_whose_reset_has_a_completion_or_send_credit() {
+    use core::task::Poll;
+    use s2n_quic_core::varint::VarInt;
+
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(1)
+        .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+        .build(None);
+    let crate::path::secret::map::entry::QueueState::Server(state) = pse.queue_state() else {
+        unreachable!("a server entry has a server queue state");
+    };
+    let state = state.clone();
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    let holder = ping(&pse);
+    let holder_cost = holder.byte_cost();
+    submit(&mut frame_tx, [holder]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(holder_cost, 0)]);
+
+    // The server rejects an init of binding 1 on slot 1 and frees the slot, which waits on the
+    // reset that the endpoint sends for the init.
+    let (mut freed_tx, _freed_rx) = crate::queue::freed_batch_channel();
+    assert!(state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(1)));
+    state.freed.record(VarInt::from_u8(1), &pse, &mut freed_tx);
+    assert!(!state.freed.has_pending_work(), "the slot waits on its reset");
+
+    // A reset of the slot's queue and binding whose producer waits on its completion waits at the
+    // window and then leaves for its lane, and the slot stays held. The poll that swaps the reset
+    // in returns ready, and the next poll finds the channel empty.
+    let completions = frame::failure_completion_channel();
+    let mut awaited = reset_frame(&pse, 2, 1);
+    awaited.completion = Some(completions.sender());
+    let awaited_cost = awaited.byte_cost();
+    submit(&mut frame_tx, [awaited]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    assert!(take_lanes(&mut lanes).is_empty());
+    window.release_peer(Some(PeerKey::of(&pse)), holder_cost, false);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    // The producer stops waiting before the reset leaves its lane, so that it may drop with a
+    // pending status.
+    drop(completions);
+    assert_eq!(take_lanes(&mut lanes), [(awaited_cost, 0)]);
+    assert!(
+        !state.freed.has_pending_work(),
+        "a reset that a producer waits on doesn't record the slot as freed"
+    );
+    assert!(
+        !state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)),
+        "a reset that a producer waits on doesn't end the hold"
+    );
+
+    // A reset of the slot's queue and binding with send credit goes into its lane at once, though
+    // the window holds the first reset's bytes, and the slot stays held.
+    let mut credited = reset_frame(&pse, 2, 1);
+    credited.flow_credits = 1;
+    let credited_cost = credited.byte_cost();
+    submit(&mut frame_tx, [credited]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(credited_cost, 1)]);
+    assert!(
+        !state.freed.has_pending_work(),
+        "a reset with send credit doesn't record the slot as freed"
+    );
+    assert!(
+        !state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)),
+        "a reset with send credit doesn't end the hold"
+    );
+
+    drop(frame_tx);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
+}
+
 // -- The window in each batch router of `frame_dispatch` -----------------------------------
 
 /// Like [`setup_with_pacing`] but over `window`, the window of the frames without send credit,
