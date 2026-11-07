@@ -8,7 +8,10 @@
 //! (frames for the same peer are coalesced), and pick-two load balancing across workers.
 //! These tests verify end-to-end behavior of the two cooperating subtasks.
 
-use super::helpers::{test_frame, test_frame_with_payload, TestReceiverExt as _};
+use super::helpers::{
+    event_count, test_frame, test_frame_with_payload, test_map_with_subscriber,
+    TestReceiverExt as _,
+};
 use crate::{
     endpoint::{
         combinator::{FrameBatch, HighestPriority, SendPacing},
@@ -41,6 +44,16 @@ fn setup_with_rates(num_workers: usize, overall_rate: Rate) -> (SubmissionSender
 
 /// Like [`setup`] but with a configurable pacing of the workers' send sockets.
 fn setup_with_pacing(num_workers: usize, pacing: SendPacing) -> (SubmissionSender, Vec<WorkerRx>) {
+    setup_with_map(num_workers, pacing, None)
+}
+
+/// Like [`setup_with_pacing`] but with the path secret map that the routers publish their events
+/// through, where one is given.
+fn setup_with_map(
+    num_workers: usize,
+    pacing: SendPacing,
+    path_secret_map: Option<crate::path::secret::Map>,
+) -> (SubmissionSender, Vec<WorkerRx>) {
     let (frame_tx, frame_rx) = frame::submission_channel(1);
 
     let mut workers = Vec::with_capacity(num_workers);
@@ -61,7 +74,7 @@ fn setup_with_pacing(num_workers: usize, pacing: SendPacing) -> (SubmissionSende
         pacing,
         Budgets::default(),
         crate::counter::Registry::default(),
-        None,
+        path_secret_map,
         crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::new(
             1_000_000,
         ))),
@@ -1047,4 +1060,78 @@ fn shares_its_window(pacing: SendPacing, workers: usize) {
             .any(|&(_, limit)| limit > crate::endpoint::combinator::BATCH_TARGET_BYTES),
         "the limit didn't grow: {arrivals:?}",
     );
+}
+
+// -- The counted-lost events of each batch router of `frame_dispatch` ----------------------
+
+/// Routes one frame through `frame_dispatch` with a path secret map that publishes its events
+/// to a testing subscriber, and returns the subscriber's counts of the events that start and end
+/// a sender's count as lost for sharing a lost pair's interface. The frame's entry has four
+/// senders and a peer of two interfaces, and sender 0's pair is marked lost.
+fn counted_lost_events(pacing: SendPacing) -> (u64, u64) {
+    let _snapshots = crate::testing::without_snapshots();
+    let (map, subscriber) = test_map_with_subscriber();
+
+    sim(move || {
+        let (mut frame_tx, rxs) = setup_with_map(4, pacing, Some(map));
+        let (result_tx, mut result_rx) = unsync::new::<FrameBatch>();
+
+        async move {
+            // The peer has two addresses, on its interfaces 1 and 2.
+            let peer = |last: u8| std::net::SocketAddr::from(([10, 0, 0, last], 4000));
+            let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+                .socket_sender_count(4)
+                .peer_data_addrs(vec![peer(1), peer(2)])
+                .peer_data_interfaces(vec![Some(1), Some(2)])
+                .build(None);
+            assert!(pse.set_sender_lost(crate::endpoint::id::LocalSenderId::from_index(0), true));
+            let mut input = PriorityInput::default();
+            input.push(test_frame(&pse));
+            frame_tx.send_batch(input).unwrap();
+        }
+        .primary()
+        .spawn();
+
+        for mut worker_rx in rxs {
+            let mut result_tx = result_tx.clone();
+            async move {
+                while let Some(batch) = worker_rx.recv().await {
+                    let _ = UnboundedSender::send(&mut result_tx, batch);
+                }
+            }
+            .spawn();
+        }
+
+        // The router publishes the events as it routes the frame's batch, before a worker
+        // takes the batch.
+        async move {
+            let batch = result_rx.recv().await.unwrap();
+            assert_eq!(batch.into_inner().len(), 1);
+        }
+        .primary()
+        .spawn();
+    });
+
+    (
+        event_count(&subscriber.path_secret_map_sender_counted_lost),
+        event_count(&subscriber.path_secret_map_sender_counted_lost_cleared),
+    )
+}
+
+/// The one-interface router counts sender 2, which sends to the peer interface of sender 0's
+/// lost pair, as lost, and publishes the start of that count through the map that
+/// `frame_dispatch` takes.
+#[test]
+fn pick_two_publishes_the_counted_lost_event_through_the_path_secret_map() {
+    assert_eq!(counted_lost_events(SendPacing::single(Rate::new(100.0))), (1, 0));
+}
+
+/// The interface-paced router counts sender 1, which shares both interfaces of sender 0's lost
+/// pair, as lost, and publishes the start of that count through the map that `frame_dispatch`
+/// takes.
+#[test]
+fn interface_paced_pick_two_publishes_the_counted_lost_event_through_the_path_secret_map() {
+    // Senders 0 and 1 send on local interface 0, and senders 2 and 3 on local interface 1.
+    let pacing = SendPacing::new(vec![Rate::new(100.0), Rate::new(100.0)], vec![0, 0, 1, 1]);
+    assert_eq!(counted_lost_events(pacing), (1, 0));
 }
