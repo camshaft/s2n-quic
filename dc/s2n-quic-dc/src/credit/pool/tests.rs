@@ -1867,3 +1867,120 @@ fn phantom_pacer_credit_released_back_does_not_drive_available_past_capacity() {
         free_test_slot(waiter);
     }
 }
+
+#[test]
+fn acquire_wait_records_each_wait_under_its_own_priority() {
+    // A low-priority acquire waits behind a high-priority one. Each wait is recorded under its
+    // own priority once it is granted, with the time it waited on the pool's clock.
+    use crate::{counter::Registry, credit::Counters, time::testing::Clock};
+    use core::time::Duration;
+
+    let registry = Registry::default();
+    let clock = Clock::new(Duration::from_secs(1));
+    let pool = Pool::with_manual_clock(cfg(0, 100), Counters::new(&registry), clock.clone());
+    let pool = Arc::new(pool);
+    let dist = Distributor::new(pool.clone());
+    let mut h = Harness {
+        pool,
+        dist,
+        dist_waker: Waker::from(Arc::new(NoopWake)),
+    };
+    let waker = Waker::from(Arc::new(NoopWake));
+
+    let low = alloc_test_slot();
+    let r = unsafe { h.poll_acquire(low, 10, Priority::Low, &waker) };
+    assert!(r.is_pending());
+    clock.advance(Duration::from_millis(5));
+    let high = alloc_test_slot();
+    let r = unsafe { h.poll_acquire(high, 10, Priority::High, &waker) };
+    assert!(r.is_pending());
+    clock.advance(Duration::from_millis(5));
+
+    // Credit for one waiter: strict priority grants the high-priority acquire after its 5 ms wait
+    // and leaves the low-priority one waiting behind it.
+    h.release(10);
+    h.distribute();
+    let low_ref = unsafe { &*low.as_ptr() };
+    let high_ref = unsafe { &*high.as_ptr() };
+    assert_eq!(high_ref.poll_granted(), GrantResult::Granted(10));
+    assert_eq!(low_ref.poll_granted(), GrantResult::Pending);
+
+    // The low-priority acquire is granted 20 ms later, after 30 ms of waiting.
+    clock.advance(Duration::from_millis(20));
+    h.release(10);
+    h.distribute();
+    assert_eq!(low_ref.poll_granted(), GrantResult::Granted(10));
+
+    // The summary reports each wait as its bucket's value in microseconds, within 1% of the wait.
+    let line = registry.take_current_metrics_line().unwrap_or_default();
+    let mut waits: Vec<(&str, f64)> = line
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.strip_prefix("credit.acquire.wait=")?;
+            let (value, rest) = entry.split_once('*')?;
+            Some((rest.rsplit(' ').next()?, value.parse().ok()?))
+        })
+        .collect();
+    waits.sort_unstable_by_key(|&(variant, _)| variant);
+    assert_eq!(waits.len(), 2, "one wait for each priority: {line}");
+    assert_eq!(waits[0].0, "Variant|High", "{line}");
+    assert!((waits[0].1 - 5_000.0).abs() <= 50.0, "{line}");
+    assert_eq!(waits[1].0, "Variant|Low", "{line}");
+    assert!((waits[1].1 - 30_000.0).abs() <= 300.0, "{line}");
+
+    drop(h);
+    unsafe {
+        free_test_slot(low);
+        free_test_slot(high);
+    }
+}
+
+#[test]
+fn oldest_wait_age_grows_while_waiting_and_reads_zero_once_empty() {
+    // Each poll cycle publishes the age of each priority's oldest waiter, and 0 once the tier
+    // has no waiter left.
+    use crate::{counter::Registry, credit::Counters, time::testing::Clock};
+    use core::time::Duration;
+
+    let registry = Registry::default();
+    let counters = Counters::new(&registry);
+    let clock = Clock::new(Duration::from_secs(1));
+    let pool = Pool::with_manual_clock(cfg(0, 100), counters.clone(), clock.clone());
+    let pool = Arc::new(pool);
+    let dist = Distributor::new(pool.clone());
+    let mut h = Harness {
+        pool,
+        dist,
+        dist_waker: Waker::from(Arc::new(NoopWake)),
+    };
+    let waker = Waker::from(Arc::new(NoopWake));
+    let age = |priority: Priority| counters.acquire_oldest_wait_us[priority as usize].get();
+
+    let low = alloc_test_slot();
+    let r = unsafe { h.poll_acquire(low, 10, Priority::Low, &waker) };
+    assert!(r.is_pending());
+
+    clock.advance(Duration::from_millis(2));
+    h.distribute();
+    assert_eq!(age(Priority::Low), 2_000);
+    for priority in Priority::ALL {
+        if priority != Priority::Low {
+            assert_eq!(age(priority), 0, "{priority:?} has no waiter");
+        }
+    }
+
+    clock.advance(Duration::from_millis(3));
+    h.distribute();
+    assert_eq!(age(Priority::Low), 5_000);
+
+    h.release(10);
+    h.distribute();
+    let low_ref = unsafe { &*low.as_ptr() };
+    assert_eq!(low_ref.poll_granted(), GrantResult::Granted(10));
+    assert_eq!(age(Priority::Low), 0);
+
+    drop(h);
+    unsafe {
+        free_test_slot(low);
+    }
+}
