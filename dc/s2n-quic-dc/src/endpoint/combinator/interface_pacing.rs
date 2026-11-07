@@ -301,7 +301,8 @@ where
     /// leave the router, so that the lists hold each peer once whatever its count of waits.
     highest_listed: HashMap<credentials::Id, HighestListed>,
     /// The number of the next wait of a peer in `highest_waiting`: the router numbers each time
-    /// a peer's batches of the input of the highest priority level begin to wait in it.
+    /// no sender may take the first of a peer's batches of the input of the highest priority
+    /// level, when they begin to wait in it and each time they wait again after an offer.
     highest_next_wait: u64,
     /// The lost mark of each sender of the batch being routed, read once for each batch so that
     /// each pass over the senders sees the same marks.
@@ -605,8 +606,7 @@ where
         // batch waits in the router until one of them is free.
         match input {
             Input::Highest => {
-                let wait = self.highest_next_wait;
-                self.highest_next_wait += 1;
+                let wait = self.highest_new_wait();
                 let waiting = HighestWaitingPeer {
                     batches: VecDeque::from([value]),
                     wait,
@@ -756,8 +756,8 @@ where
 
     /// Offers the waiting batches of `peer` from the input of the highest priority level to the
     /// senders, in the order the router read them, until no sender may take the first of them,
-    /// which then waits again as [`Self::highest_wait_on`] says. Returns how many batches it sent
-    /// or held on an interface, or `None` where a sender's receiver is gone.
+    /// which then begins a new wait, as [`Self::highest_wait_on`] says. Returns how many batches
+    /// it sent or held on an interface, or `None` where a sender's receiver is gone.
     fn offer_highest_waiting(
         &mut self,
         cx: &mut task::Context<'_>,
@@ -779,11 +779,16 @@ where
                 Ok(true) => routed += 1,
                 Ok(false) => return None,
                 Err(value) => {
-                    self.highest_waiting
+                    // The peer's batches begin a new wait, on the lists that follow from the marks
+                    // of this batch, so that an entry of the earlier wait on another list doesn't
+                    // stand for it.
+                    let wait = self.highest_new_wait();
+                    let waiting = self
+                        .highest_waiting
                         .get_mut(&peer)
-                        .expect("the peer's batches wait in the router")
-                        .batches
-                        .push_front(value);
+                        .expect("the peer's batches wait in the router");
+                    waiting.batches.push_front(value);
+                    waiting.wait = wait;
                     self.highest_wait_on(peer);
                     return Some(routed);
                 }
@@ -863,6 +868,13 @@ where
         }
     }
 
+    /// Returns the number of a new wait of a peer in `highest_waiting`.
+    fn highest_new_wait(&mut self) -> u64 {
+        let wait = self.highest_next_wait;
+        self.highest_next_wait += 1;
+        wait
+    }
+
     /// Sends `value` to `sender`, and charges the token bucket of its `interface` for it. Where
     /// the sender's receiver is gone, returns the send credit of `value` and of each batch the
     /// router holds to the pool, drops them, and returns `false`.
@@ -938,13 +950,14 @@ enum Input {
 }
 
 /// The batches of one peer that wait in [`InterfacePacedPickTwo`] from the input of the highest
-/// priority level: one wait of the peer, from the time no sender could take the first of them
-/// until they leave the router.
+/// priority level, from the time no sender could take the first of them until they leave the
+/// router.
 struct HighestWaitingPeer<T> {
     /// The peer's waiting batches, in the order the router read them.
     batches: VecDeque<T>,
-    /// The number of this wait, which each entry of the router's lists that stands for it holds
-    /// in [`HighestListed`].
+    /// The number of the peer's wait now, which the router sets each time no sender may take
+    /// the first batch, and which each entry of the router's lists that stands for that wait
+    /// holds in [`HighestListed`].
     wait: u64,
 }
 
