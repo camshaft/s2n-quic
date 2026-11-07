@@ -95,14 +95,17 @@ impl RoundTrips {
 
     /// The lowest round-trip time and the handshake's two round trips that the spread compares.
     /// Where the socket measured the wait of the reply of the lowest round trip and of the reply
-    /// of each of the two, they are each round trip less its reply's wait: the endpoint's receive
-    /// queue doesn't raise them, so a wait that grows between the round trips stays in the
-    /// handshake's time, and a far path whose round trips vary still shows that spread. Otherwise
-    /// they are the round trips as the connection measured them.
+    /// of each of the two, each wait below its round trip, they are each round trip less its
+    /// reply's wait: the endpoint's receive queue doesn't raise them, so a wait that grows
+    /// between the round trips stays in the handshake's time, and a far path whose round trips
+    /// vary still shows that spread. Otherwise, as where a wait that the socket over-counted
+    /// reaches its round trip, they are the round trips as the connection measured them.
     fn compared(self) -> (Duration, [Duration; 2]) {
+        let [first, second] = self.flights;
         match (self.measured, self.flight_waits) {
-            (true, [Some(first_wait), Some(second_wait)]) => {
-                let [first, second] = self.flights;
+            (true, [Some(first_wait), Some(second_wait)])
+                if self.waited < self.lowest && first_wait < first && second_wait < second =>
+            {
                 let first = first.saturating_sub(first_wait);
                 let second = second.saturating_sub(second_wait);
                 (self.path(), [first, second])
@@ -236,13 +239,13 @@ impl Answer {
     /// earlier time from a connection whose packets waited less keeps that wait in the rest, and
     /// without an earlier time, `path_rtt` doesn't count the most that the packet of the lowest
     /// round trip could have waited during the endpoint's last pass. Where the socket measured
-    /// the wait of each reply, of the lowest round trip and of the two, the spread compares each
-    /// less its reply's wait, so a wait that grows between the handshake's round trips, as when
-    /// the endpoint's load rises during the handshake, stays in the rest. Otherwise the spread
-    /// takes out the part of the wait that the longer round trip held above the lowest. Without
-    /// either time, the rest is the whole time. Where the round trips take the whole time, the
-    /// handshake doesn't show a time to compare, and it answers `Finished`, a clean answer without
-    /// a time, so that a time of zero doesn't become the base.
+    /// the wait of each reply, of the lowest round trip and of the two, each below its round
+    /// trip, the spread compares each less its reply's wait, so a wait that grows between the
+    /// handshake's round trips, as when the endpoint's load rises during the handshake, stays in
+    /// the rest. Otherwise the spread takes out the part of the wait that the longer round trip
+    /// held above the lowest. Without either time, the rest is the whole time. Where the round
+    /// trips take the whole time, the handshake doesn't show a time to compare, and it answers
+    /// `Finished`, a clean answer without a time, so that a time of zero doesn't become the base.
     pub(super) fn for_handshake(
         elapsed: Duration,
         earlier_rtt: Option<Duration>,
@@ -799,6 +802,18 @@ mod tests {
         let grown = rtt_waits(1, 0, [(1, 0), (5, 4)]).unwrap();
         assert_eq!(grown.spread(), Duration::ZERO);
         assert_eq!(grown.flights_time(), ms(2));
+        // A wait at or above its round trip, as where the socket over-counted it, leaves the
+        // round trips as the connection measured them, and so does a wait that reaches the
+        // lowest round trip.
+        for over in [
+            rtt_waits(1, 0, [(1, 1), (5, 4)]),
+            rtt_waits(1, 0, [(1, 0), (5, 5)]),
+            rtt_waits(1, 1, [(1, 0), (5, 4)]),
+        ] {
+            let over = over.unwrap();
+            assert_eq!(over.spread(), ms(4));
+            assert_eq!(over.flights_time(), ms(6));
+        }
     }
 
     #[test]
