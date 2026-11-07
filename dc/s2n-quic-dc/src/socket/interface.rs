@@ -27,6 +27,9 @@ use std::{
 #[cfg(test)]
 mod tests;
 
+mod pairing;
+pub use pairing::{paired_peer_addr, SendPlace};
+
 /// The identity of one of an endpoint's local interfaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Id(u16);
@@ -78,6 +81,12 @@ pub struct Config {
     /// The recv sockets on this interface, each by its position in the list of recv sockets that
     /// [`setup_endpoint`](crate::endpoint::setup_endpoint) takes.
     pub recv_sockets: Vec<usize>,
+    /// Whether this interface carries the endpoint's highest-priority traffic: the batches that
+    /// hold a frame of the highest priority level. Where more than one interface sets it, the
+    /// first of them in the list that holds a send socket carries that traffic; where none sets
+    /// it, that traffic goes as any other.
+    /// Defaults to `false`.
+    pub carries_highest_priority: bool,
 }
 
 /// The speed of an interface's link, as the operating system reports it.
@@ -133,6 +142,7 @@ pub struct Table {
     interfaces: Vec<Interface>,
     send_sockets: Vec<Id>,
     recv_sockets: Vec<Id>,
+    highest_priority: Option<Id>,
 }
 
 impl Table {
@@ -222,10 +232,20 @@ impl Table {
             .map(|(addr, listed)| place(listed, &interfaces, &addresses, addr))
             .collect();
 
+        // The first interface the configuration flags for the highest-priority traffic that
+        // holds a send socket carries it.
+        let highest_priority = configs
+            .iter()
+            .enumerate()
+            .filter(|(_, config)| config.carries_highest_priority)
+            .map(|(position, _)| Id::of_config(position))
+            .find(|id| send_sockets.contains(id));
+
         Self {
             interfaces,
             send_sockets,
             recv_sockets,
+            highest_priority,
         }
     }
 
@@ -265,6 +285,13 @@ impl Table {
             return None;
         }
         Some(self.recv_sockets.iter().map(|id| id.0).collect())
+    }
+
+    /// Returns the interface that carries the endpoint's highest-priority traffic, where the
+    /// configuration flags one that holds a send socket.
+    #[inline]
+    pub fn highest_priority(&self) -> Option<Id> {
+        self.highest_priority
     }
 }
 

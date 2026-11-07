@@ -10,8 +10,11 @@
 //! [`InterfacePacedPickTwo`], which chooses the worker of each batch first and then paces the
 //! batch with the token bucket of that worker's interface, so that a batch waiting for one
 //! interface's tokens doesn't hold a batch for another interface behind it.
+//!
+//! Where the endpoint chooses an interface for its highest-priority traffic, a batch that holds
+//! a frame of the highest priority level goes only to a worker of that interface.
 
-use super::{AssignSender, FlowCredits, PathSecretMapEntry};
+use super::{AssignSender, FlowCredits, HighestPriority, PathSecretMapEntry};
 use crate::{
     endpoint::{
         edt::pick_two_worse_probability,
@@ -39,6 +42,9 @@ pub struct SendPacing {
     /// The position in `rates` of each send socket's interface, by the send socket's position.
     /// Empty where `rates` holds one rate, which paces every send socket.
     socket_interfaces: Vec<usize>,
+    /// The position in `rates` of the interface that carries the highest-priority traffic,
+    /// where the endpoint chooses one.
+    highest_priority: Option<usize>,
 }
 
 impl SendPacing {
@@ -47,6 +53,7 @@ impl SendPacing {
         Self {
             rates: vec![rate],
             socket_interfaces: Vec::new(),
+            highest_priority: None,
         }
     }
 
@@ -68,13 +75,32 @@ impl SendPacing {
         Self {
             rates,
             socket_interfaces,
+            highest_priority: None,
         }
+    }
+
+    /// Sends the batches that hold a frame of the highest priority level only on the sockets of
+    /// the interface at `position`.
+    ///
+    /// # Panics
+    ///
+    /// Where `position` is past the end of the send rates.
+    pub fn with_highest_priority(mut self, position: usize) -> Self {
+        assert!(
+            position < self.rates.len(),
+            "the interface for highest-priority traffic is past the end of the send rates"
+        );
+        self.highest_priority = Some(position);
+        self
     }
 
     /// Paces the send sockets of each interface of `interfaces` that holds a send socket together,
     /// at that interface's send rate. Where every send socket is on one interface, this is
     /// [`Self::single`] at that interface's send rate, and where there isn't a send socket, at
     /// `overall_send_rate`.
+    /// Where the table has an interface for the highest-priority traffic and more than one
+    /// interface holds a send socket, the batches that hold a frame of the highest priority level
+    /// go only on the sockets of that interface.
     pub fn from_interfaces(interfaces: &interface::Table, overall_send_rate: Rate) -> Self {
         let mut ids = interfaces.send_sockets().to_vec();
         ids.sort_unstable();
@@ -93,7 +119,14 @@ impl SendPacing {
             .iter()
             .map(|id| ids.binary_search(id).unwrap_or(0))
             .collect();
-        Self::new(rates, socket_interfaces)
+        let pacing = Self::new(rates, socket_interfaces);
+        match interfaces
+            .highest_priority()
+            .and_then(|id| ids.binary_search(&id).ok())
+        {
+            Some(position) => pacing.with_highest_priority(position),
+            None => pacing,
+        }
     }
 
     /// Returns how many interfaces the send sockets are paced on, each with a token bucket of
@@ -119,6 +152,12 @@ impl SendPacing {
     /// Returns the position of the interface of the send socket at `socket`.
     fn interface_of(&self, socket: usize) -> usize {
         self.socket_interfaces.get(socket).copied().unwrap_or(0)
+    }
+
+    /// Returns the position of the interface that carries the highest-priority traffic, where
+    /// the endpoint chooses one.
+    fn highest_priority(&self) -> Option<usize> {
+        self.highest_priority
     }
 }
 
@@ -175,6 +214,10 @@ impl<T, Tm: precision::Timer> Pacer<T, Tm> {
 /// interface, and goes on routing batches to the workers of the other interfaces. While every
 /// interface holds a batch, the router doesn't read the next one.
 ///
+/// Where the [`SendPacing`] has an interface for the highest-priority traffic, a batch that
+/// holds a frame of the highest priority level goes only to a worker of that interface, and goes
+/// at once, charged to that interface's bucket, even while the interface holds a batch.
+///
 /// Implements `Receiver<()>` so it can be drained via `ReceiverExt::drain_budgeted`.
 pub struct InterfacePacedPickTwo<T, R, S, Clk>
 where
@@ -188,6 +231,9 @@ where
     pacers: Vec<Pacer<T, Clk::Timer>>,
     /// The position in `pacers` of each sender's interface.
     sender_interfaces: IdMap<LocalSenderId, usize>,
+    /// The position in `pacers` of the interface that carries the highest-priority traffic,
+    /// where the [`SendPacing`] has one that holds a sender.
+    highest_priority: Option<usize>,
     /// Round-robin cursor for the first pick candidate. Always in `[0, senders.len())`.
     round_robin_idx: usize,
     /// Whether `rx` closed. The router then doesn't read another batch, and ends once it has
@@ -203,7 +249,7 @@ where
 
 impl<T, R, S, Clk> InterfacePacedPickTwo<T, R, S, Clk>
 where
-    T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits,
+    T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits + HighestPriority,
     R: Receiver<T>,
     S: UnboundedSender<T>,
     Clk: precision::Clock,
@@ -246,6 +292,12 @@ where
             .collect();
         let score_delta = counter_registry
             .register_summary("pick_two.score_delta", crate::counter::Unit::Microsecond);
+        // The interface for the highest-priority traffic counts only where a sender is on it.
+        let highest_priority = pacing.highest_priority().filter(|&position| {
+            senders
+                .iter()
+                .any(|(id, _)| pacing.interface_of(id.as_usize()) == position)
+        });
         Self {
             rx,
             senders,
@@ -253,6 +305,7 @@ where
             clock,
             pacers,
             sender_interfaces,
+            highest_priority,
             round_robin_idx: 0,
             closed: false,
             pick_counters,
@@ -274,24 +327,37 @@ where
         (0..self.senders.len()).any(|sender| self.is_free(sender))
     }
 
-    /// Chooses a sender for a batch of `entry` among the senders whose interface doesn't hold a
-    /// batch, as [`PickTwo`](super::PickTwo) does: the next of them in round-robin order against
-    /// a random other one, most often the one with the lower score.
+    /// Returns whether the sender at `sender` may take a batch: for a batch that holds a frame of
+    /// the highest priority level, where the sender is on the interface for that traffic, and
+    /// for any other batch, where its interface doesn't hold a batch.
+    fn is_candidate(&self, sender: usize, highest: bool) -> bool {
+        if highest {
+            let interface = self.sender_interfaces[LocalSenderId::from_index(sender)];
+            Some(interface) == self.highest_priority
+        } else {
+            self.is_free(sender)
+        }
+    }
+
+    /// Chooses a sender for a batch of `entry` among the candidates of [`Self::is_candidate`],
+    /// as [`PickTwo`](super::PickTwo) does: the next of them in round-robin order against a
+    /// random other one, most often the one with the lower score.
     fn choose_sender(
         &mut self,
         entry: &PathSecretEntry,
         now: precision::Timestamp,
+        highest: bool,
     ) -> LocalSenderId {
         let len = self.senders.len();
         let rr = self.round_robin_idx;
         let first = (0..len)
             .map(|offset| (rr + offset) % len)
-            .find(|&sender| self.is_free(sender))
-            .expect("the router routes a batch only while a sender is free");
+            .find(|&sender| self.is_candidate(sender, highest))
+            .expect("the router routes a batch only while it has a candidate sender");
         self.round_robin_idx = (first + 1) % len;
 
         let others = (0..len)
-            .filter(|&sender| sender != first && self.is_free(sender))
+            .filter(|&sender| sender != first && self.is_candidate(sender, highest))
             .count();
         if others == 0 {
             return LocalSenderId::from_index(first);
@@ -302,9 +368,9 @@ where
             self.rng.next_usize(others)
         };
         let second = (0..len)
-            .filter(|&sender| sender != first && self.is_free(sender))
+            .filter(|&sender| sender != first && self.is_candidate(sender, highest))
             .nth(nth)
-            .expect("`nth` is less than the count of the other free senders");
+            .expect("`nth` is less than the count of the other candidates");
         let first = LocalSenderId::from_index(first);
         let second = LocalSenderId::from_index(second);
 
@@ -343,21 +409,24 @@ where
     }
 
     /// Chooses a sender for `value`, and sends it to the sender where the sender's interface may
-    /// send now, or holds it on that interface until it may. Returns `false` where the sender's
-    /// receiver is gone.
+    /// send now or where `value` holds a frame of the highest priority level, and else holds it
+    /// on that interface until it may. Returns `false` where the sender's receiver is gone.
     fn route(&mut self, cx: &mut task::Context<'_>, mut value: T) -> bool {
         let byte_cost = value.byte_cost();
         let now = self.clock.now();
+        let highest = self.highest_priority.is_some() && value.holds_highest_priority();
         let sender = {
             let entry = value.path_secret_entry();
             debug_assert_eq!(self.senders.len(), entry.socket_sender_count());
-            self.choose_sender(entry, now)
+            self.choose_sender(entry, now, highest)
         };
         self.pick_counters[sender].add(1);
         value.set_sender_id(sender);
 
         let interface = self.sender_interfaces[sender];
-        let routed = if self.pacers[interface].poll_ready(cx) {
+        // A highest-priority batch doesn't wait for its interface's tokens: it goes at once, and
+        // the bucket is charged for it, so the batches after it wait for its bytes.
+        let routed = if highest || self.pacers[interface].poll_ready(cx) {
             self.deliver(interface, sender, value)
         } else {
             self.pacers[interface].held = Some((sender, value));
@@ -403,7 +472,7 @@ where
 
 impl<T, R, S, Clk> Receiver<()> for InterfacePacedPickTwo<T, R, S, Clk>
 where
-    T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits,
+    T: ByteCost + PathSecretMapEntry + AssignSender + FlowCredits + HighestPriority,
     R: Receiver<T>,
     S: UnboundedSender<T>,
     Clk: precision::Clock,

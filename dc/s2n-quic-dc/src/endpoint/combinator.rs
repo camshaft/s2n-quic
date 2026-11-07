@@ -236,6 +236,12 @@ impl FrameBatch {
     pub fn single(frame: Entry<Frame>) -> Self {
         Self::new(frame)
     }
+
+    /// Adds `frame` to the batch, for unit tests that need a batch of more than one frame.
+    pub fn push(&mut self, frame: Entry<Frame>) {
+        let frame_cost = frame.byte_cost();
+        self.push_with_cost(frame, frame_cost);
+    }
 }
 
 impl ByteCost for FrameBatch {
@@ -441,6 +447,33 @@ impl<T: AssignSender> AssignSender for crate::intrusive::Entry<T> {
     #[inline]
     fn set_sender_id(&mut self, id: LocalSenderId) {
         (**self).set_sender_id(id);
+    }
+}
+
+/// Whether a routed item holds frames of the highest priority level alone, which the endpoint
+/// can send on an interface chosen for that traffic.
+pub trait HighestPriority {
+    fn holds_highest_priority(&self) -> bool;
+}
+
+impl HighestPriority for FrameBatch {
+    #[inline]
+    fn holds_highest_priority(&self) -> bool {
+        // Frames drain lowest index first, so the level at index 0 is the highest. A batch can
+        // hold frames of several levels, and one that holds frames of another level beside the
+        // highest isn't of the highest level, so that its pacing covers those frames too.
+        let highest = Priority::QueueReset.as_index();
+        self.queues
+            .iter()
+            .enumerate()
+            .all(|(level, queue)| queue.front().is_none() != (level == highest))
+    }
+}
+
+impl<T: HighestPriority> HighestPriority for crate::intrusive::Entry<T> {
+    #[inline]
+    fn holds_highest_priority(&self) -> bool {
+        (**self).holds_highest_priority()
     }
 }
 

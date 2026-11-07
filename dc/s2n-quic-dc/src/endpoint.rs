@@ -819,6 +819,10 @@ where
         v
     };
 
+    // Each send socket's place among the interfaces, which pairs its contexts with the peer's
+    // interfaces. A config that doesn't list an interface leaves every socket without a place.
+    let send_places = interfaces.send_places();
+
     // Distribute send sockets across send workers round-robin.
     for (socket_id, socket) in send_sockets.into_iter() {
         let raw_idx = socket_id.as_usize();
@@ -836,6 +840,7 @@ where
             pool: send_pool.clone(),
             clock: clock.clone(),
             initial_tx_descriptor_allocs,
+            interface_place: send_places.as_ref().map(|places| places[raw_idx]),
         });
     }
 
@@ -1181,6 +1186,9 @@ pub(crate) struct SendSocketParts<Socket, Clk> {
     pool: crate::socket::pool::Pool,
     clock: Clk,
     initial_tx_descriptor_allocs: usize,
+    /// The socket's place among the endpoint's interfaces, which pairs its contexts with the
+    /// peer's interfaces, or `None` where the endpoint doesn't list any.
+    interface_place: Option<crate::socket::interface::SendPlace>,
 }
 
 type PacketSender = GaugedSender<
