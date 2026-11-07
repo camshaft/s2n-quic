@@ -3586,6 +3586,9 @@ fn interface_paced_pick_two_empties_its_highest_input_lists_when_its_worker_is_g
     // The router lists both peers on the waiters of the first interface.
     assert_eq!(poll_until_idle(&mut router), Poll::Pending);
     assert_eq!(router.highest_waiter_entries(), 2);
+    // The router watches the entry of each waiting peer.
+    assert_eq!(first_peer.lost_mark_watch_count(), 1);
+    assert_eq!(second_peer.lost_mark_watch_count(), 1);
 
     // The pacer releases the first peer's second batch, which leaves tokens in the first
     // interface's bucket.
@@ -3598,6 +3601,9 @@ fn interface_paced_pick_two_empties_its_highest_input_lists_when_its_worker_is_g
     gone.set(true);
     assert_eq!(poll_once(&mut router), Poll::Ready(None));
     assert_eq!(router.highest_waiter_entries(), 0);
+    // The teardown stops watching the entries of both waiting peers.
+    assert_eq!(first_peer.lost_mark_watch_count(), 0);
+    assert_eq!(second_peer.lost_mark_watch_count(), 0);
     assert_eq!(drop_counter.load(Ordering::Relaxed), 4);
 }
 
@@ -4022,6 +4028,8 @@ fn interface_paced_pick_two_sends_a_waiting_highest_input_batch_once_no_sender_d
     assert!(costs(&first).is_empty());
     assert_eq!(costs(&second), [100_000]);
     assert_eq!(router.highest_waiter_entries(), 1);
+    // The router watches the waiting peer's entry.
+    assert_eq!(entry.lost_mark_watch_count(), 1);
 
     // A poll that doesn't follow a change of a lost mark of the peer doesn't read the peer's
     // marks, and doesn't offer its batch again.
@@ -4044,6 +4052,82 @@ fn interface_paced_pick_two_sends_a_waiting_highest_input_batch_once_no_sender_d
     assert!(entry.set_sender_lost(LocalSenderId::from_index(1), true));
     assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
     assert_eq!(poll_once(&mut router), Poll::Ready(Some(())));
+    assert_eq!(costs(&first), [100_002]);
+    assert_eq!(costs(&second), [100_000]);
+    // The peer has no batch left in the router, which stops watching its entry.
+    assert_eq!(entry.lost_mark_watch_count(), 0);
+
+    // The batch the second interface holds goes once its bucket has paid for the batch before
+    // it, and the router ends, with the peer's entry gone from its lists.
+    highest_rx.closed.set(true);
+    clock.advance(std::time::Duration::from_millis(1));
+    assert_eq!(poll_until_idle(&mut router), Poll::Ready(None));
+    assert_eq!(costs(&first), [100_002]);
+    assert_eq!(costs(&second), [100_000, 100_001]);
+    assert_eq!(router.highest_waiter_entries(), 0);
+    assert_eq!(drop_counter.load(Ordering::Relaxed), 3);
+    assert_eq!(highest_rx.consumed.get(), 300_003);
+}
+
+#[test]
+fn interface_paced_pick_two_offers_a_highest_input_batch_whose_mark_changed_before_the_watch() {
+    let rate = Rate::new(1.0);
+    let clock = test_clock();
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    // The pacing doesn't have an interface for the highest-priority traffic. The pair of the
+    // first interface's sender is lost for the peer, so the second interface's sender takes the
+    // peer's batches, paced.
+    let entry = test_path_secret_entry();
+    assert!(entry.set_sender_lost(LocalSenderId::from_index(0), true));
+    // The input of the highest priority level holds three batches of the peer, each of more
+    // bytes than a burst and a byte more than the one before it, so that the senders' records
+    // show their order. The bulk input is closed and empty.
+    let highest_rx = ClosableReceiver::default();
+    for byte_cost in [100_000, 100_001, 100_002] {
+        let mut item = new_test_item(entry.clone(), drop_counter.clone());
+        item.byte_cost = byte_cost;
+        item.highest_priority = true;
+        highest_rx.values.borrow_mut().push_back(item);
+    }
+    let rx = ClosableReceiver::default();
+    rx.closed.set(true);
+    let first = Sends::default();
+    let second = Sends::default();
+    let pacing = SendPacing::new(vec![rate, rate], vec![0, 1]);
+    let registry = crate::counter::Registry::default();
+    let mut router = InterfacePacedPickTwo::new(
+        rx,
+        timed_senders(&clock, &[&first, &second]),
+        crate::xorshift::Rng::new(),
+        clock.clone(),
+        &pacing,
+        &registry,
+        test_pool(),
+    )
+    .with_highest_priority_input(highest_rx.clone());
+    let costs = |sends: &Sends| {
+        sends
+            .borrow()
+            .iter()
+            .map(|&(_, cost)| cost)
+            .collect::<Vec<_>>()
+    };
+
+    // The peer's first batch goes to the second interface, its second waits on that interface,
+    // and no sender may take its third. The pair of the second interface's sender becomes lost
+    // for the peer after the router read the third batch's marks and before the peer's entry
+    // holds the router's watch, so the entry doesn't tell the watch of that change.
+    let marked = entry.clone();
+    router.before_next_watch(move || {
+        assert!(marked.set_sender_lost(LocalSenderId::from_index(1), true));
+    });
+
+    // Once the entry holds the watch, the router reads the peer's marks again and finds the
+    // change, so its next poll offers the third batch again: no sender delivers to the peer now,
+    // and the batch goes to the free first interface, though the clock didn't move and the second
+    // interface still holds a batch.
+    assert_eq!(poll_until_idle(&mut router), Poll::Pending);
+    assert!(entry.is_sender_lost(LocalSenderId::from_index(1)));
     assert_eq!(costs(&first), [100_002]);
     assert_eq!(costs(&second), [100_000]);
 

@@ -322,6 +322,11 @@ where
     /// How many times the router read the lost marks of a batch's peer, for the tests.
     #[cfg(test)]
     lost_mark_reads: usize,
+    /// A call of the tests that the router makes once, the next time it watches a waiting
+    /// peer's path secret entry anew: after it read the lost marks of the peer's batch and
+    /// before the entry holds the watch.
+    #[cfg(test)]
+    before_watch: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<T, R, S, Clk> InterfacePacedPickTwo<T, R, S, Clk>
@@ -405,6 +410,8 @@ where
             dispatches: 0,
             #[cfg(test)]
             lost_mark_reads: 0,
+            #[cfg(test)]
+            before_watch: None,
         }
     }
 
@@ -844,6 +851,12 @@ where
             if let Some(earlier) = waiting.watched.replace(Arc::clone(&entry)) {
                 earlier.unwatch_lost_marks(&self.lost_mark_watch);
             }
+            #[cfg(test)]
+            {
+                if let Some(before_watch) = self.before_watch.take() {
+                    before_watch();
+                }
+            }
             entry.watch_lost_marks(&self.lost_mark_watch);
             Some(entry)
         } else {
@@ -1031,6 +1044,13 @@ where
     /// Returns how many times the router read the lost marks of a batch's peer.
     pub(super) fn lost_mark_reads(&self) -> usize {
         self.lost_mark_reads
+    }
+
+    /// Makes the router call `before_watch` once, the next time it watches a waiting peer's
+    /// path secret entry anew: after it read the lost marks of the peer's batch and before the
+    /// entry holds the watch, so that a test can change a mark between the two.
+    pub(super) fn before_next_watch(&mut self, before_watch: impl FnOnce() + Send + 'static) {
+        self.before_watch = Some(Box::new(before_watch));
     }
 
     /// Returns how many entries the waiters of the interfaces hold, of the peers whose batches

@@ -486,6 +486,12 @@ impl Entry {
         });
     }
 
+    /// Returns how many watches the entry's list holds, for the tests.
+    #[cfg(test)]
+    pub(crate) fn lost_mark_watch_count(&self) -> usize {
+        lock(&self.lost_mark_watches).len()
+    }
+
     /// Tells each watch of this entry that one of its lost marks changed, once the entry has
     /// released its list, so that a wake doesn't run under that lock.
     fn tell_lost_mark_watches(&self) {

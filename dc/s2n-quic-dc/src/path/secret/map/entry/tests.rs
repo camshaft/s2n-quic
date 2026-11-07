@@ -223,16 +223,18 @@ fn a_sender_marked_lost_counts_as_lost_until_cleared() {
     assert!(entry.has_delivering_sender());
 }
 
+/// A waker that counts its wakes.
+#[derive(Default)]
+struct CountWakes(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for CountWakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[test]
 fn an_entry_tells_its_lost_mark_watch_of_each_change_until_it_drops_the_watch() {
-    #[derive(Default)]
-    struct CountWakes(std::sync::atomic::AtomicUsize);
-    impl std::task::Wake for CountWakes {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     let entry = test_entry_with_senders(2);
     let sender0 = crate::endpoint::id::LocalSenderId::from_index(0);
     let sender1 = crate::endpoint::id::LocalSenderId::from_index(1);
@@ -247,14 +249,21 @@ fn an_entry_tells_its_lost_mark_watch_of_each_change_until_it_drops_the_watch() 
     assert!(changed.is_empty());
 
     // Each change of a mark records the entry's peer once and wakes the waker the router gave
-    // last; a set that doesn't change the mark doesn't tell the watch.
+    // last.
     assert!(entry.set_sender_lost(sender0, true));
-    assert!(!entry.set_sender_lost(sender0, true));
     assert!(entry.set_sender_lost(sender1, true));
     assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
     watch.take_changed(&waker, &mut changed);
     assert_eq!(changed, [*entry.id()]);
     changed.clear();
+
+    // A set that doesn't change the mark doesn't tell the watch: it doesn't wake the waker that
+    // the take stored, and the next take doesn't return the peer.
+    assert!(!entry.set_sender_lost(sender0, true));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+    watch.take_changed(&waker, &mut changed);
+    assert!(changed.is_empty());
+
     assert!(entry.set_sender_lost(sender0, false));
     assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
     watch.take_changed(&waker, &mut changed);
@@ -274,6 +283,58 @@ fn an_entry_tells_its_lost_mark_watch_of_each_change_until_it_drops_the_watch() 
     drop(watch);
     assert!(entry.set_sender_lost(sender0, true));
     assert!(entry.lost_mark_watches.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_lost_mark_watch_keeps_a_change_made_before_the_router_stores_a_waker() {
+    let entry = test_entry_with_senders(1);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let watch = Arc::new(LostMarkWatch::default());
+    entry.watch_lost_marks(&watch);
+
+    // The router hasn't taken the changes yet, so the watch doesn't hold a waker: the change is
+    // recorded without a wake, and the router's next take returns it.
+    assert!(entry.set_sender_lost(sender, true));
+    let wakes = Arc::new(CountWakes::default());
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut changed = Vec::new();
+    watch.take_changed(&waker, &mut changed);
+    assert_eq!(changed, [*entry.id()]);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+
+    // That take stored the waker, which the next change wakes.
+    assert!(entry.set_sender_lost(sender, false));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_lost_mark_watch_records_and_returns_a_change_past_a_poisoned_lock() {
+    let entry = test_entry_with_senders(1);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let watch = Arc::new(LostMarkWatch::default());
+    entry.watch_lost_marks(&watch);
+
+    // A thread panics while it holds the watch's lock, which poisons the lock.
+    let held = Arc::clone(&watch);
+    let panicked = std::thread::spawn(move || {
+        let _state = held.state.lock().unwrap();
+        panic!("a thread panics while it holds the watch's lock");
+    })
+    .join();
+    assert!(panicked.is_err());
+    assert!(watch.state.is_poisoned());
+
+    // The watch goes on past the poisoned lock: the router's take stores its waker, the change
+    // records the peer and wakes that waker, and the next take returns the peer.
+    let wakes = Arc::new(CountWakes::default());
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut changed = Vec::new();
+    watch.take_changed(&waker, &mut changed);
+    assert!(changed.is_empty());
+    assert!(entry.set_sender_lost(sender, true));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+    watch.take_changed(&waker, &mut changed);
+    assert_eq!(changed, [*entry.id()]);
 }
 
 #[test]
