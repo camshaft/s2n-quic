@@ -274,3 +274,47 @@ fn ack_on_a_delivering_sender_is_not_recorded_as_moved() {
         .spawn();
     });
 }
+
+/// An ACK whose context's sender isn't marked lost, and hasn't delivered since a lost pair
+/// stopped while another sender has, goes to that other sender and publishes a
+/// `PathSecretMapAcknowledgementMoved` event through the path secret map.
+#[test]
+fn ack_moved_off_a_sender_without_a_delivery_since_a_loss_publishes_an_event() {
+    use crate::{endpoint::id::LocalSenderId, time::precision::Timestamp as PreciseTimestamp};
+
+    sim(|| {
+        let sender = |id: u8| LocalSenderId::new(VarInt::from_u8(id));
+        let at = |nanos| PreciseTimestamp { nanos };
+        let (map, subscriber) = test_map_with_subscriber();
+        let ctx = scheduled_context_with_senders(false);
+        {
+            let c = ctx.borrow();
+            let entry = &c.path_entry;
+            // The pair of sender 0 stopped delivering at 200, and sender 3 has an
+            // acknowledgement since. The context's sender 1 isn't marked lost and hasn't one.
+            entry.set_senders_lost_since(at(200));
+            entry.set_senders_preferred_until(at(1_000));
+            assert!(entry.set_sender_lost(sender(0), true));
+            entry.record_sender_delivered(sender(3), at(300));
+            assert_eq!(c.local_sender_id, sender(1));
+            assert!(!entry.is_sender_lost(sender(1)));
+            assert!(entry.prefers_senders_delivering_since_lost());
+        }
+        let Harness { mut output_rx } = setup_with_map([ctx], Some(map));
+
+        async move {
+            let first = output_rx
+                .recv()
+                .await
+                .expect("expected pending-ack submission");
+            let msg::Sender::PendingAck(submission) = &*first else {
+                panic!("expected a pending-ack submission");
+            };
+            assert_eq!(submission.local_sender_id, sender(3));
+            let moves = event_count(&subscriber.path_secret_map_acknowledgement_moved);
+            assert_eq!(moves, 1);
+        }
+        .primary()
+        .spawn();
+    });
+}

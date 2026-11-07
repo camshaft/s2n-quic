@@ -610,4 +610,45 @@ mod tests {
         assert_eq!(message.sender_idx(), sender(2));
         assert_eq!(moves.load(Ordering::Relaxed), 1);
     }
+
+    #[test]
+    fn a_freed_batch_moved_off_a_sender_without_a_delivery_since_a_loss_publishes_an_event() {
+        use crate::time::precision::Timestamp as PreciseTimestamp;
+        use core::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let at = |nanos| PreciseTimestamp { nanos };
+        let subscriber = Arc::new(crate::event::testing::Subscriber::no_snapshot());
+        let map = crate::path::secret::Map::builder()
+            .with_signer(crate::path::secret::stateless_reset::Signer::random())
+            .with_capacity(4)
+            .with_clock(s2n_quic_core::time::NoopClock)
+            .with_subscriber(subscriber.clone())
+            .build()
+            .unwrap();
+        let moves = &subscriber.path_secret_map_freed_batch_moved;
+        let peer = "127.0.0.1:4433".parse().unwrap();
+        let entry = crate::path::secret::map::Entry::builder(peer)
+            .socket_sender_count(4)
+            .build(None);
+        // The pair of sender 0 stopped delivering at 200, and sender 3 has an acknowledgement
+        // since. Sender 1 isn't marked lost and hasn't one.
+        entry.set_senders_lost_since(at(200));
+        entry.set_senders_preferred_until(at(1_000));
+        assert!(entry.set_sender_lost(sender(0), true));
+        entry.record_sender_delivered(sender(3), at(300));
+        assert!(!entry.is_sender_lost(sender(1)));
+        assert!(entry.prefers_senders_delivering_since_lost());
+        let mut message = msg::Sender::PendingFreed {
+            path_secret_entry: entry.clone(),
+            local_sender_id: sender(0),
+        };
+        let mut rng = Rng::with_seed(7);
+        let priority = [sender(1)];
+        // The load scores alone choose sender 1, and the batch goes to sender 3, which has
+        // delivered since the loss, so the map publishes the move.
+        route_freed_batch(&mut message, Some(&priority[..]), 4, &mut rng, Some(&map));
+        assert_eq!(message.sender_idx(), sender(3));
+        assert_eq!(moves.load(Ordering::Relaxed), 1);
+    }
 }
