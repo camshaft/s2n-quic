@@ -28,6 +28,10 @@ const FAST: Rate = Rate::new(2.5);
 /// Many short streams, so that the server frees many queues.
 const STREAMS: usize = 32;
 const STREAM_LEN: u64 = 64 * 1024;
+/// The fewest freed batches the server must route where its fast interface carries its
+/// highest-priority traffic, so that the test catches a router that picks among every sender
+/// unless each of those picks falls on the fast interface.
+const FREED_BATCHES: usize = 8;
 /// The interface of each client socket: sockets 0 to 3 on the slow one, 4 to 7 on the fast one.
 const CLIENT_INTERFACE: [usize; 8] = [0, 0, 0, 0, 1, 1, 1, 1];
 /// The interface of each server socket: the even sockets on the slow one, the odd ones on the
@@ -145,6 +149,14 @@ fn acknowledgements_and_freed_batches_go_to_the_highest_priority_interface() {
             "the server didn't route a {kind:?}",
         );
     }
+    let freed = routed
+        .iter()
+        .filter(|routed| routed.kind == Kind::PendingFreed)
+        .count();
+    assert!(
+        freed >= FREED_BATCHES,
+        "the server routed {freed} freed batches, fewer than {FREED_BATCHES}",
+    );
     for routed in &routed {
         assert_eq!(
             SERVER_INTERFACE[routed.sender.as_usize()],
@@ -155,17 +167,20 @@ fn acknowledgements_and_freed_batches_go_to_the_highest_priority_interface() {
 }
 
 /// Where no interface carries the server's highest-priority traffic, the server routes the
-/// acknowledgements as before, and some of them go to a send socket of the slow interface.
+/// acknowledgements and the freed batches as before, and some of each go to a send socket of
+/// the slow interface.
 #[test]
-fn without_a_highest_priority_interface_acknowledgements_go_to_both_interfaces() {
+fn without_a_highest_priority_interface_the_server_routes_to_both_interfaces() {
     let _snapshots = without_snapshots();
     let _tracing = without_tracing();
 
     let routed = server_routes(false);
-    assert!(
-        routed.iter().any(|routed| {
-            routed.kind == Kind::PendingAck && SERVER_INTERFACE[routed.sender.as_usize()] == 0
-        }),
-        "the server routed every acknowledgement to the fast interface",
-    );
+    for kind in [Kind::PendingAck, Kind::PendingFreed] {
+        assert!(
+            routed.iter().any(|routed| {
+                routed.kind == kind && SERVER_INTERFACE[routed.sender.as_usize()] == 0
+            }),
+            "the server didn't route a {kind:?} to a send socket of the slow interface",
+        );
+    }
 }

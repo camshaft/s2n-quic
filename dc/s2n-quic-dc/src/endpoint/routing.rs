@@ -378,6 +378,12 @@ mod tests {
             let chosen = freed_batch_sender_id(None, socket_count, &mut rng, |_| 0);
             assert_eq!(chosen, sender(0));
         }
+        // Where the two scores are equal, the first draw wins.
+        for _ in 0..256 {
+            let first = sender(rng.clone().next_usize(8));
+            let chosen = freed_batch_sender_id(None, 8, &mut rng, |_| 0);
+            assert_eq!(chosen, first);
+        }
     }
 
     #[test]
