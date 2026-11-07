@@ -707,9 +707,13 @@ fn send_worker_publishes_the_lost_mark_of_a_pair_that_sends_acknowledgements_alo
                 map,
             );
 
-            // The pair sends an acknowledgement each step, and the first one is its probe.
-            for packet_number in 0..20u8 {
-                if packet_number == 5 {
+            // The pair sends an acknowledgement each step. A new context's RTT tracker doesn't
+            // probe, so its first acknowledgements aren't ack-eliciting. Once the peer stays
+            // silent for a persistent congestion period, about ten steps, the pair's next
+            // acknowledgement is its probe, and the pair is marked lost once the probe waits
+            // another period, about ten steps more.
+            for packet_number in 0..30u8 {
+                if packet_number == 15 {
                     assert_eq!(
                         event_count(&subscriber.path_secret_map_interface_pair_lost),
                         0,

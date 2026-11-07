@@ -1473,6 +1473,10 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                         .skips_dead_mark(path_lost, &path_secret_entry);
                 let marked_dead = (unacknowledged || peer_silent_since_lost)
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
+                warn!(
+                    "diagnostic: idle expiry sender_idx={sender_idx} path_lost={path_lost} lost_at={:?} has_inflight={has_inflight} peer_silent_since_lost={peer_silent_since_lost} unacknowledged={unacknowledged} marked_dead={marked_dead} packets_sent={packets_sent}",
+                    lost_at.map(|at| at.nanos)
+                );
 
                 let result = send_caches[local_id].borrow_mut().invalidate(
                     &id,

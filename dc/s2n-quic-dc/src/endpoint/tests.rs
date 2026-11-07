@@ -2771,12 +2771,13 @@ fn dead_and_silent_peer_entry_is_replaced() {
             *broken.lock().unwrap() = Some((client_map.clone(), server_addr, old_id));
 
             // Keep opening streams, as a busy caller would, for at least five minutes.
-            for _ in 0..300 {
+            for iteration in 0..300 {
                 let peer = format!("server:{SERVER_PORT}");
                 let connect = client.connect(peer, acceptor_id);
                 let stream = match timeout(5.s(), connect).await {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(error)) => {
+                        warn!("diagnostic: iteration {iteration}: connect refused: {error:?}");
                         // Refused in the dead-peer cooldown window.
                         if error.kind() == io::ErrorKind::TimedOut {
                             cooldown_refusals_inner.fetch_add(1, Ordering::Relaxed);
@@ -2785,6 +2786,7 @@ fn dead_and_silent_peer_entry_is_replaced() {
                         continue;
                     }
                     Err(_) => {
+                        warn!("diagnostic: iteration {iteration}: connect timed out");
                         // Still waiting for a queue slot.
                         1.s().sleep().await;
                         continue;
@@ -2796,6 +2798,7 @@ fn dead_and_silent_peer_entry_is_replaced() {
                     timeout(5.s(), writer.write_all_from_fin(&mut ping)).await,
                     Ok(Ok(_))
                 ) {
+                    warn!("diagnostic: iteration {iteration}: write failed");
                     continue;
                 }
                 let mut buf = BytesMut::with_capacity(16);
@@ -2806,6 +2809,7 @@ fn dead_and_silent_peer_entry_is_replaced() {
                         _ => break false,
                     }
                 };
+                warn!("diagnostic: iteration {iteration}: read done={done} len={}", buf.len());
                 if done && &buf[..] == b"ping" {
                     let new_id = *client_map
                         .get_raw(server_addr)
