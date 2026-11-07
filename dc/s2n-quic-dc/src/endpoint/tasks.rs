@@ -8,7 +8,8 @@ use crate::{
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
             CompletionDispatcher, CreditlessWindow, FrameBatch, InterfacePacedPickTwo,
-            PathSecretMapEntry, PickTwo, SendPacing, WindowSender, BATCH_TARGET_BYTES,
+            PathSecretMapEntry, PickTwo, SendPacing, WindowReader, WindowSender,
+            BATCH_TARGET_BYTES,
         },
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
@@ -93,9 +94,40 @@ pub fn frame_dispatch<S, Clk>(
     // The frames without send credit in the lanes below, and in the batch router after them,
     // stay in this window until a worker's sender takes their batch, which bounds their bytes:
     // the send credit pool bounds the other frames. The window starts at the batch router's
-    // batch target, so that it admits a full batch, and grows and shrinks with how fast the
-    // workers take the batches.
-    let window = CreditlessWindow::new(BATCH_TARGET_BYTES);
+    // batch target, so that it admits a full batch, grows where a worker could take a batch
+    // that the batch router doesn't have, and halves where a batch waited for a sender.
+    frame_dispatch_over(
+        CreditlessWindow::new(BATCH_TARGET_BYTES),
+        spawner,
+        frame_rx,
+        worker_senders,
+        rng,
+        clock,
+        pacing,
+        budgets,
+        counter_registry,
+        send_credit_pool,
+    );
+}
+
+/// Spawns the pipeline of [`frame_dispatch`] over `window`, the window of its frames without send
+/// credit.
+#[allow(clippy::too_many_arguments)]
+fn frame_dispatch_over<S, Clk>(
+    window: CreditlessWindow,
+    spawner: &mut impl Spawner,
+    frame_rx: SubmissionReceiver,
+    worker_senders: IdMap<LocalSenderId, S>,
+    rng: crate::xorshift::Rng,
+    clock: Clk,
+    pacing: SendPacing,
+    budgets: Budgets,
+    counter_registry: counter::Registry,
+    send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+) where
+    S: UnboundedSender<Entry<FrameBatch>> + 'static,
+    Clk: precision::Clock + Clone + 'static,
+{
     let mut priority_batch_rxs = Vec::with_capacity(Priority::LEVELS);
     let priority_txs_raw: [_; Priority::LEVELS] = core::array::from_fn(|_| {
         let (tx, rx) = intrusive::unsync::new::<Frame>();
@@ -152,13 +184,8 @@ pub fn frame_dispatch<S, Clk>(
             .collect();
         let rx = PriorityRx::new(priority_batch_rxs);
         let rx = BatchFramesByPathSecret::new(rx, &clock, pacing.total_rate());
-        // Each batch keeps the window's round as the batch router reads it, and a worker's
-        // sender releases the batch's bytes from the window as it takes the batch.
-        let read_in = window.clone();
-        let rx = Map::new(rx, move |mut batch: FrameBatch| {
-            batch.set_window_round(read_in.round());
-            Entry::new(batch)
-        });
+        let rx = Map::new(rx, Entry::new);
+        // A worker's sender releases each batch's bytes from the window as it takes the batch.
         let worker_senders: IdMap<LocalSenderId, WindowSender<S>> = worker_senders
             .into_iter()
             .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
@@ -174,7 +201,10 @@ pub fn frame_dispatch<S, Clk>(
         };
         if pacing.interface_count() == 1 {
             // Every send socket is on one interface: pace them together at its rate, then choose
-            // a worker for each batch.
+            // a worker for each batch. The pacer polls this reader while it doesn't hold a batch,
+            // so the window grows where the worker could take a batch that the batch router
+            // doesn't have.
+            let rx = WindowReader::new(rx, window.clone());
             let rx = Paced::new(rx, clock, pacing.total_rate());
             let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
             let task_counter = register_task_counter();
@@ -185,7 +215,8 @@ pub fn frame_dispatch<S, Clk>(
             );
         } else {
             // The send sockets are on several interfaces: choose a worker for each batch first,
-            // then pace the batch with the token bucket of that worker's interface.
+            // then pace the batch with the token bucket of that worker's interface. The router
+            // tells the window where a sender could take a batch that it doesn't have.
             let rx = InterfacePacedPickTwo::new(
                 rx,
                 worker_senders,
@@ -194,7 +225,8 @@ pub fn frame_dispatch<S, Clk>(
                 &pacing,
                 &counter_registry,
                 send_credit_pool,
-            );
+            )
+            .with_window(window.clone());
             let task_counter = register_task_counter();
             spawner.spawn_receiver_task(
                 rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
@@ -1873,7 +1905,6 @@ where
     /// in order, until the window refuses a frame, which stays in `staging` with every frame
     /// after it. Returns whether it moved a frame.
     fn move_admitted(&mut self, cx: &mut core::task::Context<'_>) -> bool {
-        self.window.start_round();
         let mut moved = false;
         let mut refused = false;
         for (i, ((priority, mut queue), tx)) in self
