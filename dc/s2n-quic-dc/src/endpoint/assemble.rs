@@ -93,18 +93,6 @@ where
     // A context that sends acknowledgements alone has no packet in the inflight map for its
     // probe timeout to check, so its interface pair is checked here.
     context.check_acknowledgement_only_delivery(now);
-    if crate::diag() && context.is_path_lost() {
-        eprintln!(
-            "diag {} assemble-lost peer={} sender={} requested={} pending={} inflight={} acks={}",
-            now,
-            context.peer_addr,
-            context.sender_idx,
-            context.pto.probe_state.is_requested(),
-            context.has_pending_data(),
-            context.inflight.has_inflight(),
-            context.has_pending_acks(),
-        );
-    }
     let PathInfo {
         max_datagram_size: mtu,
         max_segments,
@@ -351,14 +339,6 @@ where
                                 credentials = %context.credentials.id,
                                 "PTO probe: emitting Ping as second segment"
                             );
-                            if crate::diag() {
-                                eprintln!(
-                                    "diag {} ping peer={} sender={}",
-                                    clock.now(),
-                                    context.peer_addr,
-                                    context.sender_idx,
-                                );
-                            }
                         } else if !wants_ping {
                             // No inflight entries and no prior probe sent — clear to Idle.
                             let _ = context.pto.probe_state.on_all_acked();

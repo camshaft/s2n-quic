@@ -792,9 +792,6 @@ impl Context {
         );
 
         ::tracing::debug!(%credentials, %peer_addr, %sender_idx, "deriving sealer for credentials");
-        if crate::diag() {
-            eprintln!("diag {} ctx-new peer={} sender={}", clock.now(), peer_addr, sender_idx);
-        }
 
         // A new context of this sender slot starts out delivering, whatever an earlier context
         // of the slot recorded.
@@ -1192,18 +1189,6 @@ impl Context {
             // That's harmless: the assembler will send the probe on its next run.
             let _ = self.pto.probe_state.request();
         }
-        if crate::diag() && probe && self.is_path_lost() {
-            eprintln!(
-                "diag {} pto-probe peer={} sender={} backoff={} inflight={} pending={} requested={}",
-                clock.now(),
-                self.peer_addr,
-                self.sender_idx,
-                self.pto.backoff,
-                self.inflight.has_inflight(),
-                self.has_pending(),
-                self.pto.probe_state.is_requested(),
-            );
-        }
         let interest = self.wheel_interest(clock);
         self.invariants();
         interest
@@ -1326,12 +1311,6 @@ impl Context {
     /// A lost mark keeps the next packet number this context sends: an acknowledgement of
     /// that packet or a later one shows that the pair delivers again.
     pub fn set_path_lost(&mut self, lost: bool) {
-        if crate::diag() {
-            eprintln!(
-                "diag ctx-lost peer={} sender={} lost={} was={:?} next_pn={:?}",
-                self.peer_addr, self.sender_idx, lost, self.lost_from, self.next_packet_number,
-            );
-        }
         self.lost_from = lost.then_some(self.next_packet_number);
         let _ = self
             .path_secret_entry
@@ -1341,12 +1320,6 @@ impl Context {
     /// Clears the lost mark once the peer acknowledges a packet sent after the mark was set.
     #[inline]
     pub fn on_largest_acknowledged(&mut self, largest_acknowledged: VarInt) {
-        if crate::diag() && self.lost_from.is_some() {
-            eprintln!(
-                "diag ctx-ack peer={} sender={} largest={:?} lost_from={:?}",
-                self.peer_addr, self.sender_idx, largest_acknowledged, self.lost_from,
-            );
-        }
         if matches!(self.lost_from, Some(lost_from) if largest_acknowledged >= lost_from) {
             self.set_path_lost(false);
         }
