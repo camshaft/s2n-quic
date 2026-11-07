@@ -691,6 +691,9 @@ where
     /// stopped delivering, it chooses among those senders alone, since a sender on the same
     /// down interface may not be marked lost yet. It records the score gap and the rejected
     /// candidate in the pick-two counters, as the rule does among every sender.
+    ///
+    /// Where no sender has one, a sender that sends to the peer interface of a pair marked lost
+    /// counts as lost too, as `counts_as_lost` says: every sender here is on one local interface.
     fn pick_delivering_sender(
         entry: &PathSecretEntry,
         len: usize,
@@ -700,12 +703,19 @@ where
         score_delta: &crate::counter::Summary,
     ) -> LocalSenderId {
         let prefer_delivered = entry.has_sender_delivering_since_lost();
+        // Where no sender delivers since the loss, a sender that sends to a lost pair's peer
+        // interface counts as lost too, since that interface may be down.
+        let counted_lost = if prefer_delivered {
+            Vec::new()
+        } else {
+            counts_as_lost(entry, len, |_| None, |_| None)
+        };
         let delivers = |idx: usize| {
             let sender = LocalSenderId::from_index(idx);
             if prefer_delivered {
                 entry.delivers_since_lost(sender)
             } else {
-                !entry.is_sender_lost(sender)
+                !counted_lost[idx]
             }
         };
 
@@ -746,6 +756,62 @@ where
             better
         }
     }
+}
+
+/// Returns the lost mark each of the `len` senders of `entry` counts as having where no sender
+/// delivers since a pair was lost: a sender whose interface pair is marked lost, and a sender
+/// that shares more of the marked pairs' interfaces than another sender that isn't marked.
+///
+/// A down interface stops every pair it is on, and the send workers mark one pair at a time, so
+/// a sender on the local interface or the peer interface of a marked pair may be down and not
+/// be marked yet. `local_interface` returns the position of a sender's local interface, or
+/// `None` where the router doesn't tell its senders' interfaces apart, and `place` the sender's
+/// place among the endpoint's interfaces, which pairs it with the peer interface it sends to. A
+/// sender counts once for each of the two interfaces it shares with a marked pair, and the
+/// senders that aren't marked and share the fewest keep their marks clear, so that the router
+/// keeps a sender to choose.
+fn counts_as_lost(
+    entry: &PathSecretEntry,
+    len: usize,
+    local_interface: impl Fn(usize) -> Option<usize>,
+    place: impl Fn(usize) -> Option<crate::socket::interface::SendPlace>,
+) -> Vec<bool> {
+    let marked: Vec<bool> = (0..len)
+        .map(|idx| entry.is_sender_lost(LocalSenderId::from_index(idx)))
+        .collect();
+    let locals: Vec<Option<usize>> = (0..len).map(&local_interface).collect();
+    let peers: Vec<Option<u16>> = (0..len)
+        .map(|idx| {
+            crate::socket::interface::paired_peer_interface(
+                entry.peer_data_addrs(),
+                entry.peer_data_interfaces(),
+                idx,
+                place(idx),
+            )
+        })
+        .collect();
+    let lost_locals: Vec<usize> = (0..len)
+        .filter(|&idx| marked[idx])
+        .filter_map(|idx| locals[idx])
+        .collect();
+    let lost_peers: Vec<u16> = (0..len)
+        .filter(|&idx| marked[idx])
+        .filter_map(|idx| peers[idx])
+        .collect();
+    let shared: Vec<usize> = (0..len)
+        .map(|idx| {
+            usize::from(matches!(locals[idx], Some(local) if lost_locals.contains(&local)))
+                + usize::from(matches!(peers[idx], Some(peer) if lost_peers.contains(&peer)))
+        })
+        .collect();
+    let fewest = (0..len)
+        .filter(|&idx| !marked[idx])
+        .map(|idx| shared[idx])
+        .min()
+        .unwrap_or(0);
+    (0..len)
+        .map(|idx| marked[idx] || shared[idx] > fewest)
+        .collect()
 }
 
 impl<T, R, S> Receiver<()> for PickTwo<T, R, S>

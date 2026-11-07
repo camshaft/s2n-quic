@@ -2183,13 +2183,19 @@ fn interface_paced_pick_two_skips_lost_pairs_while_another_delivers() {
     let sender = LocalSenderId::from_index;
     let items = || priority_items(&entry, &drop_counter, 20, 20);
 
-    // While the pair of sender 0 is lost, the other items go to senders 1 to 3, and the
+    // While the pair of sender 0 is lost and no sender delivers since, sender 1, on the same
+    // local interface, counts as lost too: the other items go to senders 2 and 3, and the
     // highest-priority items stay on the second interface.
     assert!(entry.set_sender_lost(sender(0), true));
     let counts = route_by_interface(items());
     assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert_eq!(
+        counts[1],
+        [0, 0],
+        "sender 1, on the lost pair's interface, got an item: {counts:?}"
+    );
     assert_eq!(counts[2][0] + counts[3][0], 20);
-    assert_eq!(counts[1][1] + counts[2][1] + counts[3][1], 20);
+    assert_eq!(counts[2][1] + counts[3][1], 20);
 
     // While every pair of the second interface is lost too, every item goes to sender 1, the
     // highest-priority items among them.
@@ -2234,9 +2240,10 @@ fn interface_paced_pick_two_chooses_by_one_read_of_the_lost_marks() {
     let sender = LocalSenderId::from_index;
     assert!(entry.set_sender_lost(sender(0), true));
 
-    // The router reads the marks while sender 0 alone is lost. Senders 1 and 2 are marked lost
-    // after that read and before the router chooses: the router chooses by the marks it read,
-    // among senders 1 to 3, and doesn't panic.
+    // The router reads the marks while sender 0 alone is lost, and sender 1, on the same
+    // interface, counts as lost too. Senders 1 and 2 are marked lost after that read and before
+    // the router chooses: the router chooses by the marks it read, between senders 2 and 3, and
+    // doesn't panic.
     let mut chosen = [0usize; 4];
     for _ in 0..30 {
         let choice = router
@@ -2253,8 +2260,9 @@ fn interface_paced_pick_two_chooses_by_one_read_of_the_lost_marks() {
         chosen[0], 0,
         "the router chose the lost sender 0: {chosen:?}"
     );
+    assert_eq!(chosen[1], 0, "the router chose sender 1: {chosen:?}");
     assert!(
-        chosen[1] + chosen[2] > 0,
+        chosen[2] > 0,
         "the router read the marks again after the first read: {chosen:?}",
     );
 }
@@ -3559,4 +3567,129 @@ fn interface_paced_pick_two_reads_the_lost_marks_where_no_sender_delivers_since_
         route_by_interface(priority_items(&entry, &drop_counter, 20, 20)),
         [[0, 0], [20, 20], [0, 0], [0, 0]]
     );
+}
+
+/// While a pair is lost and no sender delivers since, pick-two leaves out the senders that send
+/// to the lost pair's peer interface, since that interface may be down, and chooses them again
+/// once they deliver since the loss.
+#[test]
+fn pick_two_skips_the_senders_on_a_lost_pairs_peer_interface() {
+    let peer = |last: u8| std::net::SocketAddr::from(([10, 0, 0, last], 4000));
+    let entry = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .peer_data_addrs(vec![peer(1), peer(2)])
+        .peer_data_interfaces(vec![Some(1), Some(2)])
+        .build(None);
+    let sender = LocalSenderId::from_index;
+
+    // Sender i sends to the peer's address i % 2: senders 0 and 2 send to the peer's first
+    // interface, and senders 1 and 3 to its second.
+    assert!(entry.set_sender_lost(sender(0), true));
+    let calls = pick_two_calls(&entry, 100, 6);
+    assert_eq!(
+        calls[0] + calls[2],
+        0,
+        "a sender on the lost pair's peer interface got an item: {calls:?}"
+    );
+    assert_eq!(calls[1] + calls[3], 100);
+    assert!(
+        calls[1] > 0 && calls[3] > 0,
+        "a sender on the other peer interface didn't get an item: {calls:?}"
+    );
+
+    // Once senders 1 to 3 deliver since the loss, the router chooses sender 2 again.
+    let at = |nanos| crate::time::precision::Timestamp { nanos };
+    entry.set_senders_lost_since(at(200));
+    for idx in 1..4 {
+        entry.record_sender_delivered(sender(idx), at(300));
+    }
+    let calls = pick_two_calls(&entry, 100, 7);
+    assert_eq!(calls[0], 0, "the lost sender got an item: {calls:?}");
+    assert!(
+        calls[2] > 0,
+        "a sender that delivers since the loss didn't get an item: {calls:?}"
+    );
+}
+
+/// While a pair is lost and no sender delivers since, the interface-paced router leaves out the
+/// senders that share the lost pair's local interface or its peer interface, keeps the senders
+/// that share the fewest of them, and chooses sender 1 again once it delivers since the loss.
+#[test]
+fn interface_paced_pick_two_skips_the_senders_that_share_a_lost_pairs_interfaces() {
+    let drop_counter = Arc::new(AtomicUsize::new(0));
+    let peer = |last: u8| std::net::SocketAddr::from(([10, 0, 0, last], 4000));
+    let sender = LocalSenderId::from_index;
+
+    // The peer has two interfaces, each paired with one local interface: senders 0 and 1 send
+    // to the peer's first, and senders 2 and 3 to its second. Sender 1 shares both interfaces
+    // of the lost pair and counts as lost too; senders 2 and 3 share neither.
+    let paired = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .peer_data_addrs(vec![peer(1), peer(2)])
+        .peer_data_interfaces(vec![Some(1), Some(2)])
+        .build(None);
+    assert!(paired.set_sender_lost(sender(0), true));
+    let counts = route_by_interface(priority_items(&paired, &drop_counter, 20, 20));
+    assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert_eq!(counts[1], [0, 0], "sender 1 got an item: {counts:?}");
+    assert_ne!(counts[2], [0, 0], "sender 2 didn't get an item: {counts:?}");
+    assert_eq!(counts[2][0] + counts[3][0], 20);
+    assert_eq!(counts[2][1] + counts[3][1], 20);
+
+    // The peer has one interface, which every sender sends to. Senders 2 and 3 share only that
+    // one with the lost pair, fewer than sender 1 shares, and take every item.
+    let one = PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(4)
+        .peer_data_addrs(vec![peer(1)])
+        .peer_data_interfaces(vec![Some(1)])
+        .build(None);
+    assert!(one.set_sender_lost(sender(0), true));
+    let counts = route_by_interface(priority_items(&one, &drop_counter, 20, 20));
+    assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert_eq!(counts[1], [0, 0], "sender 1 got an item: {counts:?}");
+    assert_eq!(counts[2][0] + counts[3][0], 20);
+    assert_eq!(counts[2][1] + counts[3][1], 20);
+
+    // Once senders 1 to 3 deliver since the loss, the router chooses sender 1 again.
+    let at = |nanos| crate::time::precision::Timestamp { nanos };
+    one.set_senders_lost_since(at(200));
+    for idx in 1..4 {
+        one.record_sender_delivered(sender(idx), at(300));
+    }
+    let counts = route_by_interface(priority_items(&one, &drop_counter, 20, 20));
+    assert_eq!(counts[0], [0, 0], "sender 0 got an item: {counts:?}");
+    assert!(
+        counts[1][1] > 0,
+        "sender 1 didn't get an item once it delivers since the loss: {counts:?}"
+    );
+}
+
+/// The interface-paced router places each send socket among the interfaces as the interface
+/// table places it for the send workers, so that it reads the peer interface each worker sends
+/// to.
+#[test]
+fn send_pacing_places_each_send_socket_as_the_interface_table_does() {
+    use crate::socket::interface;
+
+    let overall = Rate::new(25.0);
+    let addrs: Vec<std::net::SocketAddr> = (0..5)
+        .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], 4000 + port)))
+        .collect();
+    // Socket 2, which no interface lists, is on the default interface, which ranks first.
+    let configs = [
+        interface::Config {
+            send_sockets: vec![0, 3],
+            ..Default::default()
+        },
+        interface::Config {
+            send_sockets: vec![1, 4],
+            ..Default::default()
+        },
+    ];
+    let table = interface::Table::resolve(&configs, overall, &addrs, &addrs, &interface::System);
+    let pacing = SendPacing::from_interfaces(&table, overall);
+    let places: Vec<_> = (0..addrs.len())
+        .map(|socket| pacing.send_place(socket))
+        .collect();
+    assert_eq!(table.send_places(), Some(places));
 }

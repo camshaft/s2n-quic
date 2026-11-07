@@ -104,6 +104,27 @@ pub fn paired_peer_addr(
     on_paired[place.index % on_paired.len()]
 }
 
+/// Returns the interface tag of the peer's address that a sender sends to, as
+/// [`paired_peer_addr`] chooses that address, or `None` where the peer doesn't tag it or doesn't
+/// have a data address. The senders of one tag send to one of the peer's interfaces, so a down
+/// peer interface stops the pairs of all of them.
+pub fn paired_peer_interface(
+    addrs: &[SocketAddr],
+    interfaces: &[Option<u16>],
+    sender_idx: usize,
+    place: Option<SendPlace>,
+) -> Option<u16> {
+    if addrs.is_empty() || interfaces.len() != addrs.len() {
+        return None;
+    }
+    let addr = paired_peer_addr(addrs, interfaces, sender_idx, place);
+    addrs
+        .iter()
+        .zip(interfaces)
+        .find(|(candidate, _)| **candidate == addr)
+        .and_then(|(_, tag)| *tag)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +289,33 @@ mod tests {
         }];
         let table = Table::resolve(&one, Rate::new(1.0), &sockets, &[], &System);
         assert_eq!(table.highest_priority_send_sockets(), None);
+    }
+
+    #[test]
+    fn paired_peer_interface_is_the_tag_of_the_paired_address() {
+        let peer = addrs(4);
+        let tags = [Some(1), Some(2), Some(1), Some(2)];
+
+        // A sender's peer interface is the tag of the address it sends to.
+        assert_eq!(
+            paired_peer_interface(&peer, &tags, 7, Some(place(0, 0))),
+            Some(1)
+        );
+        assert_eq!(
+            paired_peer_interface(&peer, &tags, 7, Some(place(1, 1))),
+            Some(2)
+        );
+        assert_eq!(
+            paired_peer_interface(&peer, &tags, 7, Some(place(2, 0))),
+            Some(1)
+        );
+        // Where the endpoint doesn't list interfaces, it is the tag of `addrs[sender % len]`.
+        assert_eq!(paired_peer_interface(&peer, &tags, 3, None), Some(2));
+        // An address without a tag, a peer that doesn't tag its addresses, and a peer without
+        // a data address don't have a peer interface.
+        let gap = [Some(1), None, Some(2), Some(2)];
+        assert_eq!(paired_peer_interface(&peer, &gap, 1, None), None);
+        assert_eq!(paired_peer_interface(&peer, &[], 1, None), None);
+        assert_eq!(paired_peer_interface(&[], &[], 1, None), None);
     }
 }
