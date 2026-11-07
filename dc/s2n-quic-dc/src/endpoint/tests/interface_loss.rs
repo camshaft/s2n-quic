@@ -367,6 +367,34 @@ fn assert_lost_marks(shared: &Shared) {
     assert!(marked, "the client didn't mark a pair on the lost interface lost");
 }
 
+/// Asserts that the server acknowledges each packet from the client's slow interface on a sender
+/// of its own slow interface, the pair of the interface the packet came from, though its fast
+/// interface carries its highest-priority traffic, and that it acknowledges at least one such
+/// packet.
+fn assert_slow_interface_acks_paired(routed: &[Routed], shared: &Shared) {
+    let client_addrs = shared.client_addrs.lock().unwrap();
+    let mut acks = 0;
+    for route in routed
+        .iter()
+        .filter(|route| route.kind == Kind::PendingAck && client_addrs.contains(&route.peer))
+    {
+        // The server's path has a client address as its peer, and in the sim the client's
+        // sender i is its send socket i, whose interface `CLIENT_INTERFACE` holds.
+        let remote = route.remote.expect("an acknowledgement answers a client sender");
+        let interface = CLIENT_INTERFACE[remote.as_varint().as_u64() as usize];
+        if interface == LOST {
+            continue;
+        }
+        acks += 1;
+        assert_eq!(
+            SERVER_INTERFACE[route.sender.as_usize()],
+            interface,
+            "the server routed {route:?} off the pair of the client's slow interface",
+        );
+    }
+    assert!(acks > 0, "the server didn't acknowledge a packet from the client's slow interface");
+}
+
 /// While one of the client's interfaces is lost, the client and the server move their traffic to
 /// the pairs that still deliver, so the streams the client opened before the loss finish, and
 /// the expiry of the lost pairs' send contexts doesn't mark the peer dead.
@@ -604,6 +632,10 @@ fn run(recover: bool) {
     }
     assert!(acks > 0, "no acknowledgement was routed while a pair was lost");
     assert!(freed > 0, "no freed batch was routed while a pair was lost");
+
+    // The server acknowledges each packet from the client's slow interface on a sender of its
+    // own slow interface.
+    assert_slow_interface_acks_paired(&routed, &shared);
 
     let dropped = shared.dropped.load(Ordering::Relaxed);
     assert!(dropped > 0, "the network didn't drop a packet");
