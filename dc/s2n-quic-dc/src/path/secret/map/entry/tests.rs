@@ -131,3 +131,60 @@ fn sender_with_more_queued_bytes_has_higher_load_score() {
         "sender 0 has more bytes queued so should have a higher load score"
     );
 }
+
+#[test]
+fn a_sender_marked_lost_counts_as_lost_until_cleared() {
+    let entry = test_entry_with_senders(2);
+    let sender0 = crate::endpoint::id::LocalSenderId::from_index(0);
+    let sender1 = crate::endpoint::id::LocalSenderId::from_index(1);
+    assert!(!entry.has_lost_sender());
+    assert!(entry.has_delivering_sender());
+
+    assert!(
+        entry.set_sender_lost(sender0, true),
+        "the first mark changes the slot"
+    );
+    assert!(
+        !entry.set_sender_lost(sender0, true),
+        "a second mark doesn't change it"
+    );
+    assert!(entry.is_sender_lost(sender0));
+    assert!(!entry.is_sender_lost(sender1));
+    assert!(entry.has_lost_sender());
+    assert!(entry.has_delivering_sender());
+
+    assert!(entry.set_sender_lost(sender1, true));
+    assert!(
+        !entry.has_delivering_sender(),
+        "no sender delivers once every one is lost"
+    );
+
+    assert!(entry.set_sender_lost(sender0, false));
+    assert!(!entry.is_sender_lost(sender0));
+    assert!(entry.has_delivering_sender());
+}
+
+#[test]
+fn a_load_score_update_keeps_the_lost_mark() {
+    let entry = test_entry_with_senders(1);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let now = unsafe { Timestamp::from_duration(Duration::from_micros(10)) };
+    let bandwidth =
+        s2n_quic_core::recovery::bandwidth::Bandwidth::new(1_000, Duration::from_millis(1));
+
+    entry.update_sender_load_score(sender, now, 4_000, bandwidth);
+    let score = entry.sender_load_score(sender);
+    assert!(entry.set_sender_lost(sender, true));
+    assert_eq!(
+        entry.sender_load_score(sender),
+        score,
+        "the lost mark doesn't change the load score"
+    );
+
+    entry.update_sender_load_score(sender, now, 8_000, bandwidth);
+    assert!(
+        entry.is_sender_lost(sender),
+        "a score update keeps the lost mark"
+    );
+    assert!(entry.sender_load_score(sender) > score);
+}

@@ -601,6 +601,13 @@ pub(crate) struct Context {
     /// Set when the context is invalidated (removed from cache). Prevents wheels
     /// from rearming after expiry.
     pub invalidated: bool,
+    /// The next packet number of this context when its interface pair was marked lost, or
+    /// `None` while the pair delivers. An acknowledgement of that packet or a later one
+    /// clears the mark.
+    pub lost_from: Option<VarInt>,
+    /// When this context began to wait for an acknowledgement of a packet it sent, or `None`
+    /// while the peer has acknowledged every packet it sent.
+    pub ack_wait_since: Option<precision::Timestamp>,
     /// RTT sampler for ACK-only (read-heavy) sends.
     ///
     /// When `inflight` is empty we have no ack-eliciting packets in flight and
@@ -770,6 +777,10 @@ impl Context {
 
         ::tracing::debug!(%credentials, %peer_addr, %sender_idx, "deriving sealer for credentials");
 
+        // A new context of this sender slot starts out delivering, whatever an earlier context
+        // of the slot recorded.
+        let _ = entry.set_sender_lost(sender_idx, false);
+
         Ok(Self {
             path_secret_entry: entry.clone(),
             sealer,
@@ -793,6 +804,8 @@ impl Context {
             created_at: clock.now(),
             last_peer_activity: clock.now(),
             invalidated: false,
+            lost_from: None,
+            ack_wait_since: None,
             rtt_tracker: AckRttTracker::default(),
         })
     }
@@ -849,6 +862,7 @@ impl Context {
         Rand: random::Generator,
     {
         self.last_peer_activity = clock.now();
+        self.on_largest_acknowledged(largest_acknowledged);
 
         super::ack::process_ack(
             largest_acknowledged,
@@ -898,6 +912,14 @@ impl Context {
         }
 
         if !self.inflight.has_inflight() {
+            self.ack_wait_since = None;
+        } else if self.ack_wait_since.is_none() {
+            self.ack_wait_since = Some(clock.now());
+        }
+
+        // A lost pair keeps its probe timeout armed while no packet waits for an
+        // acknowledgement, so that it is probed until one shows that it delivers again.
+        if !self.inflight.has_inflight() && !self.is_path_lost() {
             self.pto.on_ack_received(false);
             self.pto_wheel.target_time = None;
         }
@@ -905,7 +927,8 @@ impl Context {
         debug_assert!(
             !self.pto.probe_state.is_requested()
                 || self.inflight.has_inflight()
-                || self.has_pending(),
+                || self.has_pending()
+                || self.is_path_lost(),
             "probe_state is Requested but nothing to probe with"
         );
 
@@ -942,7 +965,9 @@ impl Context {
             false
         };
 
-        let pto = if !self.is_pto_scheduled() && self.inflight.has_inflight() {
+        let pto = if !self.is_pto_scheduled()
+            && (self.inflight.has_inflight() || self.is_path_lost())
+        {
             if let Some(target) = self.pto.next_target(clock, &self.rtt_estimator) {
                 self.pto_wheel.target_time = Some(target);
                 true
@@ -1127,11 +1152,19 @@ impl Context {
 
     /// Called when the PTO wheel fires for this context.
     ///
+    /// Marks the context's interface pair lost where it stopped delivering, as
+    /// [`Self::has_stopped_delivering`] decides, so that the routers stop choosing it and its
+    /// frames move to the pairs that still deliver.
+    ///
     /// Transitions the probe state from `Idle` to `Requested` if a real probe
     /// should be sent, then computes and returns the updated `WheelInterest` for
     /// rescheduling. The caller only needs to dispatch the returned interest.
     pub fn on_pto_timeout<Clk: precision::Clock + ?Sized>(&mut self, clock: &Clk) -> WheelInterest {
-        if self.pto.on_timeout() && (self.inflight.has_inflight() || self.has_pending()) {
+        let probe = self.pto.on_timeout();
+        if !self.is_path_lost() && self.has_stopped_delivering(clock.now()) {
+            self.set_path_lost(true);
+        }
+        if probe && (self.inflight.has_inflight() || self.has_pending() || self.is_path_lost()) {
             // The only failure case is `NoOp` — the state is already `Requested`
             // because a previous probe hasn't been consumed by the assembler yet.
             // That's harmless: the assembler will send the probe on its next run.
@@ -1147,7 +1180,8 @@ impl Context {
     /// Runs assertions guarded by `cfg!(debug_assertions)` — in release builds this
     /// compiles away to nothing. Call this after any mutation that could violate these
     /// invariants:
-    /// - PTO target should be `None` when there is no inflight data (no need to probe).
+    /// - PTO target should be `None` when there is no inflight data (no need to probe), except
+    ///   while the context's interface pair is lost, when the PTO keeps probing it.
     /// - Every inflight packet must either have a `probed_to` link (shell) or contain
     ///   non-empty, all-ack-eliciting frames (no stale ACK frames stored).
     /// - The sum of `sent_bytes` in the inflight map must equal `cca.bytes_in_flight()`.
@@ -1177,7 +1211,7 @@ impl Context {
 
             if self.pto_wheel.is_scheduled() && self.pto_wheel.target_time.is_some() {
                 assert!(
-                    self.inflight.has_inflight(),
+                    self.inflight.has_inflight() || self.is_path_lost(),
                     "pto wheel scheduled with target_time but no inflight packets"
                 );
             }
@@ -1191,12 +1225,12 @@ impl Context {
 
             if self.pto.probe_state.is_requested() {
                 assert!(
-                    self.inflight.has_inflight() || self.has_pending(),
+                    self.inflight.has_inflight() || self.has_pending() || self.is_path_lost(),
                     "probe_state is Requested but there is no inflight or pending work"
                 );
             }
 
-            if !self.inflight.has_inflight() {
+            if !self.inflight.has_inflight() && !self.is_path_lost() {
                 assert!(
                     !self.pto.is_armed(),
                     "PTO is armed but there is no inflight data to probe"
@@ -1244,6 +1278,99 @@ impl Context {
         if self.cca.bytes_in_flight() == 0 {
             self.inflight.clear_orphaned_shells();
         }
+    }
+
+    /// True while this context's interface pair is marked lost.
+    #[inline]
+    pub fn is_path_lost(&self) -> bool {
+        self.lost_from.is_some()
+    }
+
+    /// Marks this context's interface pair lost, or delivering again, and records the mark on
+    /// the path secret entry, which the routers read.
+    ///
+    /// A lost mark keeps the next packet number this context sends: an acknowledgement of
+    /// that packet or a later one shows that the pair delivers again.
+    pub fn set_path_lost(&mut self, lost: bool) {
+        self.lost_from = lost.then_some(self.next_packet_number);
+        let _ = self.path_secret_entry.set_sender_lost(self.sender_idx, lost);
+    }
+
+    /// Clears the lost mark once the peer acknowledges a packet sent after the mark was set.
+    #[inline]
+    pub fn on_largest_acknowledged(&mut self, largest_acknowledged: VarInt) {
+        if matches!(self.lost_from, Some(lost_from) if largest_acknowledged >= lost_from) {
+            self.set_path_lost(false);
+        }
+    }
+
+    /// True when this context has packets that wait for an acknowledgement and the peer
+    /// hasn't acknowledged any of them for a persistent congestion period of its RTT estimate
+    /// (RFC 9002, section 7.6.1): `(smoothed_rtt + max(4 * rttvar, 1ms) + max_ack_delay) * 3`.
+    ///
+    /// The period counts from the later of the last acknowledgement and the time the context
+    /// began to wait for one. The PTO wheel checks it each time it fires for this
+    /// context, at least once a base probe timeout period, so a pair is marked lost within
+    /// about one probe timeout of the period's end.
+    pub fn has_stopped_delivering(&self, now: precision::Timestamp) -> bool {
+        if !self.inflight.has_inflight() {
+            return false;
+        }
+        let Some(waiting_since) = self.ack_wait_since else {
+            return false;
+        };
+        let elapsed = now
+            .nanos_since(waiting_since)
+            .min(now.nanos_since(self.last_peer_activity));
+        let threshold = self.rtt_estimator.persistent_congestion_threshold();
+        elapsed >= threshold.as_nanos() as u64
+    }
+
+    /// True when this context's pair is lost, it holds frames to move, and another sender of
+    /// the path secret entry still delivers.
+    #[inline]
+    pub fn should_move_frames(&self) -> bool {
+        self.is_path_lost()
+            && (self.inflight.has_inflight() || self.has_pending_data())
+            && self.path_secret_entry.has_delivering_sender()
+    }
+
+    /// Moves every inflight and pending frame of this context to `output` as pending, so that
+    /// the send contexts of the pairs that still deliver send them.
+    ///
+    /// Unlike [`Self::drain_frames`], it leaves the pending acknowledgements and the freed
+    /// batch token in place: the context stays in use, and its probes go on. Returns the
+    /// number of frames moved.
+    pub fn move_frames(
+        &mut self,
+        output: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
+    ) -> usize {
+        let mut moved = 0usize;
+        let mut discarded_bytes = 0usize;
+        let range = self.inflight.get_range();
+        for (_pn, packet) in self.inflight.remove_range(range) {
+            if let Some(tx_info) = &packet.transmission_info {
+                discarded_bytes += tx_info.sent_bytes as usize;
+            }
+            for mut frame in packet.frames {
+                frame.status = frame::TransmissionStatus::Pending;
+                let _ = output.send(frame);
+                moved += 1;
+            }
+        }
+        if discarded_bytes > 0 {
+            self.cca.on_packet_discarded(discarded_bytes);
+        }
+        for queue in &mut self.queues {
+            while let Some(mut frame) = queue.pop_front() {
+                frame.status = frame::TransmissionStatus::Pending;
+                let _ = output.send(frame);
+                moved += 1;
+            }
+        }
+        self.ack_wait_since = None;
+        self.invariants();
+        moved
     }
 
     /// Drains all inflight and pending frames from this context.
@@ -1575,6 +1702,11 @@ impl Cache {
         self.send_counters.on_context_removed();
         let mut ctx = ctx.borrow_mut();
         ctx.invalidated = true;
+        // The routers read the lost mark from the path secret entry, and once the context leaves
+        // the cache, none of its probes can clear the mark.
+        if ctx.is_path_lost() {
+            ctx.set_path_lost(false);
+        }
         debug!(%id, sender_idx = %self.sender_idx, "invalidating send context");
         Some(ctx.drain_frames(Some(reason), cancelled))
     }
@@ -1625,6 +1757,10 @@ impl Cache {
         self.send_counters.on_context_removed();
         let mut ctx = ctx.borrow_mut();
         ctx.invalidated = true;
+        // Clear the lost mark, as `invalidate` does.
+        if ctx.is_path_lost() {
+            ctx.set_path_lost(false);
+        }
         debug!(
             %id,
             sender_idx = %self.sender_idx,

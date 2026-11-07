@@ -290,6 +290,10 @@ impl Entry {
         !self.peer_data_addrs.is_empty()
     }
 
+    /// The bit of a sender's load score slot that marks the sender's interface pair lost. A
+    /// load score is nanoseconds since the epoch, far below this bit.
+    const LOST_SENDER: u64 = 1 << 63;
+
     fn sender_index(&self, sender_idx: LocalSenderId) -> Option<usize> {
         let len = self.sender_load_scores.len();
         if len == 0 {
@@ -346,7 +350,7 @@ impl Entry {
         let Some(sender_idx) = self.sender_index(sender_idx) else {
             return 0;
         };
-        self.sender_load_scores[sender_idx].load(Ordering::Acquire)
+        self.sender_load_scores[sender_idx].load(Ordering::Acquire) & !Self::LOST_SENDER
     }
 
     /// Update the load score for the given sender slot.
@@ -370,9 +374,54 @@ impl Entry {
         };
         let delay = Self::queue_drain_delay(queued_bytes, bandwidth);
         let score = base + delay;
-        let score_value = Self::score_as_u64(score);
-        self.sender_load_scores[sender_idx].store(score_value, Ordering::Release);
+        let score_value = Self::score_as_u64(score).min(Self::LOST_SENDER - 1);
+        // Only this sender's send worker writes its slot, so the lost mark read here is still
+        // the slot's mark at the store.
+        let slot = &self.sender_load_scores[sender_idx];
+        let lost = slot.load(Ordering::Relaxed) & Self::LOST_SENDER;
+        slot.store(score_value | lost, Ordering::Release);
         score
+    }
+
+    /// Marks the interface pair of a sender lost, or delivering again, so that the routers
+    /// stop choosing it for new batches while another sender delivers. Returns whether the
+    /// mark changed; an entry without sender slots doesn't keep one.
+    pub fn set_sender_lost(&self, sender_idx: LocalSenderId, lost: bool) -> bool {
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return false;
+        };
+        let slot = &self.sender_load_scores[sender_idx];
+        let previous = if lost {
+            slot.fetch_or(Self::LOST_SENDER, Ordering::AcqRel)
+        } else {
+            slot.fetch_and(!Self::LOST_SENDER, Ordering::AcqRel)
+        };
+        ((previous & Self::LOST_SENDER) != 0) != lost
+    }
+
+    /// True when the interface pair of the sender is marked lost.
+    #[inline]
+    pub fn is_sender_lost(&self, sender_idx: LocalSenderId) -> bool {
+        let Some(sender_idx) = self.sender_index(sender_idx) else {
+            return false;
+        };
+        self.sender_load_scores[sender_idx].load(Ordering::Acquire) & Self::LOST_SENDER != 0
+    }
+
+    /// True when the interface pair of at least one sender is marked lost.
+    #[inline]
+    pub fn has_lost_sender(&self) -> bool {
+        self.sender_load_scores
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) & Self::LOST_SENDER != 0)
+    }
+
+    /// True when the interface pair of at least one sender isn't marked lost.
+    #[inline]
+    pub fn has_delivering_sender(&self) -> bool {
+        self.sender_load_scores
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) & Self::LOST_SENDER == 0)
     }
 
     pub fn idle_timeout(&self) -> Duration {
