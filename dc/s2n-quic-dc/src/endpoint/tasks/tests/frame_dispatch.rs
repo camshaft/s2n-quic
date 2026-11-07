@@ -584,7 +584,11 @@ fn the_priority_router_holds_frames_without_send_credit_at_the_window() {
     // The second frame, and the frame with send credit in the later lane, wait at the window.
     assert_eq!(poll_router(&mut router), Poll::Pending);
     assert!(take_lanes(&mut lanes).is_empty());
-    assert_eq!(window.round(), 2, "each pass of the priority router starts a round");
+    assert_eq!(
+        window.round(),
+        2,
+        "each pass of the priority router starts a round"
+    );
 
     // A worker's sender takes the first frame's batch, which releases its bytes.
     window.release(costs[0], window.round());
@@ -721,7 +725,11 @@ fn a_highest_priority_batch_keeps_the_windows_round_and_its_limit() {
     });
 
     let arrivals = arrivals.lock().unwrap();
-    assert_eq!(arrivals.len(), 2, "the ping and the bulk frame go in two batches");
+    assert_eq!(
+        arrivals.len(),
+        2,
+        "the ping and the bulk frame go in two batches"
+    );
     assert!(
         arrivals
             .iter()
