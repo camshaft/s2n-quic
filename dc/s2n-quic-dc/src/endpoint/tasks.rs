@@ -1829,21 +1829,27 @@ where
 // ── FrameReceiver ──────────────────────────────────────────────────────────
 
 /// Adapts the frame submission channel's `poll_swap` into a `Receiver<()>` so
-/// it can be drained via `drain_budgeted`. A poll_recv moves the frames of a swap
-/// into per-priority lane senders.
+/// it can be drained via `drain_budgeted`. A poll_recv swaps in each occupied shard of the
+/// channel and moves the frames the window admits into per-priority lane senders.
 ///
 /// A frame without send credit goes into its lane only once `window` admits its bytes, which
 /// stay in the window until a worker's sender takes the frame's batch. The frames the window
-/// refuses wait in `staging`, each lane's in order, and the receiver doesn't swap again until
-/// it has moved them, so the frames submitted meanwhile wait in the submission channel. A frame
-/// with send credit isn't counted, since the send credit pool bounds it, but it waits behind a
-/// refused frame of its lane or of a lane before it.
+/// refuses wait in `staging`, each lane's in order, and the frames submitted meanwhile go in
+/// behind them, so that they don't wait in the submission channel. A frame with a completion
+/// sender isn't dropped here, since its producer waits on that completion. A reset without
+/// one is dropped where a copy of it waits in `staging` already: no producer waits on it, and
+/// the waiting copy resets the same queue. A frame with send credit isn't counted, since the
+/// send credit pool bounds it, but it waits behind a refused frame of its lane or of a lane
+/// before it.
 struct FrameReceiver<Tx> {
     frame_rx: SubmissionReceiver,
-    /// The frames of the last swap that the window didn't admit yet.
+    /// The frames the window didn't admit yet, each lane's in the order the swaps brought them.
     staging: PriorityStorage,
-    /// An empty storage, which takes the frames that `move_admitted` keeps.
+    /// An empty storage, which `poll_swap` fills and which takes the frames that
+    /// `move_admitted` keeps.
     swapped: PriorityStorage,
+    /// The resets without a completion sender that wait in `staging`.
+    resets: WaitingResets,
     priority_list_txs: [Tx; Priority::LEVELS],
     q_router_to_batcher: [QueueGauge; Priority::LEVELS],
     window: CreditlessWindow,
@@ -1863,6 +1869,7 @@ where
             frame_rx,
             staging: PriorityStorage::default(),
             swapped: PriorityStorage::default(),
+            resets: WaitingResets::default(),
             priority_list_txs,
             q_router_to_batcher,
             window,
@@ -1891,7 +1898,10 @@ where
                     refused = true;
                     break;
                 }
-                admitted.push_back(queue.pop_front().expect("the queue holds a front frame"));
+                let frame = queue.pop_front().expect("the queue holds a front frame");
+                // A reset that leaves for its lane doesn't wait any longer, so a later copy waits.
+                self.resets.remove(&frame);
+                admitted.push_back(frame);
             }
             if !admitted.is_empty() {
                 moved = true;
@@ -1906,6 +1916,85 @@ where
             self.window.register(cx.waker());
         }
         moved
+    }
+
+    /// Moves the frames that `poll_swap` put into `swapped` behind the frames of `staging`,
+    /// each lane's in order, and drops each reset whose copy waits in `staging` already.
+    fn take_swapped(&mut self) {
+        for (priority, queue) in self.swapped.drain() {
+            let queue = if priority == Priority::QueueReset {
+                self.resets.take_new(queue)
+            } else {
+                queue
+            };
+            frame::HomogeneousBatch { queue, priority }.append_to(&mut self.staging);
+        }
+    }
+}
+
+/// The credentials of a reset's peer, with the source and destination queue ids and the
+/// binding id the reset carries.
+type ResetKey = (crate::credentials::Id, u64, u64, u64);
+
+/// The resets without a completion sender or send credit that wait in the priority router's
+/// `staging`, with each header that waits, by their peer and the queue they reset.
+#[derive(Default)]
+struct WaitingResets {
+    waiting: std::collections::HashMap<ResetKey, Vec<frame::Header>>,
+}
+
+impl WaitingResets {
+    /// Returns the key of `frame` where it is a reset without a completion sender or send
+    /// credit, which no producer waits on.
+    fn key(frame: &Frame) -> Option<ResetKey> {
+        let frame::Header::QueueReset {
+            queue_pair,
+            binding_id,
+            ..
+        } = frame.header
+        else {
+            return None;
+        };
+        if frame.completion.is_some() || frame.flow_credits != 0 {
+            return None;
+        }
+        Some((
+            *frame.path_secret_entry.id(),
+            queue_pair.source_queue_id.as_u64(),
+            queue_pair.dest_queue_id.as_u64(),
+            binding_id.as_u64(),
+        ))
+    }
+
+    /// Returns the frames of `queue` in order, without each reset whose copy waits already,
+    /// and records each other reset that `key` returns a key for as waiting.
+    fn take_new(&mut self, mut queue: Queue<Frame>) -> Queue<Frame> {
+        let mut kept = Queue::<Frame>::new();
+        while let Some(frame) = queue.pop_front() {
+            if let Some(key) = Self::key(&frame) {
+                let headers = self.waiting.entry(key).or_default();
+                if headers.contains(&frame.header) {
+                    // The waiting copy resets the same queue, and no producer waits on this one.
+                    continue;
+                }
+                headers.push(frame.header);
+            }
+            kept.push_back(frame);
+        }
+        kept
+    }
+
+    /// Forgets `frame` as it leaves `staging` for its lane, so that a later copy of it waits.
+    fn remove(&mut self, frame: &Frame) {
+        let Some(key) = Self::key(frame) else {
+            return;
+        };
+        if let Some(headers) = self.waiting.get_mut(&key) {
+            headers.retain(|header| *header != frame.header);
+            if headers.is_empty() {
+                self.waiting.remove(&key);
+            }
+        }
     }
 }
 
@@ -1923,24 +2012,43 @@ where
             return Poll::Pending;
         }
 
-        // The frames the window refused go before the next swap.
-        if !self.staging.is_empty() {
-            if !self.move_admitted(cx) {
-                return Poll::Pending;
+        // Each occupied shard of the submission channel goes into `staging`, behind the frames
+        // the window refused, so that the frames submitted meanwhile don't wait in the channel.
+        // A swap takes one shard, so this swaps until the channel doesn't hold a frame.
+        let mut took_frames = false;
+        let mut closed = false;
+        while !budget.is_exhausted() {
+            match self.frame_rx.poll_swap(cx, &mut self.swapped) {
+                Poll::Ready(Some(())) => {
+                    budget.consume();
+                    took_frames = true;
+                    self.take_swapped();
+                }
+                Poll::Ready(None) => {
+                    closed = true;
+                    break;
+                }
+                Poll::Pending => break,
             }
-            budget.consume();
+        }
+
+        if self.staging.is_empty() {
+            if closed {
+                return Poll::Ready(None);
+            }
+        } else if self.move_admitted(cx) {
+            if !took_frames {
+                budget.consume();
+            }
             return Poll::Ready(Some(()));
         }
 
-        match self.frame_rx.poll_swap(cx, &mut self.staging) {
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(())) => {
-                budget.consume();
-                self.move_admitted(cx);
-                Poll::Ready(Some(()))
-            }
+        // The channel's waker wakes this task, and the window's where it refused a frame, unless
+        // the budget ran out before the channel was empty.
+        if budget.is_exhausted() {
+            budget.set_needs_wake();
         }
+        Poll::Pending
     }
 
     fn on_consumed(&mut self, _bytes: u64) {}
