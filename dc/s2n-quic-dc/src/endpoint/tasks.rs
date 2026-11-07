@@ -1985,6 +1985,9 @@ where
 /// pool bounds it. Each poll swaps in one shard of the submission channel behind the frames
 /// that wait in `staging`, and a poll that swaps returns ready, so that the next poll swaps
 /// the next shard and a new frame of a peer that the window doesn't hold back isn't delayed.
+/// A frame with a completion sender isn't dropped here, since its producer waits on that
+/// completion. A reset without one or send credit is dropped where a copy of it waits in
+/// `staging` already: no producer waits on it, and the waiting copy resets the same queue.
 struct FrameReceiver<Tx> {
     frame_rx: SubmissionReceiver,
     /// The frames that the window didn't admit yet, and the frames of their peers after them.
@@ -1995,6 +1998,8 @@ struct FrameReceiver<Tx> {
     incoming: PriorityStorage,
     /// Whether the submission channel has closed.
     closed: bool,
+    /// The resets without a completion sender or send credit that wait in `staging`.
+    resets: WaitingResets,
     /// The peers with a frame that the window refused in this pass, whose later frames wait.
     held_back: std::collections::HashSet<PeerKey>,
     priority_list_txs: [Tx; Priority::LEVELS],
@@ -2018,6 +2023,7 @@ where
             swapped: PriorityStorage::default(),
             incoming: PriorityStorage::default(),
             closed: false,
+            resets: WaitingResets::default(),
             held_back: Default::default(),
             priority_list_txs,
             q_router_to_batcher,
@@ -2046,6 +2052,8 @@ where
                     self.held_back.insert(peer);
                     kept.push_back(frame);
                 } else {
+                    // A reset that leaves for its lane stops waiting, so a later copy waits.
+                    self.resets.remove(&frame);
                     admitted.push_back(frame);
                 }
             }
@@ -2066,6 +2074,85 @@ where
             self.window.register(cx.waker());
         }
         moved
+    }
+
+    /// Moves the frames that `poll_swap` put into `incoming` behind the frames of `staging`,
+    /// each lane's in order, and drops each reset whose copy waits in `staging` already.
+    fn take_incoming(&mut self) {
+        for (priority, queue) in self.incoming.drain() {
+            let queue = if priority == Priority::QueueReset {
+                self.resets.take_new(queue)
+            } else {
+                queue
+            };
+            frame::HomogeneousBatch { queue, priority }.append_to(&mut self.staging);
+        }
+    }
+}
+
+/// The credentials of a reset's peer, with the source and destination queue ids and the
+/// binding id the reset carries.
+type ResetKey = (crate::credentials::Id, u64, u64, u64);
+
+/// The resets without a completion sender or send credit that wait in the priority router's
+/// `staging`, with each header that waits, by their peer and the queue they reset.
+#[derive(Default)]
+struct WaitingResets {
+    waiting: std::collections::HashMap<ResetKey, Vec<frame::Header>>,
+}
+
+impl WaitingResets {
+    /// Returns the key of `frame` where it is a reset without a completion sender or send
+    /// credit, which no producer waits on.
+    fn key(frame: &Frame) -> Option<ResetKey> {
+        let frame::Header::QueueReset {
+            queue_pair,
+            binding_id,
+            ..
+        } = frame.header
+        else {
+            return None;
+        };
+        if frame.completion.is_some() || frame.flow_credits != 0 {
+            return None;
+        }
+        Some((
+            *frame.path_secret_entry.id(),
+            queue_pair.source_queue_id.as_u64(),
+            queue_pair.dest_queue_id.as_u64(),
+            binding_id.as_u64(),
+        ))
+    }
+
+    /// Returns the frames of `queue` in order, without each reset whose copy waits already,
+    /// and records each other reset that `key` returns a key for as waiting.
+    fn take_new(&mut self, mut queue: Queue<Frame>) -> Queue<Frame> {
+        let mut kept = Queue::<Frame>::new();
+        while let Some(frame) = queue.pop_front() {
+            if let Some(key) = Self::key(&frame) {
+                let headers = self.waiting.entry(key).or_default();
+                if headers.contains(&frame.header) {
+                    // The waiting copy resets the same queue, and no producer waits on this one.
+                    continue;
+                }
+                headers.push(frame.header);
+            }
+            kept.push_back(frame);
+        }
+        kept
+    }
+
+    /// Forgets `frame` as it leaves `staging` for its lane, so that a later copy of it waits.
+    fn remove(&mut self, frame: &Frame) {
+        let Some(key) = Self::key(frame) else {
+            return;
+        };
+        if let Some(headers) = self.waiting.get_mut(&key) {
+            headers.retain(|header| *header != frame.header);
+            if headers.is_empty() {
+                self.waiting.remove(&key);
+            }
+        }
     }
 }
 
@@ -2092,9 +2179,7 @@ where
                 Poll::Pending => {}
                 Poll::Ready(Some(())) => {
                     swapped_in = true;
-                    for (priority, queue) in self.incoming.drain() {
-                        frame::HomogeneousBatch { queue, priority }.append_to(&mut self.staging);
-                    }
+                    self.take_incoming();
                 }
             }
         }

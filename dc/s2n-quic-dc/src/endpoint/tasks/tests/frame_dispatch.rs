@@ -855,6 +855,209 @@ fn the_priority_router_swaps_the_next_shard_after_a_swap_of_held_back_frames() {
     assert!(take_peers(&mut lanes).is_empty());
 }
 
+// -- The frames in front of the window while it refuses a frame -----------------------------
+
+/// Returns a reset of the queue `dest_queue_id` with `error_code`, without a completion sender
+/// or send credit, as the endpoint sends one in answer to a peer's frame.
+fn reset_frame(
+    pse: &std::sync::Arc<crate::path::secret::map::Entry>,
+    dest_queue_id: u8,
+    error_code: u8,
+) -> crate::intrusive::Entry<frame::Frame> {
+    use crate::packet::datagram::{QueuePair, ResetTarget};
+    use s2n_quic_core::varint::VarInt;
+
+    let mut reset = test_frame(pse);
+    reset.header = frame::Header::QueueReset {
+        queue_pair: QueuePair {
+            source_queue_id: VarInt::from_u8(1),
+            dest_queue_id: VarInt::from_u8(dest_queue_id),
+        },
+        binding_id: VarInt::from_u8(1),
+        reset_target: ResetTarget::Both,
+        error_code: VarInt::from_u8(error_code),
+        init: None,
+    };
+    reset
+}
+
+/// Submits `frames` in one batch, which goes into the sender's next shard.
+fn submit(
+    frame_tx: &mut SubmissionSender,
+    frames: impl IntoIterator<Item = crate::intrusive::Entry<frame::Frame>>,
+) {
+    let mut input = PriorityInput::default();
+    for entry in frames {
+        input.push(entry);
+    }
+    frame_tx.send_batch(input).unwrap();
+}
+
+/// While the window refuses a frame, the priority router drops each copy of a reset without a
+/// completion sender that waits already, so the frames in front of the window don't grow with
+/// the copies that a peer's frames bring. A copy submitted after the waiting reset left for its
+/// lane waits again.
+#[test]
+fn the_priority_router_keeps_one_copy_of_a_waiting_reset() {
+    use core::task::Poll;
+
+    let pse = peer_entry("127.0.0.1:4433");
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    let holder = ping(&pse);
+    let holder_cost = holder.byte_cost();
+    submit(&mut frame_tx, [holder]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(holder_cost, 0)]);
+    // Each frame holds a reference to its path secret entry, wherever it waits.
+    let unheld = Arc::strong_count(&pse);
+
+    // The window holds the ping's bytes, so it refuses each reset of the same peer. The poll
+    // that swaps returns ready, and the next poll finds the channel empty.
+    let reset_cost = reset_frame(&pse, 2, 1).byte_cost();
+    for copies in 1..=4 {
+        submit(&mut frame_tx, (0..copies).map(|_| reset_frame(&pse, 2, 1)));
+        assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+        assert_eq!(poll_router(&mut router), Poll::Pending);
+        assert!(take_lanes(&mut lanes).is_empty());
+        assert_eq!(
+            Arc::strong_count(&pse),
+            unheld + 1,
+            "one copy of the reset waits, and the channel doesn't hold a copy"
+        );
+    }
+
+    // A worker's sender takes the ping's batch, which releases its bytes.
+    window.release_peer(Some(PeerKey::of(&pse)), holder_cost, false);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(reset_cost, 0)]);
+    assert_eq!(Arc::strong_count(&pse), unheld);
+
+    // The reset holds the window now, and a copy submitted after it left for its lane waits,
+    // since it resets the queue again.
+    submit(&mut frame_tx, [reset_frame(&pse, 2, 1)]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert!(take_lanes(&mut lanes).is_empty());
+    assert_eq!(Arc::strong_count(&pse), unheld + 1, "the later copy waits");
+    window.release_peer(Some(PeerKey::of(&pse)), reset_cost, false);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes), [(reset_cost, 0)]);
+
+    drop(frame_tx);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
+}
+
+/// The priority router keeps each reset that differs from a waiting one: a reset whose producer
+/// waits on its completion, a reset with send credit, a reset of another queue, a reset of the
+/// same queue with another error code, and a reset of the same queue of another peer.
+#[test]
+fn the_priority_router_keeps_each_reset_that_differs_from_a_waiting_one() {
+    use core::task::Poll;
+
+    let (pse, other) = (peer_entry("127.0.0.1:4433"), peer_entry("127.0.0.2:4433"));
+    assert!(pse.id() != other.id(), "the two peers' credentials differ");
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+    submit(&mut frame_tx, [ping(&pse)]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes).len(), 1);
+    let unheld = Arc::strong_count(&pse);
+
+    // The test's receiver stands for a producer that waits on the completion.
+    let completions = frame::failure_completion_channel();
+    let mut awaited = reset_frame(&pse, 2, 1);
+    awaited.completion = Some(completions.sender());
+    let mut credited = reset_frame(&pse, 2, 1);
+    credited.flow_credits = 64;
+    submit(
+        &mut frame_tx,
+        [
+            reset_frame(&pse, 2, 1),
+            awaited,
+            credited,
+            reset_frame(&pse, 3, 1),
+            reset_frame(&pse, 2, 7),
+            reset_frame(&other, 2, 1),
+            // Copies of the waiting resets of queues 3 and 2.
+            reset_frame(&pse, 3, 1),
+            reset_frame(&pse, 2, 1),
+        ],
+    );
+
+    // The window holds the first peer's bytes and none of the other peer's, so the other
+    // peer's reset goes to its lane, and the first peer's resets wait without the two copies.
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_peers(&mut lanes), [(PeerKey::of(&other), 0)]);
+    assert_eq!(Arc::strong_count(&pse), unheld + 5, "five resets of the first peer wait");
+
+    // The producer stops waiting before the frames leave their lanes, so that they may drop with
+    // a pending status, and the router then holds the window's only clone, so it moves every
+    // frame.
+    drop(completions);
+    drop(window);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes).len(), 5);
+}
+
+/// A swap takes one shard of the submission channel, and the priority router drops the copies
+/// of waiting resets in each shard it swaps, so that the swaps while the window refuses a frame
+/// leave one reset of each queue in front of the window.
+#[test]
+fn the_priority_router_drops_the_copies_of_waiting_resets_in_every_shard() {
+    use core::task::Poll;
+
+    let pse = peer_entry("127.0.0.1:4433");
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = sharded_priority_router(window.clone(), 4);
+    submit(&mut frame_tx, [ping(&pse)]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes).len(), 1);
+    let unheld = Arc::strong_count(&pse);
+
+    // Each batch goes into the next of the four shards, and each round submits a reset of each
+    // of four queues. Each poll swaps one shard and returns ready, and the poll after the four
+    // swaps finds the channel empty.
+    for round in 0..3 {
+        for queue in 2..6 {
+            submit(&mut frame_tx, [reset_frame(&pse, queue, 1)]);
+        }
+        for _ in 0..4 {
+            assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+        }
+        assert_eq!(poll_router(&mut router), Poll::Pending);
+        assert!(take_lanes(&mut lanes).is_empty());
+        assert_eq!(
+            Arc::strong_count(&pse),
+            unheld + 4,
+            "round {round}: one reset of each queue waits, and the channel doesn't hold one"
+        );
+    }
+
+    // The router holds the window's only clone now, so it moves every frame.
+    drop(window);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes).len(), 4);
+    drop(frame_tx);
+    assert_eq!(poll_router(&mut router), Poll::Ready(None));
+}
+
+/// The waiting resets forget a reset as it leaves for its lane, and don't keep an empty list for
+/// its queue.
+#[test]
+fn the_waiting_resets_forget_a_reset_that_leaves_for_its_lane() {
+    let pse = peer_entry("127.0.0.1:4433");
+    let mut resets = tasks::WaitingResets::default();
+    let mut queue = crate::intrusive::Queue::<frame::Frame>::new();
+    queue.push_back(reset_frame(&pse, 2, 1));
+    queue.push_back(reset_frame(&pse, 2, 1));
+    let mut kept = resets.take_new(queue);
+    assert_eq!(kept.len(), 1, "the copy is dropped");
+    let reset = kept.pop_front().expect("the first reset is kept");
+    resets.remove(&reset);
+    assert!(resets.waiting.is_empty());
+}
+
 // -- The window in each batch router of `frame_dispatch` -----------------------------------
 
 /// Like [`setup_with_pacing`] but over `window`, the window of the frames without send credit,
