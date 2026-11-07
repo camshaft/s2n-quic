@@ -58,6 +58,7 @@ pub mod testing;
 mod tests;
 
 pub use error::Error;
+pub use frame_trace::arm_slot_holds;
 pub use s2n_quic_platform::features::Gso;
 
 /// The maximum time a stream will be open without activity from the peer
