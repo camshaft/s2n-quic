@@ -7,7 +7,8 @@ use crate::{
         self,
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
-            CompletionDispatcher, FrameBatch, PathSecretMapEntry, PickTwo,
+            CompletionDispatcher, CreditlessWindow, FrameBatch, InterfacePacedPickTwo,
+            PathSecretMapEntry, PickTwo, SendPacing, WindowSender, BATCH_TARGET_BYTES,
         },
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
@@ -19,7 +20,11 @@ use crate::{
     runtime::Spawner,
     socket::{
         channel::{
-            intrusive::{self, unsync},
+            intrusive::{
+                self,
+                sharded::{Input as _, Storage as _},
+                unsync,
+            },
             Budget, FilterMap, Flatten, FlattenList, FlattenSegments, InspectErr, Map, Paced,
             Priority as PriorityRx, PrioritySelect, Receiver, ReceiverExt as _, RouterAdapter,
             SocketReceiver, SocketSender, UnboundedSender,
@@ -60,8 +65,8 @@ mod tests;
 ///
 /// `frame_dispatch` is the boundary between producers that submit individual [`Frame`] values
 /// and send workers that consume [`FrameBatch`] values. It is responsible for preserving frame
-/// priority, batching work by peer/path secret, applying endpoint-wide pacing, and choosing a
-/// send worker for each batch.
+/// priority, batching work by peer/path secret, pacing the send sockets of each local interface
+/// at that interface's send rate, and choosing a send worker for each batch.
 ///
 /// # Contract
 ///
@@ -70,8 +75,10 @@ mod tests;
 /// - Frames from different priority classes are never merged into the same batch.
 /// - The spawned tasks are the only side effect; callers do not receive a handle back and must
 ///   keep the underlying executor running for progress.
-/// - `overall_send_rate` and `budgets` bound how aggressively work is drained once the tasks are
-///   spawned.
+/// - `pacing` and `budgets` bound how aggressively work is drained once the tasks are spawned.
+///   With one interface, a [`Paced`] stage paces every send socket at its rate before
+///   [`PickTwo`] chooses a worker; with more, [`InterfacePacedPickTwo`] chooses the worker first
+///   and paces each interface's sockets with a token bucket of their own.
 #[allow(clippy::too_many_arguments)]
 pub fn frame_dispatch<S, Clk>(
     spawner: &mut impl Spawner,
@@ -79,10 +86,56 @@ pub fn frame_dispatch<S, Clk>(
     worker_senders: IdMap<LocalSenderId, S>,
     rng: crate::xorshift::Rng,
     clock: Clk,
-    overall_send_rate: Rate,
+    pacing: SendPacing,
+    budgets: Budgets,
+    counter_registry: counter::Registry,
+    path_secret_map: Option<crate::path::secret::Map>,
+    send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+) where
+    S: UnboundedSender<Entry<FrameBatch>> + 'static,
+    Clk: precision::Clock + Clone + 'static,
+{
+    // The frames without send credit in the lanes below, and in the batch routers after them,
+    // stay in this window until a worker's sender takes their batch, which bounds their bytes:
+    // the send credit pool bounds the other frames. The window starts at the batch router's
+    // batch target, so that it admits a full batch, and grows and shrinks with how fast the
+    // workers take the batches.
+    // Where the endpoint passes its path secret map, the window records each frame it refuses
+    // and each change of its limit as an event of the map's subscriber.
+    let window = match path_secret_map {
+        Some(path_secret_map) => {
+            CreditlessWindow::with_path_secret_map(BATCH_TARGET_BYTES, path_secret_map)
+        }
+        None => CreditlessWindow::new(BATCH_TARGET_BYTES),
+    };
+    frame_dispatch_over(
+        spawner,
+        frame_rx,
+        worker_senders,
+        rng,
+        clock,
+        pacing,
+        budgets,
+        counter_registry,
+        send_credit_pool,
+        window,
+    );
+}
+
+/// [`frame_dispatch`] over `window`, the window of the frames without send credit, which a test
+/// passes to read its limit.
+#[allow(clippy::too_many_arguments)]
+fn frame_dispatch_over<S, Clk>(
+    spawner: &mut impl Spawner,
+    frame_rx: SubmissionReceiver,
+    worker_senders: IdMap<LocalSenderId, S>,
+    rng: crate::xorshift::Rng,
+    clock: Clk,
+    pacing: SendPacing,
     budgets: Budgets,
     counter_registry: counter::Registry,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    window: CreditlessWindow,
 ) where
     S: UnboundedSender<Entry<FrameBatch>> + 'static,
     Clk: precision::Clock + Clone + 'static,
@@ -108,12 +161,12 @@ pub fn frame_dispatch<S, Clk>(
         let priority_list_txs: [_; Priority::LEVELS] =
             core::array::from_fn(|i| priority_txs_raw[i].clone().into_list_sender());
 
-        let rx = FrameReceiver {
+        let rx = FrameReceiver::new(
             frame_rx,
-            staging: PriorityStorage::default(),
             priority_list_txs,
-            q_router_to_batcher: q_router_to_batcher.clone(),
-        };
+            q_router_to_batcher.clone(),
+            window.clone(),
+        );
         let task_counter = counter_registry
             .register_task("task.priority_router")
             .with_registration_metadata(
@@ -140,24 +193,78 @@ pub fn frame_dispatch<S, Clk>(
                     .with_function("endpoint::tasks::frame_dispatch");
                 counter::GaugedQueueReceiver::new(rx.into_list_receiver(), receiver)
             })
+            .collect::<Vec<_>>();
+        // Batches the frames of `lanes`, a lane for each of their priority levels, highest first.
+        // Each batch router that this builds, the highest lane's among them, sets on each batch
+        // the window's round in which it reads the batch, and a worker's sender releases the
+        // batch's bytes from the window as it takes the batch.
+        let batch_frames = |lanes: Vec<_>| {
+            let rx = PriorityRx::new(lanes);
+            let rx = BatchFramesByPathSecret::new(rx, &clock, pacing.total_rate());
+            let read_in = window.clone();
+            Map::new(rx, move |mut batch: FrameBatch| {
+                batch.set_window_round(read_in.round());
+                Entry::new(batch)
+            })
+        };
+        let worker_senders: IdMap<LocalSenderId, WindowSender<S>> = worker_senders
+            .into_iter()
+            .map(|(id, sender)| (id, WindowSender::new(sender, window.clone())))
             .collect();
-        let rx = PriorityRx::new(priority_batch_rxs);
-        let rx = BatchFramesByPathSecret::new(rx, &clock, overall_send_rate);
-        let rx = Map::new(rx, Entry::new);
-        let rx = Paced::new(rx, clock, overall_send_rate);
-        let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
-        let task_counter = counter_registry
-            .register_task("task.frame_dispatch")
-            .with_registration_metadata(
-                "task.frame_dispatch",
-                "Batches, paces, and routes frame batches to worker send sockets",
-                "endpoint::tasks::frame_dispatch",
+        let register_task_counter = || {
+            counter_registry
+                .register_task("task.frame_dispatch")
+                .with_registration_metadata(
+                    "task.frame_dispatch",
+                    "Batches, paces, and routes frame batches to worker send sockets",
+                    "endpoint::tasks::frame_dispatch",
+                )
+        };
+        if pacing.interface_count() == 1 {
+            // Every send socket is on one interface: pace them together at its rate, then choose
+            // a worker for each batch.
+            let rx = batch_frames(priority_batch_rxs);
+            let rx = Paced::new(rx, clock, pacing.total_rate());
+            let rx = PickTwo::new(rx, worker_senders, rng, &counter_registry, send_credit_pool);
+            let task_counter = register_task_counter();
+            spawner.spawn_receiver_task(
+                rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
+                Some(budgets.frame_dispatch),
+                task_counter,
             );
-        spawner.spawn_receiver_task(
-            rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
-            Some(budgets.frame_dispatch),
-            task_counter,
-        );
+        } else {
+            // The send sockets are on several interfaces: choose a worker for each batch first,
+            // then pace the batch with the token bucket of that worker's interface.
+            // Where the endpoint chooses an interface for the highest-priority traffic, the
+            // frames of the highest level are batched apart from the others, into an input of
+            // the router's own, so that their batches go to that interface even while every
+            // interface holds a batch.
+            let mut lanes = priority_batch_rxs;
+            let highest_lane = pacing
+                .highest_priority()
+                .map(|_| lanes.remove(Priority::QueueReset.as_index()));
+            let rx = batch_frames(lanes);
+            let highest_rx = highest_lane.map(|lane| batch_frames(vec![lane]));
+            let rx = InterfacePacedPickTwo::new(
+                rx,
+                worker_senders,
+                rng,
+                clock,
+                &pacing,
+                &counter_registry,
+                send_credit_pool,
+            );
+            let rx = match highest_rx {
+                Some(highest_rx) => rx.with_highest_priority_input(highest_rx),
+                None => rx,
+            };
+            let task_counter = register_task_counter();
+            spawner.spawn_receiver_task(
+                rx.drain_budgeted_metered(Some(budgets.frame_dispatch), task_counter.clone()),
+                Some(budgets.frame_dispatch),
+                task_counter,
+            );
+        }
     }
 }
 
@@ -236,6 +343,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    path_secret_map: crate::path::secret::Map,
 ) where
     Socket: crate::socket::send::Socket + 'static,
     Clk: precision::Clock + s2n_quic_core::time::Clock + Clone + 'static,
@@ -293,10 +401,11 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         .map(|(local_id, st)| {
             sender_idx_to_local[st.sender_idx] = local_id;
 
-            let cache = Rc::new(RefCell::new(send::Cache::new(
-                &counter_registry,
-                st.sender_idx,
-            )));
+            let cache = Rc::new(RefCell::new(
+                send::Cache::new(&counter_registry, st.sender_idx)
+                    .with_place(st.interface_place)
+                    .with_path_secret_map(path_secret_map.clone()),
+            ));
 
             (local_id, cache)
         })
@@ -387,6 +496,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             GaugedSender::new(pto_wheel_tx.clone(), pto_wheel_sender),
             GaugedSender::new(idle_wheel_tx.clone(), idle_wheel_sender),
             send_credit_pool.clone(),
+            frame_tx.clone(),
         );
         let task_counter = counter_registry
             .register_nominal_task("task.context_resolver", &variant)
@@ -586,6 +696,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             tx_pto_requested,
             send_caches.clone(),
             sender_idx_to_local.clone(),
+            frame_tx.clone(),
         );
         let task_counter = counter_registry
             .register_nominal_task("task.pto_wheel", &variant)
@@ -693,6 +804,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             freed_batch_tx.clone(),
             asm_counters,
             send_counters,
+            Some(path_secret_map.clone()),
             st.socket,
             immediate_tx.clone(),
             tx_wheel_tx,
@@ -766,8 +878,12 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
 ///   no wheel work is emitted.
 /// - Otherwise the batch is appended to the peer's pending send state and the resulting wheel
 ///   interest is forwarded to `immediate_tx`, `tx_wheel_tx`, `pto_wheel_tx`, and `idle_wheel_tx`.
+/// - Where the context's interface pair is marked lost and another pair of its peer still
+///   delivers, the context's pending and unacknowledged frames, the batch's among them, go to
+///   `retransmit_tx` at once, so that the routers send them on the pairs that deliver instead
+///   of the frames waiting for the context's next probe timeout.
 #[allow(clippy::too_many_arguments)]
-pub fn context_resolver<BatchRx, Clk, ImmW, TxW, PtoW, IdleW>(
+pub fn context_resolver<BatchRx, Clk, ImmW, TxW, PtoW, IdleW, RetxW>(
     batch_rx: BatchRx,
     mut send_caches: IdMap<LocalSendSocketId, Rc<RefCell<send::Cache>>>,
     sender_idx_to_local: IdMap<LocalSenderId, LocalSendSocketId>,
@@ -778,6 +894,7 @@ pub fn context_resolver<BatchRx, Clk, ImmW, TxW, PtoW, IdleW>(
     pto_wheel_tx: PtoW,
     idle_wheel_tx: IdleW,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    mut retransmit_tx: RetxW,
 ) -> impl Receiver<()>
 where
     BatchRx: Receiver<Entry<FrameBatch>>,
@@ -786,6 +903,7 @@ where
     TxW: UnboundedSender<Rc<RefCell<send::Context>>>,
     PtoW: UnboundedSender<Rc<RefCell<send::Context>>>,
     IdleW: UnboundedSender<Rc<RefCell<send::Context>>>,
+    RetxW: UnboundedSender<Entry<Frame>>,
 {
     let rx = Map::new(
         batch_rx,
@@ -833,7 +951,17 @@ where
 
             let wheel_interest = {
                 let mut ctx = sender.borrow_mut();
-                ctx.push_batch(batch.into_inner(), &clock)
+                let interest = ctx.push_batch(batch.into_inner(), &clock);
+                if ctx.should_move_frames() {
+                    let moved = cache.borrow().move_frames(&mut ctx, &mut retransmit_tx);
+                    debug!(
+                        moved,
+                        sender_idx = ?ctx.sender_idx,
+                        peer = %ctx.path_secret_entry.peer(),
+                        "moved a batch pushed to a lost interface pair to the pairs that deliver"
+                    );
+                }
+                interest
             };
 
             Some((sender, wheel_interest))
@@ -901,7 +1029,11 @@ where
 ///
 /// For each send context emitted by the PTO wheel, this updates probe state and forwards the
 /// resulting wheel interest back to the caller-supplied scheduling channels.
-pub fn send_pto_timeout<CtxRx, Clk, ImmW, TxW, PtoW, IdleW>(
+///
+/// Where a context's interface pair is marked lost and another pair of its peer still
+/// delivers, the context's pending and unacknowledged frames go to `retransmit_tx`, so that the
+/// routers send them on the pairs that deliver.
+pub fn send_pto_timeout<CtxRx, Clk, ImmW, TxW, PtoW, IdleW, RetxW>(
     pto_context_rx: CtxRx,
     clock: Clk,
     immediate_tx: ImmW,
@@ -912,6 +1044,7 @@ pub fn send_pto_timeout<CtxRx, Clk, ImmW, TxW, PtoW, IdleW>(
     tx_pto_requested: counter::Counter,
     send_caches: IdMap<LocalSendSocketId, Rc<RefCell<send::Cache>>>,
     sender_idx_to_local: IdMap<LocalSenderId, LocalSendSocketId>,
+    mut retransmit_tx: RetxW,
 ) -> impl Receiver<()>
 where
     CtxRx: Receiver<Rc<RefCell<send::Context>>>,
@@ -920,6 +1053,7 @@ where
     TxW: UnboundedSender<Rc<RefCell<send::Context>>>,
     PtoW: UnboundedSender<Rc<RefCell<send::Context>>>,
     IdleW: UnboundedSender<Rc<RefCell<send::Context>>>,
+    RetxW: UnboundedSender<Entry<Frame>>,
 {
     let rx = Map::new(
         pto_context_rx,
@@ -927,12 +1061,12 @@ where
             tx_pto_check.add(1);
             let wheel_interest = {
                 let mut ctx = context.borrow_mut();
+                let local_idx = sender_idx_to_local[ctx.sender_idx];
+                let cache = send_caches[local_idx].borrow();
                 let requested = ctx.pto.probe_state.is_requested();
-                let interest = ctx.on_pto_timeout(&clock);
+                let interest = cache.track_path_lost(&mut ctx, |ctx| ctx.on_pto_timeout(&clock));
                 if !requested && ctx.pto.probe_state.is_requested() {
                     tx_pto_requested.add(1);
-                    let local_idx = sender_idx_to_local[ctx.sender_idx];
-                    let cache = send_caches[local_idx].borrow();
                     let counters = cache.send_counters();
                     counters
                         .tx_probe_backoff
@@ -940,6 +1074,15 @@ where
                     if ctx.pto.backoff > 2 {
                         counters.on_probe_no_response();
                     }
+                }
+                if ctx.should_move_frames() {
+                    let moved = cache.move_frames(&mut ctx, &mut retransmit_tx);
+                    debug!(
+                        moved,
+                        sender_idx = ?ctx.sender_idx,
+                        peer = %ctx.path_secret_entry.peer(),
+                        "moved the frames of a lost interface pair to the pairs that deliver"
+                    );
                 }
                 interest
             };
@@ -1107,6 +1250,8 @@ async fn wheel_drain<A, T, F, const GRANULARITY_US: u64>(
 ///   `context_rx`.
 /// - Each input context is assembled into encrypted UDP segments for `socket`.
 /// - Any post-assembly scheduling interest is routed back through the supplied wheel senders.
+/// - The assembler publishes the lost mark of a pair that sends acknowledgements alone
+///   through `path_secret_map`, where one is set.
 /// - Socket send errors are logged and dropped; they do not terminate the pipeline.
 ///
 /// Returns a `Receiver<()>` — callers must drain it (typically via
@@ -1124,6 +1269,7 @@ pub fn send_socket_assembler<ImmediateRx, ContextRx, Clk, Socket, C, A, ImmW, Tx
     freed_batch_tx: crate::queue::FreedBatchTx,
     asm_counters: AssemblerCounters,
     send_counters: Rc<endpoint::counters::Send>,
+    path_secret_map: Option<crate::path::secret::Map>,
     socket: Socket,
     immediate_tx: ImmW,
     tx_wheel_tx: TxW,
@@ -1157,6 +1303,7 @@ where
         freed_batch_tx,
         asm_counters,
         send_counters,
+        path_secret_map,
         initial_tx_descriptor_allocs,
         send_credit_pool,
     );
@@ -1242,6 +1389,8 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let peer_addr = ctx.peer_addr;
                 let ever_responded = ctx.last_peer_activity.nanos != ctx.created_at.nanos;
                 let has_inflight = ctx.inflight.has_inflight();
+                let path_lost = ctx.is_path_lost();
+                let lost_at = ctx.lost_at;
                 let pto_backoff = ctx.pto.backoff;
                 let packets_sent = ctx.next_packet_number.as_u64();
 
@@ -1310,8 +1459,24 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 // were never acknowledged — that's evidence the peer is
                 // unreachable. If there are no inflight packets, both sides
                 // simply stopped talking (natural idle) and we must not mark dead.
-                let marked_dead = has_inflight
+                // A lost pair's probes go unacknowledged, so a lost pair with unacknowledged
+                // packets marks the peer dead only once no other pair of the peer delivers.
+                // A lost pair also marks the peer dead where the peer hasn't sent an
+                // authenticated packet on any interface since the pair was marked lost, with or
+                // without unacknowledged packets and whatever the marks of the peer's other pairs.
+                let peer_silent_since_lost =
+                    lost_at.is_some_and(|since| path_secret_entry.last_activity() < since);
+                let unacknowledged = has_inflight
+                    && !peer_silent_since_lost
+                    && !send_caches[local_id]
+                        .borrow()
+                        .skips_dead_mark(path_lost, &path_secret_entry);
+                let marked_dead = (unacknowledged || peer_silent_since_lost)
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
+                warn!(
+                    "diagnostic: idle expiry sender_idx={sender_idx} path_lost={path_lost} lost_at={:?} has_inflight={has_inflight} peer_silent_since_lost={peer_silent_since_lost} unacknowledged={unacknowledged} marked_dead={marked_dead} packets_sent={packets_sent}",
+                    lost_at.map(|at| at.nanos)
+                );
 
                 let result = send_caches[local_id].borrow_mut().invalidate(
                     &id,
@@ -1779,13 +1944,84 @@ where
 // ── FrameReceiver ──────────────────────────────────────────────────────────
 
 /// Adapts the frame submission channel's `poll_swap` into a `Receiver<()>` so
-/// it can be drained via `drain_budgeted`. Each poll_recv performs one swap and
-/// distributes the resulting frames into per-priority lane senders.
+/// it can be drained via `drain_budgeted`. A poll_recv moves the frames of a swap
+/// into per-priority lane senders.
+///
+/// A frame without send credit goes into its lane only once `window` admits its bytes, which
+/// stay in the window until a worker's sender takes the frame's batch. The frames the window
+/// refuses wait in `staging`, each lane's in order, and the receiver doesn't swap again until
+/// it has moved them, so the frames submitted meanwhile wait in the submission channel. A frame
+/// with send credit isn't counted, since the send credit pool bounds it, but it waits behind a
+/// refused frame of its lane or of a lane before it.
 struct FrameReceiver<Tx> {
     frame_rx: SubmissionReceiver,
+    /// The frames of the last swap that the window didn't admit yet.
     staging: PriorityStorage,
+    /// An empty storage, which takes the frames that `move_admitted` keeps.
+    swapped: PriorityStorage,
     priority_list_txs: [Tx; Priority::LEVELS],
     q_router_to_batcher: [QueueGauge; Priority::LEVELS],
+    window: CreditlessWindow,
+}
+
+impl<Tx> FrameReceiver<Tx>
+where
+    Tx: UnboundedSender<crate::intrusive::List<crate::intrusive::EntryAdapter<Frame>>>,
+{
+    fn new(
+        frame_rx: SubmissionReceiver,
+        priority_list_txs: [Tx; Priority::LEVELS],
+        q_router_to_batcher: [QueueGauge; Priority::LEVELS],
+        window: CreditlessWindow,
+    ) -> Self {
+        Self {
+            frame_rx,
+            staging: PriorityStorage::default(),
+            swapped: PriorityStorage::default(),
+            priority_list_txs,
+            q_router_to_batcher,
+            window,
+        }
+    }
+
+    /// Moves the frames of `staging` into their lanes, highest priority first and each lane's
+    /// in order, until the window refuses a frame, which stays in `staging` with every frame
+    /// after it. Returns whether it moved a frame.
+    fn move_admitted(&mut self, cx: &mut core::task::Context<'_>) -> bool {
+        self.window.start_round();
+        let mut moved = false;
+        let mut refused = false;
+        for (i, ((priority, mut queue), tx)) in self
+            .staging
+            .drain()
+            .zip(&mut self.priority_list_txs)
+            .enumerate()
+        {
+            let mut admitted = Queue::<Frame>::new();
+            while !refused {
+                let Some(frame) = queue.front() else {
+                    break;
+                };
+                if !self.window.admit_frame(frame) {
+                    refused = true;
+                    break;
+                }
+                admitted.push_back(queue.pop_front().expect("the queue holds a front frame"));
+            }
+            if !admitted.is_empty() {
+                moved = true;
+                self.q_router_to_batcher[i].enqueue(admitted.len() as u64);
+                let _ = UnboundedSender::send(tx, admitted);
+            }
+            frame::HomogeneousBatch { queue, priority }.append_to(&mut self.swapped);
+        }
+        // `staging` is empty now, and `swapped` holds the frames the window refused.
+        core::mem::swap(&mut self.staging, &mut self.swapped);
+        if refused {
+            self.window.register(cx.waker());
+        }
+        moved
+    }
 }
 
 impl<Tx> Receiver<()> for FrameReceiver<Tx>
@@ -1802,22 +2038,21 @@ where
             return Poll::Pending;
         }
 
+        // The frames the window refused go before the next swap.
+        if !self.staging.is_empty() {
+            if !self.move_admitted(cx) {
+                return Poll::Pending;
+            }
+            budget.consume();
+            return Poll::Ready(Some(()));
+        }
+
         match self.frame_rx.poll_swap(cx, &mut self.staging) {
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(())) => {
                 budget.consume();
-                for (i, ((_priority, queue), tx)) in self
-                    .staging
-                    .drain()
-                    .zip(&mut self.priority_list_txs)
-                    .enumerate()
-                {
-                    if !queue.is_empty() {
-                        self.q_router_to_batcher[i].enqueue(queue.len() as u64);
-                        let _ = UnboundedSender::send(tx, queue);
-                    }
-                }
+                self.move_admitted(cx);
                 Poll::Ready(Some(()))
             }
         }

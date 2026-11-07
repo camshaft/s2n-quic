@@ -454,3 +454,70 @@ struct PathSecretMapAddressWriteLock {
     #[measure("duration", Duration)]
     duration: core::time::Duration,
 }
+
+#[event("path_secret_map:interface_pair_lost")]
+#[subject(endpoint)]
+/// Emitted when a send context marks its interface pair lost
+struct PathSecretMapInterfacePairLost<'a> {
+    peer_address: SocketAddress<'a>,
+}
+
+#[event("path_secret_map:interface_pair_delivering")]
+#[subject(endpoint)]
+/// Emitted when a lost interface pair delivers again
+struct PathSecretMapInterfacePairDelivering<'a> {
+    peer_address: SocketAddress<'a>,
+}
+
+#[event("path_secret_map:interface_pair_frames_moved")]
+#[subject(endpoint)]
+/// Emitted when a lost interface pair moves its frames to the pairs that deliver
+struct PathSecretMapInterfacePairFramesMoved<'a> {
+    peer_address: SocketAddress<'a>,
+
+    #[measure("frames")]
+    frames: usize,
+}
+
+#[event("path_secret_map:dead_mark_skipped")]
+#[subject(endpoint)]
+/// Emitted when the idle wheel doesn't mark a peer dead because another pair delivers
+struct PathSecretMapDeadMarkSkipped<'a> {
+    peer_address: SocketAddress<'a>,
+}
+
+#[event("creditless_window:frame_refused")]
+#[subject(endpoint)]
+/// Emitted when the creditless window refuses a frame without send credit
+struct CreditlessWindowFrameRefused {
+    #[measure("frame_bytes", Bytes)]
+    frame_bytes: u64,
+    #[measure("held_bytes", Bytes)]
+    held_bytes: u64,
+    #[measure("limit_bytes", Bytes)]
+    limit_bytes: u64,
+}
+
+#[event("creditless_window:limit_grew")]
+#[subject(endpoint)]
+/// Emitted when the creditless window's limit grows by the bytes a worker took
+struct CreditlessWindowLimitGrew {
+    #[measure("released_bytes", Bytes)]
+    released_bytes: u64,
+    #[measure("held_bytes", Bytes)]
+    held_bytes: u64,
+    #[measure("limit_bytes", Bytes)]
+    limit_bytes: u64,
+}
+
+#[event("creditless_window:limit_halved")]
+#[subject(endpoint)]
+/// Emitted once a round when the creditless window's limit halves or stays at its minimum
+struct CreditlessWindowLimitHalved {
+    #[measure("held_bytes", Bytes)]
+    held_bytes: u64,
+    #[measure("previous_limit_bytes", Bytes)]
+    previous_limit_bytes: u64,
+    #[measure("limit_bytes", Bytes)]
+    limit_bytes: u64,
+}

@@ -47,8 +47,13 @@ fn entry_size() {
                 .build(None)
                 .size(),
             // Includes per-entry sender scheduling storage metadata (Box<[AtomicU64]>) and the
-            // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes).
-            337
+            // default one-element peer_data_addrs list (one std SocketAddr, 32 bytes), and the
+            // empty peer_data_interfaces list (an Arc<[Option<u16>]>, 16 bytes).
+            // The senders' delivery times add a Box<[AtomicU64]> (16 bytes), and the time the
+            // lost pairs stopped delivering an AtomicU64 (8 bytes).
+            // The end of the preference for the senders that deliver since a loss adds an
+            // AtomicU64 (8 bytes).
+            385
         );
     }
 }
@@ -187,4 +192,259 @@ fn sender_with_more_queued_bytes_has_higher_load_score() {
         score0 > score1,
         "sender 0 has more bytes queued so should have a higher load score"
     );
+}
+
+#[test]
+fn a_sender_marked_lost_counts_as_lost_until_cleared() {
+    let entry = test_entry_with_senders(2);
+    let sender0 = crate::endpoint::id::LocalSenderId::from_index(0);
+    let sender1 = crate::endpoint::id::LocalSenderId::from_index(1);
+    assert!(!entry.has_lost_sender());
+    assert!(entry.has_delivering_sender());
+
+    assert!(
+        entry.set_sender_lost(sender0, true),
+        "the first mark changes the slot"
+    );
+    assert!(
+        !entry.set_sender_lost(sender0, true),
+        "a second mark doesn't change it"
+    );
+    assert!(entry.is_sender_lost(sender0));
+    assert!(!entry.is_sender_lost(sender1));
+    assert!(entry.has_lost_sender());
+    assert!(entry.has_delivering_sender());
+
+    assert!(entry.set_sender_lost(sender1, true));
+    assert!(
+        !entry.has_delivering_sender(),
+        "no sender delivers once every one is lost"
+    );
+
+    assert!(entry.set_sender_lost(sender0, false));
+    assert!(!entry.is_sender_lost(sender0));
+    assert!(entry.has_delivering_sender());
+}
+
+#[test]
+fn a_load_score_update_keeps_the_lost_mark() {
+    let entry = test_entry_with_senders(1);
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let now = unsafe { Timestamp::from_duration(Duration::from_micros(10)) };
+    let bandwidth =
+        s2n_quic_core::recovery::bandwidth::Bandwidth::new(1_000, Duration::from_millis(1));
+
+    entry.update_sender_load_score(sender, now, 4_000, bandwidth);
+    let score = entry.sender_load_score(sender);
+    assert!(entry.set_sender_lost(sender, true));
+    assert_eq!(
+        entry.sender_load_score(sender),
+        score,
+        "the lost mark doesn't change the load score"
+    );
+
+    entry.update_sender_load_score(sender, now, 8_000, bandwidth);
+    assert!(
+        entry.is_sender_lost(sender),
+        "a score update keeps the lost mark"
+    );
+    assert!(entry.sender_load_score(sender) > score);
+}
+
+#[test]
+fn a_message_for_a_lost_sender_goes_to_the_next_sender_that_delivers() {
+    let entry = test_entry_with_senders(4);
+    let sender = crate::endpoint::id::LocalSenderId::from_index;
+    assert_eq!(entry.delivering_sender(sender(1)), sender(1));
+
+    assert!(entry.set_sender_lost(sender(1), true));
+    assert!(entry.set_sender_lost(sender(2), true));
+    assert_eq!(
+        entry.delivering_sender(sender(1)),
+        sender(3),
+        "the first sender after a lost one whose pair delivers"
+    );
+
+    assert!(entry.set_sender_lost(sender(3), true));
+    assert_eq!(
+        entry.delivering_sender(sender(2)),
+        sender(0),
+        "the search goes on from the first slot"
+    );
+
+    assert!(entry.set_sender_lost(sender(0), true));
+    assert_eq!(
+        entry.delivering_sender(sender(2)),
+        sender(2),
+        "where every pair is lost, the preferred sender keeps the message"
+    );
+}
+
+#[test]
+fn a_message_goes_to_a_sender_that_delivers_since_a_loss_where_one_does() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let entry = test_entry_with_senders(4);
+    let sender = crate::endpoint::id::LocalSenderId::from_index;
+    let at = |nanos| PreciseTimestamp { nanos };
+
+    // The pair of sender 0 is marked lost, and sender 1, acknowledged before the lost pair
+    // stopped delivering, may be on the same down interface. While no sender has an
+    // acknowledgement since, a sender delivers while it isn't marked lost.
+    entry.record_sender_delivered(sender(1), at(100));
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    assert!(entry.set_sender_lost(sender(0), true));
+    assert!(!entry.has_sender_delivering_since_lost());
+    assert_eq!(entry.delivering_sender(sender(0)), sender(1));
+    assert_eq!(entry.delivering_sender(sender(1)), sender(1));
+
+    // Once sender 3 has an acknowledgement since the loss, a message for a sender without one
+    // goes to it, though that sender isn't marked lost.
+    entry.record_sender_delivered(sender(3), at(300));
+    assert!(entry.has_sender_delivering_since_lost());
+    assert_eq!(
+        entry.delivering_sender(sender(1)),
+        sender(3),
+        "a sender without an acknowledgement since the loss may be on the down interface"
+    );
+    assert_eq!(entry.delivering_sender(sender(0)), sender(3));
+    assert_eq!(entry.delivering_sender(sender(3)), sender(3));
+
+    // The search goes on by slot, among the senders with an acknowledgement since the loss.
+    entry.record_sender_delivered(sender(2), at(400));
+    assert_eq!(entry.delivering_sender(sender(1)), sender(2));
+    assert_eq!(entry.delivering_sender(sender(2)), sender(2));
+
+    // Once no pair is marked lost, each sender keeps its message.
+    assert!(entry.set_sender_lost(sender(0), false));
+    assert!(!entry.has_sender_delivering_since_lost());
+    assert_eq!(entry.delivering_sender(sender(0)), sender(0));
+    assert_eq!(entry.delivering_sender(sender(1)), sender(1));
+}
+
+#[test]
+fn a_sender_delivers_since_a_loss_only_after_the_lost_pairs_stopped() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let entry = test_entry_with_senders(3);
+    let sender0 = crate::endpoint::id::LocalSenderId::from_index(0);
+    let sender1 = crate::endpoint::id::LocalSenderId::from_index(1);
+    let sender2 = crate::endpoint::id::LocalSenderId::from_index(2);
+    let at = |nanos| PreciseTimestamp { nanos };
+
+    entry.record_sender_delivered(sender1, at(150));
+    entry.record_sender_delivered(sender2, at(300));
+    assert!(
+        !entry.has_sender_delivering_since_lost(),
+        "no sender delivers since a loss while no pair is lost"
+    );
+
+    entry.set_senders_lost_since(at(200));
+    assert!(entry.set_sender_lost(sender0, true));
+    entry.record_sender_delivered(sender0, at(400));
+    assert!(
+        !entry.delivers_since_lost(sender0),
+        "a lost sender doesn't deliver, whatever its delivery time"
+    );
+    assert!(
+        !entry.delivers_since_lost(sender1),
+        "a sender acknowledged before the lost pairs stopped may be on the same down interface"
+    );
+    assert!(entry.delivers_since_lost(sender2));
+    assert!(entry.has_sender_delivering_since_lost());
+
+    entry.set_senders_lost_since(at(100));
+    assert!(
+        !entry.delivers_since_lost(sender1),
+        "an earlier stop time doesn't move the recorded one back"
+    );
+    entry.set_senders_lost_since(at(300));
+    assert!(
+        !entry.delivers_since_lost(sender2),
+        "a delivery at the stop time doesn't count"
+    );
+    assert!(!entry.has_sender_delivering_since_lost());
+
+    entry.record_sender_delivered(sender1, at(500));
+    entry.record_sender_delivered(sender1, at(50));
+    assert!(
+        entry.delivers_since_lost(sender1),
+        "an earlier delivery doesn't move the recorded one back"
+    );
+    assert!(entry.has_sender_delivering_since_lost());
+}
+
+/// The routers prefer the senders that deliver since a loss until a sender has an
+/// acknowledgement after the end of the preference, so that a sender idle at the loss gets
+/// items again.
+#[test]
+fn the_preference_for_senders_that_deliver_since_a_loss_has_an_end() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let entry = test_entry_with_senders(3);
+    let sender0 = crate::endpoint::id::LocalSenderId::from_index(0);
+    let sender1 = crate::endpoint::id::LocalSenderId::from_index(1);
+    let sender2 = crate::endpoint::id::LocalSenderId::from_index(2);
+    let at = |nanos| PreciseTimestamp { nanos };
+
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    assert!(entry.set_sender_lost(sender0, true));
+    assert!(
+        !entry.prefers_senders_delivering_since_lost(),
+        "no sender delivers since the loss yet"
+    );
+
+    entry.record_sender_delivered(sender1, at(1_000));
+    assert!(
+        entry.prefers_senders_delivering_since_lost(),
+        "an acknowledgement at the preference's end is within it"
+    );
+
+    entry.record_sender_delivered(sender2, at(1_001));
+    assert!(entry.has_sender_delivering_since_lost());
+    assert!(
+        !entry.prefers_senders_delivering_since_lost(),
+        "an acknowledgement after the preference's end ends it"
+    );
+
+    entry.set_senders_preferred_until(at(2_000));
+    assert!(
+        entry.prefers_senders_delivering_since_lost(),
+        "a later end holds the preference again"
+    );
+    entry.set_senders_preferred_until(at(500));
+    assert!(
+        entry.prefers_senders_delivering_since_lost(),
+        "an earlier end doesn't move the recorded one back"
+    );
+}
+
+/// Once a sender has an acknowledgement after the end of the routers' preference for the
+/// senders that deliver since a loss, a message keeps its sender while that sender's pair
+/// isn't marked lost, as the routers choose then.
+#[test]
+fn a_message_keeps_its_sender_once_the_preference_for_senders_that_deliver_ends() {
+    use crate::time::precision::Timestamp as PreciseTimestamp;
+    let entry = test_entry_with_senders(4);
+    let sender = crate::endpoint::id::LocalSenderId::from_index;
+    let at = |nanos| PreciseTimestamp { nanos };
+
+    // The pair of sender 0 is marked lost, and within the preference a message for sender 1,
+    // without an acknowledgement since the loss, goes to sender 3, which has one.
+    entry.set_senders_lost_since(at(200));
+    entry.set_senders_preferred_until(at(1_000));
+    assert!(entry.set_sender_lost(sender(0), true));
+    entry.record_sender_delivered(sender(3), at(300));
+    assert_eq!(entry.delivering_sender(sender(1)), sender(3));
+
+    // Once sender 3 has an acknowledgement after the preference's end, a pair delivers while
+    // it isn't marked lost again.
+    entry.record_sender_delivered(sender(3), at(1_100));
+    assert!(entry.has_sender_delivering_since_lost());
+    assert!(!entry.prefers_senders_delivering_since_lost());
+    assert_eq!(
+        entry.delivering_sender(sender(1)),
+        sender(1),
+        "a sender that isn't marked lost keeps its message once the preference ends"
+    );
+    assert_eq!(entry.delivering_sender(sender(0)), sender(1));
 }
