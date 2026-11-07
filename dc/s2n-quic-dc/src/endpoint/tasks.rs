@@ -321,10 +321,9 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
         .map(|(local_id, st)| {
             sender_idx_to_local[st.sender_idx] = local_id;
 
-            let cache = Rc::new(RefCell::new(send::Cache::new(
-                &counter_registry,
-                st.sender_idx,
-            )));
+            let cache = Rc::new(RefCell::new(
+                send::Cache::new(&counter_registry, st.sender_idx).with_place(st.interface_place),
+            ));
 
             (local_id, cache)
         })
