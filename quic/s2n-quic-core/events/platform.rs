@@ -121,6 +121,11 @@ enum PlatformFeatureConfiguration {
     InitialMtu { mtu: u16 },
     /// Emitted when the max maximum transmission unit is configured
     MaxMtu { mtu: u16 },
+    /// Emitted when the socket is configured to report the time it received each datagram
+    ///
+    /// This is only emitted where the application turned on receive timestamps. `enabled` is
+    /// false where the platform doesn't support them or the socket refused them.
+    RxTimestamps { enabled: bool },
 }
 
 #[event("platform:event_loop_wakeup")]

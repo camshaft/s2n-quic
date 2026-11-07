@@ -161,8 +161,18 @@ impl Io {
 
         // Configure the socket to report the time it received each datagram, where the
         // application enabled it
-        if rx_timestamps_enabled {
-            syscall::configure_rx_timestamps(&rx_socket);
+        let rx_timestamps_requested = rx_timestamps_enabled;
+        let rx_timestamps_enabled =
+            rx_timestamps_enabled && syscall::configure_rx_timestamps(&rx_socket);
+
+        // Publish whether the socket accepted the option only where the application enabled it,
+        // so that an endpoint with the option off doesn't publish an rx timestamps configuration
+        if rx_timestamps_requested {
+            publisher.on_platform_feature_configured(event::builder::PlatformFeatureConfigured {
+                configuration: event::builder::PlatformFeatureConfiguration::RxTimestamps {
+                    enabled: rx_timestamps_enabled,
+                },
+            });
         }
 
         // Configure packet info CMSG
