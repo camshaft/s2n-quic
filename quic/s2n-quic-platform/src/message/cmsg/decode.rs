@@ -266,21 +266,28 @@ mod tests {
         })
     }
 
-    /// Encodes an `SCM_TIMESTAMPNS` message that holds `received`, and decodes it on a clock
-    /// that answers `now`
+    /// Encodes `value` as an `SCM_TIMESTAMPNS` message, and decodes it on a clock that answers
+    /// `now`
     #[cfg(target_os = "linux")]
-    fn collect_with_receive_time(received: Duration, now: Duration) -> (AncillaryData, usize) {
+    fn collect_with_receive_value<T: Copy>(value: T, now: Duration) -> (AncillaryData, usize) {
         let mut storage = Storage::<128>::default();
         let mut encoder = storage.encoder();
-        let mut time: libc::timespec = unsafe { core::mem::zeroed() };
-        time.tv_sec = received.as_secs() as _;
-        time.tv_nsec = received.subsec_nanos() as _;
         let (level, ty) = (libc::SOL_SOCKET, libc::SCM_TIMESTAMPNS);
-        assert!(encoder.encode_cmsg(level, ty, time).is_ok());
+        assert!(encoder.encode_cmsg(level, ty, value).is_ok());
 
         let reads = Cell::new(0);
         let data = collect_at(encoder.iter(), now, &reads);
         (data, reads.get())
+    }
+
+    /// Encodes an `SCM_TIMESTAMPNS` message that holds `received`, and decodes it on a clock
+    /// that answers `now`
+    #[cfg(target_os = "linux")]
+    fn collect_with_receive_time(received: Duration, now: Duration) -> (AncillaryData, usize) {
+        let mut time: libc::timespec = unsafe { core::mem::zeroed() };
+        time.tv_sec = received.as_secs() as _;
+        time.tv_nsec = received.subsec_nanos() as _;
+        collect_with_receive_value(time, now)
     }
 
     /// A message without a receive time doesn't hold a wait, and the decode doesn't read the clock
@@ -307,6 +314,35 @@ mod tests {
 
         assert_eq!(data.receive_wait_nanos, Some(2_000_000));
         assert_eq!(reads, 1);
+    }
+
+    /// A value the decode refuses doesn't hold a wait, and the decode doesn't read the clock: a
+    /// `tv_nsec` of a whole second or more, a negative `tv_sec`, or a value of another size than
+    /// a `timespec`
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn with_invalid_receive_time() {
+        let now = Duration::from_secs(20);
+        let mut time: libc::timespec = unsafe { core::mem::zeroed() };
+
+        // a `tv_nsec` of a whole second
+        time.tv_sec = 10;
+        time.tv_nsec = 1_000_000_000;
+        let (data, reads) = collect_with_receive_value(time, now);
+        assert_eq!(data.receive_wait_nanos, None);
+        assert_eq!(reads, 0);
+
+        // a negative `tv_sec`
+        time.tv_sec = -1;
+        time.tv_nsec = 0;
+        let (data, reads) = collect_with_receive_value(time, now);
+        assert_eq!(data.receive_wait_nanos, None);
+        assert_eq!(reads, 0);
+
+        // a value shorter than a `timespec`
+        let (data, reads) = collect_with_receive_value(10u32, now);
+        assert_eq!(data.receive_wait_nanos, None);
+        assert_eq!(reads, 0);
     }
 
     /// A receive time after the read, as where the clock moved back, holds a wait of zero
