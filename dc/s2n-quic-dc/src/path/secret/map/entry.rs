@@ -442,7 +442,10 @@ impl Entry {
         (1..len)
             .map(|offset| (start + offset) % len)
             .find(|&index| delivers(index))
-            .map_or(preferred, <LocalSenderId as crate::endpoint::id::Id>::from_index)
+            .map_or(
+                preferred,
+                <LocalSenderId as crate::endpoint::id::Id>::from_index,
+            )
     }
 
     pub fn idle_timeout(&self) -> Duration {
