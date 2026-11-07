@@ -17,7 +17,7 @@
 use crate::{
     endpoint::{
         id::LocalSenderId,
-        routing::observe::{self, Kind, Routed},
+        routing::observe::{self, Kind, Routed, Submitter},
     },
     path::secret::{stateless_reset::Signer, Map},
     socket::{interface, rate::Rate},
@@ -235,6 +235,34 @@ fn the_endpoint_passes_its_path_secret_map_to_the_ack_and_freed_batch_routers() 
         moved_acks > 0,
         "no acknowledgement of the server moved off a sender marked lost"
     );
+
+    // The server records which task submitted each acknowledgement. The `ack_burst` task submits
+    // the scheduled acknowledgements of a context, and the `ack_completion` task submits them
+    // again at the completion of the last one, where packets arrived after it was encoded. Each
+    // task publishes the moves of its own submissions, so the count of events below finds a
+    // task that doesn't publish them only where an acknowledgement of each task moved.
+    assert!(
+        server_routes
+            .iter()
+            .filter(|route| route.kind == Kind::PendingAck)
+            .all(|route| route.submitter.is_some()),
+        "an acknowledgement of the server went to the router outside `observe::submitting`"
+    );
+    for submitter in [Submitter::AckBurst, Submitter::AckCompletion] {
+        let moved = server_routes
+            .iter()
+            .filter(|route| {
+                route.kind == Kind::PendingAck
+                    && route.submitter == Some(submitter)
+                    && !priority.contains(&route.sender)
+            })
+            .count();
+        assert!(
+            moved > 0,
+            "no acknowledgement that {submitter:?} submitted moved off a sender marked lost"
+        );
+    }
+
     let ack_events = subscriber
         .path_secret_map_acknowledgement_moved
         .load(Ordering::Relaxed);
