@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Contract tests for extracted send-worker pipeline helpers.
-use super::helpers::{test_batch, test_entry, TestReceiver, TestReceiverExt as _};
+use super::helpers::{
+    build_send_context, event_count, insert_inflight_packet, test_batch, test_entry,
+    test_map_with_subscriber, TestReceiver, TestReceiverExt as _,
+};
 use crate::{
     endpoint::{frame, id::Id, msg, send, tasks},
     socket::channel::{intrusive::unsync, ReceiverExt as _, UnboundedSender as _},
@@ -284,6 +287,229 @@ fn send_tx_wheel_drain_routes_expired_context_to_matching_socket() {
             assert!(
                 !unexpected,
                 "socket queue 0 should not receive sender_idx=1 context"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A probe timeout that finds the peer silent on a pair for longer than the pair's persistent
+/// congestion period marks the pair lost and moves its frames to the pairs that deliver, and
+/// records the lost mark and the moved frames, each as an event and a count.
+#[test]
+fn send_pto_timeout_records_a_lost_mark_and_the_frames_it_moves() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let registry = crate::counter::Registry::default();
+        let clock = Clock::default();
+        let (map, subscriber) = test_map_with_subscriber();
+        let send_caches: crate::endpoint::id::IdMap<crate::endpoint::id::LocalSendSocketId, _> =
+            vec![Rc::new(RefCell::new(
+                send::Cache::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0))
+                    .with_path_secret_map(map),
+            ))]
+            .into();
+        let sender_idx_to_local = || {
+            crate::endpoint::id::IdMap::<
+                crate::endpoint::id::LocalSenderId,
+                crate::endpoint::id::LocalSendSocketId,
+            >::new(1, crate::endpoint::id::LocalSendSocketId::new(0))
+        };
+
+        // One sent packet that waits for an acknowledgement, on a path secret entry whose
+        // other senders deliver.
+        let entry = test_entry();
+        let ctx = build_send_context(&entry, 0, &registry, &clock);
+        {
+            let mut ctx = ctx.borrow_mut();
+            insert_inflight_packet(&mut ctx, &entry, &clock);
+            ctx.ack_wait_since = Some(precision::Clock::now(&clock));
+        }
+        assert!(!ctx.borrow().is_path_lost());
+        assert!(entry.has_delivering_sender());
+        let input = TestReceiver::new([ctx.clone()]);
+
+        let (tx_wheel_tx, _tx_wheel_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
+        let (pto_wheel_tx, _pto_wheel_rx) = unsync::new_with_adapter::<send::PtoWheelAdapter>();
+        let (idle_wheel_tx, _idle_wheel_rx) =
+            unsync::new_with_adapter::<send::IdleWheelAdapter>();
+        let (immediate_tx_raw, _immediate_rx) =
+            unsync::new_with_adapter::<send::TxImmediateAdapter>();
+        let socket_immediate_txs: crate::endpoint::id::IdMap<
+            crate::endpoint::id::LocalSendSocketId,
+            _,
+        > = core::iter::once((
+            crate::endpoint::id::LocalSendSocketId::new(0),
+            immediate_tx_raw,
+        ))
+        .collect();
+        let immediate_tx = send::ImmediateSender::new(socket_immediate_txs, sender_idx_to_local());
+        let (retransmit_tx, mut retransmit_rx) = unsync::new::<frame::Frame>();
+
+        let rx = tasks::send_pto_timeout(
+            input,
+            clock,
+            immediate_tx,
+            tx_wheel_tx,
+            pto_wheel_tx,
+            idle_wheel_tx,
+            registry.register("tx.pto_check"),
+            registry.register("tx.pto_requested"),
+            send_caches,
+            sender_idx_to_local(),
+            retransmit_tx,
+        );
+
+        async move {
+            // The probe timeout fires once the peer has been silent on the pair for longer
+            // than the pair's persistent congestion period.
+            10.s().sleep().await;
+            rx.drain_budgeted(Some(32)).await;
+
+            assert!(ctx.borrow().is_path_lost(), "the silent pair is marked lost");
+            assert!(
+                retransmit_rx.recv().await.is_some(),
+                "the lost pair's frame moves to the pairs that deliver"
+            );
+            assert_eq!(
+                event_count(&subscriber.path_secret_map_interface_pair_lost),
+                1
+            );
+            assert_eq!(
+                event_count(&subscriber.path_secret_map_interface_pair_frames_moved),
+                1
+            );
+
+            let line = registry
+                .take_current_metrics_line()
+                .expect("metrics were recorded");
+            assert!(
+                line.contains("tx.interface_pair.lost=1 Variant|send.0"),
+                "got: {line}"
+            );
+            assert!(
+                line.contains("tx.interface_pair.frames_moved=1 Variant|send.0"),
+                "got: {line}"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// An acknowledgement of a packet that a lost pair sent after its lost mark clears the mark,
+/// and the ACK processor records the pair that delivers again as an event and a count.
+#[test]
+fn send_ack_processor_records_a_lost_pair_that_delivers_again() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let registry = crate::counter::Registry::default();
+        let clock = Clock::default();
+        let (map, subscriber) = test_map_with_subscriber();
+        let cache = Rc::new(RefCell::new(
+            send::Cache::new(&registry, crate::endpoint::id::LocalSenderId::from_index(0))
+                .with_path_secret_map(map),
+        ));
+        let sender_idx_to_local = || {
+            crate::endpoint::id::IdMap::<
+                crate::endpoint::id::LocalSenderId,
+                crate::endpoint::id::LocalSendSocketId,
+            >::new(1, crate::endpoint::id::LocalSendSocketId::new(0))
+        };
+
+        // The pair is marked lost before its packet goes out, so an acknowledgement of the
+        // packet shows that the pair delivers again.
+        let entry = test_entry();
+        let ctx = cache
+            .borrow_mut()
+            .get_or_insert(&entry, &clock)
+            .expect("test context should be constructible");
+        {
+            let mut ctx = ctx.borrow_mut();
+            ctx.set_path_lost(true);
+            insert_inflight_packet(&mut ctx, &entry, &clock);
+        }
+        assert!(ctx.borrow().is_path_lost());
+        let send_caches: crate::endpoint::id::IdMap<crate::endpoint::id::LocalSendSocketId, _> =
+            vec![cache].into();
+
+        let (mut ack_tx, ack_rx) = unsync::new::<msg::Sender>();
+        let (tx_wheel_tx, _tx_wheel_rx) = unsync::new_with_adapter::<send::TxWheelAdapter>();
+        let (pto_wheel_tx, _pto_wheel_rx) = unsync::new_with_adapter::<send::PtoWheelAdapter>();
+        let (idle_wheel_tx, _idle_wheel_rx) =
+            unsync::new_with_adapter::<send::IdleWheelAdapter>();
+        let (completed_tx, _completed_rx) = unsync::new::<frame::Frame>();
+        let (cancelled_tx, _cancelled_rx) = unsync::new::<frame::Frame>();
+        let (frame_tx, _frame_rx) = frame::submission_channel(1);
+        let (immediate_tx_raw, _immediate_rx) =
+            unsync::new_with_adapter::<send::TxImmediateAdapter>();
+        let socket_immediate_txs: crate::endpoint::id::IdMap<
+            crate::endpoint::id::LocalSendSocketId,
+            _,
+        > = core::iter::once((
+            crate::endpoint::id::LocalSendSocketId::new(0),
+            immediate_tx_raw,
+        ))
+        .collect();
+        let immediate_tx = send::ImmediateSender::new(socket_immediate_txs, sender_idx_to_local());
+        let (ack_completions_tx, _ack_completions_rx) = unsync::new::<msg::Sender>();
+        let ack_completions_tx = ack_completions_tx.into_list_sender();
+
+        let rx = tasks::send_ack_processor(
+            ack_rx,
+            send_caches,
+            sender_idx_to_local(),
+            1,
+            clock,
+            Rng::new(),
+            frame_tx,
+            completed_tx,
+            cancelled_tx,
+            ack_completions_tx,
+            registry.register("!send.invalid_sender_idx"),
+            immediate_tx,
+            tx_wheel_tx,
+            pto_wheel_tx,
+            idle_wheel_tx,
+        );
+
+        async move {
+            // The acknowledgement arrives some time after the packet went out.
+            Duration::from_millis(10).sleep().await;
+            let _ = ack_tx.send(crate::intrusive::Entry::new(msg::Sender::ReceivedAck {
+                local_sender_id: crate::endpoint::id::LocalSenderId::from_index(0),
+                path_secret_entry: entry,
+                payload: BytesMut::new(),
+                ack_delay: Duration::ZERO,
+                largest_acknowledged: VarInt::ZERO,
+                ack_range: VarInt::ZERO,
+                ecn_counts: Default::default(),
+            }));
+            drop(ack_tx);
+        }
+        .spawn();
+
+        async move {
+            rx.drain_budgeted(Some(32)).await;
+
+            assert!(!ctx.borrow().is_path_lost(), "the acknowledgement clears the lost mark");
+            assert_eq!(
+                event_count(&subscriber.path_secret_map_interface_pair_delivering),
+                1
+            );
+            assert_eq!(
+                event_count(&subscriber.path_secret_map_interface_pair_lost),
+                0,
+                "the lost mark that the test sets on the context isn't recorded"
+            );
+
+            let line = registry
+                .take_current_metrics_line()
+                .expect("metrics were recorded");
+            assert!(
+                line.contains("tx.interface_pair.delivering=1 Variant|send.0"),
+                "got: {line}"
             );
         }
         .primary()

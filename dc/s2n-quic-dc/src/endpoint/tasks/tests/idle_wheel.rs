@@ -7,7 +7,10 @@
 //! On expiry the callback re-checks PathSecretEntry.last_activity — if still idle, the
 //! context is evicted from the cache; if activity occurred, it is rescheduled.
 
-use super::helpers::{test_entry, test_frame, RecvContextBuilder, TestReceiverExt, WakeNowSender};
+use super::helpers::{
+    event_count, insert_inflight_packet, test_entry, test_frame, test_map_with_subscriber,
+    RecvContextBuilder, TestReceiverExt, WakeNowSender,
+};
 use crate::{
     endpoint::{
         frame::{self, Frame},
@@ -41,17 +44,29 @@ fn setup_send() -> SetupSend {
 }
 
 fn setup_send_recording(rehandshakes: Rehandshakes) -> SetupSend {
-    setup_send_with_caches(1, rehandshakes)
+    setup_send_with_caches(1, rehandshakes, None)
 }
 
 /// Builds the send idle wheel drain over `count` send caches: the cache of sender slot `i`
 /// sends on local send socket `i`, for each `i` below `count`. `rehandshakes` records each
-/// peer that the test's `peer_dead_broadcast` asks a background handshake for.
-fn setup_send_with_caches(count: usize, rehandshakes: Rehandshakes) -> SetupSend {
+/// peer that the test's `peer_dead_broadcast` asks a background handshake for. Where
+/// `path_secret_map` is given, each cache publishes the lost-pair events of its contexts
+/// through it.
+fn setup_send_with_caches(
+    count: usize,
+    rehandshakes: Rehandshakes,
+    path_secret_map: Option<crate::path::secret::Map>,
+) -> SetupSend {
     let registry = crate::counter::Registry::default();
     let clock = Clock::default();
     let send_caches: IdMap<LocalSendSocketId, _> = (0..count)
-        .map(|idx| send::Cache::new(&registry, LocalSenderId::from_index(idx)))
+        .map(|idx| {
+            let mut cache = send::Cache::new(&registry, LocalSenderId::from_index(idx));
+            if let Some(map) = &path_secret_map {
+                cache = cache.with_path_secret_map(map.clone());
+            }
+            cache
+        })
         .map(|cache| Rc::new(RefCell::new(cache)))
         .collect::<Vec<_>>()
         .into();
@@ -995,7 +1010,7 @@ fn send_idle_wheel_marks_dead_a_peer_whose_lost_pairs_expire_at_the_same_tick() 
     let _guard = crate::testing::without_snapshots();
     sim(|| {
         let (send_caches, mut idle_wheel_tx, _completed_rx, clock, _registry) =
-            setup_send_with_caches(2, Rehandshakes::default());
+            setup_send_with_caches(2, Rehandshakes::default(), None);
 
         let pse = test_entry();
         pse.touch_activity(precision::Clock::now(&clock));
@@ -1038,6 +1053,77 @@ fn send_idle_wheel_marks_dead_a_peer_whose_lost_pairs_expire_at_the_same_tick() 
             assert!(
                 pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
                 "the lost pairs that expire at the same tick mark the peer dead"
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A lost pair's idle expiry, with a packet the peer never acknowledged, doesn't mark the
+/// peer dead while another pair of the peer delivers, and records the skipped dead mark as an
+/// event and a count.
+#[test]
+fn send_idle_wheel_records_a_skipped_dead_mark() {
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let rehandshakes = Rehandshakes::default();
+        let (map, subscriber) = test_map_with_subscriber();
+        let (send_caches, mut idle_wheel_tx, _completed_rx, clock, registry) =
+            setup_send_with_caches(1, rehandshakes.clone(), Some(map));
+
+        let pse = test_entry();
+        pse.touch_activity(precision::Clock::now(&clock));
+
+        let ctx = send_caches[LocalSendSocketId::new(0)]
+            .borrow_mut()
+            .get_or_insert(&pse, &clock)
+            .unwrap();
+        // The lost pair's packet waits for an acknowledgement until the idle expiry.
+        {
+            let mut ctx = ctx.borrow_mut();
+            ctx.set_path_lost(true);
+            insert_inflight_packet(&mut ctx, &pse, &clock);
+            let timeout = ctx.path_secret_entry.idle_timeout();
+            ctx.idle_wheel.target_time = Some(precision::Clock::now(&clock) + timeout);
+        }
+        assert!(
+            pse.has_delivering_sender(),
+            "the peer's other pairs still deliver"
+        );
+        let _ = idle_wheel_tx.send(ctx);
+
+        async move {
+            // Sleep past the idle timeout, so the wheel expires the context.
+            (pse.idle_timeout() + 2.s()).sleep().await;
+
+            assert_eq!(
+                send_caches[LocalSendSocketId::new(0)]
+                    .borrow()
+                    .context_count(),
+                0,
+                "the context expires after its idle timeout"
+            );
+            let now = precision::Clock::now(&Clock::default());
+            assert!(
+                !pse.is_dead_during_cooldown(now, crate::endpoint::DEFAULT_DEAD_PEER_COOLDOWN),
+                "a lost pair doesn't mark the peer dead while another pair delivers"
+            );
+            assert!(
+                rehandshakes.borrow().is_empty(),
+                "a skipped dead mark doesn't ask for a handshake"
+            );
+            assert_eq!(
+                event_count(&subscriber.path_secret_map_dead_mark_skipped),
+                1
+            );
+
+            let line = registry
+                .take_current_metrics_line()
+                .expect("metrics were recorded");
+            assert!(
+                line.contains("send.dead_mark_skipped=1 Variant|send.0"),
+                "got: {line}"
             );
         }
         .primary()
