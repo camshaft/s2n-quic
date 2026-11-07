@@ -1966,7 +1966,7 @@ fn send_reset(
     binding_id: VarInt,
     error_code: VarInt,
     frame_tx: &mut SubmissionSender,
-) {
+) -> bool {
     let frame = Frame {
         header: Header::QueueReset {
             queue_pair: incoming_pair.reverse(),
@@ -1983,7 +1983,8 @@ fn send_reset(
         enqueued_at: None,
         flow_credits: 0,
     };
-    let _ = frame_tx.send_batch(Entry::new(frame));
+    // The submission channel refuses the reset once the priority router has ended.
+    frame_tx.send_batch(Entry::new(frame)).is_ok()
 }
 
 /// Rejects the init of `binding_id` that `incoming_pair` routes to the server slot
@@ -2000,6 +2001,11 @@ fn send_reset(
 /// Each reject records what it does with the slot as a [`frame_trace::SlotHold`]: a new hold,
 /// whose reset is sent, a slot held already, whose reset isn't sent, or a slot past the peer's
 /// queues, which isn't held.
+///
+/// Where the priority router has ended, the submission channel refuses the reset, which then
+/// doesn't leave the router and release the hold: the hold ends before `free` frees the slot, so
+/// that the slot is recorded as freed. No other free of the slot comes between the hold and its
+/// end, since the slot is bound to the stream that `free` disables, or `free` records it.
 fn reject_init(
     server_view: &crate::queue::ServerView,
     path_secret_entry: &Arc<PathSecretEntry>,
@@ -2012,7 +2018,6 @@ fn reject_init(
     use crate::queue::server::Hold;
 
     let hold = server_view.hold_freed(incoming_pair.dest_queue_id, binding_id);
-    free(server_view);
     let outcome = match hold {
         Hold::New => frame_trace::HoldOutcome::Held,
         Hold::Already => frame_trace::HoldOutcome::AlreadyHeld,
@@ -2024,9 +2029,18 @@ fn reject_init(
         outcome,
         *path_secret_entry.id(),
     );
-    if hold == Hold::New {
-        send_reset(path_secret_entry, incoming_pair, binding_id, error_code, frame_tx);
+    if hold == Hold::New
+        && !send_reset(
+            path_secret_entry,
+            incoming_pair,
+            binding_id,
+            error_code,
+            frame_tx,
+        )
+    {
+        server_view.unhold_freed(incoming_pair.dest_queue_id, binding_id);
     }
+    free(server_view);
 }
 
 /// Settles a packet's decrypt result once the peer's dedup filter has read its packet number:

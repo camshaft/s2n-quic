@@ -1122,6 +1122,63 @@ fn the_priority_router_releases_the_slot_of_a_reset_that_leaves_for_its_lane() {
     assert_eq!(poll_router(&mut router), Poll::Ready(None));
 }
 
+/// The resets that wait in the priority router as it ends release the slots that their rejected
+/// inits held, as a reset that leaves for its lane does, so that the slots are recorded as freed:
+/// a reset that waits at the window, and one that waits in the submission channel.
+#[test]
+fn the_priority_router_releases_the_slots_of_its_waiting_resets_as_it_ends() {
+    use core::task::Poll;
+    use s2n_quic_core::varint::VarInt;
+
+    let pse = crate::path::secret::map::Entry::builder("127.0.0.1:4433".parse().unwrap())
+        .socket_sender_count(1)
+        .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+        .build(None);
+    let crate::path::secret::map::entry::QueueState::Server(state) = pse.queue_state() else {
+        unreachable!("a server entry has a server queue state");
+    };
+    let state = state.clone();
+    let window = crate::endpoint::combinator::CreditlessWindow::default();
+    let (mut frame_tx, mut router, mut lanes) = priority_router(window.clone());
+
+    // A frame without send credit takes the window, so that the resets below wait.
+    submit(&mut frame_tx, [ping(&pse)]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(take_lanes(&mut lanes).len(), 1);
+
+    // The server rejects an init of binding 1 on slots 1 and 2, and frees both slots while their
+    // resets wait: slot 1's at the window, and slot 2's in the submission channel. The poll that
+    // swaps slot 1's reset in returns ready, and the next poll finds the channel empty.
+    let (mut freed_tx, _freed_rx) = crate::queue::freed_batch_channel();
+    for slot in [1, 2] {
+        assert!(state.freed.hold(VarInt::from_u8(slot), VarInt::from_u8(1)));
+        state
+            .freed
+            .record(VarInt::from_u8(slot), &pse, &mut freed_tx);
+    }
+    submit(&mut frame_tx, [reset_frame(&pse, 2, 1)]);
+    assert_eq!(poll_router(&mut router), Poll::Ready(Some(())));
+    assert_eq!(poll_router(&mut router), Poll::Pending);
+    let mut reset = reset_frame(&pse, 3, 1);
+    if let frame::Header::QueueReset { queue_pair, .. } = &mut reset.header {
+        queue_pair.source_queue_id = VarInt::from_u8(2);
+    }
+    submit(&mut frame_tx, [reset]);
+    assert!(
+        !state.freed.has_pending_work(),
+        "the slots wait on their resets"
+    );
+
+    // The router ends before either reset leaves for its lane.
+    drop(router);
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state
+        .freed
+        .take(&mut freed)
+        .expect("the slots are recorded as freed");
+    assert!(freed.contains(1) && freed.contains(2));
+}
+
 /// A reset of a held slot's queue and binding that a producer waits on, or that borrows send
 /// credit, doesn't end the slot's hold as it leaves for its lane: only a reset without either,
 /// as the endpoint sends one for a rejected init, does. While the hold stays, the slot isn't
