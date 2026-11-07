@@ -230,6 +230,20 @@ impl ServerView {
         path_entry: &Arc<PathSecretEntry>,
         endpoint_tx: &mut FreedBatchTx,
     ) -> Result<BindResult, Error<()>> {
+        self.bind_for_init(queue_id, binding_id, path_entry, endpoint_tx)
+            .map(|(result, _)| result)
+    }
+
+    /// [`Self::bind_for_msg`], which also returns the tombstone the slot held before a
+    /// `NewBinding`, for [`Self::restore_tombstone`] to put back where the endpoint doesn't take
+    /// the init that bound the slot; 0 for `Bound`.
+    pub(crate) fn bind_for_init(
+        &mut self,
+        queue_id: VarInt,
+        binding_id: VarInt,
+        path_entry: &Arc<PathSecretEntry>,
+        endpoint_tx: &mut FreedBatchTx,
+    ) -> Result<(BindResult, u64), Error<()>> {
         let index = queue_id.as_u64() as usize;
 
         if queue_id.as_u64() > self.state.max_queue_id {
@@ -249,10 +263,13 @@ impl ServerView {
         if stored & super::slot::UNALLOCATED_BIT == 0 {
             // Slot is allocated. If binding matches, it's already bound.
             if stored == binding_id.as_u64() {
-                return Ok(BindResult::Bound {
-                    waker: AutoWake::default(),
-                    release_bytes: 0,
-                });
+                return Ok((
+                    BindResult::Bound {
+                        waker: AutoWake::default(),
+                        release_bytes: 0,
+                    },
+                    0,
+                ));
             }
             // Binding mismatch — stale or future
             if binding_id.as_u64() < stored {
@@ -278,8 +295,8 @@ impl ServerView {
         }
 
         // Slot is unallocated — bind it (tombstone re-checked under the lock).
-        match slot.allocate_and_open(binding_id, self.state.initial_recv_window) {
-            Ok(super::slot::AllocateOutcome::Allocated) => {
+        match slot.allocate_and_open_with_tombstone(binding_id, self.state.initial_recv_window) {
+            Ok((super::slot::AllocateOutcome::Allocated, tombstone)) => {
                 let slot_ptr = slot.as_ptr();
                 let on_free = OnFree::Server {
                     path_entry: path_entry.clone(),
@@ -287,20 +304,26 @@ impl ServerView {
                 };
                 let stream = StreamReceiver::new(slot_ptr, on_free.clone());
                 let control = ControlReceiver::new(slot_ptr, on_free);
-                Ok(BindResult::NewBinding {
-                    waker: AutoWake::default(),
-                    stream,
-                    control,
-                    release_bytes: 0,
-                })
+                Ok((
+                    BindResult::NewBinding {
+                        waker: AutoWake::default(),
+                        stream,
+                        control,
+                        release_bytes: 0,
+                    },
+                    tombstone,
+                ))
             }
-            Ok(super::slot::AllocateOutcome::AlreadyBound) => Ok(BindResult::Bound {
-                waker: AutoWake::default(),
-                release_bytes: 0,
-            }),
+            Ok((super::slot::AllocateOutcome::AlreadyBound, _)) => Ok((
+                BindResult::Bound {
+                    waker: AutoWake::default(),
+                    release_bytes: 0,
+                },
+                0,
+            )),
             // A concurrent recycle bumped the tombstone past `binding_id` after the
             // lock-free fast-path read passed — reject as stale.
-            Ok(super::slot::AllocateOutcome::Stale) => Err(Error::StaleBinding(())),
+            Ok((super::slot::AllocateOutcome::Stale, _)) => Err(Error::StaleBinding(())),
             Err(_) => Err(Error::SenderClosed),
         }
     }
@@ -327,6 +350,21 @@ impl ServerView {
         self.view
             .get(index, &self.state.pages)
             .map(|slot| slot.diag())
+    }
+
+    /// Puts back `tombstone`, which [`Self::bind_for_init`] returned as it bound the slot at
+    /// `queue_id` for `binding_id`, once the endpoint tears that binding's stream down without
+    /// taking its init. See [`super::slot::Slot::restore_tombstone`].
+    pub(crate) fn restore_tombstone(
+        &mut self,
+        queue_id: VarInt,
+        binding_id: VarInt,
+        tombstone: u64,
+    ) {
+        let index = queue_id.as_u64() as usize;
+        if let Some(slot) = self.view.get(index, &self.state.pages) {
+            slot.restore_tombstone(binding_id, tombstone);
+        }
     }
 
     #[inline]
