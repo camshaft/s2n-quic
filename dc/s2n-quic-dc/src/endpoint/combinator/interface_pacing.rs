@@ -291,6 +291,9 @@ where
     /// until its interface frees, and the router then skips it, or, where the peer waits again,
     /// offers its batches.
     waiters: Vec<VecDeque<credentials::Id>>,
+    /// How many batches `route_waiting` offered to the senders, read by tests alone.
+    #[cfg(test)]
+    waiting_offers: usize,
     /// The batches of `highest_rx` that no sender that delivers to their peer may take yet, by
     /// the path secret of their peer, each peer's in the order the router read them, as `waiting`
     /// holds those of `rx`. Where the router has an interface for the highest-priority traffic,
@@ -380,6 +383,8 @@ where
             waiters: (0..pacing.interface_count())
                 .map(|_| VecDeque::new())
                 .collect(),
+            #[cfg(test)]
+            waiting_offers: 0,
             highest_waiting: HashMap::new(),
             highest_waiting_order: VecDeque::new(),
             lost_marks: Vec::new(),
@@ -686,6 +691,10 @@ where
                         self.waiting.remove(&peer);
                         break;
                     };
+                    #[cfg(test)]
+                    {
+                        self.waiting_offers += 1;
+                    }
                     let highest = self.is_highest(&value);
                     match self.dispatch(cx, value, highest) {
                         Ok(true) => routed += 1,
@@ -781,6 +790,12 @@ where
     #[cfg(test)]
     pub(super) fn waiter_entries(&self) -> usize {
         self.waiters.iter().map(VecDeque::len).sum()
+    }
+
+    /// Returns how many batches `route_waiting` offered to the senders.
+    #[cfg(test)]
+    pub(super) fn waiting_offers(&self) -> usize {
+        self.waiting_offers
     }
 
     /// Sends `value` to `sender`, and charges the token bucket of its `interface` for it. Where
