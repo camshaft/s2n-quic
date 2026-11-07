@@ -24,9 +24,10 @@
 //! may go to a sender whose interface pair its path marks lost while another sender of that path
 //! delivers, and the endpoints must route at least one of each while a pair of its path is lost.
 //!
-//! Once the first streams finish, no pair whose routes avoid the lost interface may be marked
-//! lost: each endpoint sends the acknowledgements of a pair's packets back along that pair, so
-//! they don't cross the lost interface.
+//! While the interface is lost, no pair whose routes avoid it may be marked lost, either once
+//! the first streams finish or once the stream the client opens next finishes: each endpoint
+//! sends the acknowledgements of a pair's packets back along that pair, so they don't cross the
+//! lost interface.
 
 use crate::{
     endpoint::{
@@ -330,9 +331,11 @@ fn path_entry(
 }
 
 /// Asserts that neither endpoint marks a pair lost whose routes avoid the client's lost
-/// interface, and that the client marks a pair on that interface lost. The server's second
-/// interface is paired with the client's second, the lost one.
-fn assert_lost_marks(shared: &Shared) {
+/// interface, and returns the client's path secret entry for the server. The server's second
+/// interface is paired with the client's second, the lost one. A failure reports the line that
+/// calls this function, so that it says which of the test's reads failed.
+#[track_caller]
+fn assert_avoiding_pairs_unmarked(shared: &Shared) -> Arc<crate::path::secret::map::Entry> {
     let client_addrs = shared.client_addrs.lock().unwrap().clone();
     let server_addrs = shared.server_addrs.lock().unwrap().clone();
     let client = path_entry(&client_addrs, &server_addrs);
@@ -349,6 +352,14 @@ fn assert_lost_marks(shared: &Shared) {
             "the server marked the pair of its socket {socket} lost",
         );
     }
+    client
+}
+
+/// Asserts that neither endpoint marks a pair lost whose routes avoid the client's lost
+/// interface, and that the client marks a pair on that interface lost, so that the first check
+/// can't pass because no mark is set at all.
+fn assert_lost_marks(shared: &Shared) {
+    let client = assert_avoiding_pairs_unmarked(shared);
     let marked = CLIENT_INTERFACE
         .iter()
         .enumerate()
@@ -519,6 +530,10 @@ fn run(recover: bool) {
             )
             .await
             .expect("a new stream finishes while an interface is lost");
+
+            // Late in the outage too, after the quiet period and the stream that follows it,
+            // neither endpoint marks lost a pair whose routes avoid the lost interface.
+            assert_avoiding_pairs_unmarked(&client_side);
             if !recover {
                 return;
             }
