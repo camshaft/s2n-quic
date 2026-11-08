@@ -1044,6 +1044,14 @@ mod tests {
         assert!(ctx.path_entry.prefers_senders_delivering_since_lost());
         assert_eq!(submission_sender(&mut ctx), sender(3));
         assert_eq!(ctx.local_sender_id, sender(1));
+        // Where the pair of sender 1 isn't marked lost but the peer hasn't acknowledged sender 1
+        // since the loss, sender 1 doesn't deliver while the preference holds, so the
+        // acknowledgements stay on sender 3.
+        assert!(ctx.path_entry.set_sender_lost(sender(1), false));
+        assert!(!ctx.path_entry.delivers_since_lost(sender(1)));
+        assert!(ctx.path_entry.prefers_senders_delivering_since_lost());
+        assert_eq!(submission_sender(&mut ctx), sender(3));
+        assert_eq!(ctx.local_sender_id, sender(1));
     }
 
     #[test]
