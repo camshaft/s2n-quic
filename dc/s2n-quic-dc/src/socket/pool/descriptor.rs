@@ -1089,3 +1089,48 @@ impl<R: Recycler> Iterator for SegmentsIter<R> {
         self.descriptor.take()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::socket::{interface, rate::Rate};
+
+    /// Returns the identity of the first interface a configuration lists, which isn't the
+    /// default interface
+    fn listed_interface() -> interface::Id {
+        let table = interface::Table::resolve(
+            &[interface::Config::default()],
+            Rate::new(1.0),
+            &[],
+            &[],
+            &interface::System,
+        );
+        let id = table.interfaces()[1].id;
+        assert_ne!(id, interface::Id::DEFAULT);
+        id
+    }
+
+    /// Returns a filled descriptor that holds `payload`
+    fn filled(payload: &[u8]) -> Filled {
+        let unfilled = Unfilled::<SyncRecycler>::new(64).expect("the allocator has memory");
+        let segments = unfilled
+            .fill_with(|_addr, _cmsg, mut iov| {
+                iov[..payload.len()].copy_from_slice(payload);
+                Ok::<_, core::convert::Infallible>(payload.len())
+            })
+            .expect("the fill doesn't fail");
+        segments.take_filled()
+    }
+
+    #[test]
+    fn split_to_keeps_the_local_interface_on_both_halves() {
+        let local_interface = listed_interface();
+        let mut back = filled(b"front|back");
+        back.set_local_interface(Some(local_interface));
+        let front = back.split_to(6);
+        assert_eq!(front.payload(), b"front|");
+        assert_eq!(back.payload(), b"back");
+        assert_eq!(front.local_interface(), Some(local_interface));
+        assert_eq!(back.local_interface(), Some(local_interface));
+    }
+}

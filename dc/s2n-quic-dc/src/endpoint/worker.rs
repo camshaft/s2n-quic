@@ -163,3 +163,150 @@ where
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        crypto::{seal, KeyPhase},
+        endpoint::routing::ModuloRoute,
+        socket::{interface, rate::Rate},
+    };
+    use core::cell::RefCell;
+    use s2n_codec::EncoderBuffer;
+    use std::rc::Rc;
+
+    type Dispatched = Entry<packet::datagram::decoder::Packet<descriptor::Filled>>;
+
+    const PAYLOAD: &[u8] = b"datagram payload";
+    const TAG_LEN: usize = 16;
+
+    /// A channel that keeps each value sent on it
+    struct Sent<T>(Rc<RefCell<Vec<T>>>);
+
+    impl<T> channel::UnboundedSender<T> for Sent<T> {
+        fn send(&mut self, value: T) -> Result<(), T> {
+            self.0.borrow_mut().push(value);
+            Ok(())
+        }
+    }
+
+    /// Writes the payload unencrypted, with a zero tag after it
+    struct NoSeal;
+
+    impl seal::Application for NoSeal {
+        fn key_phase(&self) -> KeyPhase {
+            KeyPhase::Zero
+        }
+
+        fn tag_len(&self) -> usize {
+            TAG_LEN
+        }
+
+        fn encrypt(
+            &self,
+            _packet_number: u64,
+            _header: &[u8],
+            extra_payload: Option<&[u8]>,
+            payload_and_tag: &mut [u8],
+        ) {
+            let extra_payload = extra_payload.unwrap_or_default();
+            let tag_offset = payload_and_tag.len() - TAG_LEN;
+            let extra_offset = tag_offset - extra_payload.len();
+            payload_and_tag[extra_offset..tag_offset].copy_from_slice(extra_payload);
+            payload_and_tag[tag_offset..].fill(0);
+        }
+    }
+
+    /// Returns the identity of the first interface a configuration lists, which isn't the
+    /// default interface
+    fn listed_interface() -> interface::Id {
+        let table = interface::Table::resolve(
+            &[interface::Config::default()],
+            Rate::new(1.0),
+            &[],
+            &[],
+            &interface::System,
+        );
+        let id = table.interfaces()[1].id;
+        assert_ne!(id, interface::Id::DEFAULT);
+        id
+    }
+
+    /// Returns a segment that holds one datagram packet from sender 3, as a recv socket fills it
+    fn datagram_segment() -> descriptor::Filled {
+        let credentials = credentials::Credentials {
+            id: credentials::Id::default(),
+            key_id: VarInt::from_u8(1),
+        };
+        let unfilled = descriptor::Unfilled::<descriptor::SyncRecycler>::new(256)
+            .expect("the allocator has memory");
+        let segments = unfilled
+            .fill_with(|_addr, _cmsg, mut iov| {
+                let mut header: &[u8] = &[];
+                let mut payload = PAYLOAD;
+                let len = packet::datagram::encoder::encode(
+                    EncoderBuffer::new(&mut iov[..]),
+                    4433,
+                    RoutingInfo::SenderId {
+                        source_sender_id: VarInt::from_u8(3),
+                    },
+                    Some(VarInt::from_u8(1)),
+                    VarInt::ZERO,
+                    &mut header,
+                    VarInt::from_u8(PAYLOAD.len() as u8),
+                    &mut payload,
+                    &NoSeal,
+                    &credentials,
+                );
+                Ok::<_, core::convert::Infallible>(len)
+            })
+            .expect("the fill doesn't fail");
+        segments.take_filled()
+    }
+
+    /// Dispatches `segment` through a router of one worker that records `local_interface`, and
+    /// returns the packet the worker receives
+    fn dispatch(
+        local_interface: Option<interface::Id>,
+        segment: descriptor::Filled,
+    ) -> packet::datagram::decoder::Packet<descriptor::Filled> {
+        let dispatched = Rc::new(RefCell::new(Vec::<Dispatched>::new()));
+        let invalidated = Rc::new(RefCell::new(Vec::<Entry<descriptor::Filled>>::new()));
+        let txs = RecvDispatchWorkerId::range(1)
+            .map(|id| (id, Sent(dispatched.clone())))
+            .collect::<IdMap<_, _>>();
+        let counters = Registry::new();
+        let invalidation_tx = Sent(invalidated.clone());
+        let mut router = FanOutRouter::<_, ModuloRoute, _>::new(txs, invalidation_tx, &counters)
+            .with_local_interface(local_interface);
+        router.on_segment(segment);
+        assert!(invalidated.borrow().is_empty());
+        let mut dispatched = dispatched.borrow_mut();
+        assert_eq!(dispatched.len(), 1);
+        dispatched.pop().unwrap().into_inner()
+    }
+
+    #[test]
+    fn the_router_records_its_interface_on_each_packet_it_dispatches() {
+        let local_interface = listed_interface();
+        let packet = dispatch(Some(local_interface), datagram_segment());
+        assert_eq!(packet.storage().local_interface(), Some(local_interface));
+        // The router takes the packet apart to record the interface: the packet it sends keeps
+        // its routing information and its payload
+        assert_eq!(
+            packet.routing_info(),
+            RoutingInfo::SenderId {
+                source_sender_id: VarInt::from_u8(3),
+            }
+        );
+        assert_eq!(packet.payload(), PAYLOAD);
+    }
+
+    #[test]
+    fn a_router_without_an_interface_leaves_the_packet_without_one() {
+        let packet = dispatch(None, datagram_segment());
+        assert_eq!(packet.storage().local_interface(), None);
+        assert_eq!(packet.payload(), PAYLOAD);
+    }
+}
