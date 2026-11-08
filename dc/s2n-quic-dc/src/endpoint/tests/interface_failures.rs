@@ -221,10 +221,7 @@ fn sender(socket: usize) -> LocalSenderId {
 }
 
 /// The path secret entry of the endpoint at `local` for the peer at `peer`.
-fn path_entry(
-    local: &[SocketAddr],
-    peer: &[SocketAddr],
-) -> Arc<crate::path::secret::map::Entry> {
+fn path_entry(local: &[SocketAddr], peer: &[SocketAddr]) -> Arc<crate::path::secret::map::Entry> {
     let map = lookup_sim_map(local[0]).expect("the endpoint registered its path secret map");
     peer.iter()
         .find_map(|&addr| map.get_raw(addr))
@@ -326,7 +323,9 @@ fn assert_acknowledgements_paired(routed: &[Routed], shared: &Shared) {
             Host::Client
         };
         let peer = host.peer();
-        let remote = route.remote.expect("an acknowledgement answers a peer sender");
+        let remote = route
+            .remote
+            .expect("an acknowledgement answers a peer sender");
         let remote = remote.as_varint().as_u64() as usize;
         let local = route.sender.as_usize();
         // The acknowledged packets left the peer on the interface of the peer's sender, and
