@@ -531,6 +531,12 @@ fn run(host: Host, interface: usize) {
             .await
             .expect("the second round finishes while an interface has failed");
             assert_marks_recorded(&client_marks.lock().unwrap(), &client_side);
+            // A sender is still marked lost when the failure ends, so the rounds after it can't
+            // pass without showing a mark clear.
+            assert!(
+                !lost_senders(&client_side).is_empty(),
+                "no sender was still marked lost when {failure:?} ended",
+            );
 
             // The interface delivers again. Each lost pair probes again at its next probe
             // timeout, and the peer's acknowledgement of a packet sent after the mark clears it,
