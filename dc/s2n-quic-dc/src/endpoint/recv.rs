@@ -372,8 +372,6 @@ impl Context {
     /// Sets the place of each of the endpoint's send sockets and the senders of the interface
     /// for its highest-priority traffic, which order the move of the acknowledgements off the
     /// context's sender while that sender doesn't deliver.
-    /// The context reads the peer interface of each sender again at its next move, as the send
-    /// places it sets decide them.
     pub fn with_ack_senders(
         mut self,
         send_places: Option<Arc<[SendPlace]>>,
@@ -381,7 +379,6 @@ impl Context {
     ) -> Self {
         self.send_places = send_places;
         self.priority_senders = priority_senders;
-        self.peer_interfaces = OnceCell::new();
         self
     }
 
