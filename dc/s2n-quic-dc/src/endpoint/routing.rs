@@ -246,6 +246,55 @@ pub(crate) fn ack_sender_id(
     senders[position as usize]
 }
 
+/// Returns the sender that a context's acknowledgements go to, where `routed` is the
+/// context's sender and the path keeps `count` sender slots.
+///
+/// The acknowledgements go to `routed` while it delivers, and otherwise to a sender that
+/// delivers, in this order: a sender of the same local interface whose paired peer interface
+/// is the same, a sender of the same local interface, a sender of the interface for the
+/// endpoint's highest-priority traffic (`priority_senders`), and any other sender. Within each
+/// step, the first such sender after `routed` by slot is picked, so that the acknowledgements
+/// keep to one sender. They go to `routed` where no sender delivers, or where `routed` doesn't
+/// have a slot.
+///
+/// `local_interface` returns a sender's local interface, and `peer_interface` the peer
+/// interface the sender sends to, where each is known. The senders whose local interface isn't
+/// known count as one interface, and the first step holds only where the peer interface of
+/// `routed` is known.
+pub(crate) fn delivering_ack_sender_id(
+    routed: LocalSenderId,
+    count: usize,
+    priority_senders: Option<&[LocalSenderId]>,
+    local_interface: impl Fn(LocalSenderId) -> Option<usize>,
+    peer_interface: impl Fn(LocalSenderId) -> Option<u16>,
+    delivers: impl Fn(LocalSenderId) -> bool,
+) -> LocalSenderId {
+    let start = routed.as_usize();
+    if start >= count || delivers(routed) {
+        return routed;
+    }
+    let local = local_interface(routed);
+    let peer = peer_interface(routed);
+    let flagged = priority_senders.unwrap_or(&[]);
+    let step = |sender: LocalSenderId| {
+        let same_local = local_interface(sender) == local;
+        if same_local && peer.is_some() && peer_interface(sender) == peer {
+            0
+        } else if same_local {
+            1
+        } else if flagged.contains(&sender) {
+            2
+        } else {
+            3
+        }
+    };
+    (1..count)
+        .map(|offset| LocalSenderId::from_index((start + offset) % count))
+        .filter(|&sender| delivers(sender))
+        .min_by_key(|&sender| step(sender))
+        .unwrap_or(routed)
+}
+
 /// Returns the sender that a freed batch goes to: of two different senders drawn at random, the
 /// one with the lower `score`, or the first where the scores are equal.
 ///
@@ -493,6 +542,95 @@ mod tests {
             ack_sender_id(sender(2), remote(5), Some(&priority[..])),
             sender(3)
         );
+    }
+
+    /// Returns the sender that the acknowledgements of a context whose sender is `routed` go
+    /// to, while the senders in `lost` are marked lost, among nine senders: three on each of
+    /// three local interfaces, senders 0 to 2 on the first. The second sender of each interface
+    /// sends to the peer's interface 2 and the others to its interface 1, and the third
+    /// interface, of senders 6 to 8, carries the highest-priority traffic.
+    fn delivering_ack_sender(routed: usize, lost: &[usize]) -> LocalSenderId {
+        let priority = [sender(6), sender(7), sender(8)];
+        delivering_ack_sender_id(
+            sender(routed),
+            9,
+            Some(&priority[..]),
+            |id| Some(id.as_usize() / 3),
+            |id| Some([1, 2, 1][id.as_usize() % 3]),
+            |id| !lost.contains(&id.as_usize()),
+        )
+    }
+
+    #[test]
+    fn acknowledgements_keep_a_sender_that_delivers() {
+        assert_eq!(delivering_ack_sender(0, &[]), sender(0));
+        // Lost senders of the same interface and of others don't move them.
+        assert_eq!(delivering_ack_sender(0, &[1, 2, 6]), sender(0));
+    }
+
+    #[test]
+    fn acknowledgements_leave_a_lost_sender_for_one_of_its_interface_and_pair() {
+        // Sender 1 is on the same interface, and sender 2 on the same interface and pair.
+        assert_eq!(delivering_ack_sender(0, &[0]), sender(2));
+        // The senders after the context's sender come first, past the last sender to the first.
+        assert_eq!(delivering_ack_sender(2, &[2]), sender(0));
+    }
+
+    #[test]
+    fn acknowledgements_leave_a_lost_pair_for_another_sender_of_the_interface() {
+        assert_eq!(delivering_ack_sender(0, &[0, 2]), sender(1));
+    }
+
+    #[test]
+    fn acknowledgements_leave_a_lost_interface_for_the_highest_priority_interface() {
+        // Senders 3 to 5 come first by slot, but sender 6 is on the flagged interface.
+        assert_eq!(delivering_ack_sender(0, &[0, 1, 2]), sender(6));
+    }
+
+    #[test]
+    fn acknowledgements_leave_lost_interfaces_for_any_sender_that_delivers() {
+        assert_eq!(delivering_ack_sender(0, &[0, 1, 2, 6, 7, 8]), sender(3));
+    }
+
+    #[test]
+    fn acknowledgements_keep_the_sender_where_no_sender_delivers() {
+        let all: Vec<usize> = (0..9).collect();
+        assert_eq!(delivering_ack_sender(0, &all), sender(0));
+    }
+
+    #[test]
+    fn acknowledgements_go_to_the_next_sender_by_slot_without_known_interfaces() {
+        // Without known interfaces, every sender is on the context's interface, so sender 1
+        // comes ahead of sender 3, the flagged sender.
+        let priority = [sender(3)];
+        let delivers = |id: LocalSenderId| id != sender(0);
+        let chosen = delivering_ack_sender_id(
+            sender(0),
+            4,
+            Some(&priority[..]),
+            |_| None,
+            |_| None,
+            delivers,
+        );
+        assert_eq!(chosen, sender(1));
+    }
+
+    #[test]
+    fn acknowledgements_keep_a_sender_without_a_slot() {
+        let delivers = |id: LocalSenderId| id != sender(4);
+        let chosen = delivering_ack_sender_id(sender(4), 4, None, |_| None, |_| None, delivers);
+        assert_eq!(chosen, sender(4));
+    }
+
+    #[test]
+    fn acknowledgements_keep_slot_order_where_the_pair_of_the_sender_isnt_known() {
+        // Neither the context sender's pair nor sender 2's is known, so sender 2 doesn't count
+        // as one of the same pair, and sender 1, the next by slot, comes first.
+        let delivers = |id: LocalSenderId| id != sender(0);
+        let peers: [Option<u16>; 4] = [None, Some(1), None, Some(2)];
+        let peer = |id: LocalSenderId| peers[id.as_usize()];
+        let chosen = delivering_ack_sender_id(sender(0), 4, None, |_| Some(0), peer, delivers);
+        assert_eq!(chosen, sender(1));
     }
 
     #[test]
