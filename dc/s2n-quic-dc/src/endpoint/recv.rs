@@ -841,11 +841,12 @@ impl Cache {
 /// the local interface the packets arrived at, so that the acknowledgements cross the interfaces
 /// the packets crossed and don't cross another interface, which can be lost while that one
 /// delivers. Where the receive path doesn't record that interface, or it doesn't hold a send
-/// socket, the sender is on the local interface that the peer's interface sends to: the one
-/// paired with it, or, where the peer has more interfaces than the endpoint, the one the pairing
-/// starts again from. Otherwise it is the sender that `routing::ack_sender_id` picks from the one
-/// `route` chooses: a sender of the interface for the endpoint's highest-priority traffic, where
-/// `priority_senders` lists that interface's senders.
+/// socket, the sender is on the local interface that the peer's interface sends to, where it
+/// sends to one alone: the one paired with it, or, where the peer has more interfaces than the
+/// endpoint, the one the pairing starts again from. Otherwise it is the sender that
+/// `routing::ack_sender_id` picks from the one `route` chooses: a sender of the interface for
+/// the endpoint's highest-priority traffic, where `priority_senders` lists that interface's
+/// senders.
 fn ack_sender_id<Route: super::routing::SenderRoute>(
     send_places: Option<&[SendPlace]>,
     interface_ranks: Option<&[Option<usize>]>,
