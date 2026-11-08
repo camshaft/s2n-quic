@@ -299,6 +299,7 @@ impl<R: Recycler> Descriptor<R> {
             offset: 0,
             len,
             ecn,
+            local_interface: None,
         }
     }
 
@@ -642,6 +643,9 @@ pub struct Filled<R: Recycler = SyncRecycler> {
     len: u16,
     /// The ECN marking of the packet
     ecn: ExplicitCongestionNotification,
+    /// The local interface of the socket the packet arrived on, where the socket's router
+    /// records it
+    local_interface: Option<crate::socket::interface::Id>,
 }
 
 impl<R: Recycler> fmt::Debug for Filled<R> {
@@ -666,6 +670,19 @@ impl<R: Recycler> Filled<R> {
 
     pub fn set_ecn(&mut self, ecn: ExplicitCongestionNotification) {
         self.ecn = ecn;
+    }
+
+    /// Returns the local interface of the socket the packet arrived on, where the socket's
+    /// router records it
+    #[inline]
+    pub fn local_interface(&self) -> Option<crate::socket::interface::Id> {
+        self.local_interface
+    }
+
+    /// Records the local interface of the socket the packet arrived on
+    #[inline]
+    pub fn set_local_interface(&mut self, local_interface: Option<crate::socket::interface::Id>) {
+        self.local_interface = local_interface;
     }
 
     /// Returns the length of the payload
@@ -728,6 +745,7 @@ impl<R: Recycler> Filled<R> {
         assert!(at <= self.len);
         let offset = self.offset;
         let ecn = self.ecn;
+        let local_interface = self.local_interface;
         self.offset += at;
         self.len -= at;
 
@@ -742,6 +760,7 @@ impl<R: Recycler> Filled<R> {
             offset,
             len: at,
             ecn,
+            local_interface,
         }
     }
 
