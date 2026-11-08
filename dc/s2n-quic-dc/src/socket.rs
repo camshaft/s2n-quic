@@ -6,6 +6,7 @@ pub mod cached_addr;
 pub mod channel;
 pub mod fd;
 mod gso;
+pub mod interface;
 pub mod pool;
 pub mod rate;
 pub mod recv;
