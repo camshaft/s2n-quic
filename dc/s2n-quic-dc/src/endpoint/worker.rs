@@ -30,6 +30,9 @@ pub(crate) struct FanOutRouter<D, Route, Inv> {
     routed_counter: Counter,
     route_send_err_counter: Counter,
     per_worker_routed: IdMap<RecvDispatchWorkerId, Counter>,
+    /// The local interface of the socket this router receives from, which it records on each
+    /// packet it dispatches
+    local_interface: Option<crate::socket::interface::Id>,
 }
 
 impl<D, Route: routing::SenderRoute, Inv> FanOutRouter<D, Route, Inv> {
@@ -55,7 +58,18 @@ impl<D, Route: routing::SenderRoute, Inv> FanOutRouter<D, Route, Inv> {
             routed_counter: counters.register("router.routed"),
             route_send_err_counter: counters.register("!router.send_err"),
             per_worker_routed,
+            local_interface: None,
         }
+    }
+
+    /// Records the local interface of the socket this router receives from on each packet it
+    /// dispatches, so that the packet's acknowledgements leave on that interface
+    pub fn with_local_interface(
+        mut self,
+        local_interface: Option<crate::socket::interface::Id>,
+    ) -> Self {
+        self.local_interface = local_interface;
+        self
     }
 }
 
@@ -82,6 +96,15 @@ where
         let idx = self
             .route
             .worker_id_for_recv(packet.credentials(), source_sender_id);
+        let packet = match self.local_interface {
+            Some(local_interface) => {
+                let (meta, mut segment) = packet.into_parts();
+                segment.set_local_interface(Some(local_interface));
+                packet::datagram::decoder::Packet::from_parts(meta, segment)
+                    .expect("the segment still holds the packet")
+            }
+            None => packet,
+        };
         self.routed_counter.add(1);
         self.per_worker_routed[idx].add(1);
         if self.txs[idx].send(packet.into()).is_err() {
