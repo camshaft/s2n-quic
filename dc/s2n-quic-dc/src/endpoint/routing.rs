@@ -261,6 +261,12 @@ pub(crate) fn ack_sender_id(
 /// interface the sender sends to, where each is known. The senders whose local interface isn't
 /// known count as one interface, and the first step holds only where the peer interface of
 /// `routed` is known.
+///
+/// The senders are read in slot order after `routed`, up to the first delivering sender of the
+/// first step, which is returned at once. `delivers` is read only for a sender whose step comes
+/// ahead of the step of the sender picked so far. `local_interface` is read for each sender
+/// reached, and `peer_interface` for each such sender of the same local interface, so the
+/// caller passes reads of values it keeps.
 pub(crate) fn delivering_ack_sender_id(
     routed: LocalSenderId,
     count: usize,
@@ -276,7 +282,7 @@ pub(crate) fn delivering_ack_sender_id(
     let local = local_interface(routed);
     let peer = peer_interface(routed);
     let flagged = priority_senders.unwrap_or(&[]);
-    let step = |sender: LocalSenderId| {
+    let step = |sender: LocalSenderId| -> u8 {
         let same_local = local_interface(sender) == local;
         if same_local && peer.is_some() && peer_interface(sender) == peer {
             0
@@ -288,11 +294,23 @@ pub(crate) fn delivering_ack_sender_id(
             3
         }
     };
-    (1..count)
-        .map(|offset| LocalSenderId::from_index((start + offset) % count))
-        .filter(|&sender| delivers(sender))
-        .min_by_key(|&sender| step(sender))
-        .unwrap_or(routed)
+    // A sender replaces the one picked so far only where its step comes first, so the first
+    // delivering sender of each step after `routed` stays picked.
+    let mut picked = routed;
+    let mut picked_step = u8::MAX;
+    for offset in 1..count {
+        let sender = LocalSenderId::from_index((start + offset) % count);
+        let sender_step = step(sender);
+        if sender_step >= picked_step || !delivers(sender) {
+            continue;
+        }
+        if sender_step == 0 {
+            return sender;
+        }
+        picked = sender;
+        picked_step = sender_step;
+    }
+    picked
 }
 
 /// Returns the sender that a freed batch goes to: of two different senders drawn at random, the
@@ -631,6 +649,49 @@ mod tests {
         let peer = |id: LocalSenderId| peers[id.as_usize()];
         let chosen = delivering_ack_sender_id(sender(0), 4, None, |_| Some(0), peer, delivers);
         assert_eq!(chosen, sender(1));
+    }
+
+    #[test]
+    fn acknowledgements_stop_at_the_first_delivering_sender_of_the_same_interface_and_pair() {
+        // Sender 1 delivers on the same interface, and sender 2 on the same interface and pair,
+        // so the order doesn't read the interface of any sender after sender 2.
+        let priority = [sender(6), sender(7), sender(8)];
+        let peers: [Option<u16>; 3] = [Some(1), Some(2), Some(1)];
+        let read = core::cell::RefCell::new(Vec::new());
+        let local = |id: LocalSenderId| {
+            read.borrow_mut().push(id.as_usize());
+            Some(id.as_usize() / 3)
+        };
+        let peer = |id: LocalSenderId| peers[id.as_usize() % 3];
+        let delivers = |id: LocalSenderId| id != sender(0);
+        let chosen =
+            delivering_ack_sender_id(sender(0), 9, Some(&priority[..]), local, peer, delivers);
+        assert_eq!(chosen, sender(2));
+        assert_eq!(read.into_inner(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn acknowledgements_read_the_delivery_only_of_senders_ahead_in_the_order() {
+        // Sender 1 delivers on the same interface, and sender 2, of the same interface and pair,
+        // doesn't deliver. The senders after sender 2 come after sender 1 in the order, so the
+        // order doesn't read whether they deliver.
+        let priority = [sender(6), sender(7), sender(8)];
+        let lost = [0, 2];
+        let asked = core::cell::RefCell::new(Vec::new());
+        let delivers = |id: LocalSenderId| {
+            asked.borrow_mut().push(id.as_usize());
+            !lost.contains(&id.as_usize())
+        };
+        let chosen = delivering_ack_sender_id(
+            sender(0),
+            9,
+            Some(&priority[..]),
+            |id| Some(id.as_usize() / 3),
+            |id| Some([1, 2, 1][id.as_usize() % 3]),
+            delivers,
+        );
+        assert_eq!(chosen, sender(1));
+        assert_eq!(asked.into_inner(), [0, 1, 2]);
     }
 
     #[test]
