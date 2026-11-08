@@ -58,6 +58,7 @@ pub mod testing;
 mod tests;
 
 pub use error::Error;
+pub use frame_trace::arm_slot_holds;
 pub use s2n_quic_platform::features::Gso;
 
 /// The maximum time a stream will be open without activity from the peer
@@ -548,7 +549,10 @@ where
         "setting up endpoint"
     );
 
-    if num_recv_dispatch.is_power_of_two() {
+    // `setup_endpoint_inner` builds two routes of this type: one over the recv dispatch workers,
+    // and one over the send sockets, which picks the sender of a peer's acknowledgements. A mask
+    // picks the same index as a modulo only where the count is a power of two.
+    if num_recv_dispatch.is_power_of_two() && send_sockets.len().is_power_of_two() {
         setup_endpoint_inner::<_, _, _, _, routing::PowerOfTwoRoute>(
             runtime,
             config,
@@ -622,10 +626,7 @@ where
     let num_workers = runtime.worker_count().max(1);
     let num_send = send_sockets.len();
 
-    assert!(
-        num_send.is_power_of_two(),
-        "number of sender sockets must be a power of two"
-    );
+    assert!(num_send > 0, "at least one send socket is required");
     assert!(
         submission_shards.is_power_of_two(),
         "submission shard count must be a power of two"
@@ -904,11 +905,13 @@ where
         socket_senders,
         clock: clock.clone(),
         pacing,
+        path_secret_map: path_secret_map.clone(),
         send_credit_distributor,
         recv_credit_distributor,
         send_credit_waker_sink: send_credit_distributor_waker_sink,
         recv_credit_waker_sink: recv_credit_distributor_waker_sink,
         send_credit_pool: send_credit_pool.clone(),
+        freed_batch_tx: freed_batch_tx.clone(),
     });
 
     for (idx, drain) in waker_drains.into_iter().enumerate() {
@@ -977,6 +980,7 @@ where
             reader_metrics: reader_metrics.clone(),
             writer_metrics: writer_metrics.clone(),
             send_credit_pool: send_credit_pool.clone(),
+            path_secret_map: path_secret_map.clone(),
         });
     }
 
@@ -1000,6 +1004,14 @@ where
         .unzip();
 
     let ack_route = RecvRoute::new(num_send);
+    // Each send socket's place among the interfaces, by sender, which the recv dispatch workers
+    // read to send the acknowledgements of a peer's packets back along the pair they came on.
+    let ack_send_places: Option<Arc<[crate::socket::interface::SendPlace]>> =
+        send_places.as_deref().map(Arc::from);
+    // The rank of each local interface among the interfaces that hold a send socket, by
+    // interface, which the recv dispatch workers read to send the acknowledgements of a peer's
+    // packets from the interface they arrived at.
+    let interface_ranks: Option<Arc<[Option<usize>]>> = interfaces.send_ranks().map(Arc::from);
     for (recv_dispatch_id, dispatch_rx, ack_completion_rx, invalidation_rx, waker_sink) in (
         dispatch_rxs,
         ack_completion_rxs,
@@ -1027,6 +1039,8 @@ where
             stream_clock: stream_clock.clone(),
             route: ack_route,
             priority_senders: priority_senders.clone(),
+            send_places: ack_send_places.clone(),
+            interface_ranks: interface_ranks.clone(),
             waker_sink,
             ups_tx: ups_tx.clone(),
             invalidation_rx,
@@ -1053,11 +1067,18 @@ where
     // the syscall-assigned sockets so workers stay balanced when some sockets are adopted by rings.
     let mut syscall_recv_idx = 0usize;
     for (recv_socket_id, socket) in recv_sockets.into_iter() {
+        // The local interface of the socket, which the router records on each packet it
+        // dispatches, so that the packet's acknowledgements leave on that interface.
+        let local_interface = interfaces
+            .recv_sockets()
+            .get(recv_socket_id.as_usize())
+            .copied();
         let router = worker::FanOutRouter::<_, RecvRoute, _>::new(
             dispatch_txs.clone(),
             invalidation_raw_tx.clone(),
             &counter_registry,
-        );
+        )
+        .with_local_interface(local_interface);
 
         // Try io_uring first when enabled. On success the ring thread owns both socket and router; on
         // failure (uring disabled, no fd, or setup error) both are handed back so the syscall path can
@@ -1159,12 +1180,17 @@ struct FrameDispatchParts<Clk> {
     clock: Clk,
     /// How the pacing stage paces the send sockets of each interface.
     pacing: combinator::SendPacing,
+    /// The path secret map whose subscriber records the creditless window's events.
+    path_secret_map: crate::path::secret::Map,
     /// Send-direction credit-pool distributor. Spawned alongside the frame-dispatch
     /// task on the same worker so distribution and submission share a thread.
     send_credit_distributor: crate::credit::Distributor,
     /// Send credit pool handle, passed to `frame_dispatch` so the pick-two router can
     /// return credit when it has to drop an undeliverable batch (worker teardown).
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    /// Freed-queue submission sender, passed to `frame_dispatch` so the priority router records
+    /// a slot that a rejected init held as freed once the slot's reset leaves for its lane.
+    freed_batch_tx: crate::queue::FreedBatchTx,
     /// Recv-direction credit-pool distributor. Reserved for the Reader integration;
     /// spawned today so the close path is wired and `recv_credit_pool.release` works.
     recv_credit_distributor: crate::credit::Distributor,
@@ -1193,6 +1219,7 @@ struct SendWorkerParts {
     reader_metrics: Arc<crate::stream::metrics::ReaderMetrics>,
     writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
+    path_secret_map: crate::path::secret::Map,
 }
 
 /// Per-socket ingredients for the socket send task.
@@ -1243,6 +1270,13 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     /// The send sockets of the interface for the highest-priority traffic, which a peer's
     /// acknowledgements go to, where the endpoint has one.
     priority_senders: Option<Vec<LocalSenderId>>,
+    /// The place of each send socket among the endpoint's interfaces, by sender, or `None` where
+    /// the endpoint doesn't list any, which picks the sender of each peer's acknowledgements.
+    send_places: Option<Arc<[crate::socket::interface::SendPlace]>>,
+    /// The rank of each local interface among the interfaces that hold a send socket, by
+    /// interface, or `None` where the endpoint doesn't list any, which puts the sender of a
+    /// peer's acknowledgements on the interface its packets arrived at.
+    interface_ranks: Option<Arc<[Option<usize>]>>,
     waker_sink: waker::Sink,
     ups_tx: UpsSender,
     invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
@@ -1394,7 +1428,9 @@ where
                     fd.pacing,
                     budgets,
                     counter_registry.clone(),
+                    Some(fd.path_secret_map),
                     fd.send_credit_pool,
+                    fd.freed_batch_tx,
                 );
                 tasks::spawn_credit_distributor(
                     &mut local,
@@ -1451,6 +1487,7 @@ where
                     sw.reader_metrics,
                     sw.writer_metrics,
                     sw.send_credit_pool,
+                    sw.path_secret_map,
                 );
             }
 
@@ -1537,7 +1574,9 @@ where
                 let recv_dispatch_idx = rd.recv_dispatch_idx;
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx)
-                        .with_priority_senders(rd.priority_senders),
+                        .with_priority_senders(rd.priority_senders)
+                        .with_send_places(rd.send_places)
+                        .with_interface_ranks(rd.interface_ranks),
                 ));
                 let (ack_burst_tx, ack_burst_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<
@@ -1589,7 +1628,7 @@ where
                     recv_cache.clone(),
                     ack_burst_tx,
                     recv_idle_wheel_tx,
-                    rd.path_secret_map,
+                    rd.path_secret_map.clone(),
                     rd.acceptor_registry,
                     rd.frame_tx,
                     rd.ack_sender.clone(),
@@ -1623,6 +1662,7 @@ where
                     rd.ack_sender.clone(),
                     recv_dispatch_idx,
                     rd.counters.clone(),
+                    Some(rd.path_secret_map.clone()),
                 );
                 let task_counter = counter_registry
                     .register_nominal_task("task.ack_burst", &variant)
@@ -1649,6 +1689,7 @@ where
                     recv_cache.clone(),
                     rd.ack_sender,
                     rd.counters.clone(),
+                    Some(rd.path_secret_map),
                 );
                 let task_counter = counter_registry
                     .register_nominal_task("task.ack_completion", &variant)
@@ -1737,7 +1778,7 @@ where
                 );
                 // A client path the idle wheel marks dead asks the handshake client registered
                 // on the map, where one is, for a new handshake with the peer in the background.
-                let path_secret_map = bg.path_secret_map;
+                let path_secret_map = bg.path_secret_map.clone();
                 let request_rehandshake = move |peer| {
                     let reason = crate::psk::io::HandshakeReason::Remote;
                     let _ = path_secret_map.request_handshake(peer, reason);
@@ -1788,6 +1829,7 @@ where
                     let mut ack_sender = bg.ack_sender;
                     let socket_count = total_sender_ids;
                     let priority_senders = bg.priority_senders;
+                    let path_secret_map = bg.path_secret_map;
                     let mut rng = crate::xorshift::Rng::new();
                     let rx = crate::socket::channel::Map::new(
                         bg.freed_batch_rx,
@@ -1796,29 +1838,16 @@ where
                             // the interface for the highest-priority traffic where there is one.
                             // A sender whose interface pair is marked lost loses the draw, and
                             // where both drawn senders' pairs are lost, the batch goes to a
-                            // sender whose pair delivers.
-                            let path_secret_entry = entry.path_secret_entry();
-                            let chosen = routing::freed_batch_sender_id(
+                            // sender whose pair delivers. Each batch that the lost marks move
+                            // off the sender the load scores choose publishes an event through
+                            // the path secret map.
+                            routing::route_freed_batch(
+                                &mut entry,
                                 priority_senders.as_deref(),
                                 socket_count,
                                 &mut rng,
-                                |sender| {
-                                    (
-                                        path_secret_entry.is_sender_lost(sender),
-                                        path_secret_entry.sender_load_score(sender),
-                                    )
-                                },
+                                Some(&path_secret_map),
                             );
-                            let chosen = path_secret_entry.delivering_sender(chosen);
-
-                            // Set the chosen sender and forward
-                            if let msg::Sender::PendingFreed {
-                                ref mut local_sender_id,
-                                ..
-                            } = *entry
-                            {
-                                *local_sender_id = chosen;
-                            }
                             let _ = ack_sender.send(entry);
                         },
                     );

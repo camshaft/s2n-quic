@@ -1467,6 +1467,130 @@ where
                 peer_address: SocketAddress::from(*peer_address).into_event(),
             });
     }
+
+    fn on_interface_pair_lost(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_interface_pair_lost(
+            event::builder::PathSecretMapInterfacePairLost {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
+
+    fn on_interface_pair_delivering(&self, peer_address: &SocketAddr) {
+        self.subscriber()
+            .on_path_secret_map_interface_pair_delivering(
+                event::builder::PathSecretMapInterfacePairDelivering {
+                    peer_address: SocketAddress::from(*peer_address).into_event(),
+                },
+            );
+    }
+
+    fn on_interface_pair_frames_moved(&self, peer_address: &SocketAddr, frames: usize) {
+        self.subscriber()
+            .on_path_secret_map_interface_pair_frames_moved(
+                event::builder::PathSecretMapInterfacePairFramesMoved {
+                    peer_address: SocketAddress::from(*peer_address).into_event(),
+                    frames,
+                },
+            );
+    }
+
+    fn on_interface_pair_preference_ended(&self, peer_address: &SocketAddr) {
+        self.subscriber()
+            .on_path_secret_map_interface_pair_preference_ended(
+                event::builder::PathSecretMapInterfacePairPreferenceEnded {
+                    peer_address: SocketAddress::from(*peer_address).into_event(),
+                },
+            );
+    }
+
+    fn on_dead_mark_skipped(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_dead_mark_skipped(
+            event::builder::PathSecretMapDeadMarkSkipped {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
+
+    fn on_creditless_window_frame_refused(
+        &self,
+        peer_address: &SocketAddr,
+        frame_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.subscriber().on_creditless_window_frame_refused(
+            event::builder::CreditlessWindowFrameRefused {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+                frame_bytes,
+                held_bytes,
+                limit_bytes,
+            },
+        );
+    }
+
+    fn on_creditless_window_limit_grew(
+        &self,
+        released_bytes: u64,
+        held_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.subscriber().on_creditless_window_limit_grew(
+            event::builder::CreditlessWindowLimitGrew {
+                released_bytes,
+                held_bytes,
+                limit_bytes,
+            },
+        );
+    }
+
+    fn on_creditless_window_limit_halved(
+        &self,
+        held_bytes: u64,
+        previous_limit_bytes: u64,
+        limit_bytes: u64,
+    ) {
+        self.subscriber().on_creditless_window_limit_halved(
+            event::builder::CreditlessWindowLimitHalved {
+                held_bytes,
+                previous_limit_bytes,
+                limit_bytes,
+            },
+        );
+    }
+
+    fn on_sender_counted_lost(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_sender_counted_lost(
+            event::builder::PathSecretMapSenderCountedLost {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
+
+    fn on_sender_counted_lost_cleared(&self, peer_address: &SocketAddr) {
+        self.subscriber()
+            .on_path_secret_map_sender_counted_lost_cleared(
+                event::builder::PathSecretMapSenderCountedLostCleared {
+                    peer_address: SocketAddress::from(*peer_address).into_event(),
+                },
+            );
+    }
+
+    fn on_acknowledgement_moved(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_acknowledgement_moved(
+            event::builder::PathSecretMapAcknowledgementMoved {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
+
+    fn on_freed_batch_moved(&self, peer_address: &SocketAddr) {
+        self.subscriber().on_path_secret_map_freed_batch_moved(
+            event::builder::PathSecretMapFreedBatchMoved {
+                peer_address: SocketAddress::from(*peer_address).into_event(),
+            },
+        );
+    }
 }
 
 impl<C, S> Drop for State<C, S>

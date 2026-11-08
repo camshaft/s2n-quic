@@ -14,16 +14,37 @@
 //! probes unacknowledged: the peer must not be marked dead, and a stream the client opens next
 //! must still get its answer. The network then delivers that interface's packets again, and
 //! once the client writes on that interface again, which waits for the next probes of its
-//! pairs, the client's second interface must carry a share of eight more streams.
+//! pairs, the client writes rounds of eight streams until that interface carries more than an
+//! eighth of a round's bytes.
+//!
+//! While the interface is lost, a reset sent each way on a new stream must get through, though
+//! the lost interface carries each endpoint's highest-priority traffic.
+//!
+//! The endpoints record each acknowledgement and freed batch they route to a send worker. None
+//! may go to a sender whose interface pair its path marks lost while another sender of that path
+//! delivers, and the endpoints must route at least one of each while a pair of its path is lost.
+//! While the routers prefer the senders the peer acknowledged since the path's lost pairs
+//! stopped delivering, each must go to such a sender, and the endpoints must route at least one
+//! of each then too.
+//!
+//! While the interface is lost, no pair whose routes avoid it may be marked lost, either once
+//! the first streams finish or once the stream the client opens next finishes: each endpoint
+//! sends the acknowledgements of a pair's packets back along that pair, so they don't cross the
+//! lost interface.
 
 use crate::{
+    endpoint::{
+        id::LocalSenderId,
+        routing::observe::{self, Kind, Routed},
+    },
     socket::{interface, rate::Rate},
-    stream::endpoint::testing::sim::{Client, SimEndpointConfig},
+    stream::endpoint::testing::sim::{lookup_sim_map, Client, SimEndpointConfig},
     testing::{ext::*, sim, without_snapshots, without_tracing},
 };
 use bach::time::timeout;
 use s2n_quic_core::{stream::testing::Data, varint::VarInt};
 use std::{
+    io,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -40,8 +61,9 @@ const STREAM_LEN: u64 = 1024 * 1024;
 const REPLY_LEN: u64 = 1024;
 /// The bytes the server reads before the client's second interface stops delivering.
 const LOSS_AFTER: u64 = STREAMS as u64 * STREAM_LEN / 4;
-/// How long the client may take, once the interface delivers again, to write on it again: a
-/// lost pair probes again at its next probe timeout, whose backoff grows with the outage.
+/// How long the client may wait, once the interface delivers again, for its first write on it,
+/// and then for a round of streams in which that interface carries its share: a lost pair probes
+/// again at its next probe timeout, whose backoff grows with the outage.
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long the client waits after each stream while the interface recovers, so that the sim
 /// doesn't carry one stream after another until the lost pairs probe again.
@@ -49,6 +71,10 @@ const RECOVERY_PAUSE: Duration = Duration::from_secs(1);
 /// How long neither endpoint sends while the interface is lost: longer than the 30 s idle
 /// timeout of the sim's paths, so that the send contexts of the lost pairs expire.
 const QUIET: Duration = Duration::from_secs(45);
+/// How long the last packets of the exchanges before the quiet period, such as acknowledgements,
+/// may take to reach the endpoints. The network counts each packet it passes in the rest of the
+/// quiet period.
+const SETTLE: Duration = Duration::from_secs(1);
 /// How long each round of streams may take before the test fails.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 /// The interface of each client socket: sockets 0 to 3 on the slow one, 4 to 7 on the fast one.
@@ -73,8 +99,15 @@ struct Shared {
     losing: AtomicBool,
     /// The client's addresses on the interface the test loses.
     lost_addrs: Mutex<Vec<SocketAddr>>,
+    /// Whether the network drops only the packets from `lost_addrs`, and delivers the packets
+    /// to them.
+    only_from_lost: AtomicBool,
     /// The packets the network dropped.
     dropped: AtomicU64,
+    /// Whether the network counts the packets it passes: the quiet period, after `SETTLE`.
+    quiet: AtomicBool,
+    /// The source and destination of each packet the network passed while `quiet` was set.
+    passed_while_quiet: Mutex<Vec<(SocketAddr, SocketAddr)>>,
     /// The bytes the server read.
     read: AtomicU64,
     /// The bytes the server read while the interface was lost.
@@ -107,6 +140,33 @@ impl Shared {
         *self.client_addrs.lock().unwrap() = addrs.to_vec();
     }
 
+    /// Keeps the client's addresses, as `set_client_addrs` does, and makes the network drop the
+    /// packets that the client's sockets `lost` lists send, and deliver the packets sent to
+    /// them, instead of losing the packets to and from its interface `LOST`.
+    fn set_client_addrs_losing_sends(&self, addrs: &[SocketAddr], lost: &[usize]) {
+        *self.lost_addrs.lock().unwrap() = lost.iter().map(|&socket| addrs[socket]).collect();
+        self.only_from_lost.store(true, Ordering::Relaxed);
+        *self.client_addrs.lock().unwrap() = addrs.to_vec();
+    }
+
+    /// The bytes the monitor recorded from each of the client's interfaces to the server.
+    fn client_bytes(&self) -> [u64; 2] {
+        let client_addrs = self.client_addrs.lock().unwrap();
+        let server_addrs = self.server_addrs.lock().unwrap();
+        // In the sim, send socket i is recv socket i, so the position of an address in
+        // `data_addrs` is its socket, and `CLIENT_INTERFACE` holds that socket's interface.
+        let mut bytes = [0u64; 2];
+        for write in self.writes.lock().unwrap().iter() {
+            let Some(socket) = client_addrs.iter().position(|&addr| addr == write.local) else {
+                continue;
+            };
+            if server_addrs.contains(&write.peer) {
+                bytes[CLIENT_INTERFACE[socket]] += write.bytes;
+            }
+        }
+        bytes
+    }
+
     /// Counts `len` bytes the server read, and loses the client's interface once the server
     /// has read `LOSS_AFTER` bytes.
     fn on_read(&self, len: u64) {
@@ -125,6 +185,9 @@ impl Shared {
             return false;
         }
         let lost_addrs = self.lost_addrs.lock().unwrap();
+        if self.only_from_lost.load(Ordering::Relaxed) {
+            return lost_addrs.contains(&source);
+        }
         lost_addrs.contains(&source) || lost_addrs.contains(&destination)
     }
 
@@ -145,6 +208,13 @@ impl Shared {
     fn wrote_on_lost_interface(&self) -> bool {
         self.wrote_on_lost.load(Ordering::Relaxed)
     }
+}
+
+/// Whether the client's lost interface carried more than an eighth of `bytes`, the bytes the
+/// client wrote on each of its interfaces: the lost interface is the faster one, so once it
+/// delivers again it carries more than that.
+fn restored_share(bytes: [u64; 2]) -> bool {
+    bytes[LOST] * 8 > bytes.iter().sum::<u64>()
 }
 
 /// Two interfaces, the first at `SLOW` and the second at `FAST`, which also carries the
@@ -220,6 +290,122 @@ async fn exchange(client: &mut Client, count: usize, round: &'static str, shared
     }
 }
 
+/// The acceptor of the streams the test resets both ways.
+const RESET_ACCEPTOR_ID: VarInt = VarInt::from_u32(2);
+/// The bytes each side writes on a stream the test resets.
+const RESET_STREAM_LEN: u64 = 4;
+
+/// Opens a stream to the server's reset acceptor, writes a few bytes and reads the server's
+/// answer, without a FIN either way. The client then drops its reader, which resets the server's
+/// writer, and the server then drops its reader, which resets the client's writer. Each reset is
+/// its endpoint's highest-priority traffic.
+async fn reset_round_trip(client: &mut Client) {
+    let stream = client
+        .connect("server:0", RESET_ACCEPTOR_ID)
+        .await
+        .expect("connect");
+    let (mut reader, mut writer) = stream.into_split();
+    let mut request = Data::new(RESET_STREAM_LEN);
+    writer
+        .write_all_from(&mut request)
+        .await
+        .expect("client write");
+    let mut reply = Data::new(RESET_STREAM_LEN);
+    while !reply.is_finished() {
+        let len = reader.read_into(&mut reply).await.expect("client read");
+        assert!(len > 0, "the server's answer ended early");
+    }
+    // The client stops reading before the server's FIN, so this drop resets the server's writer.
+    drop(reader);
+    let error = writer.peer_cancellation().await;
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset,
+        "the server's reset didn't reach the client: {error:?}",
+    );
+}
+
+/// The local sender id of the send socket at `socket`.
+fn sender(socket: usize) -> LocalSenderId {
+    LocalSenderId::new(VarInt::from_u32(socket as u32))
+}
+
+/// The path secret entry of the endpoint at `local` for the peer at `peer`.
+fn path_entry(
+    local: &[SocketAddr],
+    peer: &[SocketAddr],
+) -> Arc<crate::path::secret::map::Entry> {
+    let map = lookup_sim_map(local[0]).expect("the endpoint registered its path secret map");
+    peer.iter()
+        .find_map(|&addr| map.get_raw(addr))
+        .expect("the endpoint holds a path secret for the peer")
+}
+
+/// Asserts that neither endpoint marks a pair lost whose routes avoid the client's lost
+/// interface, and returns the client's path secret entry for the server. The server's second
+/// interface is paired with the client's second, the lost one. A failure reports the line that
+/// calls this function, so that it says which of the test's reads failed.
+#[track_caller]
+fn assert_avoiding_pairs_unmarked(shared: &Shared) -> Arc<crate::path::secret::map::Entry> {
+    let client_addrs = shared.client_addrs.lock().unwrap().clone();
+    let server_addrs = shared.server_addrs.lock().unwrap().clone();
+    let client = path_entry(&client_addrs, &server_addrs);
+    let server = path_entry(&server_addrs, &client_addrs);
+    for (socket, &interface) in CLIENT_INTERFACE.iter().enumerate() {
+        assert!(
+            interface == LOST || !client.is_sender_lost(sender(socket)),
+            "the client marked the pair of its socket {socket} lost",
+        );
+    }
+    for (socket, &interface) in SERVER_INTERFACE.iter().enumerate() {
+        assert!(
+            interface == LOST || !server.is_sender_lost(sender(socket)),
+            "the server marked the pair of its socket {socket} lost",
+        );
+    }
+    client
+}
+
+/// Asserts that neither endpoint marks a pair lost whose routes avoid the client's lost
+/// interface, and that the client marks a pair on that interface lost, so that the first check
+/// can't pass because no mark is set at all.
+fn assert_lost_marks(shared: &Shared) {
+    let client = assert_avoiding_pairs_unmarked(shared);
+    let marked = CLIENT_INTERFACE
+        .iter()
+        .enumerate()
+        .any(|(socket, &interface)| interface == LOST && client.is_sender_lost(sender(socket)));
+    assert!(marked, "the client didn't mark a pair on the lost interface lost");
+}
+
+/// Asserts that the server acknowledges each packet from the client's slow interface on a sender
+/// of its own slow interface, the pair of the interface the packet came from, though its fast
+/// interface carries its highest-priority traffic, and that it acknowledges at least one such
+/// packet.
+fn assert_slow_interface_acks_paired(routed: &[Routed], shared: &Shared) {
+    let client_addrs = shared.client_addrs.lock().unwrap();
+    let mut acks = 0;
+    for route in routed
+        .iter()
+        .filter(|route| route.kind == Kind::PendingAck && client_addrs.contains(&route.peer))
+    {
+        // The server's path has a client address as its peer, and in the sim the client's
+        // sender i is its send socket i, whose interface `CLIENT_INTERFACE` holds.
+        let remote = route.remote.expect("an acknowledgement answers a client sender");
+        let interface = CLIENT_INTERFACE[remote.as_varint().as_u64() as usize];
+        if interface == LOST {
+            continue;
+        }
+        acks += 1;
+        assert_eq!(
+            SERVER_INTERFACE[route.sender.as_usize()],
+            interface,
+            "the server routed {route:?} off the pair of the client's slow interface",
+        );
+    }
+    assert!(acks > 0, "the server didn't acknowledge a packet from the client's slow interface");
+}
+
 /// While one of the client's interfaces is lost, the client and the server move their traffic to
 /// the pairs that still deliver, so the streams the client opened before the loss finish, and
 /// the expiry of the lost pairs' send contexts doesn't mark the peer dead.
@@ -231,7 +417,6 @@ fn traffic_moves_off_a_lost_interface() {
 /// As `traffic_moves_off_a_lost_interface`, and once the interface delivers again, its pairs
 /// carry traffic again.
 #[test]
-#[ignore = "a lost interface doesn't carry traffic again within RECOVERY_TIMEOUT yet"]
 fn traffic_moves_off_a_lost_interface_and_back() {
     run(true);
 }
@@ -245,8 +430,12 @@ fn run(recover: bool) {
 
     let shared = Arc::new(Shared::default());
     let in_sim = shared.clone();
+    let routed = Arc::new(Mutex::new(Vec::<Routed>::new()));
+    let routed_in_sim = routed.clone();
 
     sim(move || {
+        // The endpoints route on the thread that runs the sim, which records what they route.
+        observe::record_into(routed_in_sim);
         let monitor = in_sim.clone();
         bach::net::monitor::on_socket_write(move |write| {
             monitor.on_write(*write.local_addr, *write.peer_addr);
@@ -267,6 +456,10 @@ fn run(recover: bool) {
                 network.dropped.fetch_add(1, Ordering::Relaxed);
                 return bach::net::monitor::Command::Drop;
             }
+            if network.quiet.load(Ordering::Relaxed) {
+                let route = (packet.source(), packet.destination());
+                network.passed_while_quiet.lock().unwrap().push(route);
+            }
             bach::net::monitor::Command::Pass
         });
 
@@ -279,6 +472,40 @@ fn run(recover: bool) {
             let mut acceptor = server
                 .register_acceptor_channel(ACCEPTOR_ID, STREAMS * 2)
                 .expect("acceptor registration");
+            // The server answers a stream to the reset acceptor, waits for the client's reset of
+            // its writer, and then resets the client's writer.
+            let mut reset_acceptor = server
+                .register_acceptor_channel(RESET_ACCEPTOR_ID, 1)
+                .expect("reset acceptor registration");
+            async move {
+                while let Some(stream) = reset_acceptor.recv().await {
+                    async move {
+                        let (mut reader, mut writer) = stream.into_split();
+                        let mut request = Data::new(RESET_STREAM_LEN);
+                        while !request.is_finished() {
+                            let len = reader.read_into(&mut request).await.expect("server read");
+                            assert!(len > 0, "the client's request ended early");
+                        }
+                        let mut reply = Data::new(RESET_STREAM_LEN);
+                        writer
+                            .write_all_from(&mut reply)
+                            .await
+                            .expect("server write");
+                        let error = writer.peer_cancellation().await;
+                        assert_eq!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionReset,
+                            "the client's reset didn't reach the server: {error:?}",
+                        );
+                        // The server stops reading before the client's FIN, so this drop resets
+                        // the client's writer.
+                        drop(reader);
+                    }
+                    .primary()
+                    .spawn();
+                }
+            }
+            .spawn();
             while let Some(stream) = acceptor.recv().await {
                 let shared = server_side.clone();
                 async move {
@@ -324,17 +551,37 @@ fn run(recover: bool) {
                 "the interface wasn't lost",
             );
 
+            // The pairs whose routes avoid the lost interface still get their acknowledgements,
+            // so neither endpoint marks one of them lost.
+            assert_lost_marks(&client_side);
+
+            // Each endpoint's resets are its highest-priority traffic, whose pairs cross the lost
+            // interface, so they make their round trip on the pairs that still deliver.
+            timeout(ROUND_TIMEOUT, reset_round_trip(&mut client))
+                .await
+                .expect("a reset makes its round trip while an interface is lost");
+
             // Neither endpoint sends for longer than the paths' idle timeout, so the lost pairs'
             // send contexts expire with their probes unacknowledged. The peer isn't marked dead,
             // so the next connect isn't refused, and a stream the client opens while the
             // interface is lost gets its answer.
-            QUIET.sleep().await;
+            // A packet from the peer that an endpoint authenticates moves the idle expiry of its
+            // send contexts for that peer, so the network counts each packet it passes in the
+            // quiet period after `SETTLE`, and the test asserts that it passes none.
+            SETTLE.sleep().await;
+            client_side.quiet.store(true, Ordering::Relaxed);
+            (QUIET - SETTLE).sleep().await;
+            client_side.quiet.store(false, Ordering::Relaxed);
             timeout(
                 ROUND_TIMEOUT,
                 exchange(&mut client, 1, "the quiet round", &client_side),
             )
             .await
             .expect("a new stream finishes while an interface is lost");
+
+            // Late in the outage too, after the quiet period and the stream that follows it,
+            // neither endpoint marks lost a pair whose routes avoid the lost interface.
+            assert_avoiding_pairs_unmarked(&client_side);
             if !recover {
                 return;
             }
@@ -360,12 +607,24 @@ fn run(recover: bool) {
             .expect("the client writes on the interface again once it delivers");
             client_side.recording.store(true, Ordering::Relaxed);
 
-            timeout(
-                ROUND_TIMEOUT,
-                exchange(&mut client, STREAMS, "the last round", &client_side),
-            )
+            // The client writes rounds of streams until that interface carries more than an
+            // eighth of a round's bytes, and the monitor keeps the writes of the last round.
+            timeout(RECOVERY_TIMEOUT, async {
+                loop {
+                    client_side.writes.lock().unwrap().clear();
+                    timeout(
+                        ROUND_TIMEOUT,
+                        exchange(&mut client, STREAMS, "a recovery round", &client_side),
+                    )
+                    .await
+                    .expect("the streams finish once the interface delivers again");
+                    if restored_share(client_side.client_bytes()) {
+                        break;
+                    }
+                }
+            })
             .await
-            .expect("the streams finish once the interface delivers again");
+            .expect("the interface carries its share of a round's bytes once it delivers again");
             client_side.recording.store(false, Ordering::Relaxed);
         }
         .group("client")
@@ -373,8 +632,59 @@ fn run(recover: bool) {
         .spawn();
     });
 
+    // While a pair of a path was marked lost and another delivered, neither endpoint routed an
+    // acknowledgement or a freed batch of that path to a sender whose pair was marked lost, and
+    // the endpoints routed at least one of each. While the routers preferred the senders of the
+    // path that delivered since the loss, each went to such a sender, and the endpoints routed
+    // at least one of each then too.
+    let routed = routed.lock().unwrap();
+    let (mut acks, mut freed) = (0, 0);
+    let (mut acks_since, mut freed_since) = (0, 0);
+    for route in routed
+        .iter()
+        .filter(|route| route.path_has_lost && route.path_delivers)
+    {
+        assert!(
+            !route.lost,
+            "{route:?} went to a lost sender while another sender of its path delivers",
+        );
+        match route.kind {
+            Kind::PendingAck => acks += 1,
+            Kind::PendingFreed => freed += 1,
+        }
+        if route.path_delivers_since_lost {
+            assert!(
+                route.delivers_since_lost,
+                "{route:?} went to a sender that doesn't deliver since the loss",
+            );
+            match route.kind {
+                Kind::PendingAck => acks_since += 1,
+                Kind::PendingFreed => freed_since += 1,
+            }
+        }
+    }
+    assert!(
+        acks > 0,
+        "no acknowledgement was routed while a pair was lost"
+    );
+    assert!(freed > 0, "no freed batch was routed while a pair was lost");
+    assert!(
+        acks_since > 0,
+        "no acknowledgement was routed while a sender delivered since the loss",
+    );
+    assert!(freed_since > 0, "no freed batch was routed while a sender delivered since the loss");
+
+    // The server acknowledges each packet from the client's slow interface on a sender of its
+    // own slow interface.
+    assert_slow_interface_acks_paired(&routed, &shared);
+
     let dropped = shared.dropped.load(Ordering::Relaxed);
     assert!(dropped > 0, "the network didn't drop a packet");
+    let passed_while_quiet = shared.passed_while_quiet.lock().unwrap().clone();
+    assert!(
+        passed_while_quiet.is_empty(),
+        "the network passed packets to an endpoint in the quiet period: {passed_while_quiet:?}",
+    );
     let read_while_lost = shared.read_while_lost.load(Ordering::Relaxed);
     assert!(
         read_while_lost >= STREAM_LEN,
@@ -389,24 +699,146 @@ fn run(recover: bool) {
     let server_addrs = shared.server_addrs.lock().unwrap();
     assert_eq!(client_addrs.len(), 8, "the client has eight sockets");
     assert_eq!(server_addrs.len(), 8, "the server has eight sockets");
+    // `Shared::client_bytes` takes these locks again.
+    drop((client_addrs, server_addrs));
 
-    // In the sim, send socket i is recv socket i, so the position of an address in `data_addrs`
-    // is its socket, and `CLIENT_INTERFACE` holds that socket's interface.
-    let mut restored_bytes = [0u64; 2];
-    for write in shared.writes.lock().unwrap().iter() {
-        let Some(socket) = client_addrs.iter().position(|&addr| addr == write.local) else {
-            continue;
-        };
-        if server_addrs.contains(&write.peer) {
-            restored_bytes[CLIENT_INTERFACE[socket]] += write.bytes;
+    // The last round of streams ended once the client's lost interface carried its share, and
+    // the monitor holds that round's writes.
+    let restored_bytes = shared.client_bytes();
+    assert!(
+        restored_share(restored_bytes),
+        "the client wrote {restored_bytes:?} bytes on its interfaces in the last round",
+    );
+}
+
+/// The client sockets whose packets `acknowledgements_move_to_a_priority_sender_that_delivers`
+/// drops: three of the four sockets of the interface that `interfaces` flags for the
+/// highest-priority traffic.
+const PRIORITY_LOST: [usize; 3] = [4, 5, 6];
+/// The interface that `interfaces` flags for the highest-priority traffic.
+const HIGHEST_PRIORITY: usize = 1;
+
+/// While client senders 4 to 6, of the interface for the highest-priority traffic, are marked
+/// lost and client sender 7 delivers, no acknowledgement goes to a sender marked lost, each
+/// acknowledgement of a peer sender on that interface goes to a sender of that interface, and at
+/// least one acknowledgement of server senders 4 to 6 moves off its own client sender. Both
+/// endpoints put their sockets on their interfaces as `CLIENT_INTERFACE` does, so that each
+/// endpoint's sender `i` is paired with the other endpoint's socket `i`. The network drops the
+/// packets that client sockets 4 to 6 send and delivers the packets sent to them, so that the
+/// client acknowledges the packets of server senders 4 to 6 while its own senders 4 to 6 are
+/// marked lost.
+#[test]
+fn acknowledgements_move_to_a_priority_sender_that_delivers() {
+    let _snapshots = without_snapshots();
+    let _tracing = without_tracing();
+
+    let shared = Arc::new(Shared::default());
+    let in_sim = shared.clone();
+    let routed = Arc::new(Mutex::new(Vec::<Routed>::new()));
+    let routed_in_sim = routed.clone();
+
+    sim(move || {
+        // The endpoints route on the thread that runs the sim, which records what they route.
+        observe::record_into(routed_in_sim);
+
+        let network = in_sim.clone();
+        bach::net::monitor::on_packet_sent(move |packet| {
+            if network.drops(packet.source(), packet.destination()) {
+                network.dropped.fetch_add(1, Ordering::Relaxed);
+                return bach::net::monitor::Command::Drop;
+            }
+            bach::net::monitor::Command::Pass
+        });
+
+        let server_side = in_sim.clone();
+        async move {
+            let server = SimEndpointConfig::default()
+                .interfaces(interfaces(&CLIENT_INTERFACE))
+                .server();
+            let mut acceptor = server
+                .register_acceptor_channel(ACCEPTOR_ID, STREAMS)
+                .expect("acceptor registration");
+            while let Some(stream) = acceptor.recv().await {
+                let shared = server_side.clone();
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut request = Data::new(STREAM_LEN);
+                    loop {
+                        let len = reader.read_into(&mut request).await.expect("server read");
+                        if len == 0 {
+                            break;
+                        }
+                        shared.on_read(len as u64);
+                    }
+                    assert!(request.is_finished(), "a request ended early");
+                    let mut reply = Data::new(REPLY_LEN);
+                    writer
+                        .write_all_from_fin(&mut reply)
+                        .await
+                        .expect("server write");
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        let client_side = in_sim;
+        async move {
+            let mut client = SimEndpointConfig::default()
+                .interfaces(interfaces(&CLIENT_INTERFACE))
+                .client();
+            client_side.set_client_addrs_losing_sends(client.data_addrs(), &PRIORITY_LOST);
+
+            // The network drops what the three sockets send while the server reads these streams.
+            timeout(
+                ROUND_TIMEOUT,
+                exchange(&mut client, STREAMS, "the round", &client_side),
+            )
+            .await
+            .expect("the streams finish while three sockets' packets are dropped");
+            assert!(
+                client_side.losing.load(Ordering::Relaxed),
+                "the sockets weren't lost",
+            );
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+
+    let dropped = shared.dropped.load(Ordering::Relaxed);
+    assert!(dropped > 0, "the network didn't drop a packet");
+
+    // While a sender of the path was marked lost and another delivered, no acknowledgement that
+    // either endpoint routed went to a sender marked lost, each acknowledgement of a peer sender
+    // of the interface for the highest-priority traffic went to a sender of that interface, and
+    // at least one acknowledgement of a peer's senders 4 to 6 moved off its own sender.
+    let routes = routed.lock().unwrap();
+    let while_lost = routes.iter().filter(|route| {
+        route.kind == Kind::PendingAck && route.path_has_lost && route.path_delivers
+    });
+    let mut moved = 0;
+    for route in while_lost {
+        assert!(!route.lost, "{route:?} went to a sender marked lost");
+        let remote = route
+            .remote
+            .expect("an acknowledgement records its peer sender");
+        let remote = remote.as_varint().as_u64() as usize;
+        if CLIENT_INTERFACE[remote] == HIGHEST_PRIORITY {
+            assert_eq!(
+                CLIENT_INTERFACE[route.sender.as_usize()],
+                HIGHEST_PRIORITY,
+                "{route:?} left its peer sender's interface",
+            );
+        }
+        if PRIORITY_LOST.contains(&remote) && route.sender.as_usize() != remote {
+            moved += 1;
         }
     }
-    let total: u64 = restored_bytes.iter().sum();
-    assert!(total > 0, "the client didn't write after the loss");
-    // The lost interface is the faster one, so once it delivers again it carries more than an
-    // eighth of the client's bytes.
     assert!(
-        restored_bytes[LOST] * 8 > total,
-        "the client wrote {restored_bytes:?} bytes on its interfaces after the loss",
+        moved > 0,
+        "no acknowledgement of a peer's senders 4 to 6 moved off a lost sender"
     );
 }
