@@ -1189,5 +1189,27 @@ mod tests {
         assert!(!hit, "a packet of a newer key id replaces the context");
         assert_eq!(fallback.borrow().current_key_id, VarInt::from_u8(2));
         assert_eq!(fallback.borrow().local_sender_id, sender(1));
+
+        // A new context whose first packet arrives at the first interface is acknowledged from
+        // it too: a cache that doesn't hold a context of the peer's sender derives one from a
+        // packet of key id 3, which the peer's entry hasn't seen, and the context acknowledges
+        // from sender 0 and not from sender 1, the first sender of the interface the pairing
+        // sends the peer's packets to.
+        let mut fresh = Cache::new(RecvDispatchWorkerId::new(0))
+            .with_send_places(table.send_places().map(Arc::from))
+            .with_interface_ranks(table.send_ranks().map(Arc::from));
+        let (at_first, hit) = receive_at(
+            &mut fresh,
+            &map,
+            source,
+            id,
+            3,
+            remote_sender_id,
+            &route,
+            Some(first),
+        );
+        assert!(!hit, "the first packet derives a context");
+        assert_eq!(at_first.borrow().current_key_id, VarInt::from_u8(3));
+        assert_eq!(at_first.borrow().local_sender_id, sender(0));
     }
 }
