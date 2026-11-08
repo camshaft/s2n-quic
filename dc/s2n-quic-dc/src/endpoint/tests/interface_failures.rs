@@ -9,8 +9,9 @@
 //! its twelve sockets on three interfaces in turn, four on each. Each test fails one interface
 //! of one host: the network drops every packet to or from that interface's sockets.
 //! The client writes a round of streams to the server, and the server answers each stream with
-//! as many bytes, once before the failure and once while the interface has failed. Both rounds
-//! must finish.
+//! as many bytes: once before the failure, once while the interface has failed, and then, once
+//! the interface delivers again, until neither endpoint marks a sender lost. Each round must
+//! finish.
 //!
 //! The endpoints record each acknowledgement they route to a send worker. Each must go from the
 //! interface that the acknowledged packets arrived on to the peer's interface that they came
@@ -24,6 +25,9 @@
 //! endpoint sets once the interface has failed must be on a sender that writes to or from the
 //! failed interface, and at least one must be set. Each sender that is marked lost when the
 //! second round finishes must be one whose mark the record holds.
+//!
+//! Once the interface delivers again, each lost mark must clear: a lost pair probes again at its
+//! next probe timeout, and the peer's acknowledgement of a packet sent after the mark clears it.
 
 use crate::{
     endpoint::{
@@ -51,6 +55,9 @@ const STREAMS: usize = 16;
 const STREAM_LEN: u64 = 256 * 1024;
 /// How long each round of streams may take before the test fails.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the endpoints may take, once the interface delivers again, to clear their lost
+/// marks: each lost pair probes again at its next probe timeout.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 /// The interface of each client socket: the even sockets on the first one, the odd ones on the
 /// second.
 const CLIENT_INTERFACE: [usize; 8] = [0, 1, 0, 1, 0, 1, 0, 1];
@@ -146,6 +153,11 @@ impl Shared {
             .map(|(&addr, _)| addr)
             .collect();
         self.failing.store(true, Ordering::Relaxed);
+    }
+
+    /// Makes the network deliver the packets to and from the failed interface again.
+    fn end_failure(&self) {
+        self.failing.store(false, Ordering::Relaxed);
     }
 
     /// Whether the network drops a packet from `source` to `destination`.
@@ -320,7 +332,7 @@ fn assert_lost_marks(failure: Failure, marks: &[LostMark], shared: &Shared) {
         let peer_interface = pairs[host as usize][socket];
         assert!(
             failure.crosses(host, socket, peer_interface),
-            "{host:?} marked its socket {socket} lost while {failure:?} failed, though the socket \
+            "{host:?} marked its socket {socket} lost once {failure:?} failed, though the socket \
              writes to the peer's interface {peer_interface:?}",
         );
     }
@@ -418,8 +430,9 @@ fn server_interface_2_fails() {
     run(Host::Server, 2);
 }
 
-/// Fails the interface `interface` of `host` in the second of two rounds of streams, and checks
-/// where the endpoints route their acknowledgements and which senders they mark lost.
+/// Fails the interface `interface` of `host` in the second round of streams and lets it deliver
+/// again after that round, and checks where the endpoints route their acknowledgements and which
+/// senders they mark lost.
 fn run(host: Host, interface: usize) {
     let _snapshots = without_snapshots();
     let _tracing = without_tracing();
@@ -517,6 +530,36 @@ fn run(host: Host, interface: usize) {
             .await
             .expect("the second round finishes while an interface has failed");
             assert_marks_recorded(&client_marks.lock().unwrap(), &client_side);
+            // A sender is still marked lost when the failure ends, so the rounds after it can't
+            // pass without showing a mark clear.
+            assert!(
+                !lost_senders(&client_side).is_empty(),
+                "no sender was still marked lost when {failure:?} ended",
+            );
+
+            // The interface delivers again. Each lost pair probes again at its next probe
+            // timeout, and the peer's acknowledgement of a packet sent after the mark clears it,
+            // so the client runs rounds of streams until neither endpoint marks a sender lost.
+            client_side.end_failure();
+            let recovered = timeout(RECOVERY_TIMEOUT, async {
+                loop {
+                    timeout(
+                        ROUND_TIMEOUT,
+                        exchange(&mut client, "a round after the failure", &client_side),
+                    )
+                    .await
+                    .expect("a round finishes once the interface delivers again");
+                    if lost_senders(&client_side).is_empty() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(
+                recovered.is_ok(),
+                "the endpoints kept {:?} marked lost once {failure:?} delivered again",
+                lost_senders(&client_side),
+            );
         }
         .group("client")
         .primary()
