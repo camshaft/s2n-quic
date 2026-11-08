@@ -1304,16 +1304,28 @@ fn a_context_dropped_for_a_rejected_key_clears_its_lost_mark() {
 
 /// A context that its cache dropped stays in its probe timeout's wheel, which fires for it
 /// once more, and an assembly may still read it. Neither marks its pair lost again, or
-/// records when it would have: once the cache dropped the context, none of the cache's
-/// contexts would clear that mark, and the routers would leave the pair out after its
-/// interface delivers again.
+/// records when it would have, on the context or on the path secret entry: once the cache
+/// dropped the context, none of the cache's contexts would clear that mark, and the routers
+/// would leave the pair out after its interface delivers again.
 #[test]
 fn a_dropped_context_does_not_mark_its_pair_lost_again() {
     let (mut cache, entry, _events) = make_cache_with_a_lost_context();
     let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let other = crate::endpoint::id::LocalSenderId::from_index(1);
     let ctx = cache
         .get(entry.id())
         .expect("the cache holds the lost context");
+    // The times the setup's mark recorded on the entry: the setup's context didn't wait for an
+    // acknowledgement, so its pair stopped delivering one smoothed RTT after the peer's last
+    // activity, and the routers prefer the senders that deliver since then until two
+    // persistent congestion periods after that.
+    let (stopped_at, preferred_until) = {
+        let ctx = ctx.borrow();
+        assert!(ctx.ack_wait_start().is_none());
+        let stopped_at = ctx.last_peer_activity + ctx.rtt_estimator.smoothed_rtt();
+        let period = ctx.rtt_estimator.persistent_congestion_threshold();
+        (stopped_at, stopped_at + period * 2)
+    };
     let clock = make_clock(100);
     {
         // The lost pair sent a Ping, which the inflight map doesn't hold, and its wait for the
@@ -1330,6 +1342,13 @@ fn a_dropped_context_does_not_mark_its_pair_lost_again() {
         .invalidate(entry.id(), reason, &mut cancelled)
         .is_some());
     assert!(!entry.is_sender_lost(sender));
+
+    // Another pair of the entry stays lost, and the dropped context's sender slot delivers
+    // after the setup's pair stopped, so the routers prefer it.
+    assert!(entry.set_sender_lost(other, true));
+    entry.record_sender_delivered(sender, stopped_at + Duration::from_nanos(1));
+    assert!(entry.has_sender_delivering_since_lost());
+    assert!(entry.prefers_senders_delivering_since_lost());
 
     let mut ctx = ctx.borrow_mut();
     let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
@@ -1349,6 +1368,17 @@ fn a_dropped_context_does_not_mark_its_pair_lost_again() {
         ctx.lost_at.is_none(),
         "the dropped context's probe timeout didn't record when its pair was lost"
     );
+    assert!(
+        entry.has_sender_delivering_since_lost(),
+        "the dropped context's probe timeout left the time the setup's pair stopped delivering"
+    );
+    assert!(entry.prefers_senders_delivering_since_lost());
+    // An acknowledgement after the end of the setup's preference ends it.
+    assert!(
+        entry.record_sender_delivered(sender, preferred_until + Duration::from_nanos(1)),
+        "the dropped context's probe timeout left the end of the setup's preference"
+    );
+    assert!(!entry.prefers_senders_delivering_since_lost());
     ctx.check_acknowledgement_only_delivery(clock.get_time());
     assert!(
         !entry.is_sender_lost(sender),
@@ -1357,6 +1387,14 @@ fn a_dropped_context_does_not_mark_its_pair_lost_again() {
     assert!(
         ctx.lost_at.is_none(),
         "the dropped context's assembly didn't record when its pair was lost"
+    );
+    assert!(
+        entry.has_sender_delivering_since_lost(),
+        "the dropped context's assembly left the time the setup's pair stopped delivering"
+    );
+    assert!(
+        !entry.prefers_senders_delivering_since_lost(),
+        "the dropped context's assembly left the end of the setup's preference"
     );
 }
 
