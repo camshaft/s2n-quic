@@ -1008,6 +1008,10 @@ where
     // read to send the acknowledgements of a peer's packets back along the pair they came on.
     let ack_send_places: Option<Arc<[crate::socket::interface::SendPlace]>> =
         send_places.as_deref().map(Arc::from);
+    // The rank of each local interface among the interfaces that hold a send socket, by
+    // interface, which the recv dispatch workers read to send the acknowledgements of a peer's
+    // packets from the interface they arrived at.
+    let interface_ranks: Option<Arc<[Option<usize>]>> = interfaces.send_ranks().map(Arc::from);
     for (recv_dispatch_id, dispatch_rx, ack_completion_rx, invalidation_rx, waker_sink) in (
         dispatch_rxs,
         ack_completion_rxs,
@@ -1036,6 +1040,7 @@ where
             route: ack_route,
             priority_senders: priority_senders.clone(),
             send_places: ack_send_places.clone(),
+            interface_ranks: interface_ranks.clone(),
             waker_sink,
             ups_tx: ups_tx.clone(),
             invalidation_rx,
@@ -1062,11 +1067,15 @@ where
     // the syscall-assigned sockets so workers stay balanced when some sockets are adopted by rings.
     let mut syscall_recv_idx = 0usize;
     for (recv_socket_id, socket) in recv_sockets.into_iter() {
+        // The local interface of the socket, which the router records on each packet it
+        // dispatches, so that the packet's acknowledgements leave on that interface.
+        let local_interface = interfaces.recv_sockets().get(recv_socket_id.as_usize()).copied();
         let router = worker::FanOutRouter::<_, RecvRoute, _>::new(
             dispatch_txs.clone(),
             invalidation_raw_tx.clone(),
             &counter_registry,
-        );
+        )
+        .with_local_interface(local_interface);
 
         // Try io_uring first when enabled. On success the ring thread owns both socket and router; on
         // failure (uring disabled, no fd, or setup error) both are handed back so the syscall path can
@@ -1261,6 +1270,10 @@ struct RecvDispatchParts<Clk, AckSnd, Route> {
     /// The place of each send socket among the endpoint's interfaces, by sender, or `None` where
     /// the endpoint doesn't list any, which picks the sender of each peer's acknowledgements.
     send_places: Option<Arc<[crate::socket::interface::SendPlace]>>,
+    /// The rank of each local interface among the interfaces that hold a send socket, by
+    /// interface, or `None` where the endpoint doesn't list any, which puts the sender of a
+    /// peer's acknowledgements on the interface its packets arrived at.
+    interface_ranks: Option<Arc<[Option<usize>]>>,
     waker_sink: waker::Sink,
     ups_tx: UpsSender,
     invalidation_rx: sync_queue::Receiver<tasks::Invalidation>,
@@ -1559,7 +1572,8 @@ where
                 let recv_cache = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::stream::endpoint::recv::Cache::new(recv_dispatch_idx)
                         .with_priority_senders(rd.priority_senders)
-                        .with_send_places(rd.send_places),
+                        .with_send_places(rd.send_places)
+                        .with_interface_ranks(rd.interface_ranks),
                 ));
                 let (ack_burst_tx, ack_burst_rx) =
                     crate::socket::channel::intrusive::unsync::new_with_adapter::<

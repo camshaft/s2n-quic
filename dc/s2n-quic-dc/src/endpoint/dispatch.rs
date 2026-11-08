@@ -470,6 +470,7 @@ where
     let decrypt_len = packet.decrypt_into_len();
     let ecn = packet.storage().ecn();
     let remote_addr = packet.storage().remote_address().get();
+    let local_interface = packet.storage().local_interface();
     let source_control_port = packet.source_control_port();
 
     // Detect single-QueueMsg frame for the fast path (scatter-decrypt into slot buffer).
@@ -585,6 +586,7 @@ where
             path_secret_map,
             clock,
             remote_addr,
+            local_interface,
             &mut control_out,
             route,
             decrypt_fn,
