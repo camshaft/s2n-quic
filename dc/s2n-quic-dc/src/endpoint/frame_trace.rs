@@ -43,10 +43,15 @@
 //! *one* stuck frame end-to-end — this records *all* frames, so the dump shows the surrounding
 //! history. Each `QueueDbg` we receive [triggers](trigger) an asynchronous dump of the rings to disk.
 //!
-//! The whole facility is gated behind [`super::dbg::ENABLED`]: in plain release builds every record
-//! entry point folds to nothing — the event is never constructed and the [`backbeat::global`]
-//! recorder (and its dumper thread) is never built. It is active under `test`, the `testing`
-//! feature, or the `queue-dbg` feature — the same builds that already speak `QueueDbg`.
+//! The facility is gated behind [`super::dbg::ENABLED`]: in plain release builds each record entry
+//! point folds to nothing, so the event is never constructed. It is active under `test`, the
+//! `testing` feature, or the `queue-dbg` feature, the same builds that already speak `QueueDbg`.
+//! `slot_hold` is the one exception: a plain release build records it too where `BACKBEAT_ENABLE`
+//! arms capture, or where an application that arms capture through backbeat's API calls
+//! [`arm_slot_holds`], so that a release build can keep what a server does with a held slot.
+//! In a plain release build where neither arms it, `slot_hold` returns before it records, so it
+//! doesn't build the [`backbeat::global`] recorder or spawn its dumper thread. [`slot_hold`] says
+//! what an armed release build pays.
 //!
 //! Dumps are self-describing `.bb` files written by `backbeat::global`'s background dumper, named by
 //! UTC timestamp under `BACKBEAT_PATH` (default `${TMPDIR}/backbeat.<pid>.bb`). Read them with the
@@ -215,6 +220,28 @@ pub(crate) enum BindOutcome {
     NoSlots = 3,
     /// Init arrived for a slot already bound / stale / future binding — no new stream created.
     StaleOrBound = 4,
+}
+
+/// What a server did with the slot of an init it rejected, or with the slot's hold as the hold
+/// ended: as its reset left the priority router, or where the ended router refused the reset.
+/// Stored in [`SlotHold::outcome`].
+///
+/// Discriminants are stable dump values - append, never renumber.
+#[derive(EventEnum, IntoBytes, Immutable, Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum HoldOutcome {
+    /// The slot is held for the init's binding until its reset leaves, and the reset is sent.
+    Held = 0,
+    /// The slot is held already for an earlier rejected init whose reset hasn't left, so the
+    /// init's reset isn't sent.
+    AlreadyHeld = 1,
+    /// The slot is past the peer's queues: it isn't held, and the init's reset isn't sent.
+    PastQueues = 2,
+    /// The hold's reset left the priority router for its lane, and the hold ended.
+    Released = 3,
+    /// The submission channel refused the reset of a `Held` record's init, since the priority
+    /// router had ended, so `reject_init` ended the hold before it freed the slot.
+    Unheld = 4,
 }
 
 /// Why a reader's window-growth attempt advertised no — or no new — MAX_DATA. Stored in
@@ -618,6 +645,25 @@ pub struct ServerBind {
     pub _pad: [u8; 7],
 }
 
+/// What a server did with a slot as it rejected an init on it, or as the slot's hold ended: one
+/// record for each init that `reject_init` rejects, each hold whose reset leaves the priority
+/// router for its lane, and each hold that `reject_init` ends where the ended router refuses its
+/// reset. [`queue_id`](Self::queue_id) is the server's slot, the init's `dest_queue_id` and the
+/// reset's `source_queue_id`, so a record of a rejected init joins its [`ServerBind`] through
+/// `(cred_id, binding_id)`.
+#[derive(Event, IntoBytes, Immutable, Debug)]
+#[event(namespace = "s2n_quic_dc::recv::slot_hold")]
+#[repr(C)]
+pub struct SlotHold {
+    pub queue_id: u64,
+    #[event(key)]
+    pub binding_id: u64,
+    #[event(key)]
+    pub cred_id: [u8; 16],
+    pub outcome: HoldOutcome,
+    pub _pad: [u8; 7],
+}
+
 /// A reader's window-growth decision in `maybe_send_max_data`: why it advertised no — or no new —
 /// MAX_DATA. Proves why a streaming reader's window freezes and starves the peer writer.
 /// [`peer_max_offset`](Self::peer_max_offset) is what the writer has told us it wants to reach;
@@ -697,9 +743,9 @@ fn canonicalize_cred(mut cred_id: [u8; 16]) -> [u8; 16] {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────────
-// Recording API. Each entry point is gated by `super::dbg::on_enabled` (a `false` const in plain
-// release builds, so the whole body — including event construction — is stripped). Call sites pass
-// plain values; no closures or imports needed.
+// Recording API. Each entry point but `slot_hold` is gated by `super::dbg::on_enabled` (a `false`
+// const in plain release builds, so the whole body, event construction included, is stripped).
+// Call sites pass plain values; no closures or imports needed.
 // ──────────────────────────────────────────────────────────────────────────────────────────────
 
 /// Records a wire frame (one with a packet number) at lifecycle `lifecycle`. The frame kind and all
@@ -882,6 +928,140 @@ pub(crate) fn server_bind(
             outcome,
             _pad: [0; 7],
         })
+    });
+}
+
+/// Lets the endpoint record each slot hold in a plain release build whose application arms
+/// backbeat's capture through backbeat's API: by `backbeat::global::enable()`, or by a
+/// `backbeat::global::Config` built with `enable(true)` that `backbeat::global::configure` or
+/// `backbeat::global::init` stages. Call it beside that call. backbeat answers whether capture is
+/// armed only by building its global recorder, and a slot hold doesn't build that recorder where
+/// nothing armed capture, so the endpoint learns of the application's arming from this call.
+///
+/// Without this call, a plain release build records a slot hold only where `BACKBEAT_ENABLE`
+/// arms capture, and a build that compiles the endpoint's diagnostic in, under `test`, the
+/// `testing` feature or the `queue-dbg` feature, records each slot hold. The call doesn't touch
+/// backbeat, so a `Config` that the application stages after it, before the first slot hold,
+/// still takes effect. It can't be taken back; a later `backbeat::global::disable()` stops the
+/// records.
+///
+/// Once armed, unless something built the global recorder before, the first slot hold builds it
+/// on the calling dispatch or router thread: with backbeat's defaults, up to 16 rings of 16 MiB
+/// that the process keeps for its life, and the dumper thread. Where the application calls this
+/// without arming capture, that recorder is built all the same and records nothing.
+pub fn arm_slot_holds() {
+    SLOT_HOLD_ARM.arm();
+}
+
+/// What arms each slot hold in this process: [`slot_holds_armed`] reads it, and
+/// [`arm_slot_holds`] sets it.
+static SLOT_HOLD_ARM: SlotHoldArm = SlotHoldArm::new();
+
+/// Whether [`slot_hold`] records: always in a build that compiles the diagnostic in
+/// ([`super::dbg::ENABLED`]), and in a plain release build where `BACKBEAT_ENABLE` arms capture,
+/// read once a process, or once the application called [`arm_slot_holds`].
+#[inline]
+fn slot_holds_armed() -> bool {
+    SLOT_HOLD_ARM.is_armed(super::dbg::ENABLED, |name| std::env::var(name).ok())
+}
+
+/// What arms a slot hold: the diagnostic or `BACKBEAT_ENABLE`, decided at the first read, or a
+/// call of [`arm_slot_holds`], read at each.
+struct SlotHoldArm {
+    /// Whether the diagnostic or `BACKBEAT_ENABLE` arms each slot hold, decided at the first read.
+    by_env: std::sync::OnceLock<bool>,
+    /// Whether the application called [`arm_slot_holds`].
+    by_call: std::sync::atomic::AtomicBool,
+}
+
+impl SlotHoldArm {
+    const fn new() -> Self {
+        Self {
+            by_env: std::sync::OnceLock::new(),
+            by_call: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Arms each later slot hold, whatever the environment holds.
+    fn arm(&self) {
+        self.by_call.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a slot hold records, in a build whose diagnostic is `diagnostic`, with `var` the
+    /// read of an environment variable, which runs at the first read alone.
+    #[inline]
+    fn is_armed(&self, diagnostic: bool, var: impl FnOnce(&str) -> Option<String>) -> bool {
+        *self.by_env.get_or_init(|| slot_holds_armed_in(diagnostic, var))
+            || self.by_call.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Whether [`slot_hold`] records in a build whose diagnostic is `diagnostic`, with `var` the read
+/// of an environment variable. Without the diagnostic, it records only where `BACKBEAT_ENABLE`
+/// holds a value that backbeat reads as true as it builds the recorder: `1`, `true`, `yes` or
+/// `on`, in any letter case and with any white space around it. backbeat answers whether capture
+/// is armed only by building the recorder, so this reads the same variable before it exists.
+fn slot_holds_armed_in(diagnostic: bool, var: impl FnOnce(&str) -> Option<String>) -> bool {
+    if diagnostic {
+        return true;
+    }
+    let Some(value) = var("BACKBEAT_ENABLE") else {
+        return false;
+    };
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Records a [`SlotHold`]: what a server did with its slot `queue_id` as it rejected an init of
+/// `binding_id`, or the end of the slot's hold as its reset leaves the priority router or as
+/// `reject_init` ends it where the ended router refuses its reset.
+///
+/// Unlike the other entry points, this one isn't gated by `super::dbg::on_enabled` but by
+/// [`slot_holds_armed`]: a plain release build records each outcome too where `BACKBEAT_ENABLE`
+/// arms capture, or once the application called [`arm_slot_holds`]. What a plain release build
+/// pays:
+///
+/// * Unarmed: a read of the environment at the first call and two loads at each later call. The
+///   call returns before it records, so it doesn't build the global recorder or spawn its dumper
+///   thread.
+/// * Armed: unless something built the global recorder before, the first record
+///   builds it on the calling dispatch or router thread. With backbeat's defaults, that allocates
+///   and zeroes one 16 MiB ring a shard, a shard for each available CPU up to 16, so up to 256 MiB
+///   that the process keeps for its life; `BACKBEAT_BYTES` sets the ring size and
+///   `BACKBEAT_SHARDS` the count. It also spawns the dumper thread, and runs the `hostname`
+///   command where none of `BACKBEAT_HOST`, `HOSTNAME` and `COMPUTERNAME` is set. Each record
+///   after that is a push onto a ring.
+#[inline]
+pub(crate) fn slot_hold(
+    queue_id: VarInt,
+    binding_id: VarInt,
+    outcome: HoldOutcome,
+    cred_id: CredId,
+) {
+    record_slot_hold_if(slot_holds_armed(), queue_id, binding_id, outcome, cred_id);
+}
+
+/// Records the [`SlotHold`] of [`slot_hold`] where `armed`. Where not, it returns before it reads
+/// the global recorder, so that an unarmed call doesn't build it.
+#[inline]
+fn record_slot_hold_if(
+    armed: bool,
+    queue_id: VarInt,
+    binding_id: VarInt,
+    outcome: HoldOutcome,
+    cred_id: CredId,
+) {
+    if !armed {
+        return;
+    }
+    backbeat::global::record(&SlotHold {
+        queue_id: queue_id.as_u64(),
+        binding_id: binding_id.as_u64(),
+        cred_id: canonicalize_cred(*cred_id),
+        outcome,
+        _pad: [0; 7],
     });
 }
 
@@ -1319,4 +1499,194 @@ pub(crate) fn resident_event_kinds() -> (
     }
 
     (lifecycles, packet_events, event_ids)
+}
+
+/// Test-only: each [`SlotHold`] resident in the global recorder for the credentials `cred_id`, as
+/// `(queue_id, binding_id, outcome)`, sorted.
+#[cfg(test)]
+pub(crate) fn resident_slot_holds(cred_id: CredId) -> Vec<(u64, u64, u8)> {
+    use backbeat::record::RecordView;
+
+    let cred_id = canonicalize_cred(*cred_id);
+    let bytes = backbeat::global::recorder().dump(
+        backbeat::registry::schemas(),
+        core::iter::empty(),
+        backbeat::registry::views(),
+        "",
+    );
+
+    let mut holds = Vec::new();
+    let Ok(reader) = backbeat::wire::DumpReader::new(bytes) else {
+        return holds;
+    };
+    let Ok(shards) = reader.shards() else {
+        return holds;
+    };
+    let u64_at = |fields: &[u8], offset: usize| -> Option<u64> {
+        let word = fields.get(offset..offset + 8)?;
+        Some(u64::from_ne_bytes(word.try_into().ok()?))
+    };
+    let cred = core::mem::offset_of!(SlotHold, cred_id);
+    for shard in shards {
+        backbeat::ring::walk(
+            &shard.region,
+            shard.head as usize,
+            shard.capacity as usize,
+            |payload| {
+                let Some(view) = RecordView::parse(&payload) else {
+                    return false;
+                };
+                if view.event_id == SlotHold::ID
+                    && view.fields.get(cred..cred + 16) == Some(&cred_id[..])
+                {
+                    let fields = view.fields;
+                    if let (Some(queue_id), Some(binding_id), Some(&outcome)) = (
+                        u64_at(fields, core::mem::offset_of!(SlotHold, queue_id)),
+                        u64_at(fields, core::mem::offset_of!(SlotHold, binding_id)),
+                        fields.get(core::mem::offset_of!(SlotHold, outcome)),
+                    ) {
+                        holds.push((queue_id, binding_id, outcome));
+                    }
+                }
+                true
+            },
+        );
+    }
+    holds.sort_unstable();
+    holds
+}
+
+/// `slot_hold` records each [`HoldOutcome`] with the slot and the binding it is given, under the
+/// credentials it is given, and a slot hold that isn't armed doesn't reach the recorder.
+#[test]
+fn slot_hold_records_each_outcome() {
+    crate::testing::init_tracing();
+
+    // An address no other test uses, so that the records of its credentials in the process-wide
+    // recorder are this test's alone.
+    let entry = crate::path::secret::map::Entry::builder("127.0.0.1:44703".parse().unwrap())
+        .endpoint_type(s2n_quic_core::endpoint::Type::Server)
+        .build(None);
+    let cred_id = *entry.id();
+
+    // A build with the diagnostic compiled in arms each slot hold.
+    assert!(slot_holds_armed(), "a test build records each slot hold");
+
+    // Unarmed, the record returns before it reaches the recorder, though capture is on.
+    record_slot_hold_if(
+        false,
+        VarInt::from_u8(9),
+        VarInt::from_u8(13),
+        HoldOutcome::Held,
+        cred_id,
+    );
+    assert!(
+        resident_slot_holds(cred_id).is_empty(),
+        "a slot hold that isn't armed isn't recorded"
+    );
+
+    let outcomes = [
+        HoldOutcome::Held,
+        HoldOutcome::AlreadyHeld,
+        HoldOutcome::PastQueues,
+        HoldOutcome::Released,
+        HoldOutcome::Unheld,
+    ];
+    for (slot, outcome) in (1u8..).zip(outcomes) {
+        slot_hold(VarInt::from_u8(slot), VarInt::from_u8(slot + 4), outcome, cred_id);
+    }
+
+    assert_eq!(
+        resident_slot_holds(cred_id),
+        vec![
+            (1, 5, HoldOutcome::Held as u8),
+            (2, 6, HoldOutcome::AlreadyHeld as u8),
+            (3, 7, HoldOutcome::PastQueues as u8),
+            (4, 8, HoldOutcome::Released as u8),
+            (5, 9, HoldOutcome::Unheld as u8),
+        ],
+        "each outcome is recorded with its slot and its binding"
+    );
+}
+
+/// Without the diagnostic, only a `BACKBEAT_ENABLE` that backbeat reads as true arms a slot hold;
+/// with it, each slot hold is armed and the environment isn't read.
+#[test]
+fn backbeat_enable_arms_slot_holds_in_a_release_build() {
+    let release = |value: Option<&'static str>| {
+        slot_holds_armed_in(false, move |name| {
+            assert_eq!(name, "BACKBEAT_ENABLE", "the variable that arms capture");
+            value.map(String::from)
+        })
+    };
+    for value in ["1", "true", "TRUE", "Yes", " on\n"] {
+        assert!(release(Some(value)), "{value:?} arms capture");
+    }
+    for value in ["", "0", "false", "no", "off", "enabled"] {
+        assert!(!release(Some(value)), "{value:?} doesn't arm capture");
+    }
+    assert!(!release(None), "an unset BACKBEAT_ENABLE doesn't arm capture");
+
+    assert!(
+        slot_holds_armed_in(true, |name| panic!("a diagnostic build read {name}")),
+        "a build with the diagnostic compiled in arms each slot hold"
+    );
+}
+
+/// Each way of arming a slot hold in a plain release build arms it: `BACKBEAT_ENABLE` at the
+/// first read, and a call of [`arm_slot_holds`] at any read, the process's arm among them.
+/// Nothing else arms it, and the environment is read once.
+#[test]
+fn each_way_of_arming_arms_slot_holds_in_a_release_build() {
+    let no_read = |name: &str| -> Option<String> { panic!("the arm read {name}") };
+
+    // Neither `BACKBEAT_ENABLE` nor a call arms it.
+    let unarmed = SlotHoldArm::new();
+    assert!(
+        !unarmed.is_armed(false, |_| None),
+        "without BACKBEAT_ENABLE or a call, a slot hold isn't armed"
+    );
+    assert!(!unarmed.is_armed(false, no_read), "it stays unarmed");
+
+    // `BACKBEAT_ENABLE` arms it at the first read.
+    let by_env = SlotHoldArm::new();
+    assert!(
+        by_env.is_armed(false, |name| {
+            assert_eq!(name, "BACKBEAT_ENABLE", "the variable that arms capture");
+            Some("1".to_string())
+        }),
+        "a BACKBEAT_ENABLE that backbeat reads as true arms a slot hold"
+    );
+    assert!(by_env.is_armed(false, no_read), "it stays armed");
+
+    // A call arms it after an unarmed first read, without a second read of the environment.
+    let by_call = SlotHoldArm::new();
+    assert!(
+        !by_call.is_armed(false, |_| None),
+        "a slot hold isn't armed before the call"
+    );
+    by_call.arm();
+    assert!(
+        by_call.is_armed(false, no_read),
+        "the call arms each later slot hold"
+    );
+
+    // A build with the diagnostic compiled in arms it without either.
+    let diagnostic = SlotHoldArm::new();
+    assert!(
+        diagnostic.is_armed(true, no_read),
+        "a build with the diagnostic compiled in arms each slot hold"
+    );
+
+    // `endpoint::arm_slot_holds`, the public path, arms the process's slot holds. A test
+    // build arms each of them all the same, so the other tests of the process don't see the
+    // change, and the arm is put back after.
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    let before = SLOT_HOLD_ARM.by_call.load(ordering);
+    crate::endpoint::arm_slot_holds();
+    assert!(
+        SLOT_HOLD_ARM.by_call.load(ordering),
+        "endpoint::arm_slot_holds arms the process's slot holds"
+    );
+    SLOT_HOLD_ARM.by_call.store(before, ordering);
 }
