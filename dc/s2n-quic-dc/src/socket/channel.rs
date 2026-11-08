@@ -780,6 +780,12 @@ where
 
         // If we got an item, check if timer is ready
         if item.is_some() {
+            // A timer that isn't armed doesn't hold the item: the bucket hasn't asked for a wait
+            // since the timer last fired. Check that first, since a clock's timer may answer
+            // `Pending` while it isn't armed, as the test clock's does.
+            if !self.timer.is_armed() {
+                return Poll::Ready(item);
+            }
             match self.timer.poll_ready(cx) {
                 Poll::Ready(()) => {
                     // Timer ready, can return the item
