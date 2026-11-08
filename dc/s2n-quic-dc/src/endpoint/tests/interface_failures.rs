@@ -13,12 +13,16 @@
 //! as many bytes, once before the failure and once while the interface has failed. Both rounds
 //! must finish.
 //!
-//! The endpoints record each acknowledgement they route to a send worker. Each must go from the
-//! interface that the acknowledged packets arrived on to the peer's interface that they came
-//! from, except while the routers prefer the senders the peer acknowledged since the path's lost
-//! pairs stopped delivering, where it may go to such a sender. Each endpoint must send at least
-//! one acknowledgement on its pair from each of its interfaces, so that the check can't pass
-//! where an interface doesn't carry any.
+//! The endpoints record each acknowledgement they route to a send worker, with the senders of
+//! its path that deliver when they route it. Each must go from the interface that the
+//! acknowledged packets arrived on to the peer's interface that they came from, on a sender
+//! that delivers where one of its path does. It may leave that pair only where no sender of the
+//! pair delivers, and then goes on a delivering sender of the interface the packets arrived on
+//! where one delivers, and else on any delivering sender. While the routers prefer the senders
+//! the peer acknowledged since the path's lost pairs stopped delivering, a sender delivers where
+//! the peer acknowledged it since then, and otherwise where its pair isn't marked lost. Each
+//! endpoint must send at least one acknowledgement on its pair from each of its interfaces, so
+//! that the check can't pass where an interface doesn't carry any.
 //!
 //! The endpoints also record each lost mark they set on a sender, as they set it. Neither
 //! endpoint may set one in the first round, before the interface fails. Each mark that either
@@ -328,10 +332,17 @@ fn assert_lost_marks(failure: Failure, marks: &[LostMark], shared: &Shared) {
 }
 
 /// Asserts that each acknowledgement either endpoint routes goes from the interface that the
-/// acknowledged packets arrived on to the peer's interface that they came from, except while the
-/// routers prefer the senders the peer acknowledged since the path's lost pairs stopped
-/// delivering, where it may go to such a sender, and that each endpoint sends at least one
-/// acknowledgement on its pair from each of its interfaces.
+/// acknowledged packets arrived on to the peer's interface that they came from, or leaves that
+/// pair only as the move off a sender that doesn't deliver allows, and that each endpoint sends
+/// at least one acknowledgement on its pair from each of its interfaces.
+///
+/// The move takes the first sender that delivers, as the acknowledgement's record reads the
+/// senders, in this order: the sender that the pairing picks for the acknowledged peer sender,
+/// which is on that pair, the other senders of the pair, the other senders of the interface the
+/// packets arrived on, and any other sender. An acknowledgement on its pair goes on a sender that
+/// delivers, unless no sender of its path delivers. The sim doesn't mark an interface as the one
+/// for the endpoints' highest-priority traffic, whose senders the order takes ahead of any other
+/// sender, so that step isn't checked.
 fn assert_acknowledgements_paired(routed: &[Routed], shared: &Shared) {
     let client_addrs = shared.addrs(Host::Client);
     let pairs = [
@@ -340,6 +351,9 @@ fn assert_acknowledgements_paired(routed: &[Routed], shared: &Shared) {
     ];
     // The interfaces from which each endpoint sent at least one acknowledgement on its pair.
     let mut paired_from = [BTreeSet::new(), BTreeSet::new()];
+    // The acknowledgements whose peer sender or local sender didn't write in the sim, which the
+    // check can't place on an interface pair.
+    let mut unplaced = Vec::new();
     for route in routed {
         if route.kind != Kind::PendingAck {
             continue;
@@ -361,24 +375,67 @@ fn assert_acknowledgements_paired(routed: &[Routed], shared: &Shared) {
         // arrived on the interface that the sender writes to. The acknowledgement leaves on the
         // interface of the local sender, and arrives on the interface that it writes to.
         let Some(arrival) = pairs[peer as usize][remote] else {
+            unplaced.push(route);
             continue;
         };
         let Some(destination) = pairs[host as usize][local] else {
+            unplaced.push(route);
             continue;
         };
         let source = peer.layout()[remote];
         let from = host.layout()[local];
+        let marks = route
+            .marks
+            .expect("the endpoint records which senders of an acknowledgement's path deliver");
+        // Whether the host's sender at a socket delivers, as the routers read it when the
+        // endpoint routed the acknowledgement.
+        let delivers = |socket: usize| marks.delivers(socket, route.path_delivers_since_lost);
+        let sockets = 0..host.layout().len();
         if from == arrival && destination == source {
+            assert!(
+                // Call `Iterator::any` by its path: a generator trait in scope also has an
+                // `any` method on ranges.
+                delivers(local) || !Iterator::any(&mut sockets.clone(), delivers),
+                "{host:?} acknowledged packets on their pair from its socket {local}, which \
+                 doesn't deliver, while a sender of its path delivers: {route:?}",
+            );
             paired_from[host as usize].insert(from);
             continue;
         }
+        // The acknowledgement left its pair, so no sender of the pair may deliver, and where it
+        // left the interface the packets arrived on, no sender of that interface may deliver.
+        let on_arrival = |&socket: &usize| host.layout()[socket] == arrival;
+        let pair_delivers = sockets
+            .clone()
+            .filter(on_arrival)
+            .any(|socket| pairs[host as usize][socket] == Some(source) && delivers(socket));
+        let arrival_delivers = sockets.filter(on_arrival).any(delivers);
         assert!(
-            route.path_has_lost && route.path_delivers_since_lost && route.delivers_since_lost,
+            !pair_delivers,
             "{host:?} acknowledged packets of the peer's interface {source}, which arrived on \
-             its interface {arrival}, from its interface {from} to the peer's {destination}: \
-             {route:?}",
+             its interface {arrival}, from its interface {from} to the peer's {destination}, \
+             while a sender of that pair delivers: {route:?}",
+        );
+        assert!(
+            from == arrival || !arrival_delivers,
+            "{host:?} acknowledged packets that arrived on its interface {arrival} from its \
+             interface {from}, while a sender of the arrival interface delivers: {route:?}",
+        );
+        assert!(
+            delivers(local),
+            "{host:?} moved an acknowledgement off its pair to its socket {local}, which \
+             doesn't deliver: {route:?}",
         );
     }
+    // The sim records each socket write before the network drops its packet, so a peer sender
+    // has a write once it sent the packets an endpoint acknowledges, and a local sender once it
+    // sent anything: the check places every acknowledgement on a pair, and doesn't skip one.
+    assert!(
+        unplaced.is_empty(),
+        "the check can't place {} acknowledgements on an interface pair, since their peer \
+         sender or local sender didn't write in the sim: {unplaced:?}",
+        unplaced.len(),
+    );
     for host in [Host::Client, Host::Server] {
         for interface in 0..host.interface_count() {
             assert!(
