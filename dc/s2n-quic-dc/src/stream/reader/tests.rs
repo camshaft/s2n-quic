@@ -2410,3 +2410,26 @@ fn peer_liveness_buffers_preceding_data_before_reset() {
         .spawn();
     });
 }
+
+/// The reader submits a frame without a completion sender only as a QueueReset. While the window
+/// of frames without send credit refuses a frame, the priority router keeps one copy of each
+/// waiting reset, and the producer of every other frame waits on its completion, so a ping or a
+/// control frame without a completion sender would wait in front of the window without a bound.
+/// `send_frame` panics on such a frame in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a stream frame without a completion sender must be a QueueReset")]
+fn send_frame_panics_on_a_frame_without_a_completion_sender_that_isnt_a_reset() {
+    let (mut reader, _pusher) = make_pair();
+    let frame = Frame {
+        header: Header::Ping,
+        payload: crate::byte_vec::ByteVec::new(),
+        path_secret_entry: reader.0.path_secret_entry.clone(),
+        completion: None,
+        status: frame::TransmissionStatus::default(),
+        ttl: frame::DEFAULT_TTL,
+        enqueued_at: None,
+        flow_credits: 0,
+    };
+    let _ = reader.0.send_frame(frame);
+}
