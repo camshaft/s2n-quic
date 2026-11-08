@@ -457,6 +457,63 @@ pub(crate) mod observe {
         /// Whether the pair of `sender` isn't marked lost and the peer acknowledged `sender`
         /// after the lost pairs of the path stopped delivering.
         pub(crate) delivers_since_lost: bool,
+        /// Which senders of the path deliver as the routers read them when the endpoint routed
+        /// a pending acknowledgement, and `None` for a freed batch or a path with more senders
+        /// than `Marks` holds.
+        pub(crate) marks: Option<Marks>,
+    }
+
+    /// The senders of a path that deliver, as the routers read them, when the endpoint routed a
+    /// pending acknowledgement: bit `i` of each mask is the path's sender `i`, for its first
+    /// `Marks::SENDERS` senders.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Marks {
+        /// The senders whose interface pair the path doesn't mark lost.
+        pub(crate) unmarked: u128,
+        /// The senders whose pair isn't marked lost and that the peer acknowledged after the
+        /// path's lost pairs stopped delivering.
+        pub(crate) delivered_since_lost: u128,
+    }
+
+    impl Marks {
+        /// How many senders the masks hold.
+        const SENDERS: usize = u128::BITS as usize;
+
+        /// Reads which senders of `path` deliver, or returns `None` where the path has more
+        /// senders than the masks hold.
+        fn read(path: &crate::path::secret::map::Entry) -> Option<Self> {
+            let count = path.socket_sender_count();
+            if count > Self::SENDERS {
+                return None;
+            }
+            let mut marks = Self {
+                unmarked: 0,
+                delivered_since_lost: 0,
+            };
+            for slot in 0..count {
+                let sender = LocalSenderId::from_index(slot);
+                if !path.is_sender_lost(sender) {
+                    marks.unmarked |= 1 << slot;
+                }
+                if path.delivers_since_lost(sender) {
+                    marks.delivered_since_lost |= 1 << slot;
+                }
+            }
+            Some(marks)
+        }
+
+        /// Whether the sender at `slot` delivers as the routers read it: where the peer
+        /// acknowledged it since the path's lost pairs stopped delivering, while the routers
+        /// prefer those senders (`prefer_delivered`), and otherwise where its pair isn't marked
+        /// lost.
+        pub(crate) fn delivers(&self, slot: usize, prefer_delivered: bool) -> bool {
+            let senders = if prefer_delivered {
+                self.delivered_since_lost
+            } else {
+                self.unmarked
+            };
+            slot < Self::SENDERS && senders & (1 << slot) != 0
+        }
     }
 
     thread_local! {
@@ -504,6 +561,10 @@ pub(crate) mod observe {
             if let Some(sink) = sink.borrow().as_ref() {
                 let sender = message.sender_idx();
                 let path = message.path_secret_entry();
+                let marks = match kind {
+                    Kind::PendingAck => Marks::read(path),
+                    Kind::PendingFreed => None,
+                };
                 sink.lock().unwrap().push(Routed {
                     kind,
                     sender,
@@ -515,6 +576,7 @@ pub(crate) mod observe {
                     path_delivers: path.has_delivering_sender(),
                     path_delivers_since_lost: path.prefers_senders_delivering_since_lost(),
                     delivers_since_lost: path.delivers_since_lost(sender),
+                    marks,
                 });
             }
         });
