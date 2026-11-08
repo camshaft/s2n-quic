@@ -428,7 +428,10 @@ pub fn setup_sim_endpoint(
         path_secret_map: _,
     } = config;
 
-    assert!(num_send_sockets > 0, "num_send_sockets must be at least one");
+    assert!(
+        num_send_sockets > 0,
+        "num_send_sockets must be at least one"
+    );
     assert!(
         submission_shards.is_power_of_two(),
         "submission_shards must be a power of two"
