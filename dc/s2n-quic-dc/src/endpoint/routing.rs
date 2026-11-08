@@ -491,7 +491,7 @@ pub(crate) mod observe {
                 delivered_since_lost: 0,
             };
             for slot in 0..count {
-                let sender = LocalSenderId::from_index(slot);
+                let sender = <LocalSenderId as crate::endpoint::id::Id>::from_index(slot);
                 if !path.is_sender_lost(sender) {
                     marks.unmarked |= 1 << slot;
                 }

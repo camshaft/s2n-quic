@@ -364,7 +364,9 @@ fn assert_acknowledgements_paired(routed: &[Routed], shared: &Shared) {
         let sockets = 0..host.layout().len();
         if from == arrival && destination == source {
             assert!(
-                delivers(local) || !sockets.clone().any(delivers),
+                // Call `Iterator::any` by its path: a generator trait in scope also has an
+                // `any` method on ranges.
+                delivers(local) || !Iterator::any(&mut sockets.clone(), delivers),
                 "{host:?} acknowledged packets on their pair from its socket {local}, which \
                  doesn't deliver, while a sender of its path delivers: {route:?}",
             );
