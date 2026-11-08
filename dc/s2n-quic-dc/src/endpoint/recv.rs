@@ -13,7 +13,7 @@ use crate::{
         secret::map::{entry::QueueState, Entry as PathSecretEntry},
     },
     queue,
-    socket::interface::{paired_ack_sender, SendPlace},
+    socket::interface::{paired_ack_sender, paired_peer_interface, SendPlace},
     stream::endpoint::ack::state as ack_state,
     tracing::*,
 };
@@ -245,6 +245,14 @@ pub(crate) struct Context {
     pub ack_ranges: ack_ranges::AckRanges,
     /// Which local sender_id outgoing ACKs for this peer route through.
     pub local_sender_id: LocalSenderId,
+    /// The place of each of the endpoint's send sockets among its interfaces, by sender, as
+    /// the cache holds them, or `None` where the endpoint doesn't list interfaces. They order
+    /// the move of the acknowledgements off `local_sender_id` while it doesn't deliver.
+    pub send_places: Option<Arc<[SendPlace]>>,
+    /// The senders of the interface for the endpoint's highest-priority traffic, as the cache
+    /// holds them: the acknowledgements move to one of them, ahead of other interfaces, once no
+    /// sender of the local interface of `local_sender_id` delivers.
+    pub priority_senders: Option<Arc<[LocalSenderId]>>,
     /// Accumulated ECN counts for received packets, reported back to the sender
     /// in each ACK frame so the sender can validate ECN support and detect congestion.
     pub ecn_counts: EcnCounts,
@@ -337,6 +345,8 @@ impl Context {
             dedup_filter: Default::default(),
             ack_ranges: Default::default(),
             local_sender_id,
+            send_places: None,
+            priority_senders: None,
             ecn_counts: Default::default(),
             idle_wheel,
             created_at: now,
@@ -345,6 +355,55 @@ impl Context {
             queue_view,
             ack_burst: intrusive::Links::new(),
         }
+    }
+
+    /// Sets the place of each of the endpoint's send sockets and the senders of the interface
+    /// for its highest-priority traffic, which order the move of the acknowledgements off the
+    /// context's sender while that sender doesn't deliver.
+    pub fn with_ack_senders(
+        mut self,
+        send_places: Option<Arc<[SendPlace]>>,
+        priority_senders: Option<Arc<[LocalSenderId]>>,
+    ) -> Self {
+        self.send_places = send_places;
+        self.priority_senders = priority_senders;
+        self
+    }
+
+    /// Returns the sender that the context's acknowledgements go to: its sender while that
+    /// sender delivers, and otherwise the sender that `routing::delivering_ack_sender_id` picks
+    /// by the senders' interfaces. A sender delivers as `PathSecretEntry::delivering_sender`
+    /// reads it: while the routers prefer the senders the peer acknowledged since the path's
+    /// lost pairs stopped delivering, a sender delivers only where the peer acknowledged it
+    /// since then, and otherwise while its pair isn't marked lost.
+    fn delivering_ack_sender(&self) -> LocalSenderId {
+        let entry = &*self.path_entry;
+        let places = self.send_places.as_deref();
+        let place = |sender: LocalSenderId| places?.get(sender.as_usize()).copied();
+        let peer_interface = |sender: LocalSenderId| {
+            paired_peer_interface(
+                entry.peer_data_addrs(),
+                entry.peer_data_interfaces(),
+                sender.as_usize(),
+                place(sender),
+            )
+        };
+        let prefer_delivered = entry.prefers_senders_delivering_since_lost();
+        let delivers = |sender: LocalSenderId| {
+            if prefer_delivered {
+                entry.delivers_since_lost(sender)
+            } else {
+                !entry.is_sender_lost(sender)
+            }
+        };
+        super::routing::delivering_ack_sender_id(
+            self.local_sender_id,
+            entry.socket_sender_count(),
+            self.priority_senders.as_deref(),
+            |sender| place(sender).map(|at| at.rank),
+            peer_interface,
+            delivers,
+        )
     }
 
     /// Encode the current ACK state and produce a direct submission for the send worker.
@@ -400,8 +459,8 @@ impl Context {
             largest_recv_time: largest_recv_time.into(),
             path_secret_entry: self.path_entry.clone(),
             // The acknowledgements go to this context's sender while its interface pair
-            // delivers, and to a sender whose pair delivers while it is marked lost.
-            local_sender_id: self.path_entry.delivering_sender(self.local_sender_id),
+            // delivers, and otherwise to a delivering sender, in the order of their interfaces.
+            local_sender_id: self.delivering_ack_sender(),
             remote_sender_id: self.remote_sender_id,
             recv_worker_id,
         })
@@ -452,7 +511,7 @@ pub(crate) struct Cache {
     pub worker_id: RecvDispatchWorkerId,
     /// The senders of the interface that carries the endpoint's highest-priority traffic, which
     /// a peer's acknowledgements go to, where the endpoint has one.
-    pub priority_senders: Option<Vec<LocalSenderId>>,
+    pub priority_senders: Option<Arc<[LocalSenderId]>>,
     /// The place of each of the endpoint's send sockets among its interfaces, by sender, or
     /// `None` where the endpoint doesn't list interfaces. It picks the sender of the
     /// acknowledgements of each new context, ahead of `priority_senders`.
@@ -472,7 +531,7 @@ impl Cache {
     /// Sets the senders of the interface for the highest-priority traffic, which a peer's
     /// acknowledgements go to.
     pub fn with_priority_senders(mut self, priority_senders: Option<Vec<LocalSenderId>>) -> Self {
-        self.priority_senders = priority_senders;
+        self.priority_senders = priority_senders.map(Arc::from);
         self
     }
 
@@ -627,15 +686,18 @@ impl Cache {
                     core::mem::replace(&mut old_ref.queue_view, replacement)
                 };
 
-                let new_ctx = Rc::new(RefCell::new(Context::new(
-                    path_entry,
-                    remote_sender_id,
-                    dest_sender_id,
-                    opener,
-                    credentials.key_id,
-                    clock.now(),
-                    queue_view,
-                )));
+                let new_ctx = Rc::new(RefCell::new(
+                    Context::new(
+                        path_entry,
+                        remote_sender_id,
+                        dest_sender_id,
+                        opener,
+                        credentials.key_id,
+                        clock.now(),
+                        queue_view,
+                    )
+                    .with_ack_senders(self.send_places.clone(), self.priority_senders.clone()),
+                ));
                 new_ctx.borrow().invariants();
                 entry.insert(new_ctx.clone());
 
@@ -687,15 +749,18 @@ impl Cache {
                     route,
                 );
 
-                let ctx = Rc::new(RefCell::new(Context::new(
-                    path_entry,
-                    remote_sender_id,
-                    dest_sender_id,
-                    opener,
-                    credentials.key_id,
-                    clock.now(),
-                    queue_view,
-                )));
+                let ctx = Rc::new(RefCell::new(
+                    Context::new(
+                        path_entry,
+                        remote_sender_id,
+                        dest_sender_id,
+                        opener,
+                        credentials.key_id,
+                        clock.now(),
+                        queue_view,
+                    )
+                    .with_ack_senders(self.send_places.clone(), self.priority_senders.clone()),
+                ));
                 ctx.borrow().invariants();
                 entry.insert(ctx.clone());
                 Ok((r, ctx, false))
@@ -916,6 +981,145 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgements_leave_a_lost_sender_for_a_sender_of_the_same_peer_interface() {
+        let local: SocketAddr = "10.0.1.1:4433".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.1:4433".parse().unwrap();
+        // The peer's data addresses: two on its interface 1 and two on its interface 2. The
+        // endpoint doesn't list interfaces, so its sender `n` sends to the address at `n`.
+        let peer_data_addrs: [SocketAddr; 4] = [
+            "10.0.0.1:4000".parse().unwrap(),
+            "10.0.0.1:4001".parse().unwrap(),
+            "10.0.0.2:4000".parse().unwrap(),
+            "10.0.0.2:4001".parse().unwrap(),
+        ];
+        let peer_data_interfaces: [Option<u16>; 4] = [Some(1), Some(1), Some(2), Some(2)];
+
+        let map = path::secret::map::testing::new(16);
+        map.test_stop_cleaner();
+        // The peer's entry keeps a slot for each of four senders.
+        map.set_socket_sender_count(4);
+        let peer_map = path::secret::map::testing::new(16);
+        peer_map.test_stop_cleaner();
+        let id = map
+            .test_insert_pair(
+                PathSecretEntry::builder(peer)
+                    .local(local)
+                    .peer_data_addrs(peer_data_addrs)
+                    .peer_data_interfaces(peer_data_interfaces),
+                &peer_map,
+                PathSecretEntry::builder(local).local(peer),
+            )
+            .local;
+
+        // The route sends the acknowledgements of the peer's sender 5 to sender 1, which sends
+        // to the peer's interface 1.
+        let route = ModuloRoute::new(4);
+        let remote_sender_id = RemoteSenderId::new(VarInt::from_u8(5));
+        let mut cache = Cache::new(RecvDispatchWorkerId::new(0));
+        let source = peer_data_addrs[1];
+        let (ctx, _hit) = receive(&mut cache, &map, source, id, 0, remote_sender_id, &route);
+        let mut ctx = ctx.borrow_mut();
+        let sender = LocalSenderId::from_index;
+        assert_eq!(ctx.local_sender_id, sender(1));
+        assert_eq!(ctx.path_entry.socket_sender_count(), 4);
+        let now = unsafe {
+            s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::from_millis(1))
+        };
+        ctx.ack_ranges.on_packet_received(VarInt::from_u8(0), now);
+        assert_eq!(submission_sender(&mut ctx), sender(1));
+
+        // While the pair of sender 1 is marked lost, the acknowledgements go to sender 0, which
+        // sends to the same peer interface, ahead of sender 2, the next sender by slot.
+        assert!(ctx.path_entry.set_sender_lost(sender(1), true));
+        assert_eq!(submission_sender(&mut ctx), sender(0));
+        // Once no sender to that peer interface delivers, they go to the next sender by slot.
+        assert!(ctx.path_entry.set_sender_lost(sender(0), true));
+        assert_eq!(submission_sender(&mut ctx), sender(2));
+        // While the routers prefer the senders the peer acknowledged since the pairs were lost,
+        // sender 3 alone delivers.
+        let at = |nanos| crate::time::precision::Timestamp { nanos };
+        ctx.path_entry.set_senders_lost_since(at(200));
+        ctx.path_entry.set_senders_preferred_until(at(1_000));
+        ctx.path_entry.record_sender_delivered(sender(3), at(300));
+        assert!(ctx.path_entry.prefers_senders_delivering_since_lost());
+        assert_eq!(submission_sender(&mut ctx), sender(3));
+        assert_eq!(ctx.local_sender_id, sender(1));
+    }
+
+    #[test]
+    fn acknowledgements_leave_a_lost_local_interface_for_the_flagged_interface() {
+        let local: SocketAddr = "10.0.1.1:4433".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.1:4433".parse().unwrap();
+        // The peer's data addresses, one on each of its interfaces 1 to 3.
+        let peer_data_addrs: [SocketAddr; 3] = [
+            "10.0.0.1:4000".parse().unwrap(),
+            "10.0.0.2:4000".parse().unwrap(),
+            "10.0.0.3:4000".parse().unwrap(),
+        ];
+        let peer_data_interfaces: [Option<u16>; 3] = [Some(1), Some(2), Some(3)];
+
+        let map = path::secret::map::testing::new(16);
+        map.test_stop_cleaner();
+        // The peer's entry keeps a slot for each of six senders.
+        map.set_socket_sender_count(6);
+        let peer_map = path::secret::map::testing::new(16);
+        peer_map.test_stop_cleaner();
+        let id = map
+            .test_insert_pair(
+                PathSecretEntry::builder(peer)
+                    .local(local)
+                    .peer_data_addrs(peer_data_addrs)
+                    .peer_data_interfaces(peer_data_interfaces),
+                &peer_map,
+                PathSecretEntry::builder(local).local(peer),
+            )
+            .local;
+
+        // Six send sockets on three interfaces: sockets 0 and 3 on the first, 1 and 4 on the
+        // second, and 2 and 5 on the third, which carries the highest-priority traffic.
+        let places: Arc<[SendPlace]> = (0..6)
+            .map(|socket| SendPlace {
+                rank: socket % 3,
+                count: 3,
+                index: socket / 3,
+            })
+            .collect();
+        let priority = vec![LocalSenderId::from_index(2), LocalSenderId::from_index(5)];
+
+        // The peer's sender 6 sends from its interface 1, the pair of the first interface, so
+        // the acknowledgements go to sender 0.
+        let source = peer_data_addrs[0];
+        let route = ModuloRoute::new(6);
+        let remote_sender_id = RemoteSenderId::new(VarInt::from_u8(6));
+        let mut cache = Cache::new(RecvDispatchWorkerId::new(0))
+            .with_priority_senders(Some(priority))
+            .with_send_places(Some(places.clone()));
+        let (ctx, _hit) = receive(&mut cache, &map, source, id, 0, remote_sender_id, &route);
+        let mut ctx = ctx.borrow_mut();
+        let sender = LocalSenderId::from_index;
+        assert_eq!(ctx.local_sender_id, sender(0));
+        assert_eq!(ctx.send_places, Some(places));
+        assert_eq!(
+            ctx.priority_senders.as_deref(),
+            Some(&[sender(2), sender(5)][..])
+        );
+        let now = unsafe {
+            s2n_quic_core::time::Timestamp::from_duration(core::time::Duration::from_millis(1))
+        };
+        ctx.ack_ranges.on_packet_received(VarInt::from_u8(0), now);
+        assert_eq!(submission_sender(&mut ctx), sender(0));
+
+        // While the pair of sender 0 is marked lost, the acknowledgements go to sender 3, of
+        // the same interface and pair, ahead of senders 1 and 2.
+        assert!(ctx.path_entry.set_sender_lost(sender(0), true));
+        assert_eq!(submission_sender(&mut ctx), sender(3));
+        // Once no sender of the first interface delivers, they go to sender 2, of the interface
+        // for the highest-priority traffic, ahead of sender 1, the next sender by slot.
+        assert!(ctx.path_entry.set_sender_lost(sender(3), true));
+        assert_eq!(submission_sender(&mut ctx), sender(2));
+    }
+
+    #[test]
     fn a_context_replaced_at_a_key_id_advance_acknowledges_on_the_paired_interface() {
         let local: SocketAddr = "10.0.1.1:4433".parse().unwrap();
         let peer: SocketAddr = "10.0.0.1:4433".parse().unwrap();
@@ -979,7 +1183,7 @@ mod tests {
 
         let mut cache = Cache::new(RecvDispatchWorkerId::new(0))
             .with_priority_senders(Some(priority))
-            .with_send_places(Some(places));
+            .with_send_places(Some(places.clone()));
 
         let (derived, hit) = receive(&mut cache, &map, source, id, 0, remote_sender_id, &route);
         assert!(!hit, "the first packet derives a context");
@@ -997,5 +1201,12 @@ mod tests {
         };
         assert!(Rc::ptr_eq(&cache.senders[&key], &replaced));
         assert_eq!(replaced.borrow().local_sender_id, paired);
+        // The new context keeps the cache's send places and priority senders, which order the
+        // move of its acknowledgements off a sender marked lost.
+        assert_eq!(replaced.borrow().send_places, Some(places));
+        assert_eq!(
+            replaced.borrow().priority_senders.as_deref(),
+            Some(&[LocalSenderId::from_index(0), LocalSenderId::from_index(2)][..])
+        );
     }
 }
