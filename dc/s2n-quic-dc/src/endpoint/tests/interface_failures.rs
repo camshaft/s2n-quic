@@ -20,14 +20,16 @@
 //! one acknowledgement on its pair from each of its interfaces, so that the check can't pass
 //! where an interface doesn't carry any.
 //!
-//! Neither endpoint may mark a sender lost in the first round. Once the second round finishes,
-//! each sender that either endpoint marks lost must write to or from the failed interface, and at
-//! least one sender must be marked lost.
+//! The endpoints also record each lost mark they set on a sender, as they set it. Neither
+//! endpoint may set one in the first round, before the interface fails. Each mark that either
+//! endpoint sets once the interface has failed must be on a sender that writes to or from the
+//! failed interface, and at least one must be set. Each sender that is marked lost when the
+//! second round finishes must be one whose mark the record holds.
 
 use crate::{
     endpoint::{
         id::LocalSenderId,
-        routing::observe::{self, Kind, Routed},
+        routing::observe::{self, Kind, LostMark, Routed},
     },
     socket::interface,
     stream::endpoint::testing::sim::{lookup_sim_map, Client, SimEndpointConfig},
@@ -275,20 +277,47 @@ async fn exchange(client: &mut Client, round: &'static str, shared: &Arc<Shared>
     }
 }
 
-/// Asserts that each sender either endpoint marks lost writes to or from the failed interface,
-/// and that at least one sender is marked lost, so that the check can't pass where no mark is
-/// set at all.
-fn assert_lost_marks(failure: Failure, shared: &Shared) {
-    let lost = lost_senders(shared);
+/// The host that set `mark`, and the socket of the sender it marks lost. An endpoint's path has
+/// an address of the other endpoint as its peer, and in the sim sender i is send socket i.
+fn marked_sender(mark: &LostMark, shared: &Shared) -> (Host, usize) {
+    let host = if shared.addrs(Host::Client).contains(&mark.peer) {
+        Host::Server
+    } else {
+        Host::Client
+    };
+    (host, mark.sender.as_usize())
+}
+
+/// Asserts that each sender either endpoint marks lost now is one whose mark `marks` holds, so
+/// that the record holds each mark that the endpoints keep.
+fn assert_marks_recorded(marks: &[LostMark], shared: &Shared) {
+    let recorded: Vec<_> = marks
+        .iter()
+        .map(|mark| marked_sender(mark, shared))
+        .collect();
+    for (host, socket) in lost_senders(shared) {
+        assert!(
+            recorded.contains(&(host, socket)),
+            "{host:?} marks its socket {socket} lost, though the record of lost marks doesn't \
+             hold that mark",
+        );
+    }
+}
+
+/// Asserts that each lost mark in `marks`, each set after the interface failed, is on a sender
+/// that writes to or from the failed interface, and that the endpoints set at least one, so that
+/// the check can't pass where no mark is set at all.
+fn assert_lost_marks(failure: Failure, marks: &[LostMark], shared: &Shared) {
     assert!(
-        !lost.is_empty(),
+        !marks.is_empty(),
         "neither endpoint marked a sender lost while {failure:?} failed",
     );
     let pairs = [
         peer_interfaces(Host::Client, shared),
         peer_interfaces(Host::Server, shared),
     ];
-    for (host, socket) in lost {
+    for mark in marks {
+        let (host, socket) = marked_sender(mark, shared);
         let peer_interface = pairs[host as usize][socket];
         assert!(
             failure.crosses(host, socket, peer_interface),
@@ -401,10 +430,14 @@ fn run(host: Host, interface: usize) {
     let in_sim = shared.clone();
     let routed = Arc::new(Mutex::new(Vec::<Routed>::new()));
     let routed_in_sim = routed.clone();
+    let marks = Arc::new(Mutex::new(Vec::<LostMark>::new()));
+    let marks_in_sim = marks.clone();
 
     sim(move || {
-        // The endpoints route on the thread that runs the sim, which records what they route.
+        // The endpoints route and set their lost marks on the thread that runs the sim, which
+        // records what they route and each mark they set.
         observe::record_into(routed_in_sim);
+        observe::record_lost_marks_into(marks_in_sim.clone());
         let monitor = in_sim.clone();
         bach::net::monitor::on_socket_write(move |write| {
             let addrs = (*write.local_addr, *write.peer_addr);
@@ -453,6 +486,7 @@ fn run(host: Host, interface: usize) {
         .spawn();
 
         let client_side = in_sim;
+        let client_marks = marks_in_sim;
         async move {
             let mut client = SimEndpointConfig::default()
                 .interfaces(interfaces(Host::Client))
@@ -467,10 +501,12 @@ fn run(host: Host, interface: usize) {
             )
             .await
             .expect("the first round finishes");
-            let lost = lost_senders(&client_side);
+            // The failure starts right after this check, with no wait between them, so each
+            // mark that the record holds after it was set while the interface had failed.
+            let marked = client_marks.lock().unwrap().clone();
             assert!(
-                lost.is_empty(),
-                "the endpoints marked {lost:?} lost before an interface failed",
+                marked.is_empty(),
+                "the endpoints marked senders lost before an interface failed: {marked:?}",
             );
 
             // The network drops each packet to or from the failed interface from now on.
@@ -481,13 +517,14 @@ fn run(host: Host, interface: usize) {
             )
             .await
             .expect("the second round finishes while an interface has failed");
-            assert_lost_marks(failure, &client_side);
+            assert_marks_recorded(&client_marks.lock().unwrap(), &client_side);
         }
         .group("client")
         .primary()
         .spawn();
     });
 
+    assert_lost_marks(failure, &marks.lock().unwrap(), &shared);
     let routed = routed.lock().unwrap();
     assert_acknowledgements_paired(&routed, &shared);
     assert!(
