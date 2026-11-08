@@ -4,18 +4,22 @@
 //! The pairing of an endpoint's local interfaces with a peer's interfaces.
 //!
 //! Where an endpoint lists more than one local interface and a peer tags its data addresses
-//! with its own interfaces, each local interface sends to one of the peer's interfaces: the k-th
-//! local interface that holds a send socket, in the order of their [`Id`]s, pairs with the
-//! peer's k-th interface, in the order of its tags, and the pairing starts again from the peer's
-//! first interface where the endpoint has more interfaces than the peer. The send sockets of a
-//! local interface take the addresses of its paired interface in turn, so that they spread over
-//! them.
+//! with its own interfaces, each local interface sends to the peer's interfaces it pairs with:
+//! the k-th local interface that holds a send socket, in the order of their [`Id`]s, pairs with
+//! the peer's k-th interface, in the order of its tags, and the pairing starts again from the
+//! peer's first interface where the endpoint has more interfaces than the peer. Where the peer
+//! has more interfaces than the endpoint, the k-th local interface also pairs with the peer's
+//! interfaces at k plus each multiple of the endpoint's count, and its send sockets take those
+//! interfaces in turn, so that each of the peer's interfaces receives from the endpoint where
+//! the local interface holds a send socket for each of them. The send sockets that send to one
+//! of the peer's interfaces take its addresses in turn, so that they spread over them.
 //!
 //! Where the peer doesn't tag its addresses, the endpoint doesn't list interfaces, or either side
 //! has a single interface, a sender keeps the address it took before: `addrs[sender % len]`.
 //!
 //! A receiver sends the acknowledgements of a peer's packets from the local interface the
-//! packets arrived at, so that they cross the same interfaces as the packets: see
+//! packets arrived at, on a sender of that interface that sends back to the peer's interface the
+//! packets came from where one does, so that they cross the same interfaces as the packets: see
 //! [`paired_ack_sender`].
 
 use super::{Id, Table};
@@ -94,7 +98,9 @@ impl Table {
 ///
 /// `addrs` holds the peer's data addresses, and `interfaces` the interface tag of each, in the
 /// same order, or nothing where the peer doesn't tag them. `place` is the sender's place where
-/// the endpoint lists interfaces.
+/// the endpoint lists interfaces: the sender sends to one of the peer's interfaces paired with
+/// its own, the one its index takes where the peer has more interfaces than the endpoint, and
+/// takes that interface's addresses in turn.
 ///
 /// # Panics
 ///
@@ -122,35 +128,61 @@ pub fn paired_peer_addr(
         return unpaired;
     }
 
-    let paired = remote[place.rank % remote.len()];
+    let (rank, turn) = paired_rank(place, remote.len());
+    let paired = remote[rank];
     let on_paired: Vec<SocketAddr> = addrs
         .iter()
         .zip(interfaces)
         .filter(|(_, tag)| **tag == Some(paired))
         .map(|(addr, _)| *addr)
         .collect();
-    on_paired[place.index % on_paired.len()]
+    on_paired[turn % on_paired.len()]
+}
+
+/// Returns the rank of the peer's interface that a sender at `place` sends to, among the
+/// `peer_count` interfaces the peer tags, and the sender's turn among the senders of its
+/// interface that send to it, which picks one of that interface's addresses.
+///
+/// Where the peer has no more interfaces than the endpoint, the sender at rank `r` sends to the
+/// peer's interface at `r % peer_count`, and its turn is its index. Where the peer has more, the
+/// interfaces at `r`, `r + count`, `r + 2 * count` and so on below `peer_count` pair with the
+/// sender's interface, and the sender at index `i` sends to the one at `i % m` among them, with
+/// turn `i / m`, where `m` is how many there are.
+fn paired_rank(place: SendPlace, peer_count: usize) -> (usize, usize) {
+    if place.count <= 1 || peer_count <= place.count || place.rank >= peer_count {
+        return (place.rank % peer_count, place.index);
+    }
+    let paired = (peer_count - place.rank - 1) / place.count + 1;
+    let rank = place.rank + place.count * (place.index % paired);
+    (rank, place.index / paired)
 }
 
 /// Returns the sender that sends the acknowledgements of a peer's packets, so that they follow
-/// the packets' route back: a sender of the local interface the packets arrived at.
+/// the packets' route back: a sender of the local interface the packets arrived at that sends
+/// to the peer's interface the packets came from.
 ///
-/// `arrival` is the rank of that interface among the local interfaces that hold a send socket,
-/// in the order of their [`Id`]s, where the receive path records it. Where it is `None`, the
-/// interface is the one the peer's interface sends to: the peer's interface at rank `k` among
-/// its tags sends to the local interface at rank `k % count`, where `count` is how many local
-/// interfaces hold a send socket. That is the interface paired with the peer's or, where the
-/// peer has more interfaces than the endpoint, the one the pairing starts again from, which
-/// doesn't send back to the peer's interface. Either way the acknowledgements cross only the
-/// interfaces the packets crossed on the endpoint's side.
+/// `arrival` is the rank of that local interface among the local interfaces that hold a send
+/// socket, in the order of their [`Id`]s, where the receive path records it. Where it is `None`,
+/// the interface is inferred as the one the peer's interface sends to: the peer's interface at
+/// rank `k` among its tags sends to the local interface at rank `k % count`, where `count` is
+/// how many local interfaces hold a send socket. That inference is exact where the endpoint has
+/// no more interfaces than the peer; where it has more, the peer's interface sends to one of
+/// the local interfaces at `k` plus each multiple of the peer's count, and the inference is the
+/// first of them.
+///
+/// Among the senders of that local interface, the sender is one whose paired peer interface, as
+/// [`paired_peer_addr`] chooses it, is the one the packets came from. Where none of them sends
+/// to it, as where the peer has more interfaces than the endpoint and the local interface holds
+/// fewer send sockets than the peer's interfaces paired with it, the sender is any sender of
+/// that local interface.
 ///
 /// `addrs` and `interfaces` hold the peer's data addresses and their tags, as
 /// [`paired_peer_addr`] reads them, `places` the place of each of the endpoint's send sockets,
 /// by sender, `source` the address the packets came from, and `remote_sender` the peer's sender
-/// that sent them. Where `source` is one of `addrs`, the sender's position among the senders of
-/// its local interface is the address's position among the addresses of its interface, so
-/// that each of the peer's addresses maps to one sender. Where only the IP address of `source`
-/// matches, the peer's senders map to the senders of that local interface in turn.
+/// that sent them. Where `source` is one of `addrs`, the sender's position among those senders
+/// is the address's position among the addresses of its interface, so that each of the peer's
+/// addresses maps to one sender. Where only the IP address of `source` matches, the peer's
+/// senders map to those senders in turn.
 ///
 /// Returns `None`, which keeps the caller's choice, where the peer doesn't tag its addresses,
 /// either side has a single interface, `source` doesn't match the addresses of exactly one of
@@ -202,20 +234,32 @@ pub fn paired_ack_sender(
 
     let rank = remote.binary_search(&tag).ok()?;
     // The acknowledgements leave on the local interface the packets arrived at. Where the
-    // receive path doesn't record it, that is the one the peer's interface at `rank` sends to,
-    // the local interface at `rank % count`: its pair, or, where the peer has more interfaces
-    // than the endpoint, the one the pairing starts again from.
+    // receive path doesn't record it, that is inferred as the one the peer's interface at `rank`
+    // sends to under the peer's pairing, the local interface at `rank % count`.
     let arrived_at = |count: usize| arrival.unwrap_or(rank % count);
-    let on_rank: Vec<usize> = places
+    let on_arrival: Vec<(usize, SendPlace)> = places
         .iter()
+        .copied()
         .enumerate()
         .filter(|(_, place)| place.count > 1 && place.rank == arrived_at(place.count))
-        .map(|(sender, _)| sender)
         .collect();
-    if on_rank.is_empty() {
+    // Of those senders, the ones that send to the peer's interface the packets came from carry
+    // the acknowledgements back across it. Where none of them does, any sender of the interface
+    // carries them.
+    let paired: Vec<usize> = on_arrival
+        .iter()
+        .filter(|(_, place)| paired_rank(*place, remote.len()).0 == rank)
+        .map(|(sender, _)| *sender)
+        .collect();
+    let senders: Vec<usize> = if paired.is_empty() {
+        on_arrival.iter().map(|(sender, _)| *sender).collect()
+    } else {
+        paired
+    };
+    if senders.is_empty() {
         return None;
     }
-    Some(on_rank[position.unwrap_or(remote_sender) % on_rank.len()])
+    Some(senders[position.unwrap_or(remote_sender) % senders.len()])
 }
 
 /// Returns the interface tag of the peer's address that a sender sends to, as
@@ -558,10 +602,10 @@ mod tests {
     }
 
     #[test]
-    fn an_acknowledgement_from_an_unpaired_peer_interface_leaves_where_its_packets_arrived() {
+    fn an_acknowledgement_from_a_third_peer_interface_goes_back_across_it() {
         // The peer has three interfaces and the endpoint two: the peer's third interface sends to
-        // the endpoint's first, where the pairing starts again, and no local interface sends to
-        // it.
+        // the endpoint's first, where the pairing starts again, and the endpoint's first
+        // interface spreads its two send sockets over the peer's first and third interfaces.
         let peer = addrs(6);
         let tags = [Some(1), Some(1), Some(2), Some(2), Some(3), Some(3)];
         let places = two_interfaces();
@@ -583,13 +627,13 @@ mod tests {
             let arrived_on = local_tags[local.iter().position(|addr| *addr == arrived).unwrap()];
             assert_eq!(arrived_on, Some(places[sender].rank as u16));
 
-            // From the peer's first two interfaces, the sender sends back to the source. From its
-            // third, the sender's interface sends to the peer's first interface, its pair.
+            // The sender sends back to the peer's interface the packets came from, the third
+            // too. Each address of the peer's second interface has a send socket of its own, so
+            // the acknowledgements of its packets go back to their source.
             let back = paired_peer_addr(&peer, &tags, sender, Some(places[sender]));
-            if at < 4 {
+            assert_eq!(tag_of(&peer, &tags, back), tags[at]);
+            if at / 2 == 1 {
                 assert_eq!(back, source);
-            } else {
-                assert_eq!(tags[peer.iter().position(|addr| *addr == back).unwrap()], Some(1));
             }
         }
     }
@@ -665,5 +709,148 @@ mod tests {
             paired_ack_sender(&peer, &[], &places, source, 7, Some(0)),
             None
         );
+    }
+
+    /// The tag of `addr` among `addrs`, where it is one of them.
+    fn tag_of(addrs: &[SocketAddr], tags: &[Option<u16>], addr: SocketAddr) -> Option<u16> {
+        let at = addrs.iter().position(|other| *other == addr)?;
+        tags[at]
+    }
+
+    /// The data addresses of a host with `count` interfaces and `sockets` addresses on each,
+    /// interface by interface, and the tag of each: the rank of its interface.
+    fn tagged(host: u8, count: u16, sockets: u16) -> (Vec<SocketAddr>, Vec<Option<u16>>) {
+        let mut addrs = Vec::new();
+        let mut tags = Vec::new();
+        for at in 0..count * sockets {
+            addrs.push(SocketAddr::from(([10, 0, 0, host], 4000 + at)));
+            tags.push(Some(at / sockets));
+        }
+        (addrs, tags)
+    }
+
+    /// The places of `sockets` send sockets on each of `count` interfaces, interface by
+    /// interface.
+    fn in_runs(count: usize, sockets: usize) -> Vec<SendPlace> {
+        (0..count * sockets)
+            .map(|at| SendPlace {
+                rank: at / sockets,
+                count,
+                index: at % sockets,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn senders_spread_over_the_peer_interfaces_their_interface_pairs_with() {
+        // Host X has two interfaces and host Y three, with four send sockets on each interface,
+        // and each data address is the source of the send socket at the same position.
+        let (x, x_tags) = tagged(1, 2, 4);
+        let x_places = in_runs(2, 4);
+        let (y, y_tags) = tagged(2, 3, 4);
+        let y_places = in_runs(3, 4);
+
+        // X's first interface pairs with Y's first and third and its sockets send to them in
+        // turn, and X's second sends to Y's second. Each socket takes the addresses of its peer
+        // interface in turn.
+        let x_sends_to = [0, 8, 1, 9, 4, 5, 6, 7];
+        for (sender, &at) in x_sends_to.iter().enumerate() {
+            let place = Some(x_places[sender]);
+            assert_eq!(paired_peer_addr(&y, &y_tags, sender, place), y[at]);
+            assert_eq!(
+                paired_peer_interface(&y, &y_tags, sender, place),
+                y_tags[at]
+            );
+        }
+        // Y, which has more interfaces, sends from its interface at rank `r` to X's at `r % 2`.
+        for (sender, place) in y_places.iter().enumerate() {
+            let at = (place.rank % 2) * 4 + place.index;
+            assert_eq!(paired_peer_addr(&x, &x_tags, sender, Some(*place)), x[at]);
+        }
+
+        // X acknowledges a packet from each of Y's addresses on a sender of the interface the
+        // packet arrived at that sends back to the packet's peer interface: a packet from Y's
+        // third interface arrives at X's first and goes back on its second or fourth socket.
+        let x_acks_on = [0, 2, 0, 2, 4, 5, 6, 7, 1, 3, 1, 3];
+        for (at, &source) in y.iter().enumerate() {
+            let to = paired_peer_addr(&x, &x_tags, at, Some(y_places[at]));
+            let arrival = tag_of(&x, &x_tags, to).expect("an address of X");
+            for arrived in [Some(usize::from(arrival)), None] {
+                let sender = paired_ack_sender(&y, &y_tags, &x_places, source.into(), 7, arrived);
+                assert_eq!(sender, Some(x_acks_on[at]));
+            }
+            let sender = x_acks_on[at];
+            let back = paired_peer_addr(&y, &y_tags, sender, Some(x_places[sender]));
+            assert_eq!(tag_of(&y, &y_tags, back), y_tags[at]);
+        }
+
+        // Y acknowledges a packet from each of X's addresses on a sender of the interface the
+        // packet arrived at, which sends back to the packet's source: a packet from X's first
+        // interface that arrives at Y's third goes back across it.
+        for (at, &source) in x.iter().enumerate() {
+            let arrived = y_tags[x_sends_to[at]].map(usize::from);
+            let sender = paired_ack_sender(&x, &x_tags, &y_places, source.into(), 7, arrived)
+                .expect("a packet from a tagged address has a sender");
+            assert_eq!(arrived, Some(y_places[sender].rank));
+            let back = paired_peer_addr(&x, &x_tags, sender, Some(y_places[sender]));
+            assert_eq!(back, source);
+        }
+    }
+
+    #[test]
+    fn an_interface_with_too_few_send_sockets_acknowledges_on_another_pair() {
+        // The peer has three interfaces with two addresses each. The endpoint's first interface,
+        // which pairs with the peer's first and third, holds one send socket, which sends to the
+        // peer's first interface, so no sender sends to the peer's third.
+        let (peer, tags) = tagged(2, 3, 2);
+        let two = |rank, index| SendPlace {
+            rank,
+            count: 2,
+            index,
+        };
+        let places = [two(0, 0), two(1, 0), two(1, 1)];
+        for (sender, &at) in [0, 2, 3].iter().enumerate() {
+            assert_eq!(
+                paired_peer_addr(&peer, &tags, sender, Some(places[sender])),
+                peer[at]
+            );
+        }
+
+        // The acknowledgements of packets from the peer's third interface arrive at the
+        // endpoint's first interface, whose sender doesn't send back to it, and leave on that
+        // sender. Those of packets from the peer's first interface leave on the same sender,
+        // which sends to it.
+        for &source in &peer[4..] {
+            for arrived in [Some(0), None] {
+                assert_eq!(
+                    paired_ack_sender(&peer, &tags, &places, source.into(), 7, arrived),
+                    Some(0)
+                );
+            }
+        }
+        for &source in &peer[..2] {
+            assert_eq!(
+                paired_ack_sender(&peer, &tags, &places, source.into(), 7, None),
+                Some(0)
+            );
+        }
+
+        // With a second send socket, the endpoint's first interface sends to the peer's third
+        // interface too, and acknowledges its packets on that socket.
+        let places = [two(0, 0), two(1, 0), two(1, 1), two(0, 1)];
+        for (sender, &at) in [0, 2, 3, 4].iter().enumerate() {
+            assert_eq!(
+                paired_peer_addr(&peer, &tags, sender, Some(places[sender])),
+                peer[at]
+            );
+        }
+        for &source in &peer[4..] {
+            for arrived in [Some(0), None] {
+                assert_eq!(
+                    paired_ack_sender(&peer, &tags, &places, source.into(), 7, arrived),
+                    Some(3)
+                );
+            }
+        }
     }
 }
