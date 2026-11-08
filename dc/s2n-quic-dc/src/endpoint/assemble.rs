@@ -69,6 +69,9 @@ mod tests;
 ///
 /// Cancelled frames (where `should_transmit()` returns false) are sent to `cancelled`
 /// for completion notification.
+///
+/// The lost mark of a pair that sends acknowledgements alone is counted on `send_counters`,
+/// and its event is published through `path_secret_map` where one is set.
 pub(crate) fn assemble<R: Recycler, Clk>(
     context: &mut Context,
     immediate_queue_status: ImmediateQueueStatus,
@@ -83,6 +86,7 @@ pub(crate) fn assemble<R: Recycler, Clk>(
     freed_batch_tx: &mut FreedBatchTx,
     counters: &AssemblerCounters,
     send_counters: &crate::endpoint::counters::Send,
+    path_secret_map: Option<&crate::path::secret::Map>,
     send_credit_pool: &crate::credit::Pool,
 ) -> Option<Segments<R>>
 where
@@ -90,6 +94,12 @@ where
 {
     let now = clock.now();
     let time_sent = now.into();
+    // A context that sends acknowledgements alone has no packet in the inflight map for its
+    // probe timeout to check, so its interface pair is checked here. A lost mark records its
+    // time, counts the pair on `send_counters` and publishes its event through
+    // `path_secret_map`, as the probe timeout task's mark does.
+    let check = |context: &mut Context| context.check_acknowledgement_only_delivery(now);
+    crate::endpoint::send::track_path_lost(context, send_counters, path_secret_map, check);
     let PathInfo {
         max_datagram_size: mtu,
         max_segments,
@@ -165,7 +175,11 @@ where
             // outstanding. This prevents an ACK loop: once the peer responds to
             // our ack-eliciting probe, sampled=true keeps is_pending()=true and
             // suppresses further probing until new data enters the inflight map.
-            let make_ack_eliciting = rtt_sample_needed && !context.rtt_tracker.is_pending();
+            // A context that sends acknowledgements alone probes again once the peer hasn't
+            // acknowledged anything for a persistent congestion period, so that a probe the
+            // peer doesn't acknowledge marks a lost pair (`Context::needs_delivery_probe`).
+            let make_ack_eliciting = rtt_sample_needed
+                && (!context.rtt_tracker.is_pending() || context.needs_delivery_probe(now));
 
             // Phase 1: drain direct ACK submissions (from pending_acks queue).
             // Each entry carries an already-encoded ACK body from recv worker; stamp
@@ -293,10 +307,26 @@ where
                         );
                     }
                     ProbeResult::NothingToProbe => {
-                        if context.pto.probe_state.is_probe_once() {
+                        // A lost pair has no packet that waits for an acknowledgement once its
+                        // frames moved to the pairs that deliver; a Ping probes it, and its
+                        // acknowledgement shows that the pair delivers again.
+                        let wants_ping =
+                            context.pto.probe_state.is_probe_once() || context.is_path_lost();
+                        // The Ping goes only in a segment with room for it: a later segment of
+                        // a batch is as long as the first one at most, so where the Ping doesn't
+                        // fit, the probe waits for the next assembly, as `DoesNotFit` does.
+                        let ping_metadata = metadata.with_frame_parts(&frame::Header::Ping, 0);
+                        let ping_len = ping_metadata.estimate_packet_len(
+                            source_sender_id,
+                            source_control_port,
+                            &context.credentials,
+                            seal::Application::tag_len(&context.sealer),
+                        );
+                        if wants_ping && ping_len <= max_segment_len {
                             // Already sent one probe — emit Ping for the second segment.
                             // Don't clear probe_state here; the general on_transmit()
                             // fires after the Ping segment is encoded (ProbeOnce → Idle).
+                            metadata = ping_metadata;
                             let ping = crate::intrusive::Entry::new(Frame {
                                 header: frame::Header::Ping,
                                 payload: crate::byte_vec::ByteVec::default(),
@@ -316,7 +346,7 @@ where
                                 credentials = %context.credentials.id,
                                 "PTO probe: emitting Ping as second segment"
                             );
-                        } else {
+                        } else if !wants_ping {
                             // No inflight entries and no prior probe sent — clear to Idle.
                             let _ = context.pto.probe_state.on_all_acked();
                             trace!(
@@ -645,9 +675,11 @@ where
                         time_sent,
                         sent_bytes: encoded_len as u16,
                     };
-                    // Restart idle timeout when transitioning from no inflight to inflight.
+                    // Restart idle timeout, and start the wait for an acknowledgement, when
+                    // transitioning from no inflight to inflight.
                     if !context.inflight.has_inflight() {
                         context.last_peer_activity = now;
+                        context.ack_wait_since = Some(now);
                     }
 
                     let pn = PacketNumberSpace::Initial.new_packet_number(packet_number);
@@ -690,6 +722,12 @@ where
                             .rtt_tracker
                             .on_non_eliciting_sent(packet_number, time_sent);
                     }
+                    // The inflight map doesn't hold this packet, so the context records here
+                    // that it waits for an acknowledgement.
+                    if context.ack_only_probe_sent.is_none() {
+                        context.ack_only_probe_sent = Some(now);
+                    }
+                    context.ack_only_sent = Some(now);
                 }
                 context.invariants();
             } else if rtt_sample_needed {
@@ -700,6 +738,8 @@ where
                 context
                     .rtt_tracker
                     .on_non_eliciting_sent(packet_number, time_sent);
+                context.ack_only_since_peer_ack = true;
+                context.ack_only_sent = Some(now);
                 context.invariants();
             } else {
                 context.invariants();

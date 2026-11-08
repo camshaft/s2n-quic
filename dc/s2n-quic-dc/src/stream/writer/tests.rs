@@ -3843,3 +3843,45 @@ impl crate::credit::WakerSink for TestWakerSink {
         }
     }
 }
+
+/// A ping without a completion sender, which neither stream submits: the tests below hand it to
+/// the writer's submission path.
+#[cfg(debug_assertions)]
+fn ping_without_completion(writer: &Writer) -> Frame {
+    Frame {
+        header: Header::Ping,
+        payload: crate::byte_vec::ByteVec::new(),
+        path_secret_entry: writer.0.path_secret_entry.clone(),
+        completion: None,
+        status: frame::TransmissionStatus::default(),
+        ttl: frame::DEFAULT_TTL,
+        enqueued_at: None,
+        flow_credits: 0,
+    }
+}
+
+/// The writer submits a frame without a completion sender only as a QueueReset. While the window
+/// of frames without send credit refuses a frame, the priority router keeps one copy of each
+/// waiting reset, and the producer of every other frame waits on its completion, so a ping or a
+/// control frame without a completion sender would wait in front of the window without a bound.
+/// `send_frame` panics on such a frame in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a stream frame without a completion sender must be a QueueReset")]
+fn send_frame_panics_on_a_frame_without_a_completion_sender_that_isnt_a_reset() {
+    let (mut writer, _pusher) = make_client_pair();
+    let frame = ping_without_completion(&writer);
+    let _ = writer.0.send_frame(frame);
+}
+
+/// As `send_frame_panics_on_a_frame_without_a_completion_sender_that_isnt_a_reset`, for the
+/// frames of a batch: `send_batch` panics on such a frame in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a stream frame without a completion sender must be a QueueReset")]
+fn send_batch_panics_on_a_frame_without_a_completion_sender_that_isnt_a_reset() {
+    let (mut writer, _pusher) = make_client_pair();
+    let mut frames = intrusive::Queue::new();
+    frames.push_back(intrusive::Entry::new(ping_without_completion(&writer)));
+    let _ = writer.0.send_batch(frames);
+}
