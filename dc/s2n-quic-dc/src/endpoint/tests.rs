@@ -36,6 +36,7 @@ pub mod interface_pairing;
 pub mod interface_priority;
 pub mod interfaces;
 pub mod moved_off_lost;
+pub mod send_socket_count;
 pub mod unidirectional;
 
 #[test]
