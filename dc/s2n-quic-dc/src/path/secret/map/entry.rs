@@ -426,6 +426,13 @@ impl Entry {
         };
         let slot = &self.sender_load_scores[sender_idx];
         let previous = if lost {
+            // Each lost mark is set here, so the tests that check which senders an endpoint
+            // marks lost record each one here.
+            #[cfg(test)]
+            crate::endpoint::routing::observe::record_lost_mark(
+                LocalSenderId::from_index(sender_idx),
+                self.peer,
+            );
             slot.fetch_or(Self::LOST_SENDER, Ordering::AcqRel)
         } else {
             slot.fetch_and(!Self::LOST_SENDER, Ordering::AcqRel)

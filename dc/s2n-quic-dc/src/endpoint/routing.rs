@@ -399,8 +399,9 @@ pub(crate) fn route_freed_batch(
     }
 }
 
-/// Records each acknowledgement and freed batch that the endpoint routes to a send worker, for
-/// the tests that check which sender each goes to.
+/// Records each acknowledgement and freed batch that the endpoint routes to a send worker, and
+/// each lost mark it sets on a sender, for the tests that check which sender each goes to and
+/// which senders the endpoint marks lost.
 #[cfg(test)]
 pub(crate) mod observe {
     use super::{msg, LocalSenderId, RemoteSenderId};
@@ -487,6 +488,33 @@ pub(crate) mod observe {
         fn drop(&mut self) {
             SUBMITTER.with(|current| current.set(self.previous));
         }
+    }
+
+    /// A lost mark that the endpoint sets: the sender whose interface pair it marks lost, and
+    /// the peer of the sender's path.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct LostMark {
+        pub(crate) sender: LocalSenderId,
+        pub(crate) peer: SocketAddr,
+    }
+
+    thread_local! {
+        static MARKS: RefCell<Option<Arc<Mutex<Vec<LostMark>>>>> = const { RefCell::new(None) };
+    }
+
+    /// Records each lost mark that this thread sets from now on in `sink`.
+    pub(crate) fn record_lost_marks_into(sink: Arc<Mutex<Vec<LostMark>>>) {
+        MARKS.with(|current| *current.borrow_mut() = Some(sink));
+    }
+
+    /// Records that this thread marks the interface pair of `sender` lost on its path to `peer`,
+    /// where this thread records the lost marks it sets.
+    pub(crate) fn record_lost_mark(sender: LocalSenderId, peer: SocketAddr) {
+        MARKS.with(|sink| {
+            if let Some(sink) = sink.borrow().as_ref() {
+                sink.lock().unwrap().push(LostMark { sender, peer });
+            }
+        });
     }
 
     /// Records `message`, where this thread records the messages it routes.
