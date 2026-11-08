@@ -549,7 +549,10 @@ where
         "setting up endpoint"
     );
 
-    if num_recv_dispatch.is_power_of_two() {
+    // `setup_endpoint_inner` builds two routes of this type: one over the recv dispatch workers,
+    // and one over the send sockets, which picks the sender of a peer's acknowledgements. A mask
+    // picks the same index as a modulo only where the count is a power of two.
+    if num_recv_dispatch.is_power_of_two() && send_sockets.len().is_power_of_two() {
         setup_endpoint_inner::<_, _, _, _, routing::PowerOfTwoRoute>(
             runtime,
             config,
@@ -623,10 +626,7 @@ where
     let num_workers = runtime.worker_count().max(1);
     let num_send = send_sockets.len();
 
-    assert!(
-        num_send.is_power_of_two(),
-        "number of sender sockets must be a power of two"
-    );
+    assert!(num_send > 0, "at least one send socket is required");
     assert!(
         submission_shards.is_power_of_two(),
         "submission shard count must be a power of two"

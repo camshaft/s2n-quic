@@ -251,7 +251,7 @@ pub struct SimEndpointConfig {
     /// IPv4/IPv6-specific address forces a specific address family.
     pub bind_addr: SocketAddr,
 
-    /// Number of send sockets.  Must be a power of two (≥ 1).
+    /// Number of send sockets, at least one.
     pub num_send_sockets: usize,
 
     /// Number of recv sockets.  Distributed round-robin across recv_io workers.
@@ -428,10 +428,7 @@ pub fn setup_sim_endpoint(
         path_secret_map: _,
     } = config;
 
-    assert!(
-        num_send_sockets.is_power_of_two(),
-        "num_send_sockets must be a power of two"
-    );
+    assert!(num_send_sockets > 0, "num_send_sockets must be at least one");
     assert!(
         submission_shards.is_power_of_two(),
         "submission_shards must be a power of two"

@@ -6,9 +6,8 @@
 //! between a host with two interfaces and a host with three.
 //!
 //! The client puts its eight sockets on two interfaces in turn, four on each. The server puts
-//! its sixteen sockets on three interfaces: four on the first, four on the second and eight on
-//! the third, since the endpoint needs a power of two of send sockets. Each test fails one
-//! interface of one host: the network drops every packet to or from that interface's sockets.
+//! its twelve sockets on three interfaces in turn, four on each. Each test fails one interface
+//! of one host: the network drops every packet to or from that interface's sockets.
 //! The client writes a round of streams to the server, and the server answers each stream with
 //! as many bytes: once before the failure, once while the interface has failed, and then, once
 //! the interface delivers again, until neither endpoint marks a sender lost. Each round must
@@ -62,9 +61,9 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 /// The interface of each client socket: the even sockets on the first one, the odd ones on the
 /// second.
 const CLIENT_INTERFACE: [usize; 8] = [0, 1, 0, 1, 0, 1, 0, 1];
-/// The interface of each server socket: sockets 0, 4, 8 and 12 on the first one, 1, 5, 9 and 13
-/// on the second, and the other eight on the third.
-const SERVER_INTERFACE: [usize; 16] = [0, 1, 2, 2, 0, 1, 2, 2, 0, 1, 2, 2, 0, 1, 2, 2];
+/// The interface of each server socket: sockets 0, 3, 6 and 9 on the first one, 1, 4, 7 and 10
+/// on the second, and 2, 5, 8 and 11 on the third.
+const SERVER_INTERFACE: [usize; 12] = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2];
 
 /// One of the two endpoints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,7 +424,7 @@ fn server_interface_1_fails() {
     run(Host::Server, 1);
 }
 
-/// The server's third interface, which holds half of its sockets, fails.
+/// The server's third interface fails.
 #[test]
 fn server_interface_2_fails() {
     run(Host::Server, 2);
