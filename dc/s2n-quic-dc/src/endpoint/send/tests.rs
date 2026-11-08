@@ -1302,6 +1302,64 @@ fn a_context_dropped_for_a_rejected_key_clears_its_lost_mark() {
     assert!(events.delivering.lock().unwrap().is_empty());
 }
 
+/// A context that its cache dropped stays in its probe timeout's wheel, which fires for it
+/// once more, and an assembly may still read it. Neither marks its pair lost again, or
+/// records when it would have: once the cache dropped the context, none of the cache's
+/// contexts would clear that mark, and the routers would leave the pair out after its
+/// interface delivers again.
+#[test]
+fn a_dropped_context_does_not_mark_its_pair_lost_again() {
+    let (mut cache, entry, _events) = make_cache_with_a_lost_context();
+    let sender = crate::endpoint::id::LocalSenderId::from_index(0);
+    let ctx = cache
+        .get(entry.id())
+        .expect("the cache holds the lost context");
+    let clock = make_clock(100);
+    {
+        // The lost pair sent a Ping, which the inflight map doesn't hold, and its wait for the
+        // Ping's acknowledgement goes on.
+        let mut ctx = ctx.borrow_mut();
+        ctx.spreads_over_interfaces = true;
+        ctx.last_peer_activity = clock.get_time();
+        ctx.ack_only_probe_sent = Some(clock.get_time());
+    }
+
+    let reason = crate::endpoint::frame::FailureReason::PeerDead;
+    let mut cancelled = CollectFrames::default();
+    assert!(cache
+        .invalidate(entry.id(), reason, &mut cancelled)
+        .is_some());
+    assert!(!entry.is_sender_lost(sender));
+
+    let mut ctx = ctx.borrow_mut();
+    let threshold = ctx.rtt_estimator.persistent_congestion_threshold();
+    clock.advance(threshold);
+    ctx.ack_only_sent = Some(clock.get_time());
+    assert!(
+        ctx.has_stopped_delivering(clock.get_time()),
+        "the dropped context's Ping waited for a persistent congestion period"
+    );
+
+    let _ = ctx.on_pto_timeout(&clock);
+    assert!(
+        !entry.is_sender_lost(sender),
+        "the dropped context's probe timeout left the mark cleared"
+    );
+    assert!(
+        ctx.lost_at.is_none(),
+        "the dropped context's probe timeout didn't record when its pair was lost"
+    );
+    ctx.check_acknowledgement_only_delivery(clock.get_time());
+    assert!(
+        !entry.is_sender_lost(sender),
+        "the dropped context's assembly left the mark cleared"
+    );
+    assert!(
+        ctx.lost_at.is_none(),
+        "the dropped context's assembly didn't record when its pair was lost"
+    );
+}
+
 /// A pair whose context sends acknowledgements alone stops delivering once its last
 /// ack-eliciting packet, which the inflight map doesn't hold, waited for a persistent
 /// congestion period without an acknowledgement.
