@@ -16,6 +16,7 @@ use crate::{
     endpoint::{
         combinator::{FrameBatch, HighestPriority, SendPacing},
         frame::{self, PriorityInput, SubmissionSender},
+        id::Id as _,
         tasks, Budgets,
     },
     intrusive::EntryAdapter,
