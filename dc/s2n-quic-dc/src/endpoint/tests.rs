@@ -29,6 +29,7 @@ pub mod counted_lost;
 pub mod deterministic;
 pub mod fair_share;
 pub mod half_close;
+pub mod interface_failures;
 pub mod interface_loss;
 pub mod interface_pacing;
 pub mod interface_pairing;
