@@ -101,6 +101,7 @@ impl AssembleBenchmark {
                 &mut self.freed_batch_tx,
                 &self.assembler_counters,
                 &self.send_counters,
+                None,
                 &credit_pool,
             ) else {
                 break;
