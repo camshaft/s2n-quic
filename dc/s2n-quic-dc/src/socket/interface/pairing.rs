@@ -163,12 +163,12 @@ fn paired_rank(place: SendPlace, peer_count: usize) -> (usize, usize) {
 ///
 /// `arrival` is the rank of that local interface among the local interfaces that hold a send
 /// socket, in the order of their [`Id`]s, where the receive path records it. Where it is `None`,
-/// the interface is inferred as the one the peer's interface sends to: the peer's interface at
-/// rank `k` among its tags sends to the local interface at rank `k % count`, where `count` is
-/// how many local interfaces hold a send socket. That inference is exact where the endpoint has
-/// no more interfaces than the peer; where it has more, the peer's interface sends to one of
-/// the local interfaces at `k` plus each multiple of the peer's count, and the inference is the
-/// first of them.
+/// the interface is inferred as the one the peer's interface sends to, where it sends to one
+/// alone: the peer's interface at rank `k` among its tags sends to the local interface at rank
+/// `k % count`, where `count` is how many local interfaces hold a send socket. Where the
+/// endpoint has more interfaces than the peer, the peer's interface sends to each local
+/// interface at `k` plus a multiple of the peer's count below `count`. Where that is more than
+/// one interface, the packets may have arrived at any of them, and the interface isn't inferred.
 ///
 /// Among the senders of that local interface, the sender is one whose paired peer interface, as
 /// [`paired_peer_addr`] chooses it, is the one the packets came from. Where none of them sends
@@ -186,7 +186,8 @@ fn paired_rank(place: SendPlace, peer_count: usize) -> (usize, usize) {
 ///
 /// Returns `None`, which keeps the caller's choice, where the peer doesn't tag its addresses,
 /// either side has a single interface, `source` doesn't match the addresses of exactly one of
-/// the peer's interfaces, or `places` doesn't hold a send socket on that local interface.
+/// the peer's interfaces, `arrival` is `None` and the peer's interface sends to more than one
+/// local interface, or `places` doesn't hold a send socket on that local interface.
 pub fn paired_ack_sender(
     addrs: &[SocketAddr],
     interfaces: &[Option<u16>],
@@ -235,13 +236,20 @@ pub fn paired_ack_sender(
     let rank = remote.binary_search(&tag).ok()?;
     // The acknowledgements leave on the local interface the packets arrived at. Where the
     // receive path doesn't record it, that is inferred as the one the peer's interface at `rank`
-    // sends to under the peer's pairing, the local interface at `rank % count`.
-    let arrived_at = |count: usize| arrival.unwrap_or(rank % count);
+    // sends to under the peer's pairing, the local interface at `rank % count`, where it is the
+    // only one. Where the endpoint has more interfaces than the peer, the peer's interface
+    // sends to each local interface at `rank` plus a multiple of the peer's count below `count`,
+    // and the packets may have arrived at any of them.
+    let arrived_at = |count: usize| match arrival {
+        Some(at) => Some(at),
+        None if rank + remote.len() >= count => Some(rank % count),
+        None => None,
+    };
     let on_arrival: Vec<(usize, SendPlace)> = places
         .iter()
         .copied()
         .enumerate()
-        .filter(|(_, place)| place.count > 1 && place.rank == arrived_at(place.count))
+        .filter(|(_, place)| place.count > 1 && arrived_at(place.count) == Some(place.rank))
         .collect();
     // Of those senders, the ones that send to the peer's interface the packets came from carry
     // the acknowledgements back across it. Where none of them does, any sender of the interface
@@ -849,6 +857,54 @@ mod tests {
                 assert_eq!(
                     paired_ack_sender(&peer, &tags, &places, source.into(), 7, arrived),
                     Some(3)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_arrival_interface_is_inferred_only_where_the_peer_interface_sends_to_one() {
+        // Host X has three interfaces and host Y two, with two send sockets on each interface,
+        // and each data address is the source of the send socket at the same position.
+        let (x, x_tags) = tagged(1, 3, 2);
+        let x_places = in_runs(3, 2);
+        let (y, y_tags) = tagged(2, 2, 2);
+        let y_places = in_runs(2, 2);
+
+        // Y's first interface pairs with X's first and third and its sockets send to them in
+        // turn, and Y's second sends to X's second alone.
+        let y_sends_to = [0, 4, 2, 3];
+        for (sender, &at) in y_sends_to.iter().enumerate() {
+            assert_eq!(
+                paired_peer_addr(&x, &x_tags, sender, Some(y_places[sender])),
+                x[at]
+            );
+        }
+
+        // X acknowledges a packet from each of Y's addresses on a sender of the interface the
+        // packet arrived at, which sends back to the packet's source.
+        for (at, &source) in y.iter().enumerate() {
+            let arrived = tag_of(&x, &x_tags, x[y_sends_to[at]]).map(usize::from);
+            let sender = paired_ack_sender(&y, &y_tags, &x_places, source.into(), 7, arrived)
+                .expect("a packet from a tagged address has a sender");
+            assert_eq!(arrived, Some(x_places[sender].rank));
+            let back = paired_peer_addr(&y, &y_tags, sender, Some(x_places[sender]));
+            assert_eq!(back, source);
+
+            // Where the arrival isn't recorded, the sender is inferred for a packet from Y's
+            // second interface, which sends to X's second alone, and not for one from Y's first,
+            // which sends to X's first or third.
+            let inferred = paired_ack_sender(&y, &y_tags, &x_places, source.into(), 7, None);
+            assert_eq!(inferred, (y_tags[at] == Some(1)).then_some(sender));
+        }
+
+        // A packet from Y's first interface leaves on the interface it arrived at, either of
+        // the two its interface sends to, where the receive path records it.
+        for (arrived, senders) in [(0, [0, 1]), (2, [4, 5])] {
+            for (at, &source) in y[..2].iter().enumerate() {
+                assert_eq!(
+                    paired_ack_sender(&y, &y_tags, &x_places, source.into(), 7, Some(arrived)),
+                    Some(senders[at])
                 );
             }
         }
