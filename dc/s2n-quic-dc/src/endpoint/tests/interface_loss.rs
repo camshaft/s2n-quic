@@ -417,7 +417,6 @@ fn traffic_moves_off_a_lost_interface() {
 /// As `traffic_moves_off_a_lost_interface`, and once the interface delivers again, its pairs
 /// carry traffic again.
 #[test]
-#[ignore = "a lost interface doesn't carry traffic again within RECOVERY_TIMEOUT yet"]
 fn traffic_moves_off_a_lost_interface_and_back() {
     run(true);
 }
