@@ -1069,7 +1069,10 @@ where
     for (recv_socket_id, socket) in recv_sockets.into_iter() {
         // The local interface of the socket, which the router records on each packet it
         // dispatches, so that the packet's acknowledgements leave on that interface.
-        let local_interface = interfaces.recv_sockets().get(recv_socket_id.as_usize()).copied();
+        let local_interface = interfaces
+            .recv_sockets()
+            .get(recv_socket_id.as_usize())
+            .copied();
         let router = worker::FanOutRouter::<_, RecvRoute, _>::new(
             dispatch_txs.clone(),
             invalidation_raw_tx.clone(),

@@ -614,10 +614,14 @@ mod tests {
         ];
         let table = Table::resolve(&configs, Rate::new(1.0), &sockets, &sockets[..2], &System);
         // The default interface and the second listed interface don't hold a send socket.
-        let ranks = table.send_ranks().expect("the configuration lists interfaces");
+        let ranks = table
+            .send_ranks()
+            .expect("the configuration lists interfaces");
         assert_eq!(ranks, [None, Some(0), None, Some(1)]);
         // Each send socket's interface has the rank of the socket's place.
-        let places = table.send_places().expect("the configuration lists interfaces");
+        let places = table
+            .send_places()
+            .expect("the configuration lists interfaces");
         for (socket, place) in places.iter().enumerate() {
             let id = table.send_sockets()[socket];
             assert_eq!(ranks[id.as_usize()], Some(place.rank));
