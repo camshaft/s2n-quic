@@ -789,8 +789,9 @@ impl Context {
         if addrs.is_empty() {
             return Err(ContextError::PeerDataAddrsEmpty);
         }
-        // Where the endpoint and the peer both list interfaces, the sender sends to the peer's
-        // interface that its own is paired with; otherwise it keeps the address it took before.
+        // Where the endpoint and the peer both list interfaces, the sender sends to one of the
+        // peer's interfaces that its own is paired with, as its place chooses; otherwise it keeps
+        // the address it took before.
         let peer_addr = crate::socket::interface::paired_peer_addr(
             addrs,
             entry.peer_data_interfaces(),
@@ -1871,7 +1872,8 @@ impl Cache {
     }
 
     /// Sets the place of this cache's send socket among the endpoint's interfaces, so that each
-    /// context it builds sends to the peer's interface that the socket's own is paired with.
+    /// context it builds sends to one of the peer's interfaces that the socket's own is paired
+    /// with, as its place chooses.
     pub fn with_place(mut self, place: Option<crate::socket::interface::SendPlace>) -> Self {
         self.place = place;
         self
