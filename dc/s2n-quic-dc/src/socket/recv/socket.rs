@@ -186,21 +186,91 @@ impl std::os::fd::AsRawFd for FdRef {
 }
 
 #[cfg(feature = "tokio")]
-impl<T: std::os::fd::AsRawFd> Tokio<T> {
+mod sealed {
+    // Only this crate implements `Sealed`, so only this crate implements `OwnsDescriptor`, for
+    // the types it checks.
+    pub trait Sealed {}
+
+    impl Sealed for std::net::UdpSocket {}
+}
+
+/// A socket that owns the fd its [`as_raw_fd`](std::os::fd::AsRawFd::as_raw_fd) returns and
+/// returns that same fd on every call, until it drops.
+///
+/// [`Tokio::new`] and [`TokioUnbound::new`] accept only such a type: they register that fd with
+/// the tokio reactor, which relies on the fd staying open on the same file description for as long
+/// as the [`Tokio`] holds the socket. A type that is only [`AsRawFd`](std::os::fd::AsRawFd) can
+/// return an fd that another owner closes, or another fd on a later call, so the trait is sealed:
+/// this crate implements it for [`std::net::UdpSocket`] alone.
+///
+/// ```
+/// use s2n_quic_dc::socket::recv::{Tokio, TokioUnbound};
+/// use std::net::UdpSocket;
+///
+/// let runtime = tokio::runtime::Builder::new_current_thread()
+///     .enable_io()
+///     .build()?;
+/// let _guard = runtime.enter();
+/// let _socket = Tokio::new(UdpSocket::bind("127.0.0.1:0")?)?;
+/// let _unbound = TokioUnbound::new(UdpSocket::bind("127.0.0.1:0")?);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+///
+/// A type that returns an fd without owning it doesn't meet the bound of either constructor:
+///
+/// ```compile_fail
+/// use s2n_quic_dc::socket::recv::Tokio;
+/// use std::os::fd::{AsRawFd, RawFd};
+///
+/// struct NotOwned(RawFd);
+///
+/// impl AsRawFd for NotOwned {
+///     fn as_raw_fd(&self) -> RawFd {
+///         self.0
+///     }
+/// }
+///
+/// let _ = Tokio::new(NotOwned(0));
+/// ```
+///
+/// ```compile_fail
+/// use s2n_quic_dc::socket::recv::TokioUnbound;
+/// use std::os::fd::{AsRawFd, RawFd};
+///
+/// struct NotOwned(RawFd);
+///
+/// impl AsRawFd for NotOwned {
+///     fn as_raw_fd(&self) -> RawFd {
+///         self.0
+///     }
+/// }
+///
+/// let _ = TokioUnbound::new(NotOwned(0));
+/// ```
+#[cfg(feature = "tokio")]
+pub trait OwnsDescriptor: std::os::fd::AsRawFd + sealed::Sealed {}
+
+#[cfg(feature = "tokio")]
+impl OwnsDescriptor for std::net::UdpSocket {}
+
+#[cfg(feature = "tokio")]
+impl<T: OwnsDescriptor> Tokio<T> {
     /// Wrap `inner` and register its fd with the current tokio runtime's reactor for read readiness.
     ///
     /// Must be called from within a tokio runtime (endpoint setup runs under one) — the `AsyncFd`
     /// binds to that runtime's IO driver, which drives readiness for the fd thereafter.
     ///
-    /// `inner` must own the fd its `as_raw_fd` returns and return that same fd on every call, as
-    /// `std::net::UdpSocket` does: the `AsyncFd` relies on that fd staying open until it drops.
+    /// `T` is an [`OwnsDescriptor`] type, so `inner` owns the fd its `as_raw_fd` returns and
+    /// returns that same fd on every call: the `AsyncFd` relies on that fd staying open until it
+    /// drops.
     #[inline]
     pub fn new(inner: T) -> io::Result<Self> {
-        // SAFETY: `inner` owns the fd that `FdRef` holds, `Self` holds `inner` for as long as it
-        // lives, and this module doesn't close that fd or take `inner` out of `Self`. `async_fd`
-        // is declared before `inner`, so the `AsyncFd` drops, and deregisters the fd, before
-        // `inner` drops and closes it. The fd therefore stays open on the same file description
-        // for the whole life of the `AsyncFd`, and `FdRef::as_raw_fd` returns it on every call.
+        // SAFETY: `T: OwnsDescriptor`, so `inner` owns the fd that `FdRef` holds and returns that
+        // same fd on every call. `Self` holds `inner` for as long as it lives, and this module
+        // doesn't close that fd or take `inner` out of `Self`. `async_fd` is declared before
+        // `inner`, so the `AsyncFd` drops, and deregisters the fd, before `inner` drops and closes
+        // it. The fd therefore stays open on the same file description for the whole life of the
+        // `AsyncFd`, and `FdRef::as_raw_fd` returns it on every call.
         let async_fd = unsafe {
             tokio::io::unix::AsyncFd::register_with_interest(
                 FdRef(std::os::fd::AsRawFd::as_raw_fd(&inner)),
@@ -280,11 +350,11 @@ where
 pub struct TokioUnbound<T>(T);
 
 #[cfg(feature = "tokio")]
-impl<T> TokioUnbound<T> {
+impl<T: OwnsDescriptor> TokioUnbound<T> {
     /// Wrap a raw recv socket, deferring readiness registration until [`bind_on_worker`] runs on the
     /// worker.
     ///
-    /// `inner` must meet the requirement on its fd that [`Tokio::new`] states.
+    /// `T` is an [`OwnsDescriptor`] type, as [`Tokio::new`] requires.
     ///
     /// [`bind_on_worker`]: BindOnWorker::bind_on_worker
     #[inline]
@@ -304,7 +374,7 @@ impl<T: udp::Socket> crate::socket::LocalAddr for TokioUnbound<T> {
 #[cfg(feature = "tokio")]
 impl<T> BindOnWorker for TokioUnbound<T>
 where
-    T: udp::Socket + std::os::fd::AsRawFd,
+    T: udp::Socket + OwnsDescriptor,
 {
     type Bound = Tokio<T>;
 
@@ -357,6 +427,12 @@ mod tests {
             self.socket.as_raw_fd()
         }
     }
+
+    // `RegisterOnDrop` owns `socket` and returns its fd, and it closes that fd only after its
+    // `drop` returns, so it meets what `OwnsDescriptor` asks of a type.
+    impl sealed::Sealed for RegisterOnDrop {}
+
+    impl OwnsDescriptor for RegisterOnDrop {}
 
     impl Drop for RegisterOnDrop {
         fn drop(&mut self) {
