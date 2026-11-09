@@ -429,7 +429,7 @@ impl Entry {
         let now_ms = Self::timestamp_to_millis(now);
         let cooldown_ms = Self::duration_to_millis(cooldown);
         self.dead_at
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
                 if previous >= 0 && now_ms.saturating_sub(previous) < cooldown_ms {
                     None
                 } else {
