@@ -218,7 +218,7 @@ mod sealed {
 ///
 /// A type that returns an fd without owning it doesn't meet the bound of either constructor:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use s2n_quic_dc::socket::recv::Tokio;
 /// use std::os::fd::{AsRawFd, RawFd};
 ///
@@ -233,7 +233,7 @@ mod sealed {
 /// let _ = Tokio::new(NotOwned(0));
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use s2n_quic_dc::socket::recv::TokioUnbound;
 /// use std::os::fd::{AsRawFd, RawFd};
 ///
