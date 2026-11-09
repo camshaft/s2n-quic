@@ -1005,12 +1005,8 @@ impl transmission::interest::Provider for Controller {
     ) -> transmission::interest::Result {
         match self.state {
             State::SearchRequested => query.on_new_data()?,
-            State::SearchComplete => {
-                // Indicate interest if we need to send the MtuProbingComplete frame
-                if self.needs_to_send_completion {
-                    query.on_new_data()?
-                }
-            }
+            // Indicate interest if we need to send the MtuProbingComplete frame
+            State::SearchComplete if self.needs_to_send_completion => query.on_new_data()?,
             _ => {}
         }
 
