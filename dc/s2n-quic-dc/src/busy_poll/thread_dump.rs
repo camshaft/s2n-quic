@@ -20,7 +20,7 @@ static RESULT: Mutex<Option<Backtrace>> = Mutex::new(None);
 pub fn install_handler() {
     HANDLER_INIT.call_once(|| unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = signal_handler as usize;
+        sa.sa_sigaction = signal_handler as *const () as usize;
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
