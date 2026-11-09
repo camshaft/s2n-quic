@@ -14,7 +14,6 @@ use crate::{
         schedule::{self, Initiator},
         seal, sender,
     },
-    tracing::*,
 };
 use s2n_codec::EncoderBuffer;
 use s2n_quic_core::{dc, recovery::bandwidth::Bandwidth, time::Timestamp, varint::VarInt};
