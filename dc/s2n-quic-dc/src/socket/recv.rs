@@ -14,4 +14,4 @@ pub mod uring;
 pub use socket::{BindOnWorker, Socket};
 
 #[cfg(feature = "tokio")]
-pub use socket::{Tokio, TokioUnbound};
+pub use socket::{OwnsDescriptor, Tokio, TokioUnbound};
