@@ -579,8 +579,7 @@ mod tests {
     }
 
     /// A full queue doesn't evict a waiting item: it grows past its capacity, and
-    /// the receiver gets every item, in the order the sender sent them. A stream
-    /// the server accepted is never displaced, so it is never reset to make room.
+    /// the receiver gets every item, in the order the sender sent them.
     #[test]
     fn full_queue_keeps_every_waiting_item() {
         sim(|| {
