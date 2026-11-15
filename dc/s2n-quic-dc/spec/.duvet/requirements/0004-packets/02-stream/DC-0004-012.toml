@@ -1,0 +1,5 @@
+target = "rendered/0004-packets/02-stream.md#DC-0004-012"
+
+[[spec]]
+level = "MUST"
+quote = "In a stream packet's tag, bit 0x20 MUST be set exactly when the packet carries a source queue identifier, bit 0x10 when it belongs to the recovery packet space, bit 0x08 when it carries control data, bit 0x04 when it carries a final offset, and bit 0x02 when it carries an application header."
