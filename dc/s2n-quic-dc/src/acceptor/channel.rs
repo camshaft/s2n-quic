@@ -5,8 +5,10 @@
 //!
 //! Senders push items into receiver slots without performing wake syscalls inline.
 //! Instead, `send` returns an `Option<Waker>` that the caller forwards to a waker
-//! thread. Receivers clone to scale out, each getting a dedicated bounded queue.
-//! When a receiver's queue is full, an item is evicted per the configured policy.
+//! thread. Receivers clone to scale out, each getting a dedicated queue.
+//! A full queue grows instead of evicting a waiting item. For streams, credit bounds
+//! the queue: each waiting stream holds the queue slot its client opened it on, and
+//! the client can't open another stream until the server frees one of its slots.
 
 use crate::xorshift::Rng;
 use core::task::{Poll, Waker};
@@ -19,37 +21,23 @@ use std::{
     },
 };
 
-/// Eviction policy when a receiver's queue is at capacity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Eviction {
-    /// Remove the oldest item (front of queue) to make room. Standard FIFO behavior.
-    Front,
-    /// Remove the newest item (back of queue) to make room. LIFO-style pruning.
-    Back,
-}
-
 /// Configuration for the channel.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The number of waiting items each receiver's queue reserves room for up front,
+    /// at most 64. A queue holds more items than this by growing: it never evicts one.
     pub capacity: usize,
-    pub eviction: Eviction,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            capacity: 1024,
-            eviction: Eviction::Front,
-        }
+        Self { capacity: 1024 }
     }
 }
 
 impl From<usize> for Config {
     fn from(capacity: usize) -> Self {
-        Self {
-            capacity,
-            ..Default::default()
-        }
+        Self { capacity }
     }
 }
 
@@ -95,8 +83,6 @@ struct Shared<T> {
 struct Slot<T> {
     inner: Mutex<SlotInner<T>>,
     backlog: AtomicUsize,
-    capacity: usize,
-    eviction: Eviction,
 }
 
 struct SlotInner<T> {
@@ -106,7 +92,7 @@ struct SlotInner<T> {
 }
 
 impl<T> Slot<T> {
-    fn new(capacity: usize, eviction: Eviction) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
             inner: Mutex::new(SlotInner {
                 queue: VecDeque::with_capacity(capacity.min(64)),
@@ -114,30 +100,20 @@ impl<T> Slot<T> {
                 open: true,
             }),
             backlog: AtomicUsize::new(0),
-            capacity,
-            eviction,
         }
     }
 
-    fn push(&self, item: T) -> Result<(Option<T>, Option<Waker>), T> {
+    /// Push an item onto the back of the queue. A full queue grows: it never
+    /// evicts a waiting item.
+    fn push(&self, item: T) -> Result<Option<Waker>, T> {
         let mut inner = self.inner.lock();
         if !inner.open {
             return Err(item);
         }
 
-        let evicted = if inner.queue.len() >= self.capacity {
-            match self.eviction {
-                Eviction::Front => inner.queue.pop_front(),
-                Eviction::Back => inner.queue.pop_back(),
-            }
-        } else {
-            self.backlog.fetch_add(1, Ordering::Relaxed);
-            None
-        };
-
+        self.backlog.fetch_add(1, Ordering::Relaxed);
         inner.queue.push_back(item);
-        let waker = inner.waker.take();
-        Ok((evicted, waker))
+        Ok(inner.waker.take())
     }
 
     fn backlog(&self) -> usize {
@@ -196,13 +172,13 @@ impl<T> SendError<T> {
 impl<T> Sender<T> {
     /// Send an item to the least-loaded receiver.
     ///
-    /// Returns `Ok((evicted, waker))`:
-    /// - `evicted`: item displaced from a full queue, caller should reset it
-    /// - `waker`: if the receiver was parked, caller should forward to waker thread
+    /// Returns `Ok(waker)`: if the receiver was parked, the caller should forward the
+    /// waker to the waker thread. The item always joins the receiver's queue: a full
+    /// queue grows instead of evicting a waiting item.
     ///
     /// Returns `Err(SendError::Closed)` if all receivers have been dropped.
     /// Returns `Err(SendError::NoSlots)` if receivers exist but none have polled yet.
-    pub fn send(&mut self, item: T) -> Result<(Option<T>, Option<Waker>), SendError<T>> {
+    pub fn send(&mut self, item: T) -> Result<Option<Waker>, SendError<T>> {
         self.refresh_cache();
 
         if self.cached_slots.is_empty() {
@@ -290,7 +266,7 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> Receiver<T> {
     fn new_unregistered(shared: &Arc<Shared<T>>) -> Self {
-        let slot = Arc::new(Slot::new(shared.config.capacity, shared.config.eviction));
+        let slot = Arc::new(Slot::new(shared.config.capacity));
         shared.receiver_count.fetch_add(1, Ordering::Relaxed);
         Self {
             slot,
@@ -425,12 +401,12 @@ mod tests {
 
     /// Send an item and immediately fire any waker returned by the channel, so
     /// parked receiver tasks are rescheduled within the same bach step.
-    fn send_wake<T>(sender: &mut Sender<T>, item: T) -> Result<Option<T>, T> {
-        let (evicted, waker) = sender.send(item).map_err(|e| e.into_inner())?;
+    fn send_wake<T>(sender: &mut Sender<T>, item: T) -> Result<(), T> {
+        let waker = sender.send(item).map_err(|e| e.into_inner())?;
         if let Some(w) = waker {
             w.wake();
         }
-        Ok(evicted)
+        Ok(())
     }
 
     // ── Tests ────────────────────────────────────────────────────────────────────
@@ -490,7 +466,7 @@ mod tests {
             async move {
                 1.ms().sleep().await;
 
-                let (_, w1) = sender.send(1).unwrap();
+                let w1 = sender.send(1).unwrap();
                 assert!(
                     w1.is_some(),
                     "first send to parked receiver should return a waker"
@@ -500,7 +476,7 @@ mod tests {
                 }
 
                 // Second send before the receiver re-parks: waker slot is empty
-                let (_, w2) = sender.send(2).unwrap();
+                let w2 = sender.send(2).unwrap();
                 assert!(
                     w2.is_none(),
                     "second consecutive send should not return a waker"
@@ -602,24 +578,21 @@ mod tests {
         });
     }
 
-    /// With Front eviction, sending to a full queue discards the oldest item and
-    /// delivers the newest two to the receiver.
+    /// A full queue doesn't evict a waiting item: it grows past its capacity, and
+    /// the receiver gets every item, in the order the sender sent them. A stream
+    /// the server accepted is never displaced, so it is never reset to make room.
     #[test]
-    fn eviction_front_drops_oldest_item() {
+    fn full_queue_keeps_every_waiting_item() {
         sim(|| {
-            let (mut sender, mut rx) = new::<u32>(Config {
-                capacity: 2,
-                eviction: Eviction::Front,
-            });
+            let (mut sender, mut rx) = new::<u32>(1.into());
 
             async move {
-                assert_eq!(
-                    rx.recv().await,
-                    Some(2),
-                    "oldest item should have been evicted"
-                );
-                assert_eq!(rx.recv().await, Some(3), "newest item should be present");
-                assert!(rx.recv().await.is_none());
+                assert_eq!(rx.recv().await, Some(1), "the first item should arrive");
+                // Both later items still wait, past the queue's capacity of 1
+                assert_eq!(rx.backlog(), 2, "no waiting item should have been evicted");
+                assert_eq!(rx.recv().await, Some(2), "the second item should arrive");
+                assert_eq!(rx.recv().await, Some(3), "the third item should arrive");
+                assert!(rx.recv().await.is_none(), "the channel should close");
             }
             .primary()
             .spawn();
@@ -627,52 +600,10 @@ mod tests {
             async move {
                 1.ms().sleep().await;
 
-                // Fill the queue and overflow once
-                send_wake(&mut sender, 1).unwrap(); // will be evicted
-                send_wake(&mut sender, 2).unwrap();
-                let evicted = send_wake(&mut sender, 3).unwrap();
-                assert_eq!(evicted, Some(1), "front-eviction should discard item 1");
-
-                drop(sender);
-            }
-            .primary()
-            .spawn();
-        });
-    }
-
-    /// With Back eviction, sending to a full queue discards the most-recently
-    /// queued item and preserves the older ones.
-    #[test]
-    fn eviction_back_drops_newest_item() {
-        sim(|| {
-            let (mut sender, mut rx) = new::<u32>(Config {
-                capacity: 2,
-                eviction: Eviction::Back,
-            });
-
-            async move {
-                assert_eq!(
-                    rx.recv().await,
-                    Some(1),
-                    "first item should survive back eviction"
-                );
-                assert_eq!(
-                    rx.recv().await,
-                    Some(3),
-                    "overflow item should replace the back"
-                );
-                assert!(rx.recv().await.is_none());
-            }
-            .primary()
-            .spawn();
-
-            async move {
-                1.ms().sleep().await;
-
+                // Send two more items than the queue's capacity
                 send_wake(&mut sender, 1).unwrap();
-                send_wake(&mut sender, 2).unwrap(); // will be evicted
-                let evicted = send_wake(&mut sender, 3).unwrap();
-                assert_eq!(evicted, Some(2), "back-eviction should discard item 2");
+                send_wake(&mut sender, 2).unwrap();
+                send_wake(&mut sender, 3).unwrap();
 
                 drop(sender);
             }
@@ -830,19 +761,18 @@ mod tests {
     ///
     /// Pattern: application spawns N tasks, cloning the receiver on each iteration.
     /// The original receiver is never polled (and not dropped). Without lazy registration,
-    /// items would pile up in the original receiver's slot and get evicted. With lazy
-    /// registration, only the polled clones participate in load balancing.
+    /// items would pile up in the original receiver's slot, where no task takes them. With
+    /// lazy registration, only the polled clones participate in load balancing.
     #[test]
     fn unpolled_original_receiver_does_not_accumulate_backlog() {
-        let evicted = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(AtomicUsize::new(0));
+        let unpolled_backlog = Arc::new(AtomicUsize::new(usize::MAX));
 
         {
-            let evicted = evicted.clone();
+            let received = received.clone();
+            let unpolled_backlog = unpolled_backlog.clone();
             sim(move || {
-                let (mut sender, rx) = new::<u32>(Config {
-                    capacity: 4,
-                    eviction: Eviction::Front,
-                });
+                let (mut sender, rx) = new::<u32>(4.into());
 
                 // Simulate application pattern: clone into N workers, forget to drop original.
                 // The original `rx` is pushed into `workers` so it stays alive (held but
@@ -850,36 +780,32 @@ mod tests {
                 let mut workers: Vec<Receiver<u32>> = vec![rx.clone()];
                 for _ in 0..3 {
                     let mut worker_rx = rx.clone();
+                    let received = received.clone();
                     // Each worker polls immediately (registers its slot)
-                    async move { while worker_rx.recv().await.is_some() {} }
-                        .primary()
-                        .spawn();
+                    async move {
+                        while worker_rx.recv().await.is_some() {
+                            received.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    .primary()
+                    .spawn();
                 }
                 // Original `rx` goes into workers — NOT polled, NOT dropped until the
                 // async block below drops `workers`.
                 workers.push(rx);
 
-                let evicted = evicted.clone();
+                let unpolled_backlog = unpolled_backlog.clone();
                 async move {
                     1.ms().sleep().await; // let workers register
 
                     // Send more items than the capacity of a single slot
                     for i in 0u32..20 {
-                        match sender.send(i) {
-                            Ok((Some(_), waker)) => {
-                                evicted.fetch_add(1, Ordering::Relaxed);
-                                if let Some(w) = waker {
-                                    w.wake();
-                                }
-                            }
-                            Ok((None, waker)) => {
-                                if let Some(w) = waker {
-                                    w.wake();
-                                }
-                            }
-                            Err(_) => panic!("send should not fail"),
-                        }
+                        send_wake(&mut sender, i).unwrap();
                     }
+                    // The unpolled receivers never registered a slot, so none of the
+                    // items waits in their queues.
+                    let backlog = workers.iter().map(|rx| rx.backlog()).sum::<usize>();
+                    unpolled_backlog.store(backlog, Ordering::Relaxed);
                     drop(sender);
                     drop(workers);
                 }
@@ -888,16 +814,16 @@ mod tests {
             });
         }
 
-        // With lazy registration, the unpolled original receiver never gets a slot,
-        // so all 20 items are distributed among the 3 active workers (capacity 4 each = 12).
-        // Some eviction is expected since 20 > 12, but NOT from an idle receiver's queue.
-        // The key assertion: eviction count should be much less than if all 20 items went
-        // to a single never-drained slot (which would evict 16 out of 20).
-        let evictions = evicted.load(Ordering::Relaxed);
-        assert!(
-            evictions <= 12,
-            "evictions ({evictions}) should reflect active-worker capacity overflow, \
-             not a single unpolled receiver accumulating all items"
+        assert_eq!(
+            unpolled_backlog.load(Ordering::Relaxed),
+            0,
+            "unpolled receivers should not hold any waiting item"
+        );
+        // A full queue grows instead of evicting, so the workers get every item.
+        assert_eq!(
+            received.load(Ordering::Relaxed),
+            20,
+            "the polled workers should receive all 20 items"
         );
     }
 }
