@@ -140,3 +140,13 @@ fn update_refuses_a_key_id_past_the_limit() {
     assert!(state.update_for_stale_key(max_key_id));
     assert_eq!(*state.next_key_id(), MAX_KEY_ID);
 }
+
+#[test]
+#[should_panic = "2^62 integer incremented"]
+fn next_key_id_panics_one_past_the_limit() {
+    // With the counter one past `MAX_KEY_ID`, `next_key_id` panics, so `MAX_KEY_ID` is the last
+    // key ID it returns.
+    let state = State::new([0; secret_control::TAG_LEN]);
+    state.current_id.store(MAX_KEY_ID + 1, Ordering::Relaxed);
+    state.next_key_id();
+}
