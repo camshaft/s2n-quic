@@ -49,9 +49,11 @@
 //! a descriptor to the kernel moves it into its `bid` slot and publishes an `io_uring_buf` entry; the
 //! descriptor's allocation stays pinned there for the whole kernel operation (the io_uring
 //! memory-safety contract). On a CQE the `bid` (from [`buffer_select`](cqueue::buffer_select)) recovers
-//! the descriptor, which is finalized into a `Filled` and routed; a fresh descriptor is then allocated
-//! from the pool and published into that freed `bid` slot to keep the ring full. Backpressure is pool
-//! exhaustion — exactly as on the syscall path.
+//! the descriptor, which is finalized into a `Filled` and routed; the freed `bid` joins the list of
+//! empty bids. After each pass over the completions, the loop allocates a descriptor from the pool
+//! for each empty bid and publishes it into that bid to keep the ring full. Backpressure is pool
+//! exhaustion, exactly as on the syscall path: a bid the pool can't fill stays on the list, and a
+//! later pass fills it once descriptors recycle, so pool exhaustion never shrinks the ring.
 //!
 //! # Dual-wait intake (eventfd)
 //!
@@ -300,12 +302,12 @@ fn build_eventfd_poll(efd: RawFd) -> squeue::Entry {
 /// [`spawn`] before this thread starts, so registration failures fall back cleanly), owns the socket
 /// fd and the bid→descriptor map, keeps the ring full of provided buffers, reaps recv completions into
 /// `Filled` segments, and routes them. Returns when `shutdown.closed` is observed.
-fn ring_loop<R: Router>(
+/// `alloc` returns a descriptor to provide to the kernel, or `None` while the pool is exhausted.
+fn ring_loop<R: Router, A: FnMut() -> Option<Unfilled<SyncRecycler>>>(
     mut ring: IoUring,
     mut buf_ring: BufRing,
     fd: RawFd,
-    pool: Pool,
-    mut reuse: SyncReuseRing,
+    mut alloc: A,
     mut router: R,
     shutdown: Arc<Shutdown>,
 ) {
@@ -316,22 +318,16 @@ fn ring_loop<R: Router>(
     // here is owned by the kernel until its recv CQE arrives.
     let mut bid_map: Vec<Option<Unfilled<SyncRecycler>>> = (0..depth).map(|_| None).collect();
 
+    // Bids without a descriptor provided to the kernel. Starts with every bid, in reverse so the
+    // ring fills from bid 0; each completion puts the bid it frees back on the list.
+    let mut empty: Vec<u16> = (0..depth).rev().collect();
+
     // Fixed msghdr referenced by the (single) multishot recv SQE for the whole loop.
     let msg = recv_msghdr();
 
-    // Fill the ring: allocate a descriptor per bid, publish its recv region, park it in the bid map.
-    for bid in 0..depth {
-        let Some(unfilled) = reuse.alloc_or_reuse(&pool) else {
-            // Pool exhausted at startup — provide what we have; the loop replenishes as CQEs free bids.
-            break;
-        };
-        let (addr, len) = unfilled.recv_prefix_region();
-        // SAFETY: the descriptor is parked in `bid_map[bid]` for the kernel operation's duration, so
-        // `addr`/`len` stay valid and exclusively owned by the kernel until the CQE.
-        unsafe { buf_ring.publish(addr, len, bid) };
-        bid_map[bid as usize] = Some(unfilled);
-    }
-    buf_ring.commit();
+    // Fill the ring: provide a descriptor to each bid. Pool exhaustion at startup leaves the rest of
+    // the bids empty, and a later pass fills them once descriptors recycle.
+    replenish(&mut empty, &mut bid_map, &mut buf_ring, &mut alloc);
 
     // Arm the eventfd poll (idle wake / teardown) and the single multishot recv. On a freshly created
     // ring the SQ has `depth` slots free, so pushing two entries cannot fail; assert it so a future
@@ -348,8 +344,6 @@ fn ring_loop<R: Router>(
     }
 
     let mut recv_armed = true;
-    // Scratch list of bids freed this reap pass, replenished after routing.
-    let mut to_replenish: Vec<u16> = Vec::with_capacity(depth as usize);
 
     loop {
         if shutdown.closed.load(Ordering::Acquire) {
@@ -375,7 +369,6 @@ fn ring_loop<R: Router>(
             }
         }
 
-        to_replenish.clear();
         let mut saw_eventfd = false;
         {
             let mut cq = ring.completion();
@@ -414,7 +407,7 @@ fn ring_loop<R: Router>(
                     // Error completion: drop the descriptor (recycles) and replenish the bid.
                     tracing::trace!(errno = -res, bid, "recv error completion");
                     drop(unfilled);
-                    to_replenish.push(bid);
+                    empty.push(bid);
                     continue;
                 }
 
@@ -431,32 +424,52 @@ fn ring_loop<R: Router>(
                         // Parse/length anomaly — descriptor already dropped in `finalize`.
                     }
                 }
-                to_replenish.push(bid);
+                empty.push(bid);
             }
         }
         if saw_eventfd {
             shutdown.efd.drain();
         }
 
-        // Replenish freed bids with fresh descriptors so the ring stays full. Pool exhaustion leaves a
-        // bid empty (backpressure); a later pass retries it once descriptors recycle.
-        if !to_replenish.is_empty() {
-            for &bid in &to_replenish {
-                if let Some(unfilled) = reuse.alloc_or_reuse(&pool) {
-                    let (addr, len) = unfilled.recv_prefix_region();
-                    // SAFETY: parked in `bid_map[bid]` for the kernel operation's duration.
-                    unsafe { buf_ring.publish(addr, len, bid) };
-                    bid_map[bid as usize] = Some(unfilled);
-                }
-            }
-            buf_ring.commit();
-        }
+        // Provide a descriptor to each empty bid to keep the ring full: the bids this pass freed
+        // and each bid an earlier pass, or the startup fill, left empty while the pool was out of
+        // descriptors. A bid the pool can't fill now stays empty (backpressure), and the next pass
+        // retries it once descriptors recycle.
+        replenish(&mut empty, &mut bid_map, &mut buf_ring, &mut alloc);
     }
 
     // Teardown: unregister the buffer ring while the ring fd is still open, then drop everything. Any
     // descriptors still parked in the bid map recycle/dealloc on drop.
     let _ = ring.submitter().unregister_buf_ring(buf_ring.bgid);
     drop(bid_map);
+}
+
+/// Provide a descriptor from `alloc` to each bid of `empty` until `alloc` answers `None`, then
+/// publish the advanced tail to the kernel. A bid `alloc` can't fill stays on `empty` for a later
+/// call.
+fn replenish<A: FnMut() -> Option<Unfilled<SyncRecycler>>>(
+    empty: &mut Vec<u16>,
+    bid_map: &mut [Option<Unfilled<SyncRecycler>>],
+    buf_ring: &mut BufRing,
+    alloc: &mut A,
+) {
+    let mut published = false;
+    while let Some(bid) = empty.pop() {
+        let Some(unfilled) = alloc() else {
+            // Pool exhausted: this bid and the rest stay empty until descriptors recycle.
+            empty.push(bid);
+            break;
+        };
+        let (addr, len) = unfilled.recv_prefix_region();
+        // SAFETY: the descriptor is held in `bid_map[bid]` for the kernel operation's duration, so
+        // `addr`/`len` stay valid and exclusively owned by the kernel until the CQE.
+        unsafe { buf_ring.publish(addr, len, bid) };
+        bid_map[bid as usize] = Some(unfilled);
+        published = true;
+    }
+    if published {
+        buf_ring.commit();
+    }
 }
 
 /// Turn a successful recv completion into `Filled` segments without an application-side payload copy
@@ -575,12 +588,30 @@ pub fn spawn<S, R>(
     socket: S,
     depth: u16,
     pool: Pool,
-    reuse: SyncReuseRing,
+    mut reuse: SyncReuseRing,
     router: R,
 ) -> Result<RecvRing, SpawnError<S, R>>
 where
     S: crate::socket::recv::BindOnWorker + Send + 'static,
     R: Router + Send + 'static,
+{
+    let alloc = move || reuse.alloc_or_reuse(&pool);
+    spawn_with(idx, socket, depth, alloc, router)
+}
+
+/// [`spawn`] with the source of the descriptors the ring provides to the kernel: `alloc` returns
+/// one, or `None` while the pool is exhausted.
+fn spawn_with<S, R, A>(
+    idx: usize,
+    socket: S,
+    depth: u16,
+    alloc: A,
+    router: R,
+) -> Result<RecvRing, SpawnError<S, R>>
+where
+    S: crate::socket::recv::BindOnWorker + Send + 'static,
+    R: Router + Send + 'static,
+    A: FnMut() -> Option<Unfilled<SyncRecycler>> + Send + 'static,
 {
     // io_uring drives the socket by its raw fd on the ring thread and never polls it via `recv::Socket`
     // (it only owns the socket to keep the fd open), so an unbound recv socket is fine here — take the
@@ -628,7 +659,7 @@ where
             // it is dropped here when the loop returns (after the fd is no longer referenced by any
             // in-flight SQE — the loop tears the ring down before returning).
             let _socket = socket;
-            ring_loop(ring, buf_ring, fd, pool, reuse, router, ring_shutdown);
+            ring_loop(ring, buf_ring, fd, alloc, router, ring_shutdown);
         });
     match join {
         Ok(join) => Ok(RecvRing {
@@ -648,7 +679,7 @@ mod tests {
     };
     use std::{
         net::UdpSocket,
-        sync::{Arc, Mutex},
+        sync::{mpsc, Arc, Mutex},
         time::Duration,
     };
 
@@ -736,5 +767,85 @@ mod tests {
             assert_eq!(&got[i].0, expected, "payload {i} bytes");
             assert_eq!(got[i].1, send_addr.port(), "payload {i} source port");
         }
+    }
+
+    /// A `Router` that holds each received segment: it sends the segment to the test, which keeps
+    /// the segment's descriptor out of the pool until the test drops it.
+    struct HoldRouter {
+        segments: mpsc::Sender<Filled>,
+    }
+
+    impl Router for HoldRouter {
+        fn is_open(&self) -> bool {
+            true
+        }
+
+        fn on_segment(&mut self, segment: Filled) {
+            let _ = self.segments.send(segment);
+        }
+    }
+
+    /// A ring whose pool runs out receives again once descriptors come back. The pool here
+    /// provides two descriptors and then answers `None` until the test opens it, so two datagrams
+    /// leave every bid of the ring without a buffer. Once the test drops the two held segments and
+    /// opens the pool, the ring must provide buffers again and receive a third datagram. Skipped
+    /// (passes trivially) if io_uring is unavailable.
+    #[test]
+    fn uring_recv_recovers_after_pool_runs_out() {
+        if probe().is_err() {
+            eprintln!("io_uring unavailable; skipping pool exhaustion test");
+            return;
+        }
+
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        recv_sock.set_nonblocking(true).unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+
+        let (segments, held) = mpsc::channel();
+        let router = HoldRouter { segments };
+
+        // The pool provides two descriptors, then answers `None` until the test opens it.
+        let open = Arc::new(AtomicBool::new(false));
+        let alloc_open = open.clone();
+        let pool = Pool::new(u16::MAX);
+        let mut reuse = SyncReuseRing::new();
+        let mut provided = 0;
+        let alloc = move || {
+            if !alloc_open.load(Ordering::Acquire) {
+                if provided == 2 {
+                    return None;
+                }
+                provided += 1;
+            }
+            reuse.alloc_or_reuse(&pool)
+        };
+        let ring = spawn_with(0, BusyPoll(recv_sock), 4, alloc, router)
+            .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
+
+        let send_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let timeout = Duration::from_secs(5);
+
+        // Two datagrams use the pool's two descriptors. The test holds both segments, so every bid
+        // of the ring is left without a buffer.
+        send_sock.send_to(b"first", recv_addr).unwrap();
+        let first = held.recv_timeout(timeout).expect("first datagram");
+        assert_eq!(first.payload(), &b"first"[..]);
+        send_sock.send_to(b"second", recv_addr).unwrap();
+        let second = held.recv_timeout(timeout).expect("second datagram");
+        assert_eq!(second.payload(), &b"second"[..]);
+
+        // Descriptors come back: the held segments recycle, and the pool opens.
+        drop(first);
+        drop(second);
+        open.store(true, Ordering::Release);
+
+        send_sock.send_to(b"third", recv_addr).unwrap();
+        let third = held
+            .recv_timeout(timeout)
+            .expect("the ring receives again once descriptors come back");
+        assert_eq!(third.payload(), &b"third"[..]);
+
+        drop(third);
+        drop(ring); // stop + join the ring thread
     }
 }
