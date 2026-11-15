@@ -2,4 +2,4 @@ target = "rendered/0011-storage/08-observability.md#DC-0011-043"
 
 [[spec]]
 level = "MUST"
-quote = "The device MUST count, for each kind of operation, the operations submitted, the bytes moved and the operations that failed."
+quote = "The device MUST count, for each kind of operation, the operations submitted and the bytes moved."

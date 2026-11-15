@@ -2,4 +2,4 @@ target = "rendered/0011-storage/05-execution.md#DC-0011-029"
 
 [[spec]]
 level = "MUST"
-quote = "When the device's submission channel has closed, the device MUST refuse a new operation with a broken-pipe error and return the credit it acquired for that operation."
+quote = "When the device's submission channel has closed, the device MUST refuse a new operation with a broken-pipe error."

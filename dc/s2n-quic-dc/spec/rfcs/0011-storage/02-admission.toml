@@ -3,7 +3,7 @@ anchor = "admission"
 title = "Admission by credit"
 problem = "Storage operations run on a bounded set of execution slots. When submitters take slots before they know that the device can accept their work, blocked slots can wait on work that never gets a slot, and the system deadlocks."
 motivation = "Gating each operation on credit from the device's budget before it takes any execution slot bounds admitted work by the budget, and a submitter that waits for credit holds no slot, so the hold-and-wait cycle cannot form. Priority tiers let latency-sensitive reads go ahead of background writes."
-prose = "Each device holds one or two credit pools whose capacity is the device's queue depth. An operation's cost, in credits, is taken from a pool before the operation enters the device's execution pipeline and is returned when the operation completes. A submitter that finds the pool short of credit waits without holding a thread or an execution slot. Each operation carries a priority tier. A device also has a rate ceiling, in operations or in bytes per second."
+prose = "Each device holds one or two credit pools whose capacity is the device's queue depth. An operation's cost, in credits, is taken from a pool before the operation enters the device's execution pipeline and is returned when the operation completes. A submitter that finds the pool short of credit waits without holding a thread or an execution slot. Each operation carries a priority tier. A device's configuration also holds a rate ceiling, in operations or in bytes per second, which this version stores and doesn't yet apply to admission."
 
 [[requirement]]
 id = "DC-0011-005"
@@ -64,7 +64,7 @@ rationale = "Credit returned twice would let admitted work exceed the capacity, 
 [[requirement]]
 id = "DC-0011-012"
 level = "MUST"
-polarity = "forbidden"
+polarity = "required"
 binds_to = "system"
-statement = "The device MUST NOT admit work faster than its configured rate ceiling."
-rationale = "A device has a sustained rate beyond which queued work only adds latency."
+statement = "The device MUST keep its configured rate ceiling, in operations or in bytes per second, with its configuration."
+rationale = "The rate ceiling is part of a device's configuration, so a later version can pace admission by it without a change to how devices are configured."

@@ -1,6 +1,6 @@
 ## Cost and pools {#cost}
 
-Each device has a cost model and a weight for each kind of operation. Under the bytes model, an operation's base cost is its length in bytes. Under the operations model, it is its length divided by the configured operation unit, rounded up, and a control operation such as a flush costs one. The base cost is multiplied by the weight of the operation's kind. A device holds either one shared pool for all operations, or two pools: one for reads and one for every other kind of operation.
+Each device has a cost model, a read weight and a write weight. Under the bytes model, an operation's base cost is its length in bytes. Under the operations model, it is its length divided by the configured operation unit, rounded up, and a control operation such as a flush costs one. The base cost is multiplied by the read weight for a read and by the write weight for every other kind of operation. A device holds either one shared pool for all operations, or two pools: one for reads and one for every other kind of operation.
 
 ### DC-0011-013 {#DC-0011-013}
 
@@ -12,7 +12,7 @@ Under the operations cost model, the device MUST compute an operation's base cos
 
 ### DC-0011-015 {#DC-0011-015}
 
-The device MUST multiply an operation's base cost by the configured weight of its kind and round the result to a whole number of credits no smaller than one.
+The device MUST multiply an operation's base cost by the read weight for a read, or by the write weight for every other kind, round the result down to a whole number of credits, and charge at least one credit.
 
 ### DC-0011-016 {#DC-0011-016}
 

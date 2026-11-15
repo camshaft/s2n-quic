@@ -1,6 +1,6 @@
 ## Operations and their validation {#operations}
 
-The kinds of operation are read, write, full flush, data flush and trim. A buffered operation uses a buffer the scheduler fills or reads from; a direct operation uses a caller-owned buffer aligned to the device block size, in place, without a copy. Each operation carries an opaque token its caller chooses, which its completion returns.
+The kinds of operation are read, write, full flush, data flush and trim. A buffered operation uses a buffer the scheduler fills or reads from; a direct operation uses a caller-owned buffer aligned to the direct alignment of 4096 bytes, in place, without a copy. Each operation carries an opaque token its caller chooses, which its completion returns.
 
 ### DC-0011-019 {#DC-0011-019}
 
@@ -12,7 +12,7 @@ The device MUST reject, with an invalid-input error and before it acquires any c
 
 ### DC-0011-021 {#DC-0011-021}
 
-The device MUST reject, with an invalid-input error and before it acquires any credit, a direct operation whose offset or length is not a multiple of the device block size.
+The device MUST reject, with an invalid-input error and before it acquires any credit, a direct operation whose offset or length is not a multiple of the direct alignment of 4096 bytes.
 
 ### DC-0011-022 {#DC-0011-022}
 

@@ -1,6 +1,6 @@
 ## Admission by credit {#admission}
 
-Each device holds one or two credit pools whose capacity is the device's queue depth. An operation's cost, in credits, is taken from a pool before the operation enters the device's execution pipeline and is returned when the operation completes. A submitter that finds the pool short of credit waits without holding a thread or an execution slot. Each operation carries a priority tier. A device also has a rate ceiling, in operations or in bytes per second.
+Each device holds one or two credit pools whose capacity is the device's queue depth. An operation's cost, in credits, is taken from a pool before the operation enters the device's execution pipeline and is returned when the operation completes. A submitter that finds the pool short of credit waits without holding a thread or an execution slot. Each operation carries a priority tier. A device's configuration also holds a rate ceiling, in operations or in bytes per second, which this version stores and doesn't yet apply to admission.
 
 ### DC-0011-005 {#DC-0011-005}
 
@@ -32,4 +32,4 @@ The device MUST return an operation's credit to the pool it came from exactly on
 
 ### DC-0011-012 {#DC-0011-012}
 
-The device MUST NOT admit work faster than its configured rate ceiling.
+The device MUST keep its configured rate ceiling, in operations or in bytes per second, with its configuration.

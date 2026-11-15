@@ -2,8 +2,8 @@
 anchor = "cost"
 title = "Cost and pools"
 problem = "Operations differ in how much of a device they use: a large read uses more bandwidth than a small one, while on a device limited by operations per second every operation costs about the same. Writes also tend to cost a device more than reads."
-motivation = "A configurable cost model lets one admission budget fit a device limited by bandwidth or by operations, and per-kind weights and split pools let an operator protect reads from writes."
-prose = "Each device has a cost model and a weight for each kind of operation. Under the bytes model, an operation's base cost is its length in bytes. Under the operations model, it is its length divided by the configured operation unit, rounded up, and a control operation such as a flush costs one. The base cost is multiplied by the weight of the operation's kind. A device holds either one shared pool for all operations, or two pools: one for reads and one for every other kind of operation."
+motivation = "A configurable cost model lets one admission budget fit a device limited by bandwidth or by operations, and the read and write weights and split pools let an operator protect reads from writes."
+prose = "Each device has a cost model, a read weight and a write weight. Under the bytes model, an operation's base cost is its length in bytes. Under the operations model, it is its length divided by the configured operation unit, rounded up, and a control operation such as a flush costs one. The base cost is multiplied by the read weight for a read and by the write weight for every other kind of operation. A device holds either one shared pool for all operations, or two pools: one for reads and one for every other kind of operation."
 
 [[requirement]]
 id = "DC-0011-013"
@@ -26,8 +26,8 @@ id = "DC-0011-015"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The device MUST multiply an operation's base cost by the configured weight of its kind and round the result to a whole number of credits no smaller than one."
-rationale = "A cost of zero would let an unbounded number of operations be admitted at once."
+statement = "The device MUST multiply an operation's base cost by the read weight for a read, or by the write weight for every other kind, round the result down to a whole number of credits, and charge at least one credit."
+rationale = "Rounding down keeps two implementations from charging different costs for one operation, and a cost of zero would let an unbounded number of operations be admitted at once."
 
 [[requirement]]
 id = "DC-0011-016"

@@ -3,7 +3,7 @@ anchor = "operations"
 title = "Operations and their validation"
 problem = "A submitter describes an operation by its device, its file, its offset, its length and its buffer. An operation that can never succeed, such as one whose cost is larger than the device's budget, would wait for credit forever if it were admitted."
 motivation = "Rejecting such operations before they wait for credit keeps them from contending for the pool, and keeping the file open for the whole operation keeps an operation from touching a file its caller has closed."
-prose = "The kinds of operation are read, write, full flush, data flush and trim. A buffered operation uses a buffer the scheduler fills or reads from; a direct operation uses a caller-owned buffer aligned to the device block size, in place, without a copy. Each operation carries an opaque token its caller chooses, which its completion returns."
+prose = "The kinds of operation are read, write, full flush, data flush and trim. A buffered operation uses a buffer the scheduler fills or reads from; a direct operation uses a caller-owned buffer aligned to the direct alignment of 4096 bytes, in place, without a copy. Each operation carries an opaque token its caller chooses, which its completion returns."
 
 [[requirement]]
 id = "DC-0011-019"
@@ -26,8 +26,8 @@ id = "DC-0011-021"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The device MUST reject, with an invalid-input error and before it acquires any credit, a direct operation whose offset or length is not a multiple of the device block size."
-rationale = "A direct transfer needs a block-aligned offset and length, so a misaligned one would fail only after it held credit."
+statement = "The device MUST reject, with an invalid-input error and before it acquires any credit, a direct operation whose offset or length is not a multiple of the direct alignment of 4096 bytes."
+rationale = "A direct transfer needs an aligned offset and length, and 4096 bytes covers every common page and sector size, so a misaligned operation would fail only after it held credit."
 
 [[requirement]]
 id = "DC-0011-022"
