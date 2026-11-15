@@ -16,6 +16,11 @@
 //!    UnknownPathSecret response in the queue for each credential and sender id.
 //! 7. Each key's shard of `ups::Pending` is the recv_dispatch worker the recv router hands the
 //!    key's packets to, and `ups_send` takes each response's key out of the shard that holds it.
+//! 8. Rejections for many credentials and sender ids keep the queue within its limit, whichever
+//!    kind of rejection queues each response, and a response the queue refuses gives its place
+//!    back.
+//! 9. A full queue takes new responses up to its limit once `ups_send` drains it.
+//! 10. The default queue limit is the responses one burst of `ups_rate` sends.
 
 use super::helpers::test_entry;
 use crate::{
@@ -42,6 +47,10 @@ const BURST: usize = 100;
 /// The recv_dispatch workers each test's `ups::Pending` holds a shard of keys for: more than
 /// one, so that the tests' keys spread over several shards.
 const RECV_DISPATCH_WORKERS: usize = 4;
+
+/// The most responses each test's `ups::Pending` keeps in the queue together: more than the
+/// keys of any test that doesn't set its own limit.
+const QUEUE_LIMIT: usize = 64;
 
 fn encode_ups_packet(id: Id) -> Vec<u8> {
     let mut buf = [0u8; secret_control::MAX_PACKET_SIZE];
@@ -243,9 +252,16 @@ fn reject_unknown(
 }
 
 fn new_pending(registry: &Registry) -> ups::Pending {
+    new_pending_with_limit(registry, QUEUE_LIMIT)
+}
+
+/// A `ups::Pending` that keeps at most `limit` responses in the queue together.
+fn new_pending_with_limit(registry: &Registry, limit: usize) -> ups::Pending {
     ups::Pending::new(
         RECV_DISPATCH_WORKERS,
+        limit,
         registry.register("test.ups.pending_suppressed"),
+        registry.register("test.ups.pending_dropped"),
     )
 }
 
@@ -492,6 +508,11 @@ fn a_refused_response_does_not_hold_its_key() {
         0,
         "the refused response doesn't hold its key"
     );
+    assert_eq!(
+        pending.waiting(),
+        0,
+        "the refused response doesn't hold a place in the queue"
+    );
 }
 
 /// Rejections of packets whose credential the path secret map doesn't hold leave one
@@ -524,7 +545,12 @@ fn unknown_credentials_queue_one_response_for_each_credential_and_sender_id() {
 fn each_key_shards_by_the_recv_dispatch_worker_its_packets_route_to() {
     for workers in 1..=8 {
         let registry = Registry::default();
-        let pending = ups::Pending::new(workers, registry.register("test.ups.pending_suppressed"));
+        let pending = ups::Pending::new(
+            workers,
+            QUEUE_LIMIT,
+            registry.register("test.ups.pending_suppressed"),
+            registry.register("test.ups.pending_dropped"),
+        );
         for i in 0..=u8::MAX {
             for sender_id in 0..4 {
                 let key = ups::Key {
@@ -542,4 +568,185 @@ fn each_key_shards_by_the_recv_dispatch_worker_its_packets_route_to() {
             }
         }
     }
+}
+
+/// A peer can send each packet with a credential id and a sender id of its choice, which the
+/// endpoint can't authenticate, so one response for each key doesn't bound the queue. The queue
+/// keeps at most its limit of responses for all keys together, and drops each response past it,
+/// whichever kind of rejection queues it.
+#[test]
+fn rejections_for_many_credentials_and_sender_ids_keep_the_queue_within_its_limit() {
+    //= rendered/0002-path-secrets/09-control-packets.md#DC-0002-076
+    //= type=test
+    //# An endpoint MUST keep the unknown path secret packets waiting to be sent within a
+    //# limit the endpoint configures for all path secrets and senders together, and drop
+    //# each answer past that limit.
+    const LIMIT: usize = 16;
+
+    let registry = Registry::default();
+    let pending = new_pending_with_limit(&registry, LIMIT);
+    let dispatch_counters = counters::Dispatch::new(&registry);
+    let (tx, _rx) = unsync::new::<ups::Response>();
+    let mut ups_tx = pending.sender(tx);
+    let dest = SocketAddr::from(([127, 0, 0, 1], 4433));
+
+    let mut shards = HashSet::new();
+    for i in 0..=u8::MAX {
+        for sender_id in 0..4 {
+            let id = Id::from([i; 16]);
+            let sender_id = VarInt::from_u8(sender_id);
+            let key = ups::Key {
+                credential_id: id,
+                sender_id,
+            };
+            shards.insert(pending.shard(&key));
+            reject_unknown(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            assert!(
+                pending.waiting() <= LIMIT,
+                "the queue never holds more than its limit of responses"
+            );
+        }
+    }
+    assert!(
+        shards.len() > 1,
+        "the credentials' keys spread over more than one shard"
+    );
+    assert_eq!(
+        pending.waiting(),
+        LIMIT,
+        "the queue holds its limit of responses"
+    );
+    assert_eq!(
+        pending.queued(),
+        LIMIT,
+        "only the responses in the queue hold their keys"
+    );
+
+    // A rejection on a key the receiver has already seen finds the queue full too.
+    let id = Id::from(CREDENTIAL_BYTES);
+    let sender_id = VarInt::from_u8(7);
+    reject(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+    assert_eq!(
+        pending.waiting(),
+        LIMIT,
+        "the full queue drops the ReplayDetected response"
+    );
+}
+
+/// A response the queue refuses, as once its receiver is gone, gives its place in the queue
+/// back, so the place doesn't keep a later response out of a full queue.
+#[test]
+fn a_refused_response_gives_its_place_in_the_queue_back() {
+    let registry = Registry::default();
+    let pending = new_pending_with_limit(&registry, 1);
+    let dest = SocketAddr::from(([127, 0, 0, 1], 4433));
+
+    let (tx, rx) = unsync::new::<ups::Response>();
+    let mut refused = pending.sender(tx);
+    drop(rx);
+    let id = Id::from([1; 16]);
+    assert!(refused.send(make_response(dest, id)).is_err());
+
+    let (tx, _rx) = unsync::new::<ups::Response>();
+    let mut ups_tx = pending.sender(tx);
+    let id = Id::from([2; 16]);
+    assert!(ups_tx.send(make_response(dest, id)).is_ok());
+    assert_eq!(
+        pending.waiting(),
+        1,
+        "the queue takes the later response into the place the refused one gave back"
+    );
+}
+
+/// Once `ups_send` takes the responses off a full queue, the queue takes new responses up to its
+/// limit again, and `ups_send` sends the responses the queue took, and only those.
+#[test]
+fn a_full_queue_takes_new_responses_once_ups_send_drains_it() {
+    const LIMIT: u8 = 4;
+    const CREDENTIALS: u8 = 16;
+
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        let sender_id = VarInt::from_u8(3);
+        let registry = Registry::default();
+        let pending = new_pending_with_limit(&registry, usize::from(LIMIT));
+        let (tx, rx) = unsync::new::<ups::Response>();
+        spawn_pipeline(pending.receiver(rx));
+        let received = spawn_server();
+
+        async move {
+            let dest = server_addr().await;
+            let dispatch_counters = counters::Dispatch::new(&registry);
+            let mut ups_tx = pending.sender(tx);
+
+            for i in 0..CREDENTIALS {
+                let id = Id::from([i; 16]);
+                reject(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            }
+            assert_eq!(
+                pending.waiting(),
+                usize::from(LIMIT),
+                "the queue holds its limit of responses"
+            );
+
+            1.s().sleep().await;
+            assert_eq!(
+                pending.waiting(),
+                0,
+                "ups_send took the responses off the queue"
+            );
+            let expected: HashSet<_> = (0..LIMIT)
+                .map(|i| (Id::from([i; 16]), Some(sender_id)))
+                .collect();
+            assert_eq!(received.borrow().len(), usize::from(LIMIT));
+            assert_eq!(
+                received.borrow().iter().copied().collect::<HashSet<_>>(),
+                expected,
+                "ups_send sends the responses the queue took, and only those"
+            );
+
+            for i in CREDENTIALS..2 * CREDENTIALS {
+                let id = Id::from([i; 16]);
+                reject(&dispatch_counters, &mut ups_tx, dest, id, sender_id);
+            }
+            assert_eq!(
+                pending.waiting(),
+                usize::from(LIMIT),
+                "the drained queue takes new responses up to its limit"
+            );
+
+            1.s().sleep().await;
+            let expected: HashSet<_> = (0..LIMIT)
+                .chain(CREDENTIALS..CREDENTIALS + LIMIT)
+                .map(|i| (Id::from([i; 16]), Some(sender_id)))
+                .collect();
+            assert_eq!(received.borrow().len(), 2 * usize::from(LIMIT));
+            assert_eq!(
+                received.borrow().iter().copied().collect::<HashSet<_>>(),
+                expected
+            );
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// The default queue limit is the responses one burst of `ups_rate` sends, each counted at the
+/// largest control packet, and at least one response.
+#[test]
+fn the_default_queue_limit_is_the_responses_one_burst_of_the_rate_sends() {
+    use crate::{endpoint::default_ups_queue_limit, socket::rate::Rate};
+
+    // The default burst of 65535 bytes holds 1023 control packets of 64 bytes, at any rate.
+    assert_eq!(default_ups_queue_limit(Rate::new(0.001)), 1023);
+    assert_eq!(default_ups_queue_limit(Rate::new(100.0)), 1023);
+    assert_eq!(
+        default_ups_queue_limit(Rate::new(0.001).with_burst_bytes(640)),
+        10
+    );
+    assert_eq!(
+        default_ups_queue_limit(Rate::new(0.001).with_burst_bytes(0)),
+        1,
+        "a rate without a burst still queues one response"
+    );
 }
