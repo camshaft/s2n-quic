@@ -383,8 +383,8 @@ fn the_first_opening_frame_to_arrive_binds_the_stream() {
     }
 }
 
-/// A second opening frame for a stream the first one bound, of the same kind or a reset, doesn't
-/// hand a second stream to the acceptor.
+/// A second opening frame for a stream the first one bound, of any kind, doesn't hand a second
+/// stream to the acceptor.
 //= rendered/0005-endpoint/03-binding.md#DC-0005-019
 //= type=test
 //# A server MUST NOT bind a stream again when an opening frame arrives for a stream it has already bound.
@@ -392,9 +392,13 @@ fn the_first_opening_frame_to_arrive_binds_the_stream() {
 fn an_opening_frame_for_a_bound_stream_doesnt_bind_it_again() {
     let pairs = [
         (Kind::Data, Kind::Data),
+        (Kind::Data, Kind::Msg),
         (Kind::Data, Kind::Reset),
+        (Kind::Msg, Kind::Data),
         (Kind::Msg, Kind::Msg),
         (Kind::Msg, Kind::Reset),
+        (Kind::Reset, Kind::Data),
+        (Kind::Reset, Kind::Msg),
         (Kind::Reset, Kind::Reset),
     ];
     for (first, second) in pairs {
