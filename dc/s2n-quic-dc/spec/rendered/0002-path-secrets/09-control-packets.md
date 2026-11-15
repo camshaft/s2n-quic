@@ -4,7 +4,7 @@ There are three secret control packets. A stale key packet carries the lowest ke
 
 ### DC-0002-065 {#DC-0002-065}
 
-An endpoint MUST answer a packet that names a path secret it doesn't hold with an unknown path secret packet authenticated with the stateless reset token the endpoint computes for that path secret's identifier.
+An endpoint MUST answer packets that name a path secret it doesn't hold with unknown path secret packets authenticated with the stateless reset token the endpoint computes for that path secret's identifier, sent at a rate that stays within a limit the endpoint configures.
 
 ### DC-0002-066 {#DC-0002-066}
 
