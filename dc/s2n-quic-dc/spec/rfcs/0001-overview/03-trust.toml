@@ -3,7 +3,7 @@ anchor = "trust"
 title = "Trust model"
 problem = "A key that a host other than the two peers could derive, or a packet that such a host could forge, would let it read or inject the peers' data."
 motivation = "Tying every key to one handshake lets each side trust a packet exactly as far as that handshake authenticated the other peer."
-prose = "Each peer trusts the other as far as the handshake between them authenticated it, with the credentials that the deployment's handshake configuration asks for: a server that doesn't ask for the client's credentials derives path secrets with any client that reaches it. That handshake's session yields the path secret, from which both peers derive the keys of each later stream and datagram, and the stateless reset tokens each sends the other. A packet that doesn't authenticate under a key derived from a path secret comes from a host the system doesn't trust."
+prose = "Each peer trusts the other as far as the handshake between them authenticated it, with the credentials that the deployment's handshake configuration asks for: a server that doesn't ask for the client's credentials derives path secrets with any client that reaches it. That handshake's session yields the path secret, from which both peers derive the keys of each later stream and datagram, and the stateless reset tokens each sends the other. A packet that doesn't authenticate under a key, or against a stateless reset token, derived from a path secret comes from a host the system doesn't trust."
 
 [[requirement]]
 id = "DC-0001-014"
@@ -26,7 +26,7 @@ id = "DC-0001-016"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
-statement = "The system MUST NOT accept the data of a packet of the dc protocol that doesn't authenticate under a key derived from a path secret it holds."
+statement = "The system MUST NOT accept the data of a packet of the dc protocol that doesn't authenticate under a key, or against a stateless reset token, derived from a path secret it holds."
 rationale = "Only a peer that completed the handshake can produce such a packet."
 
 [[requirement]]

@@ -40,8 +40,12 @@ A peer MUST NOT use the dc protocol on a connection where the server didn't sele
 
 ### DC-0001-030 {#DC-0001-030}
 
-A peer that receives a dc-specific frame on a connection without a negotiated dc version MUST close the connection with an error.
+An endpoint that doesn't run the dc protocol MUST close the connection with an error when it receives a dc-specific frame.
 
 ### DC-0001-031 {#DC-0001-031}
 
 Every implementation MUST support dc version 0.
+
+### DC-0001-032 {#DC-0001-032}
+
+An endpoint that runs the dc protocol MUST ignore each dc-specific frame it receives on a connection where it doesn't use the dc protocol.

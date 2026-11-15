@@ -82,8 +82,8 @@ id = "DC-0001-030"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A peer that receives a dc-specific frame on a connection without a negotiated dc version MUST close the connection with an error."
-rationale = "Such a frame comes from a peer that disagrees about the protocol in use."
+statement = "An endpoint that doesn't run the dc protocol MUST close the connection with an error when it receives a dc-specific frame."
+rationale = "Such an endpoint can't read the frame, which comes from a peer that disagrees about the protocol in use."
 
 [[requirement]]
 id = "DC-0001-031"
@@ -92,3 +92,11 @@ polarity = "required"
 binds_to = "system"
 statement = "Every implementation MUST support dc version 0."
 rationale = "Two implementations of this specification then share at least one version."
+
+[[requirement]]
+id = "DC-0001-032"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "An endpoint that runs the dc protocol MUST ignore each dc-specific frame it receives on a connection where it doesn't use the dc protocol."
+rationale = "On a connection without a negotiated dc version, or one whose dc path the endpoint declined, the frame changes nothing, and the connection's other traffic goes on."
