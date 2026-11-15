@@ -3,7 +3,7 @@ anchor = "pacing"
 title = "Pacing"
 problem = "A sender that writes as fast as it can fills the queues of the network and of its peer, and the losses that follow cost more than the speed gained."
 motivation = "A rate with a short burst spreads a sender's datagrams over time, so queues stay short while the sender keeps to its configured rate."
-prose = "A paced sender keeps a credit, measured in time, that grows with elapsed time at its configured rate up to a burst of one largest send. Each item it sends takes its cost out of the credit. An item may take the credit below zero, and the sender then waits until the credit is restored. Credit is charged only for items that are sent."
+prose = "This section states the socket's send-rate pacer; RFC 0007 states the pacing that congestion control sets. A paced sender keeps a credit, measured in time, that grows with elapsed time at its configured rate up to a burst of one largest send. Each item it sends takes its cost out of the credit. An item may take the credit below zero, and the sender then waits until the credit is restored. Credit is charged only for items that are sent."
 
 [[requirement]]
 id = "DC-0010-024"

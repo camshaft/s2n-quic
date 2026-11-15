@@ -3,7 +3,7 @@ anchor = "receive"
 title = "Receiving datagrams"
 problem = "A reader of the network that loses a datagram's sender or congestion marking, or that hands on a coalesced read as one packet, gives every later stage wrong input."
 motivation = "Each later stage, the packet decoder, the congestion controller and the path secret map, needs one datagram at a time with where it came from and how the network marked it."
-prose = "A receiver reads datagrams from a datagram socket and hands each one, with its sender address and its explicit congestion notification marking, to the next stage. One read may return several datagrams that the network stack coalesced, each of the same segment size except a shorter last one. A receiver reads its socket in one of three ways: on the socket's readiness, by polling it in a busy-poll worker, or through a completion queue that the operating system fills. The way it reads doesn't change what it delivers."
+prose = "A receiver reads datagrams from a datagram socket and hands each one, with its sender address and its explicit congestion notification marking, to the next stage. One read may return several datagrams that the network stack coalesced, each of the same segment size except a shorter last one. A receiver reads its socket in one of three ways: on the socket's readiness, by polling it in a busy-poll worker, or through a completion queue that the operating system fills. The first two read the socket again after a read of zero bytes, and the third hands the empty datagram on to dispatch, which drops it because it doesn't decode. Whichever way it reads, the same packets reach the handlers."
 
 [[requirement]]
 id = "DC-0010-001"
@@ -24,10 +24,10 @@ rationale = "Each datagram holds one packet, so a coalesced read decodes correct
 [[requirement]]
 id = "DC-0010-003"
 level = "MUST"
-polarity = "required"
+polarity = "forbidden"
 binds_to = "system"
-statement = "A read that returns zero bytes MUST be retried instead of being delivered as a datagram."
-rationale = "A datagram without bytes doesn't hold a packet, and a zero-length read says nothing about the socket's later datagrams."
+statement = "A read that returns zero bytes MUST NOT reach a packet handler as a datagram."
+rationale = "A datagram without bytes doesn't hold a packet, so no handler has anything to act on."
 
 [[requirement]]
 id = "DC-0010-004"
@@ -42,8 +42,8 @@ id = "DC-0010-005"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
-statement = "The mechanism a receiver uses to read its socket MUST NOT change the payload, the sender address or the congestion marking of a datagram it delivers."
-rationale = "The stages after the receiver don't know how a datagram was read, so every read mechanism delivers the same datagram."
+statement = "The mechanism a receiver uses to read its socket MUST NOT change which packets reach a handler, or the payload, the sender address or the congestion marking of each one."
+rationale = "The stages after the receiver don't know how a datagram was read, so every read mechanism gives them the same packets."
 
 [[requirement]]
 id = "DC-0010-006"

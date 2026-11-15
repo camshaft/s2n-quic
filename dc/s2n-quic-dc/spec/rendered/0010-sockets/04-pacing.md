@@ -1,6 +1,6 @@
 ## Pacing {#pacing}
 
-A paced sender keeps a credit, measured in time, that grows with elapsed time at its configured rate up to a burst of one largest send. Each item it sends takes its cost out of the credit. An item may take the credit below zero, and the sender then waits until the credit is restored. Credit is charged only for items that are sent.
+This section states the socket's send-rate pacer; RFC 0007 states the pacing that congestion control sets. A paced sender keeps a credit, measured in time, that grows with elapsed time at its configured rate up to a burst of one largest send. Each item it sends takes its cost out of the credit. An item may take the credit below zero, and the sender then waits until the credit is restored. Credit is charged only for items that are sent.
 
 ### DC-0010-024 {#DC-0010-024}
 

@@ -1,6 +1,6 @@
 ## Receiving datagrams {#receive}
 
-A receiver reads datagrams from a datagram socket and hands each one, with its sender address and its explicit congestion notification marking, to the next stage. One read may return several datagrams that the network stack coalesced, each of the same segment size except a shorter last one. A receiver reads its socket in one of three ways: on the socket's readiness, by polling it in a busy-poll worker, or through a completion queue that the operating system fills. The way it reads doesn't change what it delivers.
+A receiver reads datagrams from a datagram socket and hands each one, with its sender address and its explicit congestion notification marking, to the next stage. One read may return several datagrams that the network stack coalesced, each of the same segment size except a shorter last one. A receiver reads its socket in one of three ways: on the socket's readiness, by polling it in a busy-poll worker, or through a completion queue that the operating system fills. The first two read the socket again after a read of zero bytes, and the third hands the empty datagram on to dispatch, which drops it because it doesn't decode. Whichever way it reads, the same packets reach the handlers.
 
 ### DC-0010-001 {#DC-0010-001}
 
@@ -12,7 +12,7 @@ Where one read returns several coalesced datagrams with a segment size, the rece
 
 ### DC-0010-003 {#DC-0010-003}
 
-A read that returns zero bytes MUST be retried instead of being delivered as a datagram.
+A read that returns zero bytes MUST NOT reach a packet handler as a datagram.
 
 ### DC-0010-004 {#DC-0010-004}
 
@@ -20,7 +20,7 @@ A receiver that finds its socket empty MUST yield until the socket signals that 
 
 ### DC-0010-005 {#DC-0010-005}
 
-The mechanism a receiver uses to read its socket MUST NOT change the payload, the sender address or the congestion marking of a datagram it delivers.
+The mechanism a receiver uses to read its socket MUST NOT change which packets reach a handler, or the payload, the sender address or the congestion marking of each one.
 
 ### DC-0010-006 {#DC-0010-006}
 
