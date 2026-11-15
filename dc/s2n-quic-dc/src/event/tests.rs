@@ -133,3 +133,295 @@ fn tracing_hides_snapshot_fields() {
     let bytes = credential_bytes();
     assert!(!output.contains(&bytes), "{bytes} is in {output}");
 }
+
+/// Checks each textual form of `event` that this module's doc comment lists: the `Debug` form of
+/// the builder and of the api event it builds, and the line the tracing integration logs for it
+/// once `publish` passes the api event to its `on_*` method. Each form writes each of `fields` as
+/// `"[HIDDEN]"` and doesn't hold the credential's bytes.
+#[track_caller]
+fn assert_event_hidden<B, E>(
+    target: &str,
+    fields: &[&str],
+    event: B,
+    publish: impl FnOnce(&crate::event::tracing::Subscriber, &api::EndpointMeta, &E),
+) where
+    B: core::fmt::Debug + IntoEvent<E>,
+    E: core::fmt::Debug,
+{
+    assert_hidden(&format!("{event:?}"), fields);
+    let event: E = event.into_event();
+    assert_hidden(&format!("{event:?}"), fields);
+
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let log = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+
+    tracing::subscriber::with_default(log, || {
+        let subscriber = crate::event::tracing::Subscriber::default();
+        let meta: api::EndpointMeta = builder::EndpointMeta {
+            timestamp: NoopClock.get_time().into_event(),
+        }
+        .into_event();
+        publish(&subscriber, &meta, &event);
+    });
+
+    let written = capture.0.lock().unwrap();
+    let output = String::from_utf8_lossy(&written);
+    let line = output
+        .lines()
+        .find(|line| line.contains(target))
+        .unwrap_or_else(|| panic!("{target} isn't in {output}"));
+    assert!(line.contains("DEBUG"), "{line}");
+    for field in fields {
+        let hidden = format!("{field}=\"[HIDDEN]\"");
+        assert!(line.contains(&hidden), "{hidden} isn't in {line}");
+    }
+    let bytes = credential_bytes();
+    assert!(!output.contains(&bytes), "{bytes} is in {output}");
+}
+
+/// One row for each event that has a `#[snapshot("[HIDDEN]")]` field. `ConnectionInfo` has one
+/// too, but it isn't an event and the tracing integration doesn't log it, so
+/// `connection_info_debug_hides_credential_id` checks its two `Debug` forms.
+#[test]
+fn every_event_hides_its_snapshot_fields() {
+    let age = core::time::Duration::from_secs(1);
+
+    assert_event_hidden(
+        "path_secret_map_entry_inserted",
+        &["credential_id"],
+        builder::PathSecretMapEntryInserted {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_path_secret_map_entry_inserted(meta, event),
+    );
+    assert_event_hidden(
+        "path_secret_map_entry_ready",
+        &["credential_id"],
+        builder::PathSecretMapEntryReady {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_path_secret_map_entry_ready(meta, event),
+    );
+    assert_event_hidden(
+        "path_secret_map_entry_replaced",
+        &["new_credential_id", "previous_credential_id"],
+        builder::PathSecretMapEntryReplaced {
+            peer_address: peer_address(),
+            new_credential_id: &CREDENTIAL_ID,
+            previous_credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_path_secret_map_entry_replaced(meta, event),
+    );
+    assert_event_hidden(
+        "path_secret_map_id_entry_evicted",
+        &["credential_id"],
+        builder::PathSecretMapIdEntryEvicted {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+            age,
+        },
+        |s, meta, event| s.on_path_secret_map_id_entry_evicted(meta, event),
+    );
+    assert_event_hidden(
+        "path_secret_map_address_entry_evicted",
+        &["credential_id"],
+        builder::PathSecretMapAddressEntryEvicted {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+            age,
+        },
+        |s, meta, event| s.on_path_secret_map_address_entry_evicted(meta, event),
+    );
+    assert_event_hidden(
+        "unknown_path_secret_packet_sent",
+        &["credential_id"],
+        builder::UnknownPathSecretPacketSent {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_unknown_path_secret_packet_sent(meta, event),
+    );
+    assert_event_hidden(
+        "unknown_path_secret_packet_received",
+        &["credential_id"],
+        builder::UnknownPathSecretPacketReceived {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_unknown_path_secret_packet_received(meta, event),
+    );
+    assert_event_hidden(
+        "unknown_path_secret_packet_accepted",
+        &["credential_id"],
+        builder::UnknownPathSecretPacketAccepted {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_unknown_path_secret_packet_accepted(meta, event),
+    );
+    assert_event_hidden(
+        "unknown_path_secret_packet_rejected",
+        &["credential_id"],
+        builder::UnknownPathSecretPacketRejected {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_unknown_path_secret_packet_rejected(meta, event),
+    );
+    assert_event_hidden(
+        "unknown_path_secret_packet_dropped",
+        &["credential_id"],
+        builder::UnknownPathSecretPacketDropped {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_unknown_path_secret_packet_dropped(meta, event),
+    );
+    assert_event_hidden(
+        "key_accepted",
+        &["credential_id"],
+        builder::KeyAccepted {
+            credential_id: &CREDENTIAL_ID,
+            key_id: 7,
+            gap: 2,
+            forward_shift: 1,
+        },
+        |s, meta, event| s.on_key_accepted(meta, event),
+    );
+    assert_event_hidden(
+        "replay_definitely_detected",
+        &["credential_id"],
+        builder::ReplayDefinitelyDetected {
+            credential_id: &CREDENTIAL_ID,
+            key_id: 7,
+        },
+        |s, meta, event| s.on_replay_definitely_detected(meta, event),
+    );
+    assert_event_hidden(
+        "replay_potentially_detected",
+        &["credential_id"],
+        builder::ReplayPotentiallyDetected {
+            credential_id: &CREDENTIAL_ID,
+            key_id: 7,
+            gap: 2,
+        },
+        |s, meta, event| s.on_replay_potentially_detected(meta, event),
+    );
+    assert_event_hidden(
+        "replay_detected_packet_sent",
+        &["credential_id"],
+        builder::ReplayDetectedPacketSent {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_replay_detected_packet_sent(meta, event),
+    );
+    assert_event_hidden(
+        "replay_detected_packet_received",
+        &["credential_id"],
+        builder::ReplayDetectedPacketReceived {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_replay_detected_packet_received(meta, event),
+    );
+    assert_event_hidden(
+        "replay_detected_packet_accepted",
+        &["credential_id"],
+        builder::ReplayDetectedPacketAccepted {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+            key_id: 7,
+        },
+        |s, meta, event| s.on_replay_detected_packet_accepted(meta, event),
+    );
+    assert_event_hidden(
+        "replay_detected_packet_rejected",
+        &["credential_id"],
+        builder::ReplayDetectedPacketRejected {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_replay_detected_packet_rejected(meta, event),
+    );
+    assert_event_hidden(
+        "replay_detected_packet_dropped",
+        &["credential_id"],
+        builder::ReplayDetectedPacketDropped {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_replay_detected_packet_dropped(meta, event),
+    );
+    assert_event_hidden(
+        "stale_key_packet_sent",
+        &["credential_id"],
+        builder::StaleKeyPacketSent {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_stale_key_packet_sent(meta, event),
+    );
+    assert_event_hidden(
+        "stale_key_packet_received",
+        &["credential_id"],
+        builder::StaleKeyPacketReceived {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_stale_key_packet_received(meta, event),
+    );
+    assert_event_hidden(
+        "stale_key_packet_accepted",
+        &["credential_id"],
+        builder::StaleKeyPacketAccepted {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_stale_key_packet_accepted(meta, event),
+    );
+    assert_event_hidden(
+        "stale_key_packet_rejected",
+        &["credential_id"],
+        builder::StaleKeyPacketRejected {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_stale_key_packet_rejected(meta, event),
+    );
+    assert_event_hidden(
+        "stale_key_packet_dropped",
+        &["credential_id"],
+        builder::StaleKeyPacketDropped {
+            peer_address: peer_address(),
+            credential_id: &CREDENTIAL_ID,
+        },
+        |s, meta, event| s.on_stale_key_packet_dropped(meta, event),
+    );
+    assert_event_hidden(
+        "path_secret_map_id_cache_accessed",
+        &["credential_id"],
+        builder::PathSecretMapIdCacheAccessed {
+            credential_id: &CREDENTIAL_ID,
+            hit: true,
+        },
+        |s, meta, event| s.on_path_secret_map_id_cache_accessed(meta, event),
+    );
+    assert_event_hidden(
+        "path_secret_map_id_cache_accessed_hit",
+        &["credential_id"],
+        builder::PathSecretMapIdCacheAccessedHit {
+            credential_id: &CREDENTIAL_ID,
+            age,
+        },
+        |s, meta, event| s.on_path_secret_map_id_cache_accessed_hit(meta, event),
+    );
+}
