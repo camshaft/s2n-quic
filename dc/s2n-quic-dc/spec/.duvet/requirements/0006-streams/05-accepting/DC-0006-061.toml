@@ -1,0 +1,5 @@
+target = "rendered/0006-streams/05-accepting.md#DC-0006-061"
+
+[[spec]]
+level = "MUST"
+quote = "At the handshake, the server MUST advertise to each client the grant of queue slots it starts that client with."

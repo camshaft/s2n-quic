@@ -2,8 +2,8 @@
 anchor = "accepting"
 title = "Accepting streams"
 problem = "A server needs to hand each incoming stream to the part of the application that serves it, and to keep a slow consumer from holding an unbounded number of streams."
-motivation = "Routing by acceptor identifier lets one endpoint serve several services, stream credit holds new streams back at the client while the application is slow, so the server keeps every stream it accepted, and spreading streams over receivers lets the application scale out."
-prose = "A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor."
+motivation = "Routing by acceptor identifier lets one endpoint serve several services, the queue slots the server grants each client hold new streams back at the client while the application is slow, so the server keeps every stream it accepted, and spreading streams over receivers lets the application scale out."
+prose = "A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor. The server grants each client a number of queue slots, and a client opens each stream on a slot it holds; the server grows a client's grant while its receivers take that client's streams as fast as they arrive, and holds or shrinks it while streams wait."
 
 [[requirement]]
 id = "DC-0006-037"
@@ -59,7 +59,7 @@ level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
 statement = "The server MUST NOT evict a waiting stream from a receiver's queue to make room for a new stream."
-rationale = "Eviction would drop a stream the server had already accepted; the client's stream credit, and not the queue, holds new streams back."
+rationale = "Eviction would drop a stream the server had already accepted; the queue slots the server grants each client, and not the queue, hold new streams back."
 
 [[requirement]]
 id = "DC-0006-059"
@@ -67,7 +67,87 @@ level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
 statement = "The server MUST NOT give a client back the credit of a stream until the application has finished with the stream."
-rationale = "Each waiting stream then holds the credit its client opened it with, so a slow application holds new streams back at the client, as a reader's window holds back data, and the streams that wait stay bounded."
+rationale = "Each waiting stream then holds the queue slot and the credit its client opened it with, so a slow application holds new streams back at the client, as a reader's window holds back data, and the server's grant of queue slots bounds the streams that wait."
+
+[[requirement]]
+id = "DC-0006-060"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "The server MUST set the number of queue slots each client may hold for streams to that server."
+rationale = "The server holds each waiting stream, so only the server knows how many its acceptors can keep; a number the client advertises states what the client grants, and not what the server can hold."
+
+[[requirement]]
+id = "DC-0006-061"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "At the handshake, the server MUST advertise to each client the grant of queue slots it starts that client with."
+rationale = "The client can open streams at once, on the slots the server has said it holds."
+
+[[requirement]]
+id = "DC-0006-062"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "The server MUST derive each client's grant of queue slots from how its acceptors' receivers take that client's streams, and not from a fixed number."
+rationale = "A fixed number is either too small for a fast application or lets a slow one collect more waiting streams than the server can hold; only the rate at which receivers take streams says how many the server can keep."
+
+[[requirement]]
+id = "DC-0006-063"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Where a receiver takes a stream of a client that holds every slot of its grant and the receiver's queue is empty after the take, the server MUST grow that client's grant."
+rationale = "The application is then waiting for work while the grant, and not the application, holds the client's streams back."
+
+[[requirement]]
+id = "DC-0006-064"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "The server MUST NOT grow a client's grant while streams of that client wait in a receiver's queue."
+rationale = "Waiting streams show that the application already has more work than it takes, so more slots would only add streams that wait."
+
+[[requirement]]
+id = "DC-0006-065"
+level = "MAY"
+polarity = "required"
+binds_to = "system"
+statement = "While streams of a client wait in a receiver's queue, the server MAY shrink that client's grant by keeping a freed slot instead of returning it to the client."
+rationale = "A grant that grew while the application was fast then follows the application down when it slows."
+
+[[requirement]]
+id = "DC-0006-066"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "The server MUST tell a client of each slot it adds to the client's grant by naming that slot in the frame that returns freed slots to the client."
+rationale = "One frame then carries every change of the grant, with the retransmission that frame already has, and the client learns of a new slot the way it learns of a freed one."
+
+[[requirement]]
+id = "DC-0006-067"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "The client MUST take a slot that the server names as free and that the client hasn't held as a new slot of its grant."
+rationale = "A grant then grows without a frame of its own, and a client never opens more streams than the server has granted."
+
+[[requirement]]
+id = "DC-0006-068"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "The client MUST NOT open a stream on a queue slot that the server hasn't granted it."
+rationale = "The grant is what holds new streams back at the client while the application is slow."
+
+[[requirement]]
+id = "DC-0006-069"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "The server MUST refuse a stream whose opening frame names a queue slot that the server doesn't grant that client."
+rationale = "A client that opens past its grant then can't make the server hold more streams than the server granted."
 
 [[requirement]]
 id = "DC-0006-045"

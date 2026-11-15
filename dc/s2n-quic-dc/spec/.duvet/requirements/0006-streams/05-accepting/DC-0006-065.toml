@@ -1,0 +1,5 @@
+target = "rendered/0006-streams/05-accepting.md#DC-0006-065"
+
+[[spec]]
+level = "MAY"
+quote = "While streams of a client wait in a receiver's queue, the server MAY shrink that client's grant by keeping a freed slot instead of returning it to the client."
