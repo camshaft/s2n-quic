@@ -718,11 +718,18 @@ mod tests {
         let ranges = [r(4, 9), r(2, 5)];
         let res = list.free(VarInt::from_u8(1), ranges.into_iter(), &mut |w| w.wake());
         assert_eq!(res.slots, 2, "only IDs 2 and 3 are below the limit");
-        assert_eq!(res.ranges, 1, "the range wholly above the limit isn't counted");
+        assert_eq!(
+            res.ranges, 1,
+            "the range wholly above the limit isn't counted"
+        );
 
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(2)));
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(3)));
-        assert_eq!(list.try_alloc(), None, "no ID at or above the limit is handed out");
+        assert_eq!(
+            list.try_alloc(),
+            None,
+            "no ID at or above the limit is handed out"
+        );
     }
 
     /// A QueueFree whose payload decode-errors mid-stream latches its
