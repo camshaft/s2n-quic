@@ -20,7 +20,7 @@ A summary MUST place each value it records in buckets whose relative error is th
 
 ### DC-0013-025 {#DC-0013-025}
 
-Recording a value to a metric MUST NOT wait for a lock that another processor holds.
+Recording a value to a metric MUST NOT wait for a lock that another processor holds, except for a single counter increment larger than the per-processor record holds.
 
 ### DC-0013-026 {#DC-0013-026}
 

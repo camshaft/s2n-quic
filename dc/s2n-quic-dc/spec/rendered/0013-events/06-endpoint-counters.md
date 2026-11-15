@@ -20,8 +20,12 @@ The receive path MUST count each frame it receives by the frame's type.
 
 ### DC-0013-043 {#DC-0013-043}
 
-The receive path MUST record the time it spends looking up the peer, decrypting and dispatching each datagram, and the size and the frame count of each datagram.
+The receive path MUST record the time it spends looking up the peer, decrypting and dispatching each datagram.
 
 ### DC-0013-044 {#DC-0013-044}
 
 The receive path SHOULD count the hits and the misses of its peer cache.
+
+### DC-0013-048 {#DC-0013-048}
+
+The receive path MUST record the size and the frame count of each datagram it receives.

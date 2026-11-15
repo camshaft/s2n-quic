@@ -42,8 +42,8 @@ id = "DC-0013-025"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
-statement = "Recording a value to a metric MUST NOT wait for a lock that another processor holds."
-rationale = "Metrics are recorded on the data path of every processor, where contention for a shared lock would slow every datagram."
+statement = "Recording a value to a metric MUST NOT wait for a lock that another processor holds, except for a single counter increment larger than the per-processor record holds."
+rationale = "Metrics are recorded on the data path of every processor, where contention for a shared lock would slow every datagram; an increment too large for the per-processor record is rare, so taking the shared lock for it costs little."
 
 [[requirement]]
 id = "DC-0013-026"

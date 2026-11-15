@@ -42,7 +42,7 @@ id = "DC-0013-043"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The receive path MUST record the time it spends looking up the peer, decrypting and dispatching each datagram, and the size and the frame count of each datagram."
+statement = "The receive path MUST record the time it spends looking up the peer, decrypting and dispatching each datagram."
 rationale = "The time of each stage shows which one limits the receive rate."
 
 [[requirement]]
@@ -52,3 +52,11 @@ polarity = "required"
 binds_to = "system"
 statement = "The receive path SHOULD count the hits and the misses of its peer cache."
 rationale = "A low hit rate explains a slow peer lookup."
+
+[[requirement]]
+id = "DC-0013-048"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "The receive path MUST record the size and the frame count of each datagram it receives."
+rationale = "The size and the frame count show how fully senders fill their datagrams."
