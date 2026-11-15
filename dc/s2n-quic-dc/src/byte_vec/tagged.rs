@@ -35,6 +35,7 @@ macro_rules! static_bytevec_tag {
             }
         }
 
+        /// The bytes this handle has added to `COUNT`, which its drop subtracts.
         #[derive(Debug)]
         pub struct Handle(usize);
 
@@ -42,12 +43,17 @@ macro_rules! static_bytevec_tag {
             fn increment(&mut self, len: usize) {
                 if len > 0 {
                     COUNT.fetch_add(len as _, core::sync::atomic::Ordering::Relaxed);
+                    self.0 += len;
                 }
             }
 
             fn decrement(&mut self, len: usize) {
+                // Subtract no more than this handle added, so that the count can't go below zero.
+                debug_assert!(len <= self.0);
+                let len = len.min(self.0);
                 if len > 0 {
                     COUNT.fetch_sub(len as _, core::sync::atomic::Ordering::Relaxed);
+                    self.0 -= len;
                 }
             }
         }
@@ -205,5 +211,45 @@ mod tests {
 
         assert_eq!(tag_a::Tag::current(), 0);
         assert_eq!(tag_b::Tag::current(), 0);
+    }
+
+    mod tag_c {
+        static_bytevec_tag!(crate::byte_vec::tagged);
+    }
+
+    #[test]
+    fn count_returns_to_zero_after_length_changes() {
+        let mut a: Tagged<tag_c::Tag> = ByteVec::from(b"hello!").tag(&tag_c::Tag);
+        assert_eq!(tag_c::Tag::current(), 6);
+
+        a.push_back(Bytes::from_static(b"more"));
+        assert_eq!(tag_c::Tag::current(), 10);
+
+        let mut other = ByteVec::from(b"abc");
+        a.append(&mut other);
+        assert_eq!(tag_c::Tag::current(), 13);
+
+        let mut b = a.clone();
+        assert_eq!(tag_c::Tag::current(), 26);
+
+        let chunk = a.split_to(5).unwrap();
+        assert_eq!(chunk.len(), 5);
+        assert_eq!(tag_c::Tag::current(), 21);
+
+        drop(a);
+        assert_eq!(tag_c::Tag::current(), 13);
+
+        let rest = b.split_to(8).unwrap();
+        assert_eq!(rest.len(), 8);
+        assert_eq!(tag_c::Tag::current(), 5);
+
+        drop(b);
+        assert_eq!(tag_c::Tag::current(), 0);
+
+        let c: Tagged<tag_c::Tag> = ByteVec::from(b"xyz").tag(&tag_c::Tag);
+        assert_eq!(tag_c::Tag::current(), 3);
+        let untagged = c.untag();
+        assert_eq!(untagged.len(), 3);
+        assert_eq!(tag_c::Tag::current(), 0);
     }
 }
