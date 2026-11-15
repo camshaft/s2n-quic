@@ -33,6 +33,8 @@ use s2n_quic_core::varint::VarInt;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 #[cfg(test)]
+mod binding_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) enum Error {
