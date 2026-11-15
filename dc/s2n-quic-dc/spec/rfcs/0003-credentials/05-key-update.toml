@@ -34,8 +34,16 @@ id = "DC-0003-039"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A sender MUST mark each packet with the key phase, 0 or 1, of the key that sealed it, and switch to the other phase at each update."
+statement = "A sender MUST mark each packet with the key phase, 0 or 1, of the key that sealed it."
 rationale = "One bit tells the receiver which of two keys to try, without a key number in each packet."
+
+[[requirement]]
+id = "DC-0003-050"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A sender MUST switch its key phase to the other value at each key update."
+rationale = "The change of phase is what tells the receiver that the sender moved to the next key of its chain."
 
 [[requirement]]
 id = "DC-0003-040"
@@ -43,15 +51,23 @@ level = "MUST"
 polarity = "required"
 binds_to = "system"
 statement = "A receiver MUST keep an opening key for each of the two key phases."
-rationale = "Packets sealed before and after an update can arrive out of order, and the receiver opens both."
+rationale = "The receiver holds the key its peer seals with now and the key its peer will seal with after its next update, so it opens a packet of either phase without deriving a key first."
 
 [[requirement]]
 id = "DC-0003-041"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A receiver that opens a packet of the phase it doesn't expect MUST then replace that phase's key with the next key of its chain and expect the other phase."
-rationale = "The packet shows that the sender updated, so the receiver moves forward, while it keeps the key of the phase whose packets may still arrive."
+statement = "A receiver that opens a packet of the phase it doesn't expect MUST replace the key of the phase it expected with the next key of its chain."
+rationale = "The packet shows that the sender updated, so the older key has served its last packet, and its place takes the key the sender will use after its next update."
+
+[[requirement]]
+id = "DC-0003-051"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "After that replacement, a receiver MUST expect the key phase of the packet that it opened."
+rationale = "The sender now seals with that phase, so the next packet of the other phase marks the sender's next update."
 
 [[requirement]]
 id = "DC-0003-042"
