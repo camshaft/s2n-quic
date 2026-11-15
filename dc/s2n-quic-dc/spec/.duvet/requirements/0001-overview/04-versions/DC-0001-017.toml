@@ -1,0 +1,5 @@
+target = "rendered/0001-overview/04-versions.md#DC-0001-017"
+
+[[spec]]
+level = "MUST"
+quote = "A client MUST list the dc versions it supports, most preferred first and at most four of them, in the transport parameter 0xdc0000, each encoded as a variable-length integer."

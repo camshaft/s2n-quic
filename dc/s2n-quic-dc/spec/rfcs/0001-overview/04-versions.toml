@@ -1,0 +1,70 @@
+[section]
+anchor = "versions"
+title = "Versions"
+problem = "Two peers that speak different versions of the dc protocol, or that each believe a different version was agreed, misread each other's packets."
+motivation = "A negotiation inside the handshake, in which the server's preference decides, gives both peers one version before any dc packet is sent, and lets later versions be added without breaking older peers."
+prose = "A dc version is a whole number. Each implementation holds the versions it supports in order of preference. The client lists its versions in a transport parameter of the handshake, the server selects one and answers with it in the same parameter, and both peers then speak the version the server selected. Where the server selects none, the connection doesn't use the dc protocol. Version 0 is the only version this specification defines."
+
+[[requirement]]
+id = "DC-0001-016"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A dc version MUST be a whole number from 0 to 4294967295."
+rationale = "Both peers encode and compare versions over the same range."
+
+[[requirement]]
+id = "DC-0001-017"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A client MUST list the dc versions it supports, most preferred first and at most four of them, in the transport parameter 0xdc0000, each encoded as a variable-length integer."
+rationale = "The server reads the client's versions in one agreed parameter and encoding, and the bound keeps the parameter small."
+
+[[requirement]]
+id = "DC-0001-018"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A server MUST select the first of its own supported dc versions, in its order of preference, that the client's list holds."
+rationale = "The server's preference decides, so that one side's order settles the choice and both peers reach the same version."
+
+[[requirement]]
+id = "DC-0001-019"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A server that selects a dc version MUST send that version alone in the transport parameter 0xdc0000."
+rationale = "The client learns the selected version from the server's parameter."
+
+[[requirement]]
+id = "DC-0001-020"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A server MUST read the first four versions of a client's list and ignore the versions after them."
+rationale = "A later client can list more versions without making an older server refuse the parameter."
+
+[[requirement]]
+id = "DC-0001-021"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "A peer MUST NOT use the dc protocol on a connection where the server didn't select a dc version."
+rationale = "Without a selected version the peers don't agree on how to read dc packets."
+
+[[requirement]]
+id = "DC-0001-022"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A peer that receives a dc-specific frame on a connection without a negotiated dc version MUST close the connection with an error."
+rationale = "Such a frame comes from a peer that disagrees about the protocol in use."
+
+[[requirement]]
+id = "DC-0001-023"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Every implementation MUST support dc version 0."
+rationale = "Two implementations of this specification then share at least one version."

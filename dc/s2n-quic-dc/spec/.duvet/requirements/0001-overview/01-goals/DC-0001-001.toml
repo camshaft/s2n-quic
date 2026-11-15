@@ -1,0 +1,5 @@
+target = "rendered/0001-overview/01-goals.md#DC-0001-001"
+
+[[spec]]
+level = "MUST"
+quote = "The system MUST protect each packet it sends to a peer after the handshake with a key derived from the path secret it shares with that peer."

@@ -1,0 +1,5 @@
+target = "rendered/0001-overview/04-versions.md#DC-0001-022"
+
+[[spec]]
+level = "MUST"
+quote = "A peer that receives a dc-specific frame on a connection without a negotiated dc version MUST close the connection with an error."

@@ -1,0 +1,5 @@
+target = "rendered/0001-overview/03-trust.md#DC-0001-014"
+
+[[spec]]
+level = "MUST"
+quote = "Once a handshake's path secret is derived, each peer MUST send the other peer the stateless reset tokens it derives from that secret."

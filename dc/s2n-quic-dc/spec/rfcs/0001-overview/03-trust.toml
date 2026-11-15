@@ -1,0 +1,38 @@
+[section]
+anchor = "trust"
+title = "Trust model"
+problem = "A key that a host other than the two peers could derive, or a packet that such a host could forge, would let it read or inject the peers' data."
+motivation = "Tying every key to one handshake that authenticated the peer lets each side trust a packet exactly as far as it trusts the peer's credentials."
+prose = "Each peer trusts the other only after a handshake that authenticates it with the credentials the deployment configures. That handshake's session yields the path secret, from which both peers derive the keys of each later stream and datagram, and the stateless reset tokens each sends the other. A packet that doesn't authenticate under a key derived from a path secret comes from a host the system doesn't trust."
+
+[[requirement]]
+id = "DC-0001-012"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "The system MUST derive a path secret only from a handshake that authenticated the peer with the credentials its deployment configures."
+rationale = "The path secret is only as trustworthy as the authentication of the handshake it comes from."
+
+[[requirement]]
+id = "DC-0001-013"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "The system MUST NOT accept the data of a packet that doesn't authenticate under a key derived from a path secret it holds."
+rationale = "Only a peer that completed the handshake can produce such a packet."
+
+[[requirement]]
+id = "DC-0001-014"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Once a handshake's path secret is derived, each peer MUST send the other peer the stateless reset tokens it derives from that secret."
+rationale = "A peer that later loses its state can then end the other peer's use of the path with a reset the other peer can verify."
+
+[[requirement]]
+id = "DC-0001-015"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Each peer MUST treat the handshake as complete for the dc protocol only once the other peer has confirmed that it received its stateless reset tokens."
+rationale = "Until then a peer can't be sure that the other peer could verify a reset of the path."
