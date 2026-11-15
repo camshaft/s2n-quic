@@ -96,6 +96,9 @@ impl Tag {
     #[inline]
     fn validate(&self) -> Result<(), s2n_codec::DecoderError> {
         let range = Self::MIN..=Self::MAX;
+
+        //= rendered/0009-tunneled-datagrams/03-receiving.md#DC-0009-015
+        //# A receiver MUST reject a packet whose first byte doesn't hold 0100 in its high four bits.
         s2n_codec::decoder_invariant!(range.contains(&(self.0).0), "invalid datagram bit pattern");
         Ok(())
     }
