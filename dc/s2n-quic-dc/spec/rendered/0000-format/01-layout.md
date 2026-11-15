@@ -20,4 +20,4 @@ Each section of an RFC MUST state the problem it addresses and the motivation fo
 
 ### DC-0000-020 {#DC-0000-020}
 
-A person MUST NOT edit a file under `rendered` or `.duvet/requirements` by hand.
+The files under `rendered` and `.duvet/requirements` MUST be exactly the files, byte for byte, that the render command writes from the sources.
