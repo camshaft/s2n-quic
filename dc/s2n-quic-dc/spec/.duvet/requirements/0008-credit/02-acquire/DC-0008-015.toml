@@ -2,4 +2,4 @@ target = "rendered/0008-credit/02-acquire.md#DC-0008-015"
 
 [[spec]]
 level = "MUST"
-quote = "A release MUST return its bytes to the pool and wake the distribution."
+quote = "A release MUST return its bytes to the pool."

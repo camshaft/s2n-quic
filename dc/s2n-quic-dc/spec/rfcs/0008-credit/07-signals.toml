@@ -50,37 +50,125 @@ id = "DC-0008-051"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A pool MUST count, at each priority level, the requests it granted at once and the requests that waited."
-rationale = "The split shows how often holders of each level wait for credit."
+statement = "A pool MUST count, at each priority level, the requests it granted at once."
+rationale = "Beside the count of requests that waited, it shows how often holders of each level wait for credit."
 
 [[requirement]]
 id = "DC-0008-052"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A pool MUST count the bytes acquired, the bytes released and the releases made."
-rationale = "Bytes acquired and released over a long time show whether holders return what they take."
+statement = "A pool MUST count the bytes acquired."
+rationale = "Beside the bytes released over a long time, it shows whether holders return what they take."
 
 [[requirement]]
 id = "DC-0008-053"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A pool MUST count the distribution's passes, its grants, the cancelled waits it reclaimed, the races of a cancel and a grant, and the turns that ended on their budget."
-rationale = "These counts show how the distribution spends its work and where waits end."
+statement = "A pool MUST count the distribution's passes."
+rationale = "The count of passes shows how often the distribution runs."
 
 [[requirement]]
 id = "DC-0008-054"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A pool MUST report the credit a pass held back for the next pass, and count each clamp of its free credit to its capacity."
-rationale = "Held-back credit shows the rule against new requests at work, and a clamp shows the refill adding more than releases took."
+statement = "A pool MUST report the credit a pass held back for the next pass."
+rationale = "Held-back credit shows the rule against new requests at work."
 
 [[requirement]]
 id = "DC-0008-055"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A pool MUST count the bytes the refill added, its ticks that added credit and its ticks that didn't, and report how many ticks in a row added credit."
-rationale = "A refill that adds credit tick after tick shows a wedged pool, and a refill that adds nothing shows healthy load."
+statement = "A pool MUST count the bytes the refill added."
+rationale = "The bytes the refill adds show how much credit it had to restore."
+
+[[requirement]]
+id = "DC-0008-070"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count, at each priority level, the requests that waited."
+rationale = "Beside the count of requests granted at once, it shows how often holders of each level wait for credit."
+
+[[requirement]]
+id = "DC-0008-071"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count the bytes released."
+rationale = "Beside the bytes acquired over a long time, it shows whether holders return what they take."
+
+[[requirement]]
+id = "DC-0008-072"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count the releases made."
+rationale = "Beside the bytes released, it shows the size of a release."
+
+[[requirement]]
+id = "DC-0008-073"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count the distribution's grants."
+rationale = "Grants beside passes show how much each pass serves."
+
+[[requirement]]
+id = "DC-0008-074"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count the cancelled waits the distribution reclaimed."
+rationale = "Reclaimed waits show how often holders stop waiting."
+
+[[requirement]]
+id = "DC-0008-075"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count the races of a cancel and a grant."
+rationale = "A race shows a grant that reached a request as it was cancelled, whose credit the pool took back."
+
+[[requirement]]
+id = "DC-0008-076"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count the distribution's turns that ended on their budget."
+rationale = "Turns that end on their budget show a backlog larger than one turn serves."
+
+[[requirement]]
+id = "DC-0008-077"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count each clamp of its free credit to its capacity."
+rationale = "A clamp shows the refill adding more than releases took."
+
+[[requirement]]
+id = "DC-0008-078"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count the refill's ticks that added credit."
+rationale = "A refill that adds credit tick after tick shows a wedged pool."
+
+[[requirement]]
+id = "DC-0008-079"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST count the refill's ticks that added no credit."
+rationale = "A refill that adds nothing shows healthy load."
+
+[[requirement]]
+id = "DC-0008-080"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A pool MUST report how many ticks in a row the refill added credit."
+rationale = "A long run of ticks that added credit shows how long the pool has been wedged."

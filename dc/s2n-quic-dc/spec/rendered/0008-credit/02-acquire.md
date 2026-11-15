@@ -28,4 +28,8 @@ A wake of a waiting request that carries neither a grant nor the close MUST NOT 
 
 ### DC-0008-015 {#DC-0008-015}
 
-A release MUST return its bytes to the pool and wake the distribution.
+A release MUST return its bytes to the pool.
+
+### DC-0008-069 {#DC-0008-069}
+
+A release MUST wake the distribution.

@@ -2,4 +2,4 @@ target = "rendered/0008-credit/07-signals.md#DC-0008-053"
 
 [[spec]]
 level = "MUST"
-quote = "A pool MUST count the distribution's passes, its grants, the cancelled waits it reclaimed, the races of a cancel and a grant, and the turns that ended on their budget."
+quote = "A pool MUST count the distribution's passes."

@@ -24,20 +24,64 @@ A pool MUST report the credit its holders hold, as its capacity less its free, o
 
 ### DC-0008-051 {#DC-0008-051}
 
-A pool MUST count, at each priority level, the requests it granted at once and the requests that waited.
+A pool MUST count, at each priority level, the requests it granted at once.
 
 ### DC-0008-052 {#DC-0008-052}
 
-A pool MUST count the bytes acquired, the bytes released and the releases made.
+A pool MUST count the bytes acquired.
 
 ### DC-0008-053 {#DC-0008-053}
 
-A pool MUST count the distribution's passes, its grants, the cancelled waits it reclaimed, the races of a cancel and a grant, and the turns that ended on their budget.
+A pool MUST count the distribution's passes.
 
 ### DC-0008-054 {#DC-0008-054}
 
-A pool MUST report the credit a pass held back for the next pass, and count each clamp of its free credit to its capacity.
+A pool MUST report the credit a pass held back for the next pass.
 
 ### DC-0008-055 {#DC-0008-055}
 
-A pool MUST count the bytes the refill added, its ticks that added credit and its ticks that didn't, and report how many ticks in a row added credit.
+A pool MUST count the bytes the refill added.
+
+### DC-0008-070 {#DC-0008-070}
+
+A pool MUST count, at each priority level, the requests that waited.
+
+### DC-0008-071 {#DC-0008-071}
+
+A pool MUST count the bytes released.
+
+### DC-0008-072 {#DC-0008-072}
+
+A pool MUST count the releases made.
+
+### DC-0008-073 {#DC-0008-073}
+
+A pool MUST count the distribution's grants.
+
+### DC-0008-074 {#DC-0008-074}
+
+A pool MUST count the cancelled waits the distribution reclaimed.
+
+### DC-0008-075 {#DC-0008-075}
+
+A pool MUST count the races of a cancel and a grant.
+
+### DC-0008-076 {#DC-0008-076}
+
+A pool MUST count the distribution's turns that ended on their budget.
+
+### DC-0008-077 {#DC-0008-077}
+
+A pool MUST count each clamp of its free credit to its capacity.
+
+### DC-0008-078 {#DC-0008-078}
+
+A pool MUST count the refill's ticks that added credit.
+
+### DC-0008-079 {#DC-0008-079}
+
+A pool MUST count the refill's ticks that added no credit.
+
+### DC-0008-080 {#DC-0008-080}
+
+A pool MUST report how many ticks in a row the refill added credit.

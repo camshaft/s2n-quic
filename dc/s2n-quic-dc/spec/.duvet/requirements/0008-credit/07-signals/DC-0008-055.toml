@@ -2,4 +2,4 @@ target = "rendered/0008-credit/07-signals.md#DC-0008-055"
 
 [[spec]]
 level = "MUST"
-quote = "A pool MUST count the bytes the refill added, its ticks that added credit and its ticks that didn't, and report how many ticks in a row added credit."
+quote = "A pool MUST count the bytes the refill added."
