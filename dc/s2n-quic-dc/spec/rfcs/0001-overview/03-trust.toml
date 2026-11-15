@@ -26,7 +26,7 @@ id = "DC-0001-016"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
-statement = "The system MUST NOT accept the data of a packet that doesn't authenticate under a key derived from a path secret it holds."
+statement = "The system MUST NOT accept the data of a packet of the dc protocol that doesn't authenticate under a key derived from a path secret it holds."
 rationale = "Only a peer that completed the handshake can produce such a packet."
 
 [[requirement]]

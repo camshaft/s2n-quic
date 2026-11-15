@@ -26,8 +26,8 @@ id = "DC-0001-008"
 level = "MAY"
 polarity = "required"
 binds_to = "system"
-statement = "A peer MAY send data packets to the addresses the other peer advertised as soon as the handshake completes."
-rationale = "The advertised addresses are known once the handshake completes, so data doesn't need to wait for another exchange."
+statement = "A peer MAY send data packets of the dc protocol to the addresses the other peer advertised as soon as the QUIC handshake completes."
+rationale = "The advertised addresses are known once the QUIC handshake completes, so data doesn't need to wait for another exchange."
 
 [[requirement]]
 id = "DC-0001-009"
@@ -58,8 +58,8 @@ id = "DC-0001-012"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "An endpoint that receives a datagram that doesn't decode as a QUIC packet MUST pass it to its handling of path secret control packets."
-rationale = "Path secret control packets arrive on the same addresses as the handshake and aren't QUIC packets."
+statement = "An endpoint that runs the dc protocol MUST pass each short-header packet that no connection accepts to its handling of path secret control packets."
+rationale = "Path secret control packets arrive on the handshake's addresses, where they read as short-header packets of no connection."
 
 [[requirement]]
 id = "DC-0001-013"

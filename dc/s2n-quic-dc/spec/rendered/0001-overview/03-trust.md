@@ -12,7 +12,7 @@ A deployment SHOULD configure the handshake to authenticate both peers.
 
 ### DC-0001-016 {#DC-0001-016}
 
-The system MUST NOT accept the data of a packet that doesn't authenticate under a key derived from a path secret it holds.
+The system MUST NOT accept the data of a packet of the dc protocol that doesn't authenticate under a key derived from a path secret it holds.
 
 ### DC-0001-017 {#DC-0001-017}
 

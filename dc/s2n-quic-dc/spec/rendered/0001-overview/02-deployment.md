@@ -12,7 +12,7 @@ A peer MAY advertise in the handshake the addresses on which it receives data pa
 
 ### DC-0001-008 {#DC-0001-008}
 
-A peer MAY send data packets to the addresses the other peer advertised as soon as the handshake completes.
+A peer MAY send data packets of the dc protocol to the addresses the other peer advertised as soon as the QUIC handshake completes.
 
 ### DC-0001-009 {#DC-0001-009}
 
@@ -28,7 +28,7 @@ A peer MUST complete a handshake with a peer that sends neither its peer informa
 
 ### DC-0001-012 {#DC-0001-012}
 
-An endpoint that receives a datagram that doesn't decode as a QUIC packet MUST pass it to its handling of path secret control packets.
+An endpoint that runs the dc protocol MUST pass each short-header packet that no connection accepts to its handling of path secret control packets.
 
 ### DC-0001-013 {#DC-0001-013}
 

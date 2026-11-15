@@ -10,7 +10,7 @@ id = "DC-0001-001"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The system MUST protect each packet it sends to a peer after the handshake with a key derived from the path secret it shares with that peer."
+statement = "The system MUST protect each packet of the dc protocol's streams and datagrams with a key derived from the path secret the two peers share."
 rationale = "Every packet then carries the authentication and the confidentiality that the one handshake established."
 
 [[requirement]]
@@ -26,7 +26,7 @@ id = "DC-0001-003"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
-statement = "The system MUST NOT send application data to a peer before it holds a path secret shared with that peer."
+statement = "The system MUST NOT send application data to a peer in a packet of the dc protocol before it holds a path secret shared with that peer."
 rationale = "Data sent before the path secret exists would travel without the protection the handshake provides."
 
 [[requirement]]

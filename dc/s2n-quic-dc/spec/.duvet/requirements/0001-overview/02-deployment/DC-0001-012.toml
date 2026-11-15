@@ -2,4 +2,4 @@ target = "rendered/0001-overview/02-deployment.md#DC-0001-012"
 
 [[spec]]
 level = "MUST"
-quote = "An endpoint that receives a datagram that doesn't decode as a QUIC packet MUST pass it to its handling of path secret control packets."
+quote = "An endpoint that runs the dc protocol MUST pass each short-header packet that no connection accepts to its handling of path secret control packets."
