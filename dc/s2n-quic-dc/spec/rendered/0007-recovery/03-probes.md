@@ -32,11 +32,11 @@ An acknowledgement of a packet whose frames a probe carried MUST complete those 
 
 ### DC-0007-020 {#DC-0007-020}
 
-Declaring lost a packet whose frames a probe carried MUST NOT queue those frames for retransmission.
+Once a probe carries a packet's frames, the system MUST treat those frames as frames of the probe's packet.
 
 ### DC-0007-021 {#DC-0007-021}
 
-The system MUST discard each record of a packet whose frames a probe carried once the outstanding bytes reach zero.
+The system MUST discard each record of a packet whose frames a probe carried no later than when the outstanding bytes reach zero.
 
 ### DC-0007-022 {#DC-0007-022}
 

@@ -64,17 +64,17 @@ rationale = "An acknowledgement of the original can arrive after the probe is se
 [[requirement]]
 id = "DC-0007-020"
 level = "MUST"
-polarity = "forbidden"
+polarity = "required"
 binds_to = "system"
-statement = "Declaring lost a packet whose frames a probe carried MUST NOT queue those frames for retransmission."
-rationale = "The probe carries those frames already, so retransmitting them again would send them twice."
+statement = "Once a probe carries a packet's frames, the system MUST treat those frames as frames of the probe's packet."
+rationale = "The probe carries those frames already, so recovering them through the probe's packet sends them once, and a loss of the original packet then leaves it no frames of its own to queue for retransmission."
 
 [[requirement]]
 id = "DC-0007-021"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The system MUST discard each record of a packet whose frames a probe carried once the outstanding bytes reach zero."
+statement = "The system MUST discard each record of a packet whose frames a probe carried no later than when the outstanding bytes reach zero."
 rationale = "Once nothing is outstanding, such a record can't be resolved, and keeping it would hold the probe timer armed."
 
 [[requirement]]

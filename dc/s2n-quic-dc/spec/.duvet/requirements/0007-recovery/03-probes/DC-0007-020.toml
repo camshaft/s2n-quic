@@ -2,4 +2,4 @@ target = "rendered/0007-recovery/03-probes.md#DC-0007-020"
 
 [[spec]]
 level = "MUST"
-quote = "Declaring lost a packet whose frames a probe carried MUST NOT queue those frames for retransmission."
+quote = "Once a probe carries a packet's frames, the system MUST treat those frames as frames of the probe's packet."

@@ -48,7 +48,7 @@ rationale = "Declaring loss as a run from the oldest packet lets one ordered sca
 [[requirement]]
 id = "DC-0007-012"
 level = "MUST"
-polarity = "forbidden"
+polarity = "required"
 binds_to = "system"
-statement = "The system MUST NOT keep an acknowledgement frame for retransmission."
-rationale = "A later acknowledgement replaces an earlier one, so retransmitting it only adds load."
+statement = "A sent packet's record MUST hold only its frames other than acknowledgement frames."
+rationale = "A later acknowledgement replaces an earlier one, so retransmitting it only adds load; keeping acknowledgement frames out of the record leaves the frames recovered on a loss to the ack-eliciting ones."

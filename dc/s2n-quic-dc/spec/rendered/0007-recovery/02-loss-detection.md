@@ -24,4 +24,4 @@ The system MUST NOT declare a packet lost while an outstanding packet with a sma
 
 ### DC-0007-012 {#DC-0007-012}
 
-The system MUST NOT keep an acknowledgement frame for retransmission.
+A sent packet's record MUST hold only its frames other than acknowledgement frames.

@@ -2,4 +2,4 @@ target = "rendered/0007-recovery/02-loss-detection.md#DC-0007-012"
 
 [[spec]]
 level = "MUST"
-quote = "The system MUST NOT keep an acknowledgement frame for retransmission."
+quote = "A sent packet's record MUST hold only its frames other than acknowledgement frames."
