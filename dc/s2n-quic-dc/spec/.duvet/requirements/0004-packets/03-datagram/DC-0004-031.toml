@@ -2,4 +2,4 @@ target = "rendered/0004-packets/03-datagram.md#DC-0004-031"
 
 [[spec]]
 level = "MUST"
-quote = "The nonce of a datagram packet's seal MUST be its packet number, or zero where the packet carries none."
+quote = "In a datagram packet's tag, bit 0x04 MUST be set exactly when the packet carries a packet number."

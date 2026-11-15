@@ -2,4 +2,4 @@ target = "rendered/0004-packets/03-datagram.md#DC-0004-030"
 
 [[spec]]
 level = "MUST"
-quote = "A datagram packet MUST carry an application header length exactly when bit 0x02 of its tag is set, and a packet without one has an empty application header."
+quote = "In a datagram packet's tag, bit 0x08 MUST be set exactly when the packet carries routing information."

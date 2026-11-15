@@ -2,4 +2,4 @@ target = "rendered/0004-packets/02-stream.md#DC-0004-017"
 
 [[spec]]
 level = "MUST"
-quote = "The source queue identifier, packet number, next expected control packet number, stream offset, final offset and every length of a stream packet MUST be variable-length integers."
+quote = "Bit 0x01 of a stream packet's tag MUST hold the key phase of the key that sealed the packet."

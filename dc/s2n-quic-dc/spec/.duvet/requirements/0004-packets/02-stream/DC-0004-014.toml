@@ -2,4 +2,4 @@ target = "rendered/0004-packets/02-stream.md#DC-0004-014"
 
 [[spec]]
 level = "MUST"
-quote = "A stream packet's fields MUST appear in this order: the tag, the credentials, the wire version, two reserved bytes, the stream identifier, the source queue identifier, the packet number, the retransmission offset, the next expected control packet number, the stream offset, the final offset, the control data length, the payload length, the application header length, the application header, the control data, the payload and the authentication tag, each optional field only where its condition holds."
+quote = "In a stream packet's tag, bit 0x08 MUST be set exactly when the packet carries control data."

@@ -2,4 +2,4 @@ target = "rendered/0004-packets/02-stream.md#DC-0004-024"
 
 [[spec]]
 level = "MUST"
-quote = "Before a receiver opens a retransmitted stream packet, it MUST clear the tag's recovery bit, set the four retransmission offset bytes to zero and remove the retransmission's change to the authentication tag, so that it checks the header the first transmission sealed."
+quote = "The nonce of a stream packet's seal MUST be its packet number."

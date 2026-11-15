@@ -2,4 +2,4 @@ target = "rendered/0004-packets/02-stream.md#DC-0004-015"
 
 [[spec]]
 level = "MUST"
-quote = "A sender MUST set the two reserved bytes that follow a stream packet's wire version to zero."
+quote = "In a stream packet's tag, bit 0x04 MUST be set exactly when the packet carries a final offset."

@@ -2,4 +2,4 @@ target = "rendered/0004-packets/02-stream.md#DC-0004-022"
 
 [[spec]]
 level = "MUST"
-quote = "A stream packet in the recovery packet space MUST NOT carry a payload."
+quote = "A packet of a reliable stream MUST carry a 4-byte retransmission offset after its packet number, whose value added to the packet number gives the number of this transmission."
