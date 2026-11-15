@@ -1,6 +1,6 @@
 ## Assembling and sending packets {#assembly}
 
-When a peer's frames are due, the sender packs as many of them as fit into packets of at most the path's packet size and within the congestion window, protects each packet, sends it, and records which frames it carried until it is acknowledged or declared lost. A packet's routing fields and frame metadata travel unencrypted and are authenticated; the frame payloads are encrypted. When the probe timeout of RFC 0007 fires, the sender sends probes so that the peer answers. RFC 0007 sets the congestion window, the pacing and the probe timeout.
+When a peer's frames are due, the sender packs as many of them as fit into packets of at most the path's packet size and within the congestion window, protects each packet, sends it, and records which frames it carried until it is acknowledged or declared lost. A packet's routing fields and frame metadata travel unencrypted and are authenticated; the frame payloads are encrypted. A sender may zero-pad a datagram after the last packet's tag; the padding isn't part of the packet, and the receiver ignores the bytes after the tag. When the probe timeout of RFC 0007 fires, the sender sends probes so that the peer answers. RFC 0007 sets the congestion window, the pacing and the probe timeout.
 
 ### DC-0005-032 {#DC-0005-032}
 
