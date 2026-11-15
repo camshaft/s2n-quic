@@ -273,13 +273,13 @@ impl FreeList {
         }
 
         // Only IDs below the agreed limit and below the high-water mark enter
-        // `freed`. The server holds slots only up to that limit, so a freed ID
-        // at or above it isn't one this client allocated, and handing it out
-        // would address a slot the server doesn't hold (DC-0012-038,
-        // DC-0012-048). The client hasn't handed out an ID at or above the
-        // high-water mark yet, and `try_alloc_fresh` hands that ID out later, so
-        // the same ID in `freed` would go to a second stream. The bitset's
-        // capacity bounds the limit too.
+        // `freed` from a free message. The server holds slots only up to that
+        // limit, so a freed ID at or above it isn't one this client allocated,
+        // and handing it out would address a slot the server doesn't hold
+        // (DC-0012-038, DC-0012-048). The client hasn't handed out an ID at or
+        // above the high-water mark yet, and `try_alloc_fresh` hands that ID
+        // out later, so the same ID in `freed` would go to a second stream. The
+        // bitset's capacity bounds the limit too.
         let limit = self
             .max_queues
             .load(Ordering::Relaxed)
@@ -722,11 +722,18 @@ mod tests {
         let ranges = [r(4, 9), r(2, 5)];
         let res = list.free(VarInt::from_u8(1), ranges.into_iter(), &mut |w| w.wake());
         assert_eq!(res.slots, 2, "only IDs 2 and 3 are below the limit");
-        assert_eq!(res.ranges, 1, "the range wholly above the limit isn't counted");
+        assert_eq!(
+            res.ranges, 1,
+            "the range wholly above the limit isn't counted"
+        );
 
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(2)));
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(3)));
-        assert_eq!(list.try_alloc(), None, "no ID at or above the limit is handed out");
+        assert_eq!(
+            list.try_alloc(),
+            None,
+            "no ID at or above the limit is handed out"
+        );
     }
 
     /// A free message that names an ID below the agreed limit but at or above
@@ -753,7 +760,10 @@ mod tests {
         let ranges = [r(3, 3), r(1, 2)];
         let res = list.free(VarInt::from_u8(1), ranges.into_iter(), &mut |w| w.wake());
         assert_eq!(res.slots, 1, "only ID 1 was handed out");
-        assert_eq!(res.ranges, 1, "the range wholly above the high-water mark isn't counted");
+        assert_eq!(
+            res.ranges, 1,
+            "the range wholly above the high-water mark isn't counted"
+        );
 
         // IDs 2 and 3 come from fresh allocation and ID 1 from `freed`, each once.
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(2)));
