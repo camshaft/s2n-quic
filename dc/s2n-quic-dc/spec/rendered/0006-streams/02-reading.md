@@ -16,15 +16,19 @@ Where the peer resets a stream after the read half has buffered some of its byte
 
 ### DC-0006-011 {#DC-0006-011}
 
-The read half MUST raise the limit on how much the peer may send as the application consumes the data it received.
+The read half MUST raise the limit on how much the peer can send as the application consumes the data it received.
 
 ### DC-0006-012 {#DC-0006-012}
 
-While the peer's write half keeps reporting that it is blocked on credit, the read half SHOULD raise the limit ahead of the peer's stated demand by about the data one round trip carries.
+While the peer's write half keeps reporting that it is blocked on credit, the read half SHOULD grow its extra credit beyond the peer's stated demand, doubling it each time the peer stays blocked after a window drains, up to the most credit it can take at once.
 
 ### DC-0006-013 {#DC-0006-013}
 
 Where the application drops the read half before the end of the stream, the read half MUST ask the peer's write half to stop sending.
+
+### DC-0006-055 {#DC-0006-055}
+
+Where the read half is dropped while the application is failing abnormally, it MUST reset the stream in both directions.
 
 ### DC-0006-014 {#DC-0006-014}
 
@@ -32,4 +36,4 @@ The read half MUST let the application learn that the peer's write half has ende
 
 ### DC-0006-015 {#DC-0006-015}
 
-The read half of a server's stream MUST tell the peer when it has consumed the end of the stream.
+Where the peer's end-of-stream signal arrives after the server's stream is created, the read half of a server's stream MUST keep raising the limit as the application consumes data, until the limit covers the end of the stream.

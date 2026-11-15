@@ -4,7 +4,11 @@ A request-response exchange opens a stream, writes the whole request with the en
 
 ### DC-0006-048 {#DC-0006-048}
 
-A request-response exchange MUST write the whole request followed by the end-of-stream signal, and read the response until its end.
+A request-response exchange MUST write the whole request followed by the end-of-stream signal.
+
+### DC-0006-053 {#DC-0006-053}
+
+A request-response exchange MUST read the response until its end before it returns.
 
 ### DC-0006-049 {#DC-0006-049}
 

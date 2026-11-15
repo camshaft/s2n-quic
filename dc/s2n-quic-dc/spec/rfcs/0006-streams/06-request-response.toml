@@ -10,8 +10,16 @@ id = "DC-0006-048"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A request-response exchange MUST write the whole request followed by the end-of-stream signal, and read the response until its end."
-rationale = "The server knows the request is whole once the end arrives, and the caller knows the response is whole once its end arrives."
+statement = "A request-response exchange MUST write the whole request followed by the end-of-stream signal."
+rationale = "The server knows the request is whole once its end arrives."
+
+[[requirement]]
+id = "DC-0006-053"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A request-response exchange MUST read the response until its end before it returns."
+rationale = "The caller knows the response is whole once its end arrives."
 
 [[requirement]]
 id = "DC-0006-049"

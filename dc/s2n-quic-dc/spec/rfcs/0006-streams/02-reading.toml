@@ -34,7 +34,7 @@ id = "DC-0006-011"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The read half MUST raise the limit on how much the peer may send as the application consumes the data it received."
+statement = "The read half MUST raise the limit on how much the peer can send as the application consumes the data it received."
 rationale = "Credit that follows what the application reads keeps a fast sender from filling the receiver's memory, and lets a sender that keeps up go on sending."
 
 [[requirement]]
@@ -42,7 +42,7 @@ id = "DC-0006-012"
 level = "SHOULD"
 polarity = "required"
 binds_to = "system"
-statement = "While the peer's write half keeps reporting that it is blocked on credit, the read half SHOULD raise the limit ahead of the peer's stated demand by about the data one round trip carries."
+statement = "While the peer's write half keeps reporting that it is blocked on credit, the read half SHOULD grow its extra credit beyond the peer's stated demand, doubling it each time the peer stays blocked after a window drains, up to the most credit it can take at once."
 rationale = "A limit equal to the last stated demand would leave a continuously sending peer blocked every round trip, so its throughput would fall to one window for each round trip."
 
 [[requirement]]
@@ -52,6 +52,14 @@ polarity = "required"
 binds_to = "system"
 statement = "Where the application drops the read half before the end of the stream, the read half MUST ask the peer's write half to stop sending."
 rationale = "The peer then learns that nobody reads its data, and stops spending credit and bandwidth on it."
+
+[[requirement]]
+id = "DC-0006-055"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Where the read half is dropped while the application is failing abnormally, it MUST reset the stream in both directions."
+rationale = "Data the application handled before an abnormal failure may be incomplete, so the peer needs to learn that the whole exchange failed."
 
 [[requirement]]
 id = "DC-0006-014"
@@ -66,5 +74,5 @@ id = "DC-0006-015"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The read half of a server's stream MUST tell the peer when it has consumed the end of the stream."
-rationale = "The client then learns that the server accepted the stream and read the whole request."
+statement = "Where the peer's end-of-stream signal arrives after the server's stream is created, the read half of a server's stream MUST keep raising the limit as the application consumes data, until the limit covers the end of the stream."
+rationale = "A server that has read part of a request keeps the client's data moving until the whole request is in."

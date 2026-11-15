@@ -1,6 +1,6 @@
 ## Accepting streams {#accepting}
 
-A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. The application clones a receiver to add workers, and drops every receiver to retire the acceptor.
+A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has asked for one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor.
 
 ### DC-0006-037 {#DC-0006-037}
 
@@ -12,7 +12,7 @@ A server MUST deliver each incoming stream to the acceptor registered under the 
 
 ### DC-0006-039 {#DC-0006-039}
 
-A server MUST refuse to register an acceptor under an identifier that a live acceptor holds, with an address-in-use error.
+A server MUST refuse to register an acceptor under an identifier that is still registered, and report that the identifier is in use.
 
 ### DC-0006-040 {#DC-0006-040}
 
@@ -42,6 +42,10 @@ Where an acceptor has several receivers, the server SHOULD give each stream to t
 
 The server MUST NOT give streams to a receiver that hasn't yet asked for one.
 
+### DC-0006-054 {#DC-0006-054}
+
+Where an acceptor has receivers and none of them has asked for a stream yet, the server MUST reset an incoming stream to that acceptor as busy.
+
 ### DC-0006-047 {#DC-0006-047}
 
-Once every receiver of an acceptor is dropped, the server MUST remove the acceptor's registration, so that streams to its identifier are rejected.
+Once every receiver of an acceptor is dropped, the server MUST reject streams to the acceptor's identifier, and remove its registration once a stream to it finds every receiver gone.

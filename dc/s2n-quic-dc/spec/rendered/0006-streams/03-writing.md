@@ -36,7 +36,7 @@ The write half MUST let the application learn, without writing, that the peer ha
 
 ### DC-0006-024 {#DC-0006-024}
 
-Where a write that asked for the end of the stream is torn down before all of its bytes are sent, the write half MUST reset the stream instead of sending the end-of-stream signal.
+Where a write that asked for the end of the stream, or a message the receiver assembles whole, is torn down before all of its bytes are sent, the write half MUST reset the stream instead of ending it cleanly.
 
 ### DC-0006-025 {#DC-0006-025}
 
@@ -52,4 +52,8 @@ The write half MUST let the application send a whole message that the receiver a
 
 ### DC-0006-028 {#DC-0006-028}
 
-The application MAY change the priority at which the write half asks for send credit, and the change applies to the credit the write half asks for after it.
+The application MAY change the priority at which the write half asks for send credit.
+
+### DC-0006-052 {#DC-0006-052}
+
+A change of the write half's priority MUST apply only to the credit the write half asks for after the change.

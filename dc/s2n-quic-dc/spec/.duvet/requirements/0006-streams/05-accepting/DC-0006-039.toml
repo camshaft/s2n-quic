@@ -2,4 +2,4 @@ target = "rendered/0006-streams/05-accepting.md#DC-0006-039"
 
 [[spec]]
 level = "MUST"
-quote = "A server MUST refuse to register an acceptor under an identifier that a live acceptor holds, with an address-in-use error."
+quote = "A server MUST refuse to register an acceptor under an identifier that is still registered, and report that the identifier is in use."

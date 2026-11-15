@@ -2,4 +2,4 @@ target = "rendered/0006-streams/02-reading.md#DC-0006-015"
 
 [[spec]]
 level = "MUST"
-quote = "The read half of a server's stream MUST tell the peer when it has consumed the end of the stream."
+quote = "Where the peer's end-of-stream signal arrives after the server's stream is created, the read half of a server's stream MUST keep raising the limit as the application consumes data, until the limit covers the end of the stream."
