@@ -5,6 +5,9 @@ on:
   pull_request:
     branches:
       - main
+    # A pull request that changes only the specification runs the spec workflow alone.
+    paths-ignore:
+      - 'dc/s2n-quic-dc/spec/**'
   schedule:
     # Run daily job at 8:00 AM and 8:00 PM PT.
     # The workflow is run in the morning to allow for the clippy job to resolve lints from new Rust
@@ -13,6 +16,11 @@ on:
   workflow_dispatch:
 
 name: ci
+
+# A newer push to a pull request's branch cancels that branch's run in progress; any other run has a group of its own.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_INCREMENTAL: 0
