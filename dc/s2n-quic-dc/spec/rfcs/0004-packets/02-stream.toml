@@ -10,11 +10,43 @@ id = "DC-0004-012"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "In a stream packet's tag, bit 0x20 MUST be set exactly when the packet carries a source queue identifier, bit 0x10 when it belongs to the recovery packet space, bit 0x08 when it carries control data, bit 0x04 when it carries a final offset, and bit 0x02 when it carries an application header."
-rationale = "Each optional field is present only where the tag says so, so a receiver reads the layout from the tag alone."
+statement = "In a stream packet's tag, bit 0x20 MUST be set exactly when the packet carries a source queue identifier."
+rationale = "A receiver learns from the tag alone whether a source queue identifier follows."
 
 [[requirement]]
 id = "DC-0004-013"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "In a stream packet's tag, bit 0x10 MUST be set exactly when the packet belongs to the recovery packet space."
+rationale = "A receiver tells recovery packets from other stream packets by this bit."
+
+[[requirement]]
+id = "DC-0004-014"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "In a stream packet's tag, bit 0x08 MUST be set exactly when the packet carries control data."
+rationale = "A receiver learns from the tag alone whether the control data length and the control data follow."
+
+[[requirement]]
+id = "DC-0004-015"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "In a stream packet's tag, bit 0x04 MUST be set exactly when the packet carries a final offset."
+rationale = "A receiver learns from the tag alone whether a final offset follows."
+
+[[requirement]]
+id = "DC-0004-016"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "In a stream packet's tag, bit 0x02 MUST be set exactly when the packet carries an application header."
+rationale = "A receiver learns from the tag alone whether the application header length and the application header follow."
+
+[[requirement]]
+id = "DC-0004-017"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -22,7 +54,7 @@ statement = "Bit 0x01 of a stream packet's tag MUST hold the key phase of the ke
 rationale = "The receiver chooses between the current and the next key from this bit."
 
 [[requirement]]
-id = "DC-0004-014"
+id = "DC-0004-018"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -30,7 +62,7 @@ statement = "A stream packet's fields MUST appear in this order: the tag, the cr
 rationale = "A fixed order lets a receiver read each field without a marker for it."
 
 [[requirement]]
-id = "DC-0004-015"
+id = "DC-0004-019"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -38,7 +70,7 @@ statement = "A sender MUST set the two reserved bytes that follow a stream packe
 rationale = "The bytes once held a port that a later field replaced, and zero keeps them free for a later version."
 
 [[requirement]]
-id = "DC-0004-016"
+id = "DC-0004-020"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -46,7 +78,7 @@ statement = "A stream identifier MUST be one variable-length integer whose value
 rationale = "One integer names the receiving queue and the stream's two properties."
 
 [[requirement]]
-id = "DC-0004-017"
+id = "DC-0004-021"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -54,7 +86,7 @@ statement = "The source queue identifier, packet number, next expected control p
 rationale = "The integers take only the bytes their values need."
 
 [[requirement]]
-id = "DC-0004-018"
+id = "DC-0004-022"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -62,7 +94,7 @@ statement = "A packet of a reliable stream MUST carry a 4-byte retransmission of
 rationale = "The packet number stays the original's, so the seal's nonce doesn't change, and the offset tells the receiver which transmission arrived."
 
 [[requirement]]
-id = "DC-0004-019"
+id = "DC-0004-023"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
@@ -70,7 +102,7 @@ statement = "A receiver MUST NOT accept a stream packet whose packet number plus
 rationale = "A transmission number past that value can't be encoded, so such a packet is malformed."
 
 [[requirement]]
-id = "DC-0004-020"
+id = "DC-0004-024"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -78,7 +110,7 @@ statement = "The nonce of a stream packet's seal MUST be its packet number."
 rationale = "A retransmission keeps the original's packet number, so it is opened with the nonce of the first transmission."
 
 [[requirement]]
-id = "DC-0004-021"
+id = "DC-0004-025"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -86,15 +118,15 @@ statement = "The associated data of a stream packet's seal MUST be every byte fr
 rationale = "Every header field, the application header and the control data are authenticated, while only the payload is encrypted."
 
 [[requirement]]
-id = "DC-0004-022"
+id = "DC-0004-026"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
-statement = "A stream packet in the recovery packet space MUST NOT carry a payload."
-rationale = "A recovery packet probes the path, and its authentication tag covers the header alone."
+statement = "A stream packet in the recovery packet space that isn't a retransmission MUST NOT carry a payload."
+rationale = "A recovery packet probes the path, and its authentication tag covers the header alone; a retransmission in the recovery space keeps the payload of the packet it repeats."
 
 [[requirement]]
-id = "DC-0004-023"
+id = "DC-0004-027"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
@@ -102,7 +134,7 @@ statement = "A sender MUST NOT retransmit a packet of a stream that isn't reliab
 rationale = "Only a reliable stream's packets carry the retransmission offset."
 
 [[requirement]]
-id = "DC-0004-024"
+id = "DC-0004-028"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -110,7 +142,7 @@ statement = "Before a receiver opens a retransmitted stream packet, it MUST clea
 rationale = "A retransmission isn't sealed again: its sender adjusts the original's authentication tag for the new transmission number, and the receiver undoes that adjustment."
 
 [[requirement]]
-id = "DC-0004-025"
+id = "DC-0004-029"
 level = "MUST"
 polarity = "required"
 binds_to = "system"

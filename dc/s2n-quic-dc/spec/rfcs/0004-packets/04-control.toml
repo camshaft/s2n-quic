@@ -6,15 +6,31 @@ motivation = "A control packet carries QUIC frames, such as acknowledgments, aut
 prose = "A control packet carries control frames from a stream's receiver to its sender: its tag's flags, its credentials and wire version, the stream identifier where it answers one stream, an optional source queue identifier, the packet number, the control data length, optional routing information, the control data and the authentication tag. The control data isn't encrypted; the authentication tag covers the whole packet."
 
 [[requirement]]
-id = "DC-0004-036"
+id = "DC-0004-044"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "In a control packet's tag, bit 0x08 MUST be set exactly when the packet carries a source queue identifier, bit 0x04 when it carries the identifier of the stream it answers, and bit 0x02 when it carries routing information."
-rationale = "Each optional field is present only where the tag says so."
+statement = "In a control packet's tag, bit 0x08 MUST be set exactly when the packet carries a source queue identifier."
+rationale = "A receiver learns from the tag alone whether a source queue identifier follows."
 
 [[requirement]]
-id = "DC-0004-037"
+id = "DC-0004-045"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "In a control packet's tag, bit 0x04 MUST be set exactly when the packet carries the identifier of the stream it answers."
+rationale = "A receiver learns from the tag alone whether a stream identifier follows."
+
+[[requirement]]
+id = "DC-0004-046"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "In a control packet's tag, bit 0x02 MUST be set exactly when the packet carries routing information."
+rationale = "A receiver learns from the tag alone whether routing information follows."
+
+[[requirement]]
+id = "DC-0004-047"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -22,7 +38,7 @@ statement = "A sender MUST set bit 0x01 of a control packet's tag to zero."
 rationale = "The bit has no meaning yet, and zero keeps it free for a later version."
 
 [[requirement]]
-id = "DC-0004-038"
+id = "DC-0004-048"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -30,7 +46,7 @@ statement = "A control packet's fields MUST appear in this order: the tag, the c
 rationale = "A fixed order lets a receiver read each field without a marker for it."
 
 [[requirement]]
-id = "DC-0004-039"
+id = "DC-0004-049"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -38,7 +54,7 @@ statement = "The stream identifier, source queue identifier, packet number and c
 rationale = "One encoding of the stream identifier names the same stream in stream and control packets."
 
 [[requirement]]
-id = "DC-0004-040"
+id = "DC-0004-050"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -46,15 +62,31 @@ statement = "The control data of a control packet MUST be a sequence of QUIC fra
 rationale = "Acknowledgments and other control information reuse the frames QUIC defines."
 
 [[requirement]]
-id = "DC-0004-041"
+id = "DC-0004-051"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "A sender MUST NOT encrypt a control packet's control data."
+rationale = "The control data holds no secret, so it travels in the clear and its authentication alone keeps it from being forged."
+
+[[requirement]]
+id = "DC-0004-052"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A control packet MUST be authenticated and not encrypted: its authentication tag covers every byte from the packet's tag to the end of its control data, with the packet number as nonce and key phase zero."
-rationale = "The control data holds no secret, so authentication alone keeps it from being forged."
+statement = "A control packet's authentication tag MUST cover every byte from the packet's tag to the end of its control data."
+rationale = "Authenticating the whole packet keeps its header and frames from being forged."
 
 [[requirement]]
-id = "DC-0004-042"
+id = "DC-0004-053"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "The nonce of a control packet's authentication tag MUST be its packet number."
+rationale = "Each packet number gives a fresh nonce under the path's key."
+
+[[requirement]]
+id = "DC-0004-054"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -62,7 +94,7 @@ statement = "The routing information of a control packet MUST be a routing type 
 rationale = "The two identifiers route the reply back to the sender that sent the data it answers."
 
 [[requirement]]
-id = "DC-0004-043"
+id = "DC-0004-055"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
