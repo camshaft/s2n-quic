@@ -6,7 +6,7 @@ motivation = "Stating the roles of the two hosts, the handshake that joins them 
 prose = "Each host runs an endpoint that accepts handshakes and an endpoint that carries data. The host that opens a path is its client, and the host that accepts it is its server; one host can be both, toward different peers. The handshake runs between the two hosts' handshake addresses. During it, each peer can describe itself and advertise the addresses on which it receives data packets, and once it completes, the peers exchange data on those addresses. A peer that doesn't send either description is treated as an older peer that didn't send it."
 
 [[requirement]]
-id = "DC-0001-005"
+id = "DC-0001-006"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -14,7 +14,7 @@ statement = "The system MUST run each handshake as a QUIC connection over UDP wh
 rationale = "A standard, reviewed handshake authenticates the peers and yields the session from which the path secret is derived."
 
 [[requirement]]
-id = "DC-0001-006"
+id = "DC-0001-007"
 level = "MAY"
 polarity = "required"
 binds_to = "system"
@@ -22,7 +22,7 @@ statement = "A peer MAY advertise in the handshake the addresses on which it rec
 rationale = "A host can serve its handshakes and its data on different sockets."
 
 [[requirement]]
-id = "DC-0001-007"
+id = "DC-0001-008"
 level = "MAY"
 polarity = "required"
 binds_to = "system"
@@ -30,23 +30,31 @@ statement = "A peer MAY send data packets to the addresses the other peer advert
 rationale = "The advertised addresses are known once the handshake completes, so data doesn't need to wait for another exchange."
 
 [[requirement]]
-id = "DC-0001-008"
-level = "MUST"
-polarity = "required"
-binds_to = "system"
-statement = "A peer MUST carry its peer information in the transport parameter 0xdc0003 and the addresses it advertises in the transport parameter 0xdc0004."
-rationale = "Two implementations read each other's description and addresses only where both use the same parameters."
-
-[[requirement]]
 id = "DC-0001-009"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A peer MUST complete a handshake with a peer that sends neither its peer information nor its data addresses, and treat each as absent."
-rationale = "Older peers don't send either parameter, and they still need to reach newer ones."
+statement = "A peer MUST carry its peer information in the transport parameter 0xdc0003."
+rationale = "Two implementations read each other's description only where both use the same parameter."
 
 [[requirement]]
 id = "DC-0001-010"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A peer MUST carry the addresses it advertises in the transport parameter 0xdc0004."
+rationale = "Two implementations read each other's data addresses only where both use the same parameter."
+
+[[requirement]]
+id = "DC-0001-011"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A peer MUST complete a handshake with a peer that sends neither its peer information nor its data addresses."
+rationale = "Older peers don't send either parameter, and they still need to reach newer ones."
+
+[[requirement]]
+id = "DC-0001-012"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -54,7 +62,7 @@ statement = "An endpoint that receives a datagram that doesn't decode as a QUIC 
 rationale = "Path secret control packets arrive on the same addresses as the handshake and aren't QUIC packets."
 
 [[requirement]]
-id = "DC-0001-011"
+id = "DC-0001-013"
 level = "MAY"
 polarity = "required"
 binds_to = "system"

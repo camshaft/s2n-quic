@@ -6,7 +6,7 @@ motivation = "A negotiation inside the handshake, in which the server's preferen
 prose = "A dc version is a whole number. Each implementation holds the versions it supports in order of preference. The client lists its versions in a transport parameter of the handshake, the server selects one and answers with it in the same parameter, and both peers then speak the version the server selected. Where the server selects none, the connection doesn't use the dc protocol. Version 0 is the only version this specification defines."
 
 [[requirement]]
-id = "DC-0001-016"
+id = "DC-0001-020"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -14,15 +14,39 @@ statement = "A dc version MUST be a whole number from 0 to 4294967295."
 rationale = "Both peers encode and compare versions over the same range."
 
 [[requirement]]
-id = "DC-0001-017"
+id = "DC-0001-021"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A client MUST list the dc versions it supports, most preferred first and at most four of them, in the transport parameter 0xdc0000, each encoded as a variable-length integer."
-rationale = "The server reads the client's versions in one agreed parameter and encoding, and the bound keeps the parameter small."
+statement = "A client MUST list the dc versions it supports in the transport parameter 0xdc0000."
+rationale = "The server reads the client's versions from one agreed parameter."
 
 [[requirement]]
-id = "DC-0001-018"
+id = "DC-0001-022"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A client MUST list its dc versions in its order of preference, the most preferred first."
+rationale = "The order records the client's preference, which the server reads where its own preference allows a choice."
+
+[[requirement]]
+id = "DC-0001-023"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "A client MUST NOT list more than four dc versions."
+rationale = "The bound keeps the parameter small, and a server reads no more than four."
+
+[[requirement]]
+id = "DC-0001-024"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A peer MUST encode each dc version in the transport parameter 0xdc0000 as a variable-length integer."
+rationale = "Both peers read the versions with the same encoding."
+
+[[requirement]]
+id = "DC-0001-025"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -30,7 +54,7 @@ statement = "A server MUST select the first of its own supported dc versions, in
 rationale = "The server's preference decides, so that one side's order settles the choice and both peers reach the same version."
 
 [[requirement]]
-id = "DC-0001-019"
+id = "DC-0001-026"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -38,15 +62,15 @@ statement = "A server that selects a dc version MUST send that version alone in 
 rationale = "The client learns the selected version from the server's parameter."
 
 [[requirement]]
-id = "DC-0001-020"
+id = "DC-0001-027"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A server MUST read the first four versions of a client's list and ignore the versions after them."
+statement = "A server MUST ignore each version of a client's list after its fourth."
 rationale = "A later client can list more versions without making an older server refuse the parameter."
 
 [[requirement]]
-id = "DC-0001-021"
+id = "DC-0001-028"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
@@ -54,7 +78,7 @@ statement = "A peer MUST NOT use the dc protocol on a connection where the serve
 rationale = "Without a selected version the peers don't agree on how to read dc packets."
 
 [[requirement]]
-id = "DC-0001-022"
+id = "DC-0001-029"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -62,7 +86,7 @@ statement = "A peer that receives a dc-specific frame on a connection without a 
 rationale = "Such a frame comes from a peer that disagrees about the protocol in use."
 
 [[requirement]]
-id = "DC-0001-023"
+id = "DC-0001-030"
 level = "MUST"
 polarity = "required"
 binds_to = "system"

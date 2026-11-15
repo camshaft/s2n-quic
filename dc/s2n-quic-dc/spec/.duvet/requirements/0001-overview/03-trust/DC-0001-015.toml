@@ -1,5 +1,5 @@
 target = "rendered/0001-overview/03-trust.md#DC-0001-015"
 
 [[spec]]
-level = "MUST"
-quote = "Each peer MUST treat the handshake as complete for the dc protocol only once the other peer has confirmed that it received its stateless reset tokens."
+level = "SHOULD"
+quote = "A deployment SHOULD configure the handshake to authenticate both peers."

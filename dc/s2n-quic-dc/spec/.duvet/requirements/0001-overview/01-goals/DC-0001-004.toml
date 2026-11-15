@@ -2,4 +2,4 @@ target = "rendered/0001-overview/01-goals.md#DC-0001-004"
 
 [[spec]]
 level = "MUST"
-quote = "The system MUST carry both reliable, ordered streams and unreliable datagrams between peers that share a path secret."
+quote = "The system MUST carry reliable, ordered streams between peers that share a path secret."

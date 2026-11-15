@@ -16,4 +16,8 @@ The system MUST NOT send application data to a peer before it holds a path secre
 
 ### DC-0001-004 {#DC-0001-004}
 
-The system MUST carry both reliable, ordered streams and unreliable datagrams between peers that share a path secret.
+The system MUST carry reliable, ordered streams between peers that share a path secret.
+
+### DC-0001-005 {#DC-0001-005}
+
+The system MUST carry unreliable datagrams between peers that share a path secret.

@@ -1,5 +1,5 @@
 target = "rendered/0001-overview/02-deployment.md#DC-0001-008"
 
 [[spec]]
-level = "MUST"
-quote = "A peer MUST carry its peer information in the transport parameter 0xdc0003 and the addresses it advertises in the transport parameter 0xdc0004."
+level = "MAY"
+quote = "A peer MAY send data packets to the addresses the other peer advertised as soon as the handshake completes."
