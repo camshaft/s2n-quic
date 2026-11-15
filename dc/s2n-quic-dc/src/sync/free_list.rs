@@ -272,14 +272,18 @@ impl FreeList {
             return FreeResult::DUPLICATE;
         }
 
-        // Only IDs below the agreed limit enter `freed`. The server holds slots
-        // only up to that limit, so a freed ID at or above it isn't one this
-        // client allocated, and handing it out would address a slot the server
-        // doesn't hold (DC-0012-038, DC-0012-048). The bitset's capacity bounds
-        // the limit too.
+        // Only IDs below the agreed limit and below the high-water mark enter
+        // `freed`. The server holds slots only up to that limit, so a freed ID
+        // at or above it isn't one this client allocated, and handing it out
+        // would address a slot the server doesn't hold (DC-0012-038,
+        // DC-0012-048). The client hasn't handed out an ID at or above the
+        // high-water mark yet, and `try_alloc_fresh` hands that ID out later, so
+        // the same ID in `freed` would go to a second stream. The bitset's
+        // capacity bounds the limit too.
         let limit = self
             .max_queues
             .load(Ordering::Relaxed)
+            .min(self.high_water_mark.load(Ordering::Relaxed))
             .min(HierarchicalBitSet::MAX_CAPACITY as u64);
 
         let mut slots = 0usize;
@@ -723,6 +727,39 @@ mod tests {
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(2)));
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(3)));
         assert_eq!(list.try_alloc(), None, "no ID at or above the limit is handed out");
+    }
+
+    /// A free message that names an ID below the agreed limit but at or above
+    /// the high-water mark doesn't make that ID allocatable from `freed`: the
+    /// client hasn't handed that ID out yet, and a later fresh allocation hands
+    /// it out, so taking it into `freed` too would hand it to a second stream.
+    #[test]
+    fn free_ignores_ids_at_or_above_the_high_water_mark() {
+        use core::ops::RangeInclusive;
+        use s2n_codec::DecoderError;
+
+        // The agreed limit is 4, and the client has handed out IDs 0 and 1, so
+        // the high-water mark is 2.
+        let list = FreeList::new(VarInt::from_u8(4));
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(0)));
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(1)));
+
+        let r = |a: u8, b: u8| -> Result<RangeInclusive<VarInt>, DecoderError> {
+            Ok(VarInt::from_u8(a)..=VarInt::from_u8(b))
+        };
+
+        // One range lies wholly between the high-water mark and the limit, and
+        // one straddles the high-water mark.
+        let ranges = [r(3, 3), r(1, 2)];
+        let res = list.free(VarInt::from_u8(1), ranges.into_iter(), &mut |w| w.wake());
+        assert_eq!(res.slots, 1, "only ID 1 was handed out");
+        assert_eq!(res.ranges, 1, "the range wholly above the high-water mark isn't counted");
+
+        // IDs 2 and 3 come from fresh allocation and ID 1 from `freed`, each once.
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(2)));
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(3)));
+        assert_eq!(list.try_alloc(), Some(VarInt::from_u8(1)));
+        assert_eq!(list.try_alloc(), None, "no ID is handed out twice");
     }
 
     /// A QueueFree whose payload decode-errors mid-stream latches its
