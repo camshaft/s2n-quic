@@ -16,7 +16,11 @@ A sender MUST update its sealing key once it has sealed 2^23 - 2^16 packets with
 
 ### DC-0003-039 {#DC-0003-039}
 
-A sender MUST mark each packet with the key phase, 0 or 1, of the key that sealed it, and switch to the other phase at each update.
+A sender MUST mark each packet with the key phase, 0 or 1, of the key that sealed it.
+
+### DC-0003-050 {#DC-0003-050}
+
+A sender MUST switch its key phase to the other value at each key update.
 
 ### DC-0003-040 {#DC-0003-040}
 
@@ -24,7 +28,11 @@ A receiver MUST keep an opening key for each of the two key phases.
 
 ### DC-0003-041 {#DC-0003-041}
 
-A receiver that opens a packet of the phase it doesn't expect MUST then replace that phase's key with the next key of its chain and expect the other phase.
+A receiver that opens a packet of the phase it doesn't expect MUST replace the key of the phase it expected with the next key of its chain.
+
+### DC-0003-051 {#DC-0003-051}
+
+After that replacement, a receiver MUST expect the key phase of the packet that it opened.
 
 ### DC-0003-042 {#DC-0003-042}
 

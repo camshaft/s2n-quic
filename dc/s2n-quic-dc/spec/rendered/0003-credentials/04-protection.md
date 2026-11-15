@@ -40,4 +40,8 @@ The tag of a retransmitted stream control packet MUST be its original tag combin
 
 ### DC-0003-035 {#DC-0003-035}
 
-An endpoint MAY run a stream without control keys over a transport that delivers packets reliably and in order, and it then refuses to verify a control tag or to make a retransmission tag.
+An endpoint MAY run a stream without control keys over a transport that delivers packets reliably and in order.
+
+### DC-0003-049 {#DC-0003-049}
+
+An endpoint that runs a stream without control keys MUST refuse each control-tag operation on that stream, verifying a control tag and making a retransmission tag alike.
