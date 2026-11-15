@@ -81,7 +81,10 @@ impl Server {
 
     /// Registers a channel-based acceptor and returns a receiver.
     ///
-    /// Incoming streams are placed in a bounded queue.
+    /// Incoming streams wait in a queue until the application takes them. A full queue
+    /// grows instead of evicting a waiting stream: each waiting stream holds the queue
+    /// slot its client opened it on, so a client can't open more streams than the slots
+    /// the server granted it.
     ///
     /// Cloning the receiver scales out acceptance across multiple tasks: incoming streams
     /// are distributed across all live receivers using pick-two load balancing.
@@ -89,8 +92,8 @@ impl Server {
     /// The acceptor is automatically cleaned up when all receivers are dropped and a
     /// background cleanup pass runs.
     ///
-    /// `config` controls the per-receiver queue capacity and eviction policy for streams
-    /// that arrive faster than the application can accept them.
+    /// `config` sets how many waiting streams each receiver's queue reserves room for up
+    /// front.
     ///
     /// # Errors
     ///
