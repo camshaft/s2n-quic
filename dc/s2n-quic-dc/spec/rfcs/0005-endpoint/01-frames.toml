@@ -34,8 +34,16 @@ id = "DC-0005-004"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The endpoint MUST bound the number of transmissions of each frame, and report the frame as failed when it reaches that bound without an acknowledgement."
-rationale = "A frame that never gets through would otherwise be sent forever, and its writer would never learn that it failed."
+statement = "The endpoint MUST bound the number of transmissions of each frame."
+rationale = "A frame that never gets through would otherwise be sent forever, and spend the path for nothing."
+
+[[requirement]]
+id = "DC-0005-051"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "When a frame reaches its bound on transmissions without an acknowledgement, the endpoint MUST report the frame to its writer as failed."
+rationale = "The writer of a frame that stops being sent would otherwise never learn that it failed."
 
 [[requirement]]
 id = "DC-0005-005"

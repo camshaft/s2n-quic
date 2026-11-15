@@ -12,7 +12,11 @@ A sender MUST number each packet it sends under one sender identifier higher tha
 
 ### DC-0005-034 {#DC-0005-034}
 
-A sender MUST protect each packet so that its frame payloads are encrypted and every byte of its header and frame metadata is authenticated.
+A sender MUST encrypt the frame payloads of each packet.
+
+### DC-0005-052 {#DC-0005-052}
+
+A sender MUST authenticate every byte of each packet, its unencrypted header and frame metadata among them.
 
 ### DC-0005-035 {#DC-0005-035}
 

@@ -26,8 +26,16 @@ id = "DC-0005-034"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A sender MUST protect each packet so that its frame payloads are encrypted and every byte of its header and frame metadata is authenticated."
-rationale = "Encryption keeps stream data private, and authenticating the cleartext routing fields and metadata keeps an attacker from redirecting or reshaping frames."
+statement = "A sender MUST encrypt the frame payloads of each packet."
+rationale = "Encryption keeps stream data private on the path."
+
+[[requirement]]
+id = "DC-0005-052"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A sender MUST authenticate every byte of each packet, its unencrypted header and frame metadata among them."
+rationale = "Authenticating the unencrypted routing fields and metadata keeps an attacker from redirecting or reshaping frames without the receiver noticing."
 
 [[requirement]]
 id = "DC-0005-035"

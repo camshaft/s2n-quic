@@ -1,6 +1,6 @@
 ## Receiving packets {#receive}
 
-The receiver keeps receive state for each pair of peer credential and sender identifier, since each sender of a peer numbers its packets in its own space. A packet is authenticated with the path secret its credential names and checked against the packet numbers already accepted from its sender, and only then are its frames dispatched to their streams, in the order the packet holds them. When the receiver can't use a packet's credential, it tells the sender why, through the notices RFC 0002 defines.
+The receiver keeps receive state for each pair of peer credential and sender identifier, since each sender of a peer numbers its packets in its own space. A packet is authenticated with the path secret its credential names and checked against the packet numbers already accepted from its sender, and only then is the payload of its frames delivered to their streams, in the order the packet holds them. When the receiver can't use a packet's credential, it tells the sender why, through the notices RFC 0002 defines.
 
 ### DC-0005-007 {#DC-0005-007}
 
@@ -8,7 +8,7 @@ A receiver MUST keep separate packet number and acknowledgement state for each p
 
 ### DC-0005-008 {#DC-0005-008}
 
-A receiver MUST NOT dispatch any frame of a packet that fails authentication.
+A receiver MUST NOT deliver to a stream the payload of a frame whose packet fails authentication.
 
 ### DC-0005-009 {#DC-0005-009}
 

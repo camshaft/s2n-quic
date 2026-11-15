@@ -40,4 +40,4 @@ When a sender has no packet that carries data awaiting acknowledgement, it MAY m
 
 ### DC-0005-031 {#DC-0005-031}
 
-After such an acknowledgement yields a round-trip sample, a sender MUST NOT mark another acknowledgement as ack-eliciting until it has sent a packet that carries data.
+After an acknowledgement that a sender marked ack-eliciting to measure the round-trip time yields a sample, the sender MUST NOT mark another acknowledgement as ack-eliciting until it has sent a packet that carries data.

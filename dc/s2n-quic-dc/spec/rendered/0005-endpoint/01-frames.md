@@ -16,7 +16,11 @@ The endpoint MUST NOT transmit a frame whose writer has cancelled it or gone awa
 
 ### DC-0005-004 {#DC-0005-004}
 
-The endpoint MUST bound the number of transmissions of each frame, and report the frame as failed when it reaches that bound without an acknowledgement.
+The endpoint MUST bound the number of transmissions of each frame.
+
+### DC-0005-051 {#DC-0005-051}
+
+When a frame reaches its bound on transmissions without an acknowledgement, the endpoint MUST report the frame to its writer as failed.
 
 ### DC-0005-005 {#DC-0005-005}
 
