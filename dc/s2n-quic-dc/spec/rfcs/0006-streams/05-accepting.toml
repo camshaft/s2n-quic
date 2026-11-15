@@ -46,7 +46,7 @@ statement = "A server MUST reject a stream whose acceptor identifier doesn't nam
 rationale = "The client then learns of its mistake instead of waiting on a stream that nobody reads."
 
 [[requirement]]
-id = "DC-0006-042"
+id = "DC-0006-057"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
@@ -54,7 +54,7 @@ statement = "Each receiver of an acceptor MUST keep every stream that waits for 
 rationale = "A stream the server accepted is work it took on, and dropping it because many streams wait would lose that work."
 
 [[requirement]]
-id = "DC-0006-043"
+id = "DC-0006-058"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
@@ -62,7 +62,7 @@ statement = "The server MUST NOT evict a waiting stream from a receiver's queue 
 rationale = "Eviction would drop a stream the server had already accepted; the client's stream credit, and not the queue, holds new streams back."
 
 [[requirement]]
-id = "DC-0006-044"
+id = "DC-0006-059"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
