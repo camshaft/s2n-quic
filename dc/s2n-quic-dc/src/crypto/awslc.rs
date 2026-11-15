@@ -22,10 +22,10 @@ pub mod seal {
 
     impl Application {
         #[inline]
-        pub fn new(key: &[u8], iv: [u8; NONCE_LEN], algorithm: &'static Algorithm) -> Self {
+        pub fn new(key: &[u8], iv: &[u8; NONCE_LEN], algorithm: &'static Algorithm) -> Self {
             let key = UnboundKey::new(algorithm, key).unwrap();
             let key = LessSafeKey::new(key);
-            Self { key, iv: Iv(iv) }
+            Self { key, iv: Iv(*iv) }
         }
 
         #[inline]
@@ -151,10 +151,10 @@ pub mod open {
 
     impl Application {
         #[inline]
-        pub fn new(key: &[u8], iv: [u8; NONCE_LEN], algorithm: &'static Algorithm) -> Self {
+        pub fn new(key: &[u8], iv: &[u8; NONCE_LEN], algorithm: &'static Algorithm) -> Self {
             let key = UnboundKey::new(algorithm, key).unwrap();
             let key = LessSafeKey::new(key);
-            Self { key, iv: Iv(iv) }
+            Self { key, iv: Iv(*iv) }
         }
     }
 
@@ -383,5 +383,15 @@ mod tests {
         // Safety: the drop leaves the bytes of the `Iv` in place, and a byte array has no padding.
         let bytes = unsafe { core::ptr::addr_of!((*iv.as_ptr()).0).read() };
         assert_eq!(bytes, [0; NONCE_LEN]);
+    }
+
+    #[test]
+    fn application_keys_borrow_the_iv() {
+        // `new` borrows the IV, so the caller's IV stays in the buffer that zeroes it, and the
+        // only copy is the `Iv` that zeroes itself on drop.
+        let _: fn(&[u8], &[u8; NONCE_LEN], &'static Algorithm) -> seal::Application =
+            seal::Application::new;
+        let _: fn(&[u8], &[u8; NONCE_LEN], &'static Algorithm) -> open::Application =
+            open::Application::new;
     }
 }
