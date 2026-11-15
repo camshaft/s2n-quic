@@ -1,5 +1,0 @@
-target = "rendered/0004-packets/04-control.md#DC-0004-041"
-
-[[spec]]
-level = "MUST"
-quote = "A control packet MUST be authenticated and not encrypted: its authentication tag covers every byte from the packet's tag to the end of its control data, with the packet number as nonce and key phase zero."

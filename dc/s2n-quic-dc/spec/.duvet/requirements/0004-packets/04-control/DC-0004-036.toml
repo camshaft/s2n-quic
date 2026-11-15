@@ -1,5 +1,0 @@
-target = "rendered/0004-packets/04-control.md#DC-0004-036"
-
-[[spec]]
-level = "MUST"
-quote = "In a control packet's tag, bit 0x08 MUST be set exactly when the packet carries a source queue identifier, bit 0x04 when it carries the identifier of the stream it answers, and bit 0x02 when it carries routing information."

@@ -1,5 +1,0 @@
-target = "rendered/0004-packets/06-secret-transfer.md#DC-0004-060"
-
-[[spec]]
-level = "MUST"
-quote = "A receiver MUST NOT accept application parameters whose maximum idle timeout is larger than 4294967295 milliseconds."

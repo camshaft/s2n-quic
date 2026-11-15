@@ -1,5 +1,0 @@
-target = "rendered/0004-packets/05-secret-control.md#DC-0004-044"
-
-[[spec]]
-level = "MUST"
-quote = "A secret control packet's tag MUST be 0x60 for an unknown path secret packet, 0x61 for a stale key packet, 0x62 for a replay detected packet and 0x67 for a queue reset packet, with bit 0x04 set on the first three exactly when the packet carries a queue identifier."
