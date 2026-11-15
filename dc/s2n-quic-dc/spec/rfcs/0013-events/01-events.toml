@@ -3,7 +3,7 @@ anchor = "events"
 title = "Events"
 problem = "Without a record of what an endpoint does, an operator can't tell why a connection failed, why a datagram was dropped or why a peer was refused."
 motivation = "Events report each thing that happens in the endpoint as it happens, so that the application decides what to keep, count or forward."
-prose = "The endpoint reports what it does as events. Each event names one thing that happened, such as a datagram sent, a key accepted or a connection that timed out. An event carries the time it happened and its subject: the endpoint as a whole, or one connection, named by an identifier that is unique within the process. The events of a stream's key updates carry the identifier 0, which no connection is assigned. The application supplies a subscriber when it creates the endpoint, and the subscriber receives every event. An application that supplies none gets a subscriber that discards them."
+prose = "The endpoint reports what it does as events. Each event names one thing that happened, such as a datagram sent, a key accepted or a handshake confirmation that timed out. An event carries the time it happened and its subject: the endpoint as a whole, or one connection, named by an identifier that is unique within the process. The events of a stream's key updates carry the identifier 0, which no connection is assigned. The application supplies a subscriber when it creates the endpoint, and the subscriber receives every event. An application that supplies none gets a subscriber that discards them."
 
 [[requirement]]
 id = "DC-0013-001"

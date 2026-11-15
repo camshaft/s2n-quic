@@ -1,6 +1,6 @@
 ## Events {#events}
 
-The endpoint reports what it does as events. Each event names one thing that happened, such as a datagram sent, a key accepted or a connection that timed out. An event carries the time it happened and its subject: the endpoint as a whole, or one connection, named by an identifier that is unique within the process. The events of a stream's key updates carry the identifier 0, which no connection is assigned. The application supplies a subscriber when it creates the endpoint, and the subscriber receives every event. An application that supplies none gets a subscriber that discards them.
+The endpoint reports what it does as events. Each event names one thing that happened, such as a datagram sent, a key accepted or a handshake confirmation that timed out. An event carries the time it happened and its subject: the endpoint as a whole, or one connection, named by an identifier that is unique within the process. The events of a stream's key updates carry the identifier 0, which no connection is assigned. The application supplies a subscriber when it creates the endpoint, and the subscriber receives every event. An application that supplies none gets a subscriber that discards them.
 
 ### DC-0013-001 {#DC-0013-001}
 
