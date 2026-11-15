@@ -16,7 +16,7 @@ A sender MUST encrypt the frame payloads of each packet.
 
 ### DC-0005-052 {#DC-0005-052}
 
-A sender MUST authenticate every byte of each packet, its unencrypted header and frame metadata among them.
+A sender MUST authenticate every byte of each packet that carries frames, its unencrypted header and frame metadata among them.
 
 ### DC-0005-035 {#DC-0005-035}
 

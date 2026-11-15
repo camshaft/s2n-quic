@@ -34,7 +34,7 @@ id = "DC-0005-052"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A sender MUST authenticate every byte of each packet, its unencrypted header and frame metadata among them."
+statement = "A sender MUST authenticate every byte of each packet that carries frames, its unencrypted header and frame metadata among them."
 rationale = "Authenticating the unencrypted routing fields and metadata keeps an attacker from redirecting or reshaping frames without the receiver noticing."
 
 [[requirement]]
