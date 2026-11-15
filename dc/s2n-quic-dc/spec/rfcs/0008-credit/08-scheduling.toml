@@ -108,3 +108,11 @@ polarity = "required"
 binds_to = "system"
 statement = "A token bucket's burst SHOULD be 65535 bytes of cost at its rate."
 rationale = "A burst of one batch of segments lets a source that was idle send at once without flooding the device's queue."
+
+[[requirement]]
+id = "DC-0008-083"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A priority select MUST close when its fallback source closes while its priority source holds no item."
+rationale = "The fallback carries the pipeline's bulk work, so a select whose fallback ended and whose priority source is empty has no more work to yield; a pipeline that sends priority items later keeps its fallback open."

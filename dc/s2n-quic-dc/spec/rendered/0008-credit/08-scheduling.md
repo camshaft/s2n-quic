@@ -53,3 +53,7 @@ A token bucket MUST refill at its rate over the time since its last use, up to i
 ### DC-0008-068 {#DC-0008-068}
 
 A token bucket's burst SHOULD be 65535 bytes of cost at its rate.
+
+### DC-0008-083 {#DC-0008-083}
+
+A priority select MUST close when its fallback source closes while its priority source holds no item.

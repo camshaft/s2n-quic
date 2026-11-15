@@ -50,16 +50,16 @@ id = "DC-0008-051"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A pool MUST count, at each priority level, the requests it granted at once."
-rationale = "Beside the count of requests that waited, it shows how often holders of each level wait for credit."
+statement = "A pool MUST count the requests it granted at once."
+rationale = "Beside the counts of requests that waited at each level, it shows how often holders wait for credit."
 
 [[requirement]]
 id = "DC-0008-052"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A pool MUST count the bytes acquired."
-rationale = "Beside the bytes released over a long time, it shows whether holders return what they take."
+statement = "A pool MUST count the bytes requested: each request's whole amount when it is granted at once or begins to wait."
+rationale = "The bytes requested show the demand on the pool, whether or not each request is granted in full."
 
 [[requirement]]
 id = "DC-0008-053"
@@ -99,14 +99,14 @@ level = "MUST"
 polarity = "required"
 binds_to = "system"
 statement = "A pool MUST count the bytes released."
-rationale = "Beside the bytes acquired over a long time, it shows whether holders return what they take."
+rationale = "The bytes released show how much credit holders return to the pool."
 
 [[requirement]]
 id = "DC-0008-072"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A pool MUST count the releases made."
+statement = "A pool MUST count each release of more than 0 bytes made while it is open."
 rationale = "Beside the bytes released, it shows the size of a release."
 
 [[requirement]]
@@ -172,3 +172,11 @@ polarity = "required"
 binds_to = "system"
 statement = "A pool MUST report how many ticks in a row the refill added credit."
 rationale = "A long run of ticks that added credit shows how long the pool has been wedged."
+
+[[requirement]]
+id = "DC-0008-082"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "While a request waits, a pool MUST report how far its free credit is below its capacity."
+rationale = "The deficit shows how much credit the pool lacks to serve its waiters."
