@@ -1,0 +1,5 @@
+target = "rendered/0005-endpoint/04-acknowledgement.md#DC-0005-031"
+
+[[spec]]
+level = "MUST"
+quote = "After such an acknowledgement yields a round-trip sample, a sender MUST NOT mark another acknowledgement as ack-eliciting until it has sent a packet that carries data."

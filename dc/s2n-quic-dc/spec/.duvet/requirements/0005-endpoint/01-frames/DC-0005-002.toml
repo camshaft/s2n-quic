@@ -1,0 +1,5 @@
+target = "rendered/0005-endpoint/01-frames.md#DC-0005-002"
+
+[[spec]]
+level = "MUST"
+quote = "The endpoint MUST report exactly one outcome for each frame to its writer: acknowledged, or failed with its reason."
