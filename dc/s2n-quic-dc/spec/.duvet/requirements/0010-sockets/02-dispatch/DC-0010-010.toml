@@ -1,0 +1,5 @@
+target = "rendered/0010-sockets/02-dispatch.md#DC-0010-010"
+
+[[spec]]
+level = "MUST"
+quote = "Each packet passed to a handler MUST carry the sender address and the congestion marking of the datagram that held it."
