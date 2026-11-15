@@ -24,11 +24,11 @@ A pool MUST report the credit its holders hold, as its capacity less its free, o
 
 ### DC-0008-051 {#DC-0008-051}
 
-A pool MUST count the requests it granted at once.
+A pool MUST count the requests of more than 0 bytes it granted at once.
 
 ### DC-0008-052 {#DC-0008-052}
 
-A pool MUST count the bytes requested: each request's whole amount when it is granted at once or begins to wait.
+A pool MUST count the bytes requested: each request's amount, lowered to its level's largest single acquire, when it is granted at once or begins to wait.
 
 ### DC-0008-053 {#DC-0008-053}
 
@@ -52,7 +52,7 @@ A pool MUST count the bytes released.
 
 ### DC-0008-072 {#DC-0008-072}
 
-A pool MUST count each release of more than 0 bytes made while it is open.
+A pool MUST count each release of more than 0 bytes.
 
 ### DC-0008-073 {#DC-0008-073}
 
@@ -88,4 +88,4 @@ A pool MUST report how many ticks in a row the refill added credit.
 
 ### DC-0008-082 {#DC-0008-082}
 
-While a request waits, a pool MUST report how far its free credit is below its capacity.
+Where a refill is set, a pool MUST report, at each refill tick, how far its free credit is below its capacity.

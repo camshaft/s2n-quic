@@ -2,4 +2,4 @@ target = "rendered/0008-credit/07-signals.md#DC-0008-051"
 
 [[spec]]
 level = "MUST"
-quote = "A pool MUST count the requests it granted at once."
+quote = "A pool MUST count the requests of more than 0 bytes it granted at once."
