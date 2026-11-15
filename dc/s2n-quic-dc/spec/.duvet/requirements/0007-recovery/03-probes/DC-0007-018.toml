@@ -1,0 +1,5 @@
+target = "rendered/0007-recovery/03-probes.md#DC-0007-018"
+
+[[spec]]
+level = "MUST"
+quote = "A probe MUST carry the frames of the oldest outstanding packet, under a new packet number."
