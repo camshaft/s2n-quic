@@ -1,0 +1,5 @@
+target = "rendered/0003-credentials/06-handling.md#DC-0003-043"
+
+[[spec]]
+level = "MUST"
+quote = "An endpoint MUST overwrite each secret, key-update secret, key and IV with zeros when it stops using it."
