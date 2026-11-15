@@ -3,8 +3,14 @@
 
 use super::schedule;
 use crate::{crypto::awslc::open, packet::secret_control};
-use s2n_quic_core::varint::VarInt;
+use s2n_quic_core::varint::{VarInt, MAX_VARINT_VALUE};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The last key ID that [`State::next_key_id`] returns.
+///
+/// `next_key_id` panics where its counter is at `MAX_VARINT_VALUE - 1`, since it never moves the
+/// counter to `VarInt::MAX`, so the last ID it returns is one less than that.
+pub(crate) const MAX_KEY_ID: u64 = MAX_VARINT_VALUE - 2;
 
 type StatelessReset = [u8; secret_control::TAG_LEN];
 
@@ -62,16 +68,26 @@ impl State {
         secret.control_opener()
     }
 
-    /// Update the sender for a received stale key packet.
+    /// Update the sender for a received stale key or replay detected packet.
     ///
     /// This increments the current ID we are sending at to at least the ID provided in the packet.
+    ///
+    /// Returns false, and leaves the current ID as it is, where `min_key_id` is past
+    /// [`MAX_KEY_ID`]: the sender can't send at that ID, and [`Self::next_key_id`] would panic on
+    /// its next call.
     ///
     /// Note that this packet can be replayed without detection, we must deal with authenticated
     /// but arbitrarily old IDs here. In the future we may want to guard against advancing too
     /// quickly (e.g., due to bit flips), but for now we ignore that problem.
-    pub(super) fn update_for_stale_key(&self, min_key_id: VarInt) {
+    #[must_use]
+    pub(super) fn update_for_stale_key(&self, min_key_id: VarInt) -> bool {
+        if *min_key_id > MAX_KEY_ID {
+            return false;
+        }
+
         // Update the key to the new minimum to start at.
         self.current_id.fetch_max(*min_key_id, Ordering::Relaxed);
+        true
     }
 
     #[cfg(test)]
@@ -100,8 +116,27 @@ fn update_restarts_sequence() {
     let state = State::new([0; secret_control::TAG_LEN]);
     assert_eq!(*state.next_key_id(), 0);
 
-    state.update_for_stale_key(VarInt::new(3).unwrap());
+    assert!(state.update_for_stale_key(VarInt::new(3).unwrap()));
 
     // Update should start at the minimum trusted key ID on the other side.
     assert_eq!(*state.next_key_id(), 3);
+}
+
+#[test]
+fn update_refuses_a_key_id_past_the_limit() {
+    let state = State::new([0; secret_control::TAG_LEN]);
+    assert_eq!(*state.next_key_id(), 0);
+
+    // A minimum key ID past the last one `next_key_id` returns is refused, and the sender goes on
+    // from its current ID.
+    for min_key_id in [MAX_KEY_ID + 1, MAX_VARINT_VALUE] {
+        let min_key_id = VarInt::new(min_key_id).unwrap();
+        assert!(!state.update_for_stale_key(min_key_id));
+    }
+    assert_eq!(*state.next_key_id(), 1);
+
+    // The last key ID is accepted, and the sender sends at it.
+    let max_key_id = VarInt::new(MAX_KEY_ID).unwrap();
+    assert!(state.update_for_stale_key(max_key_id));
+    assert_eq!(*state.next_key_id(), MAX_KEY_ID);
 }
