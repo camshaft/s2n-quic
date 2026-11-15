@@ -33,6 +33,8 @@ use s2n_quic_core::varint::VarInt;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 #[cfg(test)]
+mod binding_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) enum Error {
@@ -76,7 +78,7 @@ enum FastPathError {
     HeaderMismatch,
     WriteFailed,
     /// The packet's routing fields steered it to a binding we are rejecting
-    /// (stale/unallocated/future binding, missing acceptor, or not a server view), so the
+    /// (stale, unallocated or future binding, or a chunk geometry the table rejects), so the
     /// scatter-decrypt never ran and the packet is still un-authenticated. The caller must
     /// authenticate it in place before ACKing.
     ///
@@ -90,25 +92,31 @@ enum FastPathError {
     AuthForDrop,
 }
 
+/// Whether `header` opens a stream: a `QueueMsg` that names the acceptor it is for.
+fn is_opening_frame(header: &Header) -> bool {
+    matches!(
+        header,
+        Header::QueueMsg {
+            dest_acceptor_id: Some(_),
+            ..
+        }
+    )
+}
+
 /// Fast path: decrypt a single-QueueMsg-frame packet directly into the slot buffer.
 ///
-/// Handles both init (with binding setup) and non-init frames.
-#[allow(clippy::too_many_arguments)]
+/// Handles a frame for a stream this receiver has bound already. An opening frame (see
+/// [`is_opening_frame`]) never takes this path: `process` sends it to the slow path, which
+/// authenticates the whole packet before it binds a slot, hands a stream to an acceptor, evicts
+/// a queued stream or sends a reset. An opening frame's header is a mismatch here, so a packet
+/// that reaches this function with one is dropped without an ACK.
 fn decrypt_fast_path(
     header: Header,
     opener: &crate::crypto::awslc::open::Application,
     packet: &packet::datagram::decoder::Packet<descriptor::Filled>,
     decrypt_len: usize,
     queue_view: &mut recv::QueueView,
-    acceptor_registry: &mut acceptor::LocalRegistry<Stream>,
-    frame_tx: &mut SubmissionSender,
-    freed_batch_tx: &mut crate::queue::FreedBatchTx,
     counters: &counters::Dispatch,
-    path_entry: &Arc<PathSecretEntry>,
-    stream_clock: &crate::time::DefaultClock,
-    reader_metrics: &Arc<crate::stream::metrics::ReaderMetrics>,
-    writer_metrics: &Arc<crate::stream::metrics::WriterMetrics>,
-    send_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
     recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) -> Result<AutoWake, FastPathError> {
     let Header::QueueMsg {
@@ -123,161 +131,12 @@ fn decrypt_fast_path(
         is_fin,
         is_wakeup,
         blocked,
-        dest_acceptor_id,
-        priority,
+        dest_acceptor_id: None,
+        priority: _,
     } = header
     else {
         return Err(FastPathError::HeaderMismatch);
     };
-
-    // Handle init: bind the slot before attempting push_msg
-    if let Some(acceptor_id) = dest_acceptor_id {
-        let Some(server_view) = queue_view.as_server_mut() else {
-            // Un-authenticated reject — caller must authenticate before ACKing. See `AuthForDrop`.
-            return Err(FastPathError::AuthForDrop);
-        };
-
-        let Some(acceptor_sender) = acceptor_registry.get(acceptor_id) else {
-            counters.rx_init_no_acceptor.add(1);
-            trace_server_bind(
-                *path_entry.id(),
-                queue_pair,
-                binding_id,
-                frame_trace::BindOutcome::NoAcceptor,
-            );
-            server_view.record_freed(queue_pair.dest_queue_id, path_entry, freed_batch_tx);
-            send_reset(
-                path_entry,
-                queue_pair,
-                binding_id,
-                error::ACCEPTOR_NOT_FOUND,
-                frame_tx,
-            );
-            // Un-authenticated reject — caller must authenticate before ACKing. See `AuthForDrop`.
-            return Err(FastPathError::AuthForDrop);
-        };
-
-        match server_view.bind_for_msg(
-            queue_pair.dest_queue_id,
-            binding_id,
-            path_entry,
-            freed_batch_tx,
-        ) {
-            Ok(crate::queue::BindResult::NewBinding {
-                waker,
-                stream,
-                control,
-                release_bytes,
-            }) => {
-                // `bind_for_msg` only allocates the slot, so this waker is empty
-                // and `release_bytes` zero today; the real wake/release comes from
-                // the `send_msg` below. Unlike the slow path there is no waker sink
-                // here (the fast path returns a single `AutoWake`), so let this
-                // `waker` drop-wake as its failsafe and release any bytes
-                // explicitly — never silently dropped.
-                recv_credit_pool.release(release_bytes);
-                drop(waker);
-                let writer = Writer::new_server(
-                    frame_tx.clone(),
-                    path_entry.clone(),
-                    queue_pair.source_queue_id,
-                    acceptor_id,
-                    control,
-                    stream_clock.clone(),
-                    writer_metrics.clone(),
-                    send_credit_pool.clone(),
-                    priority,
-                );
-                let reader = Reader::new_server(
-                    frame_tx.clone(),
-                    path_entry.clone(),
-                    queue_pair.source_queue_id,
-                    acceptor_id,
-                    stream,
-                    is_fin,
-                    stream_clock.clone(),
-                    reader_metrics.clone(),
-                    recv_credit_pool.clone(),
-                    priority,
-                );
-                let new_stream = Stream::new(reader, writer);
-                match acceptor_sender.send(new_stream) {
-                    Ok((mut evicted, acceptor_waker)) => {
-                        if let Some(ref mut ev) = evicted {
-                            ev.reset(crate::stream::endpoint::Error::ServerBusy);
-                        }
-                        counters.queue_accepted.add(1);
-                        trace_server_bind(
-                            *path_entry.id(),
-                            queue_pair,
-                            binding_id,
-                            frame_trace::BindOutcome::Accepted,
-                        );
-                        // We'll return the msg waker; acceptor waker fires on drop
-                        drop(AutoWake::new(acceptor_waker));
-                    }
-                    Err(acceptor::channel::SendError::Closed(mut s)) => {
-                        s.disable();
-                        counters.rx_init_acceptor_closed.add(1);
-                        trace_server_bind(
-                            *path_entry.id(),
-                            queue_pair,
-                            binding_id,
-                            frame_trace::BindOutcome::AcceptorClosed,
-                        );
-                        // `disable()` tears the bound slot down locally only (no frame). The
-                        // client is still establishing this binding and the QueueInit it sent
-                        // gets ACKed, so without an explicit reset it wedges in InitSent forever.
-                        // Notify it like the acceptor-not-found arm does.
-                        send_reset(
-                            path_entry,
-                            queue_pair,
-                            binding_id,
-                            error::ACCEPTOR_NOT_FOUND,
-                            frame_tx,
-                        );
-                    }
-                    Err(acceptor::channel::SendError::NoSlots(mut s)) => {
-                        s.disable();
-                        counters.rx_init_acceptor_no_slots.add(1);
-                        trace_server_bind(
-                            *path_entry.id(),
-                            queue_pair,
-                            binding_id,
-                            frame_trace::BindOutcome::NoSlots,
-                        );
-                        // See the `Closed` arm: the client must be reset explicitly or it
-                        // wedges in InitSent after its QueueInit is ACKed.
-                        send_reset(
-                            path_entry,
-                            queue_pair,
-                            binding_id,
-                            error::SERVER_BUSY,
-                            frame_tx,
-                        );
-                    }
-                }
-            }
-            Ok(crate::queue::BindResult::Bound {
-                waker,
-                release_bytes,
-            }) => {
-                trace_server_bind(
-                    *path_entry.id(),
-                    queue_pair,
-                    binding_id,
-                    frame_trace::BindOutcome::StaleOrBound,
-                );
-                // Slot already bound (init retransmit / coalesced frames). As with
-                // NewBinding above: no waker sink here, so release bytes
-                // explicitly and let `waker` drop-wake as its failsafe.
-                recv_credit_pool.release(release_bytes);
-                drop(waker);
-            }
-            // Un-authenticated reject — caller must authenticate before ACKing. See `AuthForDrop`.
-            Err(_) => return Err(FastPathError::AuthForDrop),
-        }
-    }
 
     // Scatter-decrypt directly into the slot buffer
     let waker = queue_view.send_msg(
@@ -434,6 +293,11 @@ where
     // Detect single-QueueMsg frame for the fast path (scatter-decrypt into slot buffer).
     let single_queue_msg =
         decode::detect_single_queue_msg(packet.application_header(), decrypt_len);
+    // An opening frame takes the slow path instead. The slow path authenticates the whole packet
+    // before `handle_queue_msg_init` binds a slot, hands the stream to an acceptor, evicts a
+    // queued stream or sends a reset, so a packet that fails authentication changes none of that
+    // state. The cost is one copy of an opening frame's payload.
+    let single_queue_msg = single_queue_msg.filter(|header| !is_opening_frame(header));
 
     // Get or create peer receive state, decrypting the packet on-demand.
     //
@@ -448,7 +312,7 @@ where
     let mut control_out = Vec::new();
     let decrypt_fn = |opener: &crate::crypto::awslc::open::Application,
                       queue_view: &mut recv::QueueView,
-                      path_entry: &Arc<PathSecretEntry>|
+                      _path_entry: &Arc<PathSecretEntry>|
      -> Option<DecryptResult> {
         let _guard = counters.rx_decrypt_time.start();
 
@@ -468,15 +332,7 @@ where
                 &packet,
                 decrypt_len,
                 queue_view,
-                acceptor_registry,
-                frame_tx,
-                freed_batch_tx,
                 counters,
-                path_entry,
-                stream_clock,
-                reader_metrics,
-                writer_metrics,
-                send_credit_pool,
                 recv_credit_pool,
             ) {
                 Ok(waker) => Some(DecryptResult::FastPath(waker)),
