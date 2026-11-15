@@ -1,6 +1,6 @@
 ## Rejected keys and silent peers {#peers}
 
-A peer tells the endpoint that it doesn't know a path secret, that a key is stale, or that it detected a replay, through the notices RFC 0002 defines. The endpoint acts on such a notice only once it has validated it against its path secrets. A send state that receives nothing from its peer for the idle timeout is discarded; where it still held packets the peer never acknowledged, the peer is declared dead.
+A peer tells the endpoint that it doesn't know a path secret, that a key is stale, or that it detected a replay, through the notices RFC 0002 defines. The endpoint acts on such a notice only once it has validated it against its path secrets. A send state that receives nothing from its peer for the idle timeout is discarded; where it still held packets the peer never acknowledged, the peer is declared dead, unless the cooldown of an earlier declaration is still running.
 
 ### DC-0005-040 {#DC-0005-040}
 
@@ -32,7 +32,7 @@ When a sender discards a send state for idleness, it MUST fail each of its pendi
 
 ### DC-0005-047 {#DC-0005-047}
 
-When a send state discarded for idleness still held packets its peer never acknowledged, the endpoint MUST reset every stream with that peer.
+When a send state discarded for idleness still held packets its peer never acknowledged, and the cooldown of an earlier declaration of the peer as dead isn't running, the endpoint MUST reset every stream with that peer.
 
 ### DC-0005-048 {#DC-0005-048}
 

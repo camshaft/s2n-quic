@@ -3,7 +3,7 @@ anchor = "peers"
 title = "Rejected keys and silent peers"
 problem = "A peer can lose a path secret, reject a key as stale or replayed, or stop answering, and a sender that goes on sending under the old state wastes the path and leaves its streams hanging."
 motivation = "Acting on each validated rejection and on prolonged silence lets the endpoint send again under a fresh key where the peer is still there, and fail and reset the streams of a peer that is gone, so that no stream waits forever."
-prose = "A peer tells the endpoint that it doesn't know a path secret, that a key is stale, or that it detected a replay, through the notices RFC 0002 defines. The endpoint acts on such a notice only once it has validated it against its path secrets. A send state that receives nothing from its peer for the idle timeout is discarded; where it still held packets the peer never acknowledged, the peer is declared dead."
+prose = "A peer tells the endpoint that it doesn't know a path secret, that a key is stale, or that it detected a replay, through the notices RFC 0002 defines. The endpoint acts on such a notice only once it has validated it against its path secrets. A send state that receives nothing from its peer for the idle timeout is discarded; where it still held packets the peer never acknowledged, the peer is declared dead, unless the cooldown of an earlier declaration is still running."
 
 [[requirement]]
 id = "DC-0005-040"
@@ -66,7 +66,7 @@ id = "DC-0005-047"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "When a send state discarded for idleness still held packets its peer never acknowledged, the endpoint MUST reset every stream with that peer."
+statement = "When a send state discarded for idleness still held packets its peer never acknowledged, and the cooldown of an earlier declaration of the peer as dead isn't running, the endpoint MUST reset every stream with that peer."
 rationale = "Unacknowledged packets after a full idle timeout show that the peer is unreachable, and a stream with it would otherwise wait forever."
 
 [[requirement]]
