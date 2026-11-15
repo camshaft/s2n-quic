@@ -4,6 +4,7 @@
 use super::IntoNonce;
 use aws_lc_rs::aead::{Aad, Algorithm, LessSafeKey, Nonce, UnboundKey, NONCE_LEN};
 use s2n_quic_core::{assume, packet::KeyPhase};
+use zeroize::Zeroize;
 
 pub use aws_lc_rs::aead::{AES_128_GCM, AES_256_GCM};
 
@@ -350,6 +351,13 @@ mod control {
 #[derive(Debug)]
 struct Iv([u8; NONCE_LEN]);
 
+impl Drop for Iv {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl Iv {
     #[inline]
     fn nonce<N: IntoNonce>(&self, nonce: N) -> Nonce {
@@ -358,5 +366,22 @@ impl Iv {
             *dst ^= src;
         }
         Nonce::assume_unique_for_key(nonce)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::MaybeUninit;
+
+    #[test]
+    fn iv_is_zeroed_on_drop() {
+        let mut iv = MaybeUninit::new(Iv([0xa5; NONCE_LEN]));
+        // Safety: `iv` holds an initialized `Iv`, which is dropped once here and isn't used as an
+        // `Iv` again.
+        unsafe { core::ptr::drop_in_place(iv.as_mut_ptr()) };
+        // Safety: the drop leaves the bytes of the `Iv` in place, and a byte array has no padding.
+        let bytes = unsafe { core::ptr::addr_of!((*iv.as_ptr()).0).read() };
+        assert_eq!(bytes, [0; NONCE_LEN]);
     }
 }

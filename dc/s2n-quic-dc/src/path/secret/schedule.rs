@@ -208,7 +208,7 @@ impl Secret {
         initiator: Initiator,
     ) -> (seal::Application, SealUpdate, open::Application, OpenUpdate) {
         let ciphersuite = &self.ciphersuite;
-        let mut out = [0u8; (NONCE_LEN + MAX_KEY_LEN) * 2 + MAX_KEY_LEN * 2];
+        let mut out = Zeroizing::new([0u8; (NONCE_LEN + MAX_KEY_LEN) * 2 + MAX_KEY_LEN * 2]);
         let key_len = hkdf::KeyType::len(ciphersuite);
         let out_len = (NONCE_LEN + key_len) * 2 + key_len * 2;
 
@@ -264,7 +264,7 @@ impl Secret {
         initiator: Initiator,
     ) -> (seal::control::Stream, open::control::Stream) {
         let ciphersuite = &self.ciphersuite;
-        let mut out = [0u8; MAX_HMAC_KEY_LEN * 2];
+        let mut out = Zeroizing::new([0u8; MAX_HMAC_KEY_LEN * 2]);
         let key_len = {
             // Use the block length for the key, instead of output length for stronger security and to
             // avoid padding.
@@ -326,7 +326,7 @@ impl Secret {
     where
         F: FnOnce(&'static aead::Algorithm, &[u8], [u8; NONCE_LEN]) -> R,
     {
-        let mut out = [0u8; NONCE_LEN + MAX_KEY_LEN];
+        let mut out = Zeroizing::new([0u8; NONCE_LEN + MAX_KEY_LEN]);
         let key_len = hkdf::KeyType::len(&self.ciphersuite);
         let out_len = NONCE_LEN + key_len;
         debug_assert!(out_len <= u16::MAX as usize);
@@ -360,7 +360,7 @@ impl Secret {
     where
         F: FnOnce(&[u8], &'static hmac::Algorithm) -> R,
     {
-        let mut out = [0u8; MAX_HMAC_KEY_LEN];
+        let mut out = Zeroizing::new([0u8; MAX_HMAC_KEY_LEN]);
         let key_len = {
             // Use the block length for the key, instead of output length for stronger security and to
             // avoid padding.
@@ -472,7 +472,7 @@ impl Updater {
     {
         let ciphersuite = &self.ciphersuite;
 
-        let mut out = [0u8; NONCE_LEN + MAX_KEY_LEN * 2];
+        let mut out = Zeroizing::new([0u8; NONCE_LEN + MAX_KEY_LEN * 2]);
         let key_len = hkdf::KeyType::len(ciphersuite);
         let out_len = NONCE_LEN + key_len * 2;
         let (out, _) = out.split_at_mut(out_len);
