@@ -1,0 +1,5 @@
+target = "rendered/0013-events/03-privacy.md#DC-0013-018"
+
+[[spec]]
+level = "MUST"
+quote = "A textual form of an event, such as a snapshot or a log line, MUST NOT show the value of a credential identifier."
