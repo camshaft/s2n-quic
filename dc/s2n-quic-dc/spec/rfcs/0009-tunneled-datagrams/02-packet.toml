@@ -58,7 +58,7 @@ id = "DC-0009-013"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A sender MUST write as the packet's control port the port of the control path it is bound to."
+statement = "A sender MUST write as the packet's control port the source port of the control path its caller passes to the send."
 rationale = "The receiver answers on that port, so a control message about the datagrams reaches the sender's control path."
 
 [[requirement]]
@@ -66,5 +66,29 @@ id = "DC-0009-014"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A sender MUST encrypt the payload and authenticate the whole header together with it, with the packet number as the nonce and the phase of its key in the key phase bit."
+statement = "A sender MUST encrypt the whole payload of each packet."
+rationale = "The payload belongs to the application, and only a holder of the path secret may read it."
+
+[[requirement]]
+id = "DC-0009-028"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A sender MUST authenticate the whole header of each packet together with its payload."
 rationale = "An attacker who changed any header field, the credentials or the packet number among them, would then fail the receiver's check of the tag."
+
+[[requirement]]
+id = "DC-0009-029"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A sender MUST use the packet's packet number as the nonce of its encryption."
+rationale = "The packet number is unique under the key, so each nonce is too, and the receiver reads it from the packet."
+
+[[requirement]]
+id = "DC-0009-030"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A sender MUST write the phase of the key that seals a packet in the packet's key phase bit."
+rationale = "The receiver reads the bit to choose the key that opens the packet."

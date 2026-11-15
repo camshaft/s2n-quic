@@ -28,8 +28,20 @@ A sender MUST write wire version zero in each tunneled datagram packet it sends.
 
 ### DC-0009-013 {#DC-0009-013}
 
-A sender MUST write as the packet's control port the port of the control path it is bound to.
+A sender MUST write as the packet's control port the source port of the control path its caller passes to the send.
 
 ### DC-0009-014 {#DC-0009-014}
 
-A sender MUST encrypt the payload and authenticate the whole header together with it, with the packet number as the nonce and the phase of its key in the key phase bit.
+A sender MUST encrypt the whole payload of each packet.
+
+### DC-0009-028 {#DC-0009-028}
+
+A sender MUST authenticate the whole header of each packet together with its payload.
+
+### DC-0009-029 {#DC-0009-029}
+
+A sender MUST use the packet's packet number as the nonce of its encryption.
+
+### DC-0009-030 {#DC-0009-030}
+
+A sender MUST write the phase of the key that seals a packet in the packet's key phase bit.

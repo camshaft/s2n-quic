@@ -2,4 +2,4 @@ target = "rendered/0009-tunneled-datagrams/03-receiving.md#DC-0009-019"
 
 [[spec]]
 level = "MUST"
-quote = "A receiver MUST NOT hand a payload to the application unless the packet's authentication tag verifies over its header and its payload, under the key its credentials identify and with its packet number as the nonce."
+quote = "A receiver MUST NOT hand a payload to the application unless the packet's authentication tag verifies over its header and its payload, under the receiver's key and with its packet number as the nonce."

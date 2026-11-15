@@ -2,4 +2,4 @@ target = "rendered/0009-tunneled-datagrams/02-packet.md#DC-0009-014"
 
 [[spec]]
 level = "MUST"
-quote = "A sender MUST encrypt the payload and authenticate the whole header together with it, with the packet number as the nonce and the phase of its key in the key phase bit."
+quote = "A sender MUST encrypt the whole payload of each packet."

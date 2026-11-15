@@ -2,8 +2,8 @@
 anchor = "receiving"
 title = "Receiving"
 problem = "A receiver that acts on a packet it can't authenticate, or on a packet of another kind, hands an attacker's bytes to the application."
-motivation = "Checking the first byte before anything else drops packets of the wrong kind cheaply, and opening the payload only under the key the credentials identify keeps every payload the application reads one that a holder of the path secret sealed."
-prose = "A receiver decodes a packet from the front of a datagram and leaves the bytes after it for the next packet. It rejects a packet whose first byte doesn't mark a datagram packet, or marks routing information or an application header. It opens the payload with the key the credentials identify, with the packet number as the nonce and the header as associated data, and hands the payload to the application only once the authentication tag verifies."
+motivation = "Checking the first byte before anything else drops packets of the wrong kind cheaply, and opening the payload only under the receiver's key keeps every payload the application reads one that a holder of the path secret sealed."
+prose = "A receiver decodes a packet from the front of a datagram and leaves the bytes after it for the next packet. It rejects a packet whose first byte doesn't mark a datagram packet, marks routing information or an application header, or doesn't mark a packet number, and a packet whose wire version isn't zero. It opens the payload with its key, with the packet number as the nonce and the header as associated data, and hands the payload to the application only once the authentication tag verifies. The receiver's caller chooses that key, and a packet whose credentials identify another key fails the tag, since the tag authenticates the credentials."
 
 [[requirement]]
 id = "DC-0009-015"
@@ -42,7 +42,7 @@ id = "DC-0009-019"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
-statement = "A receiver MUST NOT hand a payload to the application unless the packet's authentication tag verifies over its header and its payload, under the key its credentials identify and with its packet number as the nonce."
+statement = "A receiver MUST NOT hand a payload to the application unless the packet's authentication tag verifies over its header and its payload, under the receiver's key and with its packet number as the nonce."
 rationale = "A payload whose tag doesn't verify could come from anyone, or could have been changed on the way."
 
 [[requirement]]
@@ -52,3 +52,19 @@ polarity = "required"
 binds_to = "system"
 statement = "A datagram MAY carry more than one tunneled datagram packet, each starting at the byte after the end of the one before it."
 rationale = "Several small payloads can share one datagram, which saves the cost of a send for each."
+
+[[requirement]]
+id = "DC-0009-031"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A receiver MUST reject a packet whose wire version isn't zero."
+rationale = "Zero is the only layout this RFC defines, so the receiver can't read the fields of a packet of another version."
+
+[[requirement]]
+id = "DC-0009-032"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "A receiver MUST reject a packet whose packet number bit is clear."
+rationale = "A packet without its number would be opened under a fixed nonce and couldn't be checked for replay."
