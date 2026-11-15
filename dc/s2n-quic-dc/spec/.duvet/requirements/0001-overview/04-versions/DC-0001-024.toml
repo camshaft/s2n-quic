@@ -2,4 +2,4 @@ target = "rendered/0001-overview/04-versions.md#DC-0001-024"
 
 [[spec]]
 level = "MUST"
-quote = "A peer MUST encode each dc version in the transport parameter 0xdc0000 as a variable-length integer."
+quote = "A client MUST NOT list more than four dc versions."

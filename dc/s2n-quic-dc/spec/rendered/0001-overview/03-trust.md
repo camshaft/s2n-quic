@@ -24,4 +24,8 @@ A server MUST send the client the stateless reset tokens it derives from the pat
 
 ### DC-0001-019 {#DC-0001-019}
 
-Each peer MUST treat the handshake as complete for the dc protocol only once the other peer has confirmed that it received its stateless reset tokens.
+A client MUST treat the dc handshake as complete once it receives the server's stateless reset tokens.
+
+### DC-0001-020 {#DC-0001-020}
+
+A server MUST treat the dc handshake as complete once the client acknowledges the frame that carries the server's stateless reset tokens.
