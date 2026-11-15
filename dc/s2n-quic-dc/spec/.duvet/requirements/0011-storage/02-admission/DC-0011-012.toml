@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/02-admission.md#DC-0011-012"
+
+[[spec]]
+level = "MUST"
+quote = "The device MUST NOT admit work faster than its configured rate ceiling."
