@@ -1,0 +1,30 @@
+[section]
+anchor = "privacy"
+title = "Credentials and secrets in diagnostics"
+problem = "A credential identifier or key material copied into a log or a stored snapshot reaches readers who were never meant to hold it."
+motivation = "Keeping secrets out of every textual form lets operators share logs and snapshots, while the application can still join the events of one peer."
+prose = "An event delivered to the subscriber may carry the identifier of the credential a connection uses, so that the application can group the events of one peer. A textual form of an event, such as a snapshot taken for a test or a line written to a log, hides that identifier. No event, metric or log line carries key material."
+
+[[requirement]]
+id = "DC-0013-018"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "A textual form of an event, such as a snapshot or a log line, MUST NOT show the value of a credential identifier."
+rationale = "Text is stored and shared beyond the application, and a credential identifier names the peer's secret."
+
+[[requirement]]
+id = "DC-0013-019"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "An event, a metric or a log line MUST NOT carry the bytes of a key or of a path secret."
+rationale = "Anyone who reads key material can read or forge the traffic it protects."
+
+[[requirement]]
+id = "DC-0013-020"
+level = "MAY"
+polarity = "required"
+binds_to = "system"
+statement = "An event delivered to the subscriber MAY carry the identifier of the credential a connection uses."
+rationale = "The application can join the events of one peer by it, and the application already holds that identifier."
