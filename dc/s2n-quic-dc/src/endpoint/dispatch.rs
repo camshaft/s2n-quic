@@ -202,10 +202,7 @@ fn decrypt_fast_path(
                 );
                 let new_stream = Stream::new(reader, writer);
                 match acceptor_sender.send(new_stream) {
-                    Ok((mut evicted, acceptor_waker)) => {
-                        if let Some(ref mut ev) = evicted {
-                            ev.reset(crate::stream::endpoint::Error::ServerBusy);
-                        }
+                    Ok(acceptor_waker) => {
                         counters.queue_accepted.add(1);
                         trace_server_bind(
                             *path_entry.id(),
@@ -1580,10 +1577,7 @@ fn handle_queue_msg_init(
             let new_stream = Stream::new(reader, writer);
 
             match acceptor_sender.send(new_stream) {
-                Ok((mut evicted, acceptor_waker)) => {
-                    if let Some(ref mut ev) = evicted {
-                        ev.reset(crate::stream::endpoint::Error::ServerBusy);
-                    }
+                Ok(acceptor_waker) => {
                     counters.queue_accepted.add(1);
                     trace_server_bind(
                         cred_id,
@@ -1786,10 +1780,7 @@ fn handle_queue_data_init(
             let new_stream = Stream::new(reader, writer);
 
             match acceptor_sender.send(new_stream) {
-                Ok((mut evicted, acceptor_waker)) => {
-                    if let Some(ref mut ev) = evicted {
-                        ev.reset(crate::stream::endpoint::Error::ServerBusy);
-                    }
+                Ok(acceptor_waker) => {
                     counters.queue_accepted.add(1);
                     trace_server_bind(
                         cred_id,
@@ -2303,10 +2294,7 @@ fn bind_for_reset(
             let new_stream = Stream::new(reader, writer);
 
             match acceptor_sender.send(new_stream) {
-                Ok((mut evicted, acceptor_waker)) => {
-                    if let Some(ref mut ev) = evicted {
-                        ev.reset(crate::stream::endpoint::Error::ServerBusy);
-                    }
+                Ok(acceptor_waker) => {
                     counters.queue_accepted.add(1);
                     trace_server_bind(
                         cred_id,

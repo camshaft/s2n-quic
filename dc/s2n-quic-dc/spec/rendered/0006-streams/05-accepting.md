@@ -22,17 +22,17 @@ A server MUST let acceptors registered under different identifiers receive strea
 
 A server MUST reject a stream whose acceptor identifier doesn't name a registered acceptor.
 
-### DC-0006-042 {#DC-0006-042}
+### DC-0006-057 {#DC-0006-057}
 
-Each receiver of an acceptor MUST hold its waiting streams in a queue whose capacity the application configures.
+Each receiver of an acceptor MUST keep every stream that waits for it until the application takes the stream or drops the receiver.
 
-### DC-0006-043 {#DC-0006-043}
+### DC-0006-058 {#DC-0006-058}
 
-When a receiver's queue is full, the server MUST evict either the oldest or the newest waiting stream, as the application configures.
+The server MUST NOT evict a waiting stream from a receiver's queue to make room for a new stream.
 
-### DC-0006-044 {#DC-0006-044}
+### DC-0006-059 {#DC-0006-059}
 
-The server MUST reset each stream it evicts from a receiver's queue.
+The server MUST NOT give a client back the credit of a stream until the application has finished with the stream.
 
 ### DC-0006-045 {#DC-0006-045}
 
