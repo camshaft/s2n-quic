@@ -1,0 +1,5 @@
+target = "rendered/0002-path-secrets/05-handshake-requests.md#DC-0002-044"
+
+[[spec]]
+level = "SHOULD"
+quote = "An endpoint SHOULD evict a path secret and handshake again with its peer where the path secret is marked dead, its dead-peer cooldown has passed, and it is silent."

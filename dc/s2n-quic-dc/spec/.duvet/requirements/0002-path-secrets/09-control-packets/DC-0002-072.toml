@@ -1,0 +1,5 @@
+target = "rendered/0002-path-secrets/09-control-packets.md#DC-0002-072"
+
+[[spec]]
+level = "SHOULD"
+quote = "An endpoint SHOULD drop a secret control packet that it can't send at once, instead of queuing it."

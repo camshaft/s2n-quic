@@ -1,0 +1,5 @@
+target = "rendered/0002-path-secrets/09-control-packets.md#DC-0002-065"
+
+[[spec]]
+level = "MUST"
+quote = "An endpoint MUST answer a packet that names a path secret it doesn't hold with an unknown path secret packet authenticated with the stateless reset token the endpoint computes for that path secret's identifier."

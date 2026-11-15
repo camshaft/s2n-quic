@@ -1,0 +1,70 @@
+[section]
+anchor = "control-packets"
+title = "Secret control packets"
+problem = "Two endpoints whose path secret states diverge, by a restart, an eviction or a gap in key identifiers, can't open each other's packets until one tells the other."
+motivation = "Small authenticated control packets let a receiver tell a sender what went wrong, so the sender fixes its key identifiers or handshakes again, without letting a third party forge that report."
+prose = "There are three secret control packets. A stale key packet carries the lowest key identifier its sender would accept; a replay detected packet carries a key identifier its sender rejected; both are authenticated with the control key of the path secret they name, which RFC 0003 derives. An unknown path secret packet tells a peer that its sender doesn't hold the path secret a packet named, and is authenticated with the stateless reset token its sender gave for that path secret. RFC 0004 specifies their wire format."
+
+[[requirement]]
+id = "DC-0002-065"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "An endpoint MUST answer a packet that names a path secret it doesn't hold with an unknown path secret packet authenticated with the stateless reset token the endpoint computes for that path secret's identifier."
+rationale = "The peer accepts the report only where it carries the token the peer stored for that path secret, and the endpoint can compute that token without the path secret."
+
+[[requirement]]
+id = "DC-0002-066"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "An endpoint MUST authenticate each stale key and replay detected packet it sends with the control key of the path secret the packet names."
+rationale = "Only an endpoint that holds the path secret can then send one, so a third party can't move the sender's key identifiers."
+
+[[requirement]]
+id = "DC-0002-067"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "An endpoint MUST NOT act on a secret control packet that fails authentication."
+rationale = "An unauthenticated control packet could come from anyone on the path."
+
+[[requirement]]
+id = "DC-0002-068"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "An endpoint MUST find the path secret a received control packet names by the identifier of its own side of that path secret, derived from the identifier the packet carries."
+rationale = "The packet's sender writes the identifier from its own side, and each side's identifier differs in the role it carries."
+
+[[requirement]]
+id = "DC-0002-069"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "An endpoint MUST request a handshake with the peer when it accepts an unknown path secret packet."
+rationale = "The peer no longer holds the path secret, so only a new handshake restores the path."
+
+[[requirement]]
+id = "DC-0002-070"
+level = "MAY"
+polarity = "required"
+binds_to = "system"
+statement = "An endpoint MAY evict the path secret an accepted unknown path secret packet names, where its configuration asks for it."
+rationale = "Evicting at once stops new flows under a path secret the peer can't open, at the cost of the flows still in progress."
+
+[[requirement]]
+id = "DC-0002-071"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "An endpoint MUST NOT treat an unknown path secret packet as proof that its peer holds the path secret."
+rationale = "The stateless reset token authenticates the packet's origin weakly and says nothing of the path secret, so the packet can't clear a dead mark."
+
+[[requirement]]
+id = "DC-0002-072"
+level = "SHOULD"
+polarity = "required"
+binds_to = "system"
+statement = "An endpoint SHOULD drop a secret control packet that it can't send at once, instead of queuing it."
+rationale = "Control packets answer packets that keep arriving, so a later packet brings a fresh answer and a queue would only add delay and memory."
