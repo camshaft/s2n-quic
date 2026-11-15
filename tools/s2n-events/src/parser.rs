@@ -115,7 +115,32 @@ impl Struct {
         let builder_fields = fields.iter().map(Field::builder);
         let builder_field_impls = fields.iter().map(Field::builder_impl);
         let api_fields = fields.iter().map(Field::api);
-        let snapshot_fields = fields.iter().map(Field::snapshot);
+        let snapshot_fields: Vec<_> = fields.iter().map(Field::snapshot).collect();
+        let tracing_patterns: Vec<_> = fields.iter().map(Field::tracing_pattern).collect();
+        let tracing_fields: Vec<_> = fields.iter().map(Field::tracing).collect();
+
+        // A field with a `#[snapshot(...)]` attribute is written in its snapshot form in each
+        // textual form of the struct: its snapshot, its `Debug` form and its tracing fields. A
+        // struct with such a field implements `Debug` with the snapshot's form of each field
+        // instead of deriving it.
+        let has_snapshot_fields = fields.iter().any(|field| field.attrs.snapshot.is_some());
+        let (derive, debug_impl) = if has_snapshot_fields {
+            (
+                quote!(#[derive(Clone)]),
+                quote!(
+                    #allow_deprecated
+                    impl #generics core::fmt::Debug for #ident #generics {
+                        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+                            let mut fmt = fmt.debug_struct(#ident_str);
+                            #(#snapshot_fields)*
+                            fmt.finish()
+                        }
+                    }
+                ),
+            )
+        } else {
+            (quote!(#[derive(Clone, Debug)]), quote!())
+        };
 
         if attrs.builder_derive {
             output.builders.extend(quote!(
@@ -124,11 +149,13 @@ impl Struct {
         }
 
         output.builders.extend(quote!(
-            #[derive(Clone, Debug)]
+            #derive
             #extra_attrs
             pub struct #ident #generics {
                 #(#builder_fields)*
             }
+
+            #debug_impl
 
             #allow_deprecated
             impl #generics IntoEvent<api::#ident #generics> for #ident #generics {
@@ -146,8 +173,14 @@ impl Struct {
         ));
 
         if attrs.derive {
-            output.api.extend(quote!(#[derive(Clone, Debug)]));
+            output.api.extend(quote!(#derive));
         }
+
+        let api_debug_impl = if attrs.derive {
+            debug_impl
+        } else {
+            quote!()
+        };
 
         if !attrs.exhaustive {
             output.api.extend(quote!(#[non_exhaustive]));
@@ -161,6 +194,8 @@ impl Struct {
             pub struct #ident #generics {
                 #(#api_fields)*
             }
+
+            #api_debug_impl
 
             #[cfg(any(test, feature = "testing"))]
             #allow_deprecated
@@ -242,8 +277,8 @@ impl Struct {
                         #allow_deprecated
                         fn #function(&#receiver self, meta: &api::EndpointMeta, event: &api::#ident) {
                             let parent = self.parent(meta);
-                            let api::#ident { #(#destructure_fields),* } = event;
-                            tracing::event!(target: #snake, parent: parent, tracing::Level::DEBUG, { #(#destructure_fields = tracing::field::debug(#destructure_fields)),* });
+                            let api::#ident { #(#tracing_patterns),* } = event;
+                            tracing::event!(target: #snake, parent: parent, tracing::Level::DEBUG, { #(#tracing_fields),* });
                         }
                     ));
 
@@ -354,8 +389,8 @@ impl Struct {
                             event: &api::#ident
                         ) {
                             let id = context.id();
-                            let api::#ident { #(#destructure_fields),* } = event;
-                            tracing::event!(target: #snake, parent: id, tracing::Level::DEBUG, { #(#destructure_fields = tracing::field::debug(#destructure_fields)),* });
+                            let api::#ident { #(#tracing_patterns),* } = event;
+                            tracing::event!(target: #snake, parent: id, tracing::Level::DEBUG, { #(#tracing_fields),* });
                         }
                     ));
 
@@ -683,6 +718,33 @@ impl Field {
     fn destructure(&self) -> TokenStream {
         let Self { ident, .. } = self;
         quote!(#ident)
+    }
+
+    /// The field's pattern in the tracing integration's destructure of the event
+    ///
+    /// A field written in its snapshot form doesn't read its value, so the pattern doesn't
+    /// bind it.
+    fn tracing_pattern(&self) -> TokenStream {
+        let Self { attrs, ident, .. } = self;
+        if attrs.snapshot.is_some() {
+            quote!(#ident: _)
+        } else {
+            quote!(#ident)
+        }
+    }
+
+    /// The field as the tracing integration records it
+    ///
+    /// A field with a `#[snapshot(...)]` attribute is recorded in its snapshot form. The
+    /// expression is evaluated in the subscriber's method, where `self` is the subscriber and
+    /// not the event.
+    fn tracing(&self) -> TokenStream {
+        let Self { attrs, ident, .. } = self;
+        if let Some(expr) = attrs.snapshot.as_ref() {
+            quote!(#ident = tracing::field::debug(&#expr))
+        } else {
+            quote!(#ident = tracing::field::debug(#ident))
+        }
     }
 
     fn builder(&self) -> TokenStream {
