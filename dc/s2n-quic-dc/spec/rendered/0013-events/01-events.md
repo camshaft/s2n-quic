@@ -1,6 +1,6 @@
 ## Events {#events}
 
-The endpoint reports what it does as events. Each event names one thing that happened, such as a datagram sent, a key accepted or a connection that timed out. An event carries the time it happened and its subject: the endpoint as a whole, or one connection, named by an identifier that is unique within the process. The application supplies a subscriber when it creates the endpoint, and the subscriber receives every event. An application that supplies none gets a subscriber that discards them.
+The endpoint reports what it does as events. Each event names one thing that happened, such as a datagram sent, a key accepted or a connection that timed out. An event carries the time it happened and its subject: the endpoint as a whole, or one connection, named by an identifier that is unique within the process. The events of a stream's key updates carry the identifier 0, which no connection is assigned. The application supplies a subscriber when it creates the endpoint, and the subscriber receives every event. An application that supplies none gets a subscriber that discards them.
 
 ### DC-0013-001 {#DC-0013-001}
 
@@ -12,7 +12,7 @@ Each event MUST carry the time at which it happened and its subject, which is ei
 
 ### DC-0013-003 {#DC-0013-003}
 
-The system MUST assign each connection an identifier that no earlier connection of the same process held, counting up from 1.
+Each identifier the system assigns to a connection MUST differ from every identifier it assigned earlier in the same process, counting up from 1.
 
 ### DC-0013-004 {#DC-0013-004}
 
@@ -25,3 +25,7 @@ An endpoint created without a subscriber MUST use a subscriber that discards eve
 ### DC-0013-006 {#DC-0013-006}
 
 The endpoint SHOULD report an event without waiting for the subscriber to write or send anything.
+
+### DC-0013-049 {#DC-0013-049}
+
+An event of a stream's key update MUST carry the connection identifier 0, which the system assigns to no connection.

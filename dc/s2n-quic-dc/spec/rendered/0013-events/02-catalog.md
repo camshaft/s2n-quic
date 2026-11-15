@@ -16,7 +16,7 @@ The endpoint MUST report an event for each transmission and each receive operati
 
 ### DC-0013-010 {#DC-0013-010}
 
-The endpoint MUST report an event when a connection times out.
+The endpoint MUST report an event when the confirmation of a handshake or a path MTU probe times out, with the peer's address.
 
 ### DC-0013-011 {#DC-0013-011}
 

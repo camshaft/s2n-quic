@@ -24,7 +24,7 @@ Recording a value to a metric MUST NOT wait for a lock that another processor ho
 
 ### DC-0013-026 {#DC-0013-026}
 
-A set of counters for the outcomes of one event MUST share one metric name and differ by variant, with one variant that counts each outcome the set doesn't list.
+The counters registered for the variants of one enumerated outcome MUST share one metric name and differ by variant, with one variant that counts each value the enumeration doesn't list.
 
 ### DC-0013-027 {#DC-0013-027}
 

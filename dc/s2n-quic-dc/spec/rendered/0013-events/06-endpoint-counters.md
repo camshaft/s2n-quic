@@ -4,7 +4,7 @@ The receive path counts each datagram by what happened to it, each failure by it
 
 ### DC-0013-039 {#DC-0013-039}
 
-The receive path MUST count each datagram by its outcome: dispatched to a stream, dispatched to a control queue, refused because no acceptor or free slot was available, or dropped for an unallocated, half-closed, stale or future binding.
+The receive path MUST count each datagram by its outcome: dispatched to a stream, dispatched to a control queue, refused because no acceptor was available, the acceptor was closed or no free slot was available, or dropped for an unallocated, half-closed, stale or future binding.
 
 ### DC-0013-040 {#DC-0013-040}
 

@@ -34,8 +34,8 @@ id = "DC-0013-010"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The endpoint MUST report an event when a connection times out."
-rationale = "A timeout ends a connection without any message from the peer, so the event is the only record of why it ended."
+statement = "The endpoint MUST report an event when the confirmation of a handshake or a path MTU probe times out, with the peer's address."
+rationale = "These timeouts end the work with a peer without any message from it, so the event and its address are the only record of which peer stopped answering."
 
 [[requirement]]
 id = "DC-0013-011"

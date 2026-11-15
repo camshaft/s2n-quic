@@ -2,4 +2,4 @@ target = "rendered/0013-events/01-events.md#DC-0013-003"
 
 [[spec]]
 level = "MUST"
-quote = "The system MUST assign each connection an identifier that no earlier connection of the same process held, counting up from 1."
+quote = "Each identifier the system assigns to a connection MUST differ from every identifier it assigned earlier in the same process, counting up from 1."

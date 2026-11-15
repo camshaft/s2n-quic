@@ -50,8 +50,8 @@ id = "DC-0013-026"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "A set of counters for the outcomes of one event MUST share one metric name and differ by variant, with one variant that counts each outcome the set doesn't list."
-rationale = "A shared name lets a reader add the outcomes into a total, and the extra variant keeps an outcome added later from going uncounted."
+statement = "The counters registered for the variants of one enumerated outcome MUST share one metric name and differ by variant, with one variant that counts each value the enumeration doesn't list."
+rationale = "A shared name lets a reader add the outcomes into a total, and the extra variant keeps an outcome added to the enumeration later from going uncounted."
 
 [[requirement]]
 id = "DC-0013-027"
@@ -59,7 +59,7 @@ level = "SHOULD"
 polarity = "required"
 binds_to = "system"
 statement = "The name of a counter that counts a failure SHOULD mark it as a failure, so that a reader tells it apart from a count of successes."
-rationale = "Readers scan for failures first, and a mark in the name finds them without a list of which counters are failures."
+rationale = "Readers scan for failures first, and a mark in the name finds them without a list of which counters are failures; the count of datagrams dropped for a stale binding is an exception today, since drops of that kind are expected after a binding moves on."
 
 [[requirement]]
 id = "DC-0013-028"
