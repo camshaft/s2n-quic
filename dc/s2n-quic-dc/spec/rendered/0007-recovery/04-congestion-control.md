@@ -1,6 +1,6 @@
 ## Congestion control {#congestion-control}
 
-Each sender has one congestion controller, created with the path's maximum datagram size. The controller is model-based: it estimates the path's bottleneck bandwidth and its minimum round-trip time from the acknowledgements it receives, and sets the congestion window, the pacing rate and the send quantum from those estimates, with loss and congestion marks as further signals. A sender that has no more application data queued doesn't lower its rate or its window for the room it leaves unused, so a quiet sender isn't read as a slow path. A run of consecutive lost packet numbers counts as one loss event, and each increase of the peer's count of packets marked congestion experienced counts as a sign of congestion. The sender takes an acknowledgement's congestion marks and losses into account before it raises its rate or its window for the data that acknowledgement acknowledges. The sender doesn't treat a long silence as persistent congestion: the probe timer and the model cover it. The sender sends new data frames only while the window has room, as a fast retransmission, or when the frames make up a probe, and each send carries at most the send quantum. The room for new data is the window less the total size of the outstanding packets, and once a probe carries a packet's frames, the original no longer takes room.
+Each sender has one congestion controller, created with the path's maximum datagram size. The controller is model-based: it estimates the path's bottleneck bandwidth and its minimum round-trip time from the acknowledgements it receives, and sets the congestion window, the pacing rate and the send quantum from those estimates, with loss and congestion marks as further signals. A sender that has no more application data queued doesn't lower its rate or its window for the room it leaves unused, so a quiet sender isn't read as a slow path. A run of consecutive lost packet numbers counts as one loss event, and each increase of the peer's count of packets marked congestion experienced counts as a sign of congestion. The sender takes an acknowledgement's congestion marks and losses into account before it raises its rate or its window for the data that acknowledgement acknowledges. The sender doesn't treat a long silence as persistent congestion: the probe timer and the model cover it. The sender sends new data frames only while it has room for new data, as a fast retransmission, or when the frames make up a probe, and each send carries at most the send quantum. The room for new data is the window less the total size of the outstanding packets, leaving out each packet whose frames a probe has carried again, and it is never less than zero.
 
 ### DC-0007-023 {#DC-0007-023}
 
@@ -28,19 +28,19 @@ A sender MUST lower its sending rate or its window in response to an increase of
 
 ### DC-0007-028 {#DC-0007-028}
 
-The sending rate and the window a sender uses after it receives an acknowledgement MUST reflect that acknowledgement's losses and congestion marks as well as the data it acknowledges.
+A sender MUST apply an acknowledgement's losses and congestion marks to its sending rate and its window before it raises either of them for the data that acknowledgement acknowledges.
 
 ### DC-0007-029 {#DC-0007-029}
 
-A sender MUST NOT send new data frames while the data it has sent and not yet seen acknowledged fills its window, unless it sends them as a fast retransmission or as a probe.
+A sender MUST NOT send new data frames while it has no room for new data, unless it sends them as a fast retransmission or as a probe.
 
 ### DC-0007-030 {#DC-0007-030}
 
-Each send of a sender MUST put at most its send quantum on the wire, counted in datagrams of the path's maximum size and rounded up, where the send quantum is the burst size the sender sets from its estimate of the path's bottleneck bandwidth.
+Each send of a sender MUST put at most its send quantum on the wire, counted in datagrams of the path's maximum size and rounded up.
 
 ### DC-0007-031 {#DC-0007-031}
 
-The room a sender has for new data MUST be its window less the total size of its outstanding packets.
+The room a sender has for new data MUST be the larger of zero and its window less the total size of its outstanding packets whose frames no probe has carried again.
 
 ### DC-0007-032 {#DC-0007-032}
 
