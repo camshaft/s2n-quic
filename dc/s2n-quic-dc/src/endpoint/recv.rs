@@ -457,6 +457,30 @@ impl Cache {
         }
     }
 
+    /// Whether the sender `(credentials.id, remote_sender_id)`'s receive state may accept
+    /// `packet_number`, read without recording it. Returns `false` where that state, under
+    /// `credentials.key_id`, accepted `packet_number` already or is too far past it to check, and
+    /// `true` where the cache doesn't hold the sender or holds it under another key id:
+    /// [`Self::get_or_insert`] refuses an older key id before it decrypts the packet, and a newer
+    /// key id starts a new packet number space.
+    #[inline]
+    pub fn may_accept_packet_number(
+        &self,
+        credentials: &Credentials,
+        remote_sender_id: RemoteSenderId,
+        packet_number: VarInt,
+    ) -> bool {
+        let key = Key {
+            id: credentials.id,
+            remote_sender_id,
+        };
+        let Some(ctx) = self.senders.get(&key) else {
+            return true;
+        };
+        let ctx = ctx.borrow();
+        ctx.current_key_id != credentials.key_id || ctx.dedup_filter.check(packet_number).is_ok()
+    }
+
     /// Look up an existing [`Context`] by `(credentials.id, remote_sender_id)`, or derive
     /// a new one on cache miss.
     ///
