@@ -1,6 +1,6 @@
 ## Congestion control {#congestion-control}
 
-Each sender has one congestion controller, created with the path's maximum datagram size. The controller is model-based: it estimates the path's bottleneck bandwidth and its minimum round-trip time from the acknowledgements it receives, and sets the congestion window, the pacing rate and the send quantum from those estimates, with loss and congestion marks as further signals. A sender that has no more application data queued doesn't lower its rate or its window for the room it leaves unused, so a quiet sender isn't read as a slow path. A run of consecutive lost packet numbers counts as one loss event, and each increase of the peer's count of packets marked congestion experienced counts as a sign of congestion. The sender takes an acknowledgement's congestion marks and losses into account before it raises its rate or its window for the data that acknowledgement acknowledges. The sender doesn't treat a long silence as persistent congestion: the probe timer and the model cover it. The sender sends new data frames only while the window has room, while the controller asks for fast retransmission, or when the frames make up a probe, and each send carries at most the send quantum. The bytes counted against the window count each outstanding packet once: when a probe carries a packet's frames, the original's bytes leave the count.
+Each sender has one congestion controller, created with the path's maximum datagram size. The controller is model-based: it estimates the path's bottleneck bandwidth and its minimum round-trip time from the acknowledgements it receives, and sets the congestion window, the pacing rate and the send quantum from those estimates, with loss and congestion marks as further signals. A sender that has no more application data queued doesn't lower its rate or its window for the room it leaves unused, so a quiet sender isn't read as a slow path. A run of consecutive lost packet numbers counts as one loss event, and each increase of the peer's count of packets marked congestion experienced counts as a sign of congestion. A sender that probes above its bandwidth estimate ends the probe once more than half of the data an acknowledgement shows delivered was marked, and caps its window near the data it had sent and not yet seen acknowledged when it sent that data. The sender takes an acknowledgement's congestion marks and losses into account before it raises its rate or its window for the data that acknowledgement acknowledges. The sender doesn't treat a long silence as persistent congestion: the probe timer and the model cover it. The sender sends new data frames only while the window has room, while the controller asks for fast retransmission, or when the frames make up a probe, and each send carries at most the send quantum. The bytes counted against the window count each outstanding packet once: when a probe carries a packet's frames, the original's bytes leave the count.
 
 ### DC-0007-023 {#DC-0007-023}
 
@@ -29,6 +29,14 @@ A sender MUST lower a limit that caps its window, and that never caps it below t
 ### DC-0007-043 {#DC-0007-043}
 
 A sender that is starting up MUST end its start-up, in which it raises its sending rate each round trip, after two consecutive round trips in each of which the packets marked congestion experienced, each counted at the path's maximum datagram size, made up more than half of the data delivered.
+
+### DC-0007-044 {#DC-0007-044}
+
+A sender that is sending above its estimate of the path's bottleneck bandwidth to probe for more bandwidth MUST end that probe and lower its sending rate below its estimate on an acknowledgement for which the packets marked congestion experienced, each counted at the path's maximum datagram size, made up more than half of the data delivered between the send of the newest packet that acknowledgement acknowledges and its arrival.
+
+### DC-0007-045 {#DC-0007-045}
+
+On an acknowledgement that ends a probe as DC-0007-044 describes, unless the sender had no application data queued when it sent the newest packet that acknowledgement acknowledges, the sender MUST set a limit that caps its window, and that never caps it below the sender's minimum window, to the larger of the data it had sent and not yet seen acknowledged when it sent that packet and seven tenths of the smaller of its window and its estimate of the path's bandwidth-delay product.
 
 ### DC-0007-028 {#DC-0007-028}
 
