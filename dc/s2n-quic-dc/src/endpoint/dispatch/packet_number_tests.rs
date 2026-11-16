@@ -341,3 +341,39 @@ fn a_packet_number_too_old_to_check_doesnt_reach_the_stream() {
     assert!(receiver.receive(next, &path_secret_map).is_ok(), "process must accept packet 201");
     assert_eq!(received(), [2], "the stream must receive message 2 from packet 201");
 }
+
+/// A packet whose packet number the sender's receive state accepted already, below the newest
+/// number it accepted, doesn't reach the stream, though it carries a message the stream hasn't
+/// received: packet 0 after packet 1 falls inside the window, on a number the window holds.
+//= rendered/0005-endpoint/02-receive.md#DC-0005-010
+//= type=test
+//# A receiver MUST NOT dispatch the frames of a packet whose packet number it has already accepted from the same sender, or whose packet number is too old for it to tell.
+#[test]
+fn a_new_message_under_an_accepted_packet_number_below_the_newest_doesnt_reach_the_stream() {
+    let path_secret_map = crate::path::secret::map::testing::new(16);
+    path_secret_map.test_insert(PEER.parse().unwrap(), endpoint::Type::Server);
+    let mut receiver = Receiver::new();
+
+    let (first, credentials) = sealed_packet(0, 0);
+    let (newest, _) = sealed_packet(1, 1);
+    let (repeat, _) = sealed_packet(0, 2);
+    let (next, _) = sealed_packet(2, 2);
+    let mut received = bind_stream(&path_secret_map, &credentials);
+
+    assert!(receiver.receive(first, &path_secret_map).is_ok(), "process must accept packet 0");
+    assert!(receiver.receive(newest, &path_secret_map).is_ok(), "process must accept packet 1");
+    assert_eq!(received(), [0, 1], "the stream must receive messages 0 and 1");
+
+    assert_duplicate(
+        receiver.receive(repeat, &path_secret_map),
+        "a second packet 0, below the newest packet 1, that carries message 2",
+    );
+    assert_eq!(
+        received(),
+        Vec::<u64>::new(),
+        "the stream must not receive message 2 from a second packet 0"
+    );
+
+    assert!(receiver.receive(next, &path_secret_map).is_ok(), "process must accept packet 2");
+    assert_eq!(received(), [2], "the stream must receive message 2 from packet 2");
+}
