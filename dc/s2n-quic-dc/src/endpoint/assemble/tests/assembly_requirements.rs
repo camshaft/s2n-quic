@@ -459,6 +459,10 @@ fn sent_frames_are_kept_until_acknowledged_or_lost() {
     assert!(completed
         .iter()
         .all(|frame| matches!(frame.status, TransmissionStatus::Acknowledged)));
+    assert!(
+        cancelled.is_empty(),
+        "process_ack doesn't cancel any frame: each one is acknowledged, lost or still recorded"
+    );
 
     let mut accounted = queued_offsets(&lost);
     accounted.extend(queued_offsets(&cancelled));
