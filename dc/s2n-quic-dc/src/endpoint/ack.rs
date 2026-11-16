@@ -655,8 +655,6 @@ fn detect_loss<Rand>(
                 continue;
             }
 
-            //= rendered/0005-endpoint/01-frames.md#DC-0005-004
-            //# The endpoint MUST bound the number of transmissions of each frame.
             //= rendered/0005-endpoint/01-frames.md#DC-0005-051
             //# When a frame reaches its bound on transmissions without an acknowledgement, the endpoint MUST report the frame to its writer as failed with the transmission error reason.
             if entry.ttl == 0 {
