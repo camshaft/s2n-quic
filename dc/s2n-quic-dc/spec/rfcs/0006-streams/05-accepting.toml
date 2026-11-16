@@ -3,7 +3,7 @@ anchor = "accepting"
 title = "Accepting streams"
 problem = "A server needs to hand each incoming stream to the part of the application that serves it, and to keep a slow consumer from holding an unbounded number of streams."
 motivation = "Routing by acceptor identifier lets one endpoint serve several services, the queue slots the server grants each client hold new streams back at the client while the application is slow, so the server keeps every stream it accepted, and spreading streams over receivers lets the application scale out."
-prose = "A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor. A queue slot is the room the server holds for one stream of one client: the client opens each stream on a slot it holds, each write of the stream names that slot until the server confirms the stream, and the stream keeps its slot until the application has finished with it. The server then returns the freed slot to the client in a frame that names the slot, and the client may open another stream on it. The server starts each client with one slot, grows the client's grant, up to doubling it, while its receivers take that client's streams as fast as they arrive, and holds it while streams wait or halves it by keeping freed slots. The server takes room for each slot from the memory that holds waiting streams when it grants the slot, so a stream on a granted slot always has room, and gives that room back when the slot leaves the grant; while that memory refuses room for a slot, no grant grows and the server takes each freed slot back, except a client's last."
+prose = "A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor. A queue slot is the room the server holds for one stream of one client: the client opens each stream on a slot it holds, each write of the stream names that slot until the server confirms the stream, and the stream keeps its slot until the application has finished with it. The server then returns the freed slot to the client in a frame that names the slot, and the client may open another stream on it. The server starts each client with one slot where the memory that holds waiting streams has room for it, and otherwise with none until that memory gives room for one; it then grows the client's grant, up to doubling it, while its receivers take that client's streams as fast as they arrive, and holds it while streams wait or halves it by keeping freed slots. The server takes room for each slot from the memory that holds waiting streams when it grants the slot, so a stream on a granted slot always has room, and gives that room back when the slot leaves the grant; while that memory refuses room for a slot, no grant grows and the server takes each freed slot back, except a client's last."
 
 [[requirement]]
 id = "DC-0006-037"
@@ -82,8 +82,8 @@ id = "DC-0006-061"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "At the handshake, the server MUST advertise to each client a starting grant of one queue slot."
-rationale = "The client can open a stream at once, and the server learns how fast its receivers take that client's streams before it lets the client hold more."
+statement = "At the handshake, the server MUST advertise to each client a starting grant of one queue slot where the memory that holds waiting streams gives room for that slot."
+rationale = "The client can open a stream at once, and the server learns how fast its receivers take that client's streams before it lets the client hold more; DC-0006-075 says what the server does where that memory has no room for the slot."
 
 [[requirement]]
 id = "DC-0006-062"
@@ -154,8 +154,8 @@ id = "DC-0006-070"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The server MUST keep each client's grant of queue slots at one slot or more."
-rationale = "A client with no slot can't open a stream, and a grant grows only when a receiver takes one of that client's streams, so a grant of no slots would never grow again."
+statement = "Once the server has granted a client its first queue slot, the server MUST keep that client's grant at one slot or more."
+rationale = "A client without a slot can't open a stream, and a grant grows only when a receiver takes one of that client's streams, so a grant that fell to no slots would never grow again. A client that waits for its first slot gets it when the memory gives room (DC-0006-076), and not from a take."
 
 [[requirement]]
 id = "DC-0006-071"
@@ -188,6 +188,22 @@ polarity = "required"
 binds_to = "system"
 statement = "The server MUST keep the room it took for a granted slot until the slot leaves the client's grant."
 rationale = "A slot the client may open a stream on then always has room for that stream, and room goes back to the memory only with a slot that no stream can use."
+
+[[requirement]]
+id = "DC-0006-075"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Where the memory that holds waiting streams refuses room for a client's first queue slot at the handshake, the server MUST advertise to that client a starting grant of no slots."
+rationale = "A first slot that the memory can't hold would let each new client add a waiting stream the memory doesn't have room for. Without a slot, the client holds its new streams back as DC-0006-068 asks, as it does while every slot of a full grant holds a stream, and the server neither refuses the client nor drops its work."
+
+[[requirement]]
+id = "DC-0006-076"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Once the memory that holds waiting streams gives room for one queue slot while clients wait for their first slot, the server MUST add that slot to the grant of the client that has waited longest."
+rationale = "The memory's answer is the event that ends the wait, so the server doesn't ask it again on a timer; DC-0006-066 tells the client of the slot, and DC-0006-067 has the client take it. The client that has waited longest takes the room, so a waiting client isn't passed over again and again."
 
 [[requirement]]
 id = "DC-0006-045"

@@ -1,6 +1,6 @@
 ## Accepting streams {#accepting}
 
-A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor. A queue slot is the room the server holds for one stream of one client: the client opens each stream on a slot it holds, each write of the stream names that slot until the server confirms the stream, and the stream keeps its slot until the application has finished with it. The server then returns the freed slot to the client in a frame that names the slot, and the client may open another stream on it. The server starts each client with one slot, grows the client's grant, up to doubling it, while its receivers take that client's streams as fast as they arrive, and holds it while streams wait or halves it by keeping freed slots. The server takes room for each slot from the memory that holds waiting streams when it grants the slot, so a stream on a granted slot always has room, and gives that room back when the slot leaves the grant; while that memory refuses room for a slot, no grant grows and the server takes each freed slot back, except a client's last.
+A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor. A queue slot is the room the server holds for one stream of one client: the client opens each stream on a slot it holds, each write of the stream names that slot until the server confirms the stream, and the stream keeps its slot until the application has finished with it. The server then returns the freed slot to the client in a frame that names the slot, and the client may open another stream on it. The server starts each client with one slot where the memory that holds waiting streams has room for it, and otherwise with none until that memory gives room for one; it then grows the client's grant, up to doubling it, while its receivers take that client's streams as fast as they arrive, and holds it while streams wait or halves it by keeping freed slots. The server takes room for each slot from the memory that holds waiting streams when it grants the slot, so a stream on a granted slot always has room, and gives that room back when the slot leaves the grant; while that memory refuses room for a slot, no grant grows and the server takes each freed slot back, except a client's last.
 
 ### DC-0006-037 {#DC-0006-037}
 
@@ -40,7 +40,7 @@ The server MUST set the number of queue slots each client may hold for streams t
 
 ### DC-0006-061 {#DC-0006-061}
 
-At the handshake, the server MUST advertise to each client a starting grant of one queue slot.
+At the handshake, the server MUST advertise to each client a starting grant of one queue slot where the memory that holds waiting streams gives room for that slot.
 
 ### DC-0006-062 {#DC-0006-062}
 
@@ -76,7 +76,7 @@ The server MUST refuse a stream whose first write to reach the server names a qu
 
 ### DC-0006-070 {#DC-0006-070}
 
-The server MUST keep each client's grant of queue slots at one slot or more.
+Once the server has granted a client its first queue slot, the server MUST keep that client's grant at one slot or more.
 
 ### DC-0006-071 {#DC-0006-071}
 
@@ -93,6 +93,14 @@ While the memory that holds waiting streams refuses room for a slot, the server 
 ### DC-0006-074 {#DC-0006-074}
 
 The server MUST keep the room it took for a granted slot until the slot leaves the client's grant.
+
+### DC-0006-075 {#DC-0006-075}
+
+Where the memory that holds waiting streams refuses room for a client's first queue slot at the handshake, the server MUST advertise to that client a starting grant of no slots.
+
+### DC-0006-076 {#DC-0006-076}
+
+Once the memory that holds waiting streams gives room for one queue slot while clients wait for their first slot, the server MUST add that slot to the grant of the client that has waited longest.
 
 ### DC-0006-045 {#DC-0006-045}
 

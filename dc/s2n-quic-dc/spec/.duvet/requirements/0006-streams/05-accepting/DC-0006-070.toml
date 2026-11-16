@@ -2,4 +2,4 @@ target = "rendered/0006-streams/05-accepting.md#DC-0006-070"
 
 [[spec]]
 level = "MUST"
-quote = "The server MUST keep each client's grant of queue slots at one slot or more."
+quote = "Once the server has granted a client its first queue slot, the server MUST keep that client's grant at one slot or more."
