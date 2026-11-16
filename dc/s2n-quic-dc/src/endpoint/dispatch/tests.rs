@@ -280,7 +280,7 @@ fn fast_path_unallocated_binding_requires_auth_before_ack() {
 
     let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
     assert!(
-        matches!(result, Err(FastPathError::AuthForDrop)),
+        matches!(result, Err(FastPathError::AuthForDrop { unbound: true })),
         "an un-authenticated binding reject must demand authentication before ACK, \
          not report success"
     );
@@ -304,7 +304,7 @@ fn fast_path_auth_for_drop_distinguishes_tampered_packet() {
         let mut harness = FastPathHarness::new();
 
         let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
-        assert!(matches!(result, Err(FastPathError::AuthForDrop)));
+        assert!(matches!(result, Err(FastPathError::AuthForDrop { unbound: true })));
         // The closure authenticates in place before ACKing; an authentic packet passes.
         assert!(
             packet.decrypt_in_place(&opener).is_ok(),
@@ -322,7 +322,7 @@ fn fast_path_auth_for_drop_distinguishes_tampered_packet() {
         let mut harness = FastPathHarness::new();
 
         let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
-        assert!(matches!(result, Err(FastPathError::AuthForDrop)));
+        assert!(matches!(result, Err(FastPathError::AuthForDrop { unbound: true })));
 
         // Corrupt an authenticated byte, then confirm in-place auth fails → ACK suppressed →
         // the genuine packet is retransmitted rather than freed by a spurious ACK.
@@ -401,7 +401,7 @@ fn fast_path_insert_reject_requires_auth_before_ack() {
 
     let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
     assert!(
-        matches!(result, Err(FastPathError::AuthForDrop)),
+        matches!(result, Err(FastPathError::AuthForDrop { unbound: false })),
         "a QueueMsg rejected by MsgTable::insert BEFORE the scatter-decrypt was never \
          authenticated, so the fast path must demand auth-before-ACK (AuthForDrop) rather than \
          report success and let `process` ACK an un-verified packet — got {}",
@@ -409,7 +409,7 @@ fn fast_path_insert_reject_requires_auth_before_ack() {
             Ok(_) => "Ok (packet would be ACKed un-authenticated — BUG)",
             Err(FastPathError::HeaderMismatch) => "HeaderMismatch",
             Err(FastPathError::WriteFailed) => "WriteFailed",
-            Err(FastPathError::AuthForDrop) => "AuthForDrop",
+            Err(FastPathError::AuthForDrop { .. }) => "AuthForDrop",
         }
     );
 }
@@ -980,3 +980,8 @@ fn an_opening_frame_that_fails_authentication_doesnt_evict_a_queued_stream() {
         "an opening frame whose packet fails authentication must not reset the queued stream"
     );
 }
+
+/// The tests of the reset that answers a frame for a stream the server hasn't bound
+/// (DC-0005-020), apart from the binding tests.
+#[path = "unbound_reset_tests.rs"]
+mod unbound_reset_tests;
