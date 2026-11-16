@@ -1339,6 +1339,9 @@ impl std::fmt::Debug for Frame {
 }
 
 #[cfg(test)]
+mod spec_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
