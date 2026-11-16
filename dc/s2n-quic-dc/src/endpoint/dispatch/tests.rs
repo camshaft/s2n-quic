@@ -48,6 +48,44 @@ fn sealed_queue_msg_packet_geometry(
     crate::crypto::awslc::open::Application,
     usize,
 ) {
+    sealed_queue_packet(
+        dest_queue_id,
+        binding_id,
+        None,
+        message_size,
+        chunk_size,
+        chunk_index,
+    )
+}
+
+/// Like [`sealed_queue_msg_packet`] for an init: the frame carries `dest_acceptor_id`, so the
+/// server binds the slot for that acceptor before the scatter-decrypt runs.
+fn sealed_queue_init_packet(
+    dest_queue_id: VarInt,
+    binding_id: VarInt,
+    dest_acceptor_id: VarInt,
+) -> (
+    datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    crate::crypto::awslc::open::Application,
+    usize,
+) {
+    sealed_queue_packet(dest_queue_id, binding_id, Some(dest_acceptor_id), 17, 17, 0)
+}
+
+/// Seals the single QueueMsg frame that [`sealed_queue_msg_packet_geometry`] and
+/// [`sealed_queue_init_packet`] describe.
+fn sealed_queue_packet(
+    dest_queue_id: VarInt,
+    binding_id: VarInt,
+    dest_acceptor_id: Option<VarInt>,
+    message_size: u64,
+    chunk_size: u64,
+    chunk_index: u64,
+) -> (
+    datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    crate::crypto::awslc::open::Application,
+    usize,
+) {
     let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     let sealer_entry = PathSecretEntry::builder(peer)
         .endpoint_type(endpoint::Type::Client)
@@ -81,7 +119,7 @@ fn sealed_queue_msg_packet_geometry(
         is_fin: true,
         is_wakeup: true,
         blocked: false,
-        dest_acceptor_id: None,
+        dest_acceptor_id,
         priority: crate::credit::Priority::default(),
     };
 
@@ -195,6 +233,7 @@ fn bound_server_view(queue_id: VarInt, binding_id: VarInt) -> recv::QueueView {
 struct FastPathHarness {
     acceptor_registry: acceptor::LocalRegistry<Stream>,
     frame_tx: SubmissionSender,
+    frame_rx: crate::endpoint::frame::SubmissionReceiver,
     freed_batch_tx: crate::queue::FreedBatchTx,
     counters: Arc<counters::Dispatch>,
     stream_clock: crate::time::DefaultClock,
@@ -209,11 +248,12 @@ struct FastPathHarness {
 impl FastPathHarness {
     fn new() -> Self {
         let registry = crate::counter::Registry::default();
-        let (frame_tx, _frame_rx) = crate::endpoint::frame::submission_channel(1);
+        let (frame_tx, frame_rx) = crate::endpoint::frame::submission_channel(1);
         let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
         Self {
             acceptor_registry: acceptor::Registry::<Stream>::new().local(),
             frame_tx,
+            frame_rx,
             freed_batch_tx,
             counters: counters::Dispatch::new(&registry),
             stream_clock: crate::time::DefaultClock::default(),
@@ -258,6 +298,29 @@ impl FastPathHarness {
             &self.send_credit_pool,
             &self.recv_credit_pool,
         )
+    }
+
+    /// Authenticates `packet` in place and settles the init the fast path rejected, as `process`
+    /// does once it reads whether the packet number is new, and returns whether the packet
+    /// authenticated.
+    fn authenticate(
+        &mut self,
+        rejected: RejectedInit,
+        packet: &mut datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+        opener: &crate::crypto::awslc::open::Application,
+        queue_view: &mut recv::QueueView,
+        new_packet_number: bool,
+    ) -> bool {
+        let authenticated = packet.decrypt_in_place(opener).is_ok();
+        settle_rejected_init(
+            rejected,
+            authenticated && new_packet_number,
+            queue_view,
+            &self.path_entry,
+            &mut self.frame_tx,
+            &mut self.freed_batch_tx,
+        );
+        authenticated
     }
 }
 
@@ -416,6 +479,7 @@ fn fast_path_insert_reject_requires_auth_before_ack() {
             Err(FastPathError::HeaderMismatch) => "HeaderMismatch",
             Err(FastPathError::WriteFailed) => "WriteFailed",
             Err(FastPathError::AuthForDrop) => "AuthForDrop",
+            Err(FastPathError::RejectInit(_)) => "RejectInit",
         }
     );
 }
@@ -452,6 +516,830 @@ fn slot_diag_reports_bound_vs_unallocated_state() {
             .is_none_or(|d| d.unallocated && !d.stream_has_receiver),
         "an unbound slot must read back as unallocated with no receiver"
     );
+}
+
+/// Drains the frames the dispatch submitted to `frame_rx`, and returns each reset among them by
+/// the slot it resets and its binding id.
+fn take_resets(frame_rx: &mut crate::endpoint::frame::SubmissionReceiver) -> Vec<(u64, u64)> {
+    let waker = s2n_quic_core::task::waker::noop();
+    let mut cx = core::task::Context::from_waker(&waker);
+    let mut resets = Vec::new();
+    loop {
+        let mut storage = crate::endpoint::frame::PriorityStorage::default();
+        let core::task::Poll::Ready(Some(())) = frame_rx.poll_swap(&mut cx, &mut storage) else {
+            break;
+        };
+        for frame in storage.iter() {
+            if let Header::QueueReset {
+                queue_pair,
+                binding_id,
+                ..
+            } = frame.header
+            {
+                resets.push((queue_pair.source_queue_id.as_u64(), binding_id.as_u64()));
+            }
+        }
+    }
+    resets
+}
+
+/// The inits a peer sends while the creditless window refuses frames can't add a reset for each
+/// rejected init: each slot of the peer's queues gets the reset of its first rejected init alone,
+/// whatever the binding ids of the inits routed to it, until that reset leaves the priority router
+/// and releases the slot. A slot past the peer's queues doesn't get a reset.
+#[test]
+fn rejected_inits_leave_one_reset_for_each_slot_until_it_leaves() {
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let mut view = recv::QueueView::Server(state.view());
+    let mut harness = FastPathHarness::new();
+
+    let init = |harness: &mut FastPathHarness, view: &mut recv::QueueView, slot: u8, binding: u8| {
+        // The registry doesn't hold an acceptor, so the server rejects the init.
+        let (mut packet, opener, decrypt_len) = sealed_queue_init_packet(
+            VarInt::from_u8(slot),
+            VarInt::from_u8(binding),
+            VarInt::from_u8(9),
+        );
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("the server rejects an init without an acceptor");
+        };
+        assert!(
+            harness.authenticate(rejected, &mut packet, &opener, view, true),
+            "the init is sealed with its own header, so it authenticates"
+        );
+    };
+
+    // Three bindings each send an init to eight slots, and none of the resets leaves.
+    for binding in 1..=3 {
+        for slot in 0..8 {
+            init(&mut harness, &mut view, slot, binding);
+        }
+    }
+    assert_eq!(
+        take_resets(&mut harness.frame_rx),
+        vec![(0, 1), (1, 1), (2, 1), (3, 1)],
+        "each of the peer's 4 queues gets the reset of its first rejected init alone"
+    );
+    // The slots past the peer's queues are recorded as freed, and each held slot waits on its
+    // reset.
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the slots past the peer's queues are freed");
+    assert!((4..8).all(|slot| freed.contains(slot)));
+    assert!((0..4).all(|slot| !freed.contains(slot)), "a held slot waits on its reset");
+
+    // Slot 2's reset leaves the priority router: slot 2 gets the reset of its next rejected init,
+    // and slot 3, whose reset still waits, doesn't.
+    state.freed.release(
+        VarInt::from_u8(2),
+        VarInt::from_u8(1),
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the release records slot 2 as freed");
+    assert!(freed.contains(2) && !freed.contains(3));
+    init(&mut harness, &mut view, 2, 4);
+    init(&mut harness, &mut view, 3, 4);
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(2, 4)]);
+}
+
+/// An init whose packet fails the AEAD check doesn't hold its slot, record it as freed or send a
+/// reset: a tampered or forged init can't hold a slot for its own binding and so keep the reset of
+/// the client's genuine rejected init on that slot from being sent.
+#[test]
+fn a_rejected_init_that_fails_authentication_leaves_the_slot_unheld() {
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let mut view = recv::QueueView::Server(state.view());
+    let mut harness = FastPathHarness::new();
+
+    // An init on slot 1 for binding 2 whose payload is changed on the network.
+    let (mut packet, opener, decrypt_len) =
+        sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(2), VarInt::from_u8(9));
+    let header = single_queue_msg_header(&packet, decrypt_len);
+    let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+    let Err(FastPathError::RejectInit(rejected)) = result else {
+        panic!("the server rejects an init without an acceptor");
+    };
+    packet.payload_mut()[0] ^= 0xFF;
+    assert!(
+        !harness.authenticate(rejected, &mut packet, &opener, &mut view, true),
+        "a tampered packet fails the AEAD check, so it isn't ACKed"
+    );
+    assert!(
+        take_resets(&mut harness.frame_rx).is_empty(),
+        "a packet that fails the AEAD check doesn't send a reset"
+    );
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    assert!(
+        state.freed.take(&mut freed).is_none(),
+        "a packet that fails the AEAD check doesn't record its slot as freed"
+    );
+
+    // The client's genuine init on slot 1 for binding 1 then holds the slot and gets its reset.
+    let (mut packet, opener, decrypt_len) =
+        sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(1), VarInt::from_u8(9));
+    let header = single_queue_msg_header(&packet, decrypt_len);
+    let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+    let Err(FastPathError::RejectInit(rejected)) = result else {
+        panic!("the server rejects an init without an acceptor");
+    };
+    assert!(harness.authenticate(rejected, &mut packet, &opener, &mut view, true));
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 1)]);
+}
+
+/// A copy of an authentic rejected init whose packet number the endpoint took already, as a
+/// replayed packet, leaves the slot as the first copy left it: it doesn't hold the slot, record it
+/// as freed or send a reset, so the genuine rejected init of the next binding on the slot gets its
+/// reset.
+#[test]
+fn a_replayed_rejected_init_leaves_the_slot_as_the_first_copy_left_it() {
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let mut view = recv::QueueView::Server(state.view());
+    let mut harness = FastPathHarness::new();
+
+    let init = |harness: &mut FastPathHarness,
+                view: &mut recv::QueueView,
+                binding: u8,
+                new_packet_number: bool| {
+        // The registry doesn't hold an acceptor, so the server rejects the init.
+        let (mut packet, opener, decrypt_len) = sealed_queue_init_packet(
+            VarInt::from_u8(1),
+            VarInt::from_u8(binding),
+            VarInt::from_u8(9),
+        );
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("the server rejects an init without an acceptor");
+        };
+        harness.authenticate(rejected, &mut packet, &opener, view, new_packet_number)
+    };
+
+    // Binding 1's init on slot 1 is rejected with a reset, and the reset leaves.
+    assert!(init(&mut harness, &mut view, 1, true));
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 1)]);
+    state.freed.release(
+        VarInt::from_u8(1),
+        VarInt::from_u8(1),
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the release records slot 1 as freed");
+
+    // A copy of that packet comes again: it authenticates, and its packet number was taken.
+    assert!(init(&mut harness, &mut view, 1, false));
+    assert!(
+        take_resets(&mut harness.frame_rx).is_empty(),
+        "a replayed init doesn't send a reset"
+    );
+    assert!(
+        state.freed.take(&mut freed).is_none(),
+        "a replayed init doesn't record its slot as freed"
+    );
+
+    // Binding 2's genuine init on slot 1 then holds the slot and gets its reset.
+    assert!(init(&mut harness, &mut view, 2, true));
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 2)]);
+}
+
+/// `process` settles an init the fast path rejected with what the peer's dedup filter answered
+/// for its packet number: the first copy of an authentic init on slot 1 holds the slot and gets
+/// its reset, and once that reset leaves, a copy with the same packet number is dropped as a
+/// duplicate, and doesn't hold the slot, record it as freed or send a reset.
+#[test]
+fn a_rejected_init_whose_packet_number_repeats_is_a_duplicate_that_leaves_the_slot() {
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let mut view = recv::QueueView::Server(state.view());
+    let mut harness = FastPathHarness::new();
+    let mut dedup_filter = recv::dedup::StreamFilter::default();
+
+    let init = |harness: &mut FastPathHarness,
+                view: &mut recv::QueueView,
+                dedup_filter: &mut recv::dedup::StreamFilter| {
+        // The registry doesn't hold an acceptor, so the server rejects the init, and the packet
+        // authenticates in place, as in the decrypt closure of `process`.
+        let (mut packet, opener, decrypt_len) =
+            sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(1), VarInt::from_u8(9));
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("the server rejects an init without an acceptor");
+        };
+        assert!(
+            packet.decrypt_in_place(&opener).is_ok(),
+            "the init is sealed with its own header, so it authenticates"
+        );
+        let packet_number = packet.packet_number();
+        let dedup = dedup_filter.on_packet_number(packet_number);
+        let settled = settle_decrypt_result(
+            DecryptResult::RejectedInit(rejected),
+            dedup,
+            *packet.credentials(),
+            packet_number,
+            VarInt::from_u8(7),
+            view,
+            &harness.path_entry,
+            &mut harness.frame_tx,
+            &mut harness.freed_batch_tx,
+        );
+        (packet_number, settled)
+    };
+
+    // The first copy's packet number is new: it holds slot 1 for binding 1 and gets its reset.
+    let (_, settled) = init(&mut harness, &mut view, &mut dedup_filter);
+    assert!(matches!(settled, Ok(Ok(_))), "a new packet number is taken");
+    assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 1)]);
+
+    // The reset leaves the priority router, which ends the hold and records slot 1 as freed.
+    state.freed.release(
+        VarInt::from_u8(1),
+        VarInt::from_u8(1),
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state.freed.take(&mut freed).expect("the release records slot 1 as freed");
+
+    // A copy with the same packet number comes again: the dedup filter refuses its number, so
+    // it is dropped as a duplicate and leaves slot 1 as the release left it.
+    let (packet_number, settled) = init(&mut harness, &mut view, &mut dedup_filter);
+    let Err(Error::Duplicate {
+        packet_number: duplicate,
+        ..
+    }) = settled
+    else {
+        panic!("a packet number the dedup filter refuses is a duplicate");
+    };
+    assert_eq!(duplicate, packet_number);
+    assert!(
+        take_resets(&mut harness.frame_rx).is_empty(),
+        "a duplicate doesn't send a reset"
+    );
+    assert!(
+        state.freed.take(&mut freed).is_none(),
+        "a duplicate doesn't record its slot as freed"
+    );
+    assert!(
+        state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)),
+        "a duplicate doesn't hold slot 1"
+    );
+}
+
+/// A rejected init whose slot `bind_for_msg` bound disables the bound stream as the reject drops,
+/// as where the path secret map refuses its packet after the decrypt: the stream's reader doesn't
+/// reset the binding, so a reset doesn't leave the priority router and release the hold of the
+/// slot's genuine rejected init.
+#[test]
+fn a_dropped_rejected_init_disables_its_bound_stream() {
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let mut view = recv::QueueView::Server(state.view());
+    let mut harness = FastPathHarness::new();
+    // The registry holds an acceptor whose receiver is dropped, so the server binds the slot
+    // and then rejects the init with the stream it bound.
+    let registry = acceptor::Registry::<Stream>::new();
+    let receiver = registry
+        .register(VarInt::from_u8(9), Default::default())
+        .expect("the acceptor registers");
+    drop(receiver);
+    harness.acceptor_registry = registry.local();
+
+    let (packet, opener, decrypt_len) =
+        sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(1), VarInt::from_u8(9));
+    let header = single_queue_msg_header(&packet, decrypt_len);
+    let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+    let Err(FastPathError::RejectInit(rejected)) = result else {
+        panic!("the server rejects an init whose acceptor's receiver is dropped");
+    };
+    assert!(rejected.stream.is_some(), "the reject holds the stream it bound");
+
+    drop(rejected);
+    assert!(
+        take_resets(&mut harness.frame_rx).is_empty(),
+        "a dropped reject disables its stream, so its reader doesn't send a reset"
+    );
+}
+
+/// Each init that `reject_init` rejects records what it does with the slot: the first rejected init
+/// of a slot holds it, a later one finds it held, and a slot past the peer's queues isn't held.
+#[test]
+fn a_rejected_init_records_what_it_does_with_its_slot() {
+    use crate::endpoint::frame_trace::{resident_slot_holds, HoldOutcome};
+
+    // The recorder's capture starts off; arm it, as a test process doesn't otherwise.
+    crate::testing::init_tracing();
+
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let view = state.view();
+    // An address no other test uses, so that the records of its credentials in the process-wide
+    // recorder are this test's alone.
+    let path_entry = PathSecretEntry::builder("127.0.0.1:44701".parse().unwrap())
+        .endpoint_type(endpoint::Type::Server)
+        .build(None);
+    let (mut frame_tx, mut frame_rx) = crate::endpoint::frame::submission_channel(1);
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    let mut reject = |slot: u8, binding: u8| {
+        let slot = VarInt::from_u8(slot);
+        reject_init(
+            &view,
+            &path_entry,
+            QueuePair {
+                source_queue_id: VarInt::from_u8(9),
+                dest_queue_id: slot,
+            },
+            VarInt::from_u8(binding),
+            error::ACCEPTOR_NOT_FOUND,
+            &mut frame_tx,
+            |server| server.record_freed(slot, &path_entry, &mut freed_batch_tx),
+        );
+    };
+    reject(1, 1);
+    reject(1, 2);
+    reject(1, 3);
+    reject(4, 1);
+
+    assert_eq!(take_resets(&mut frame_rx), vec![(1, 1)]);
+    assert_eq!(
+        resident_slot_holds(*path_entry.id()),
+        vec![
+            (1, 1, HoldOutcome::Held as u8),
+            (1, 2, HoldOutcome::AlreadyHeld as u8),
+            (1, 3, HoldOutcome::AlreadyHeld as u8),
+            (4, 1, HoldOutcome::PastQueues as u8),
+        ],
+        "the first init of slot 1 holds it, the next two find it held, and slot 4 isn't held"
+    );
+}
+
+/// A rejected init whose reset the ended priority router refuses records its new hold and then
+/// the end of that hold, and its slot is recorded as freed.
+#[test]
+fn a_rejected_init_whose_reset_the_ended_router_refuses_records_the_end_of_its_hold() {
+    use crate::endpoint::frame_trace::{resident_slot_holds, HoldOutcome};
+
+    // The recorder's capture starts off; arm it, as a test process doesn't otherwise.
+    crate::testing::init_tracing();
+
+    let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+    let view = state.view();
+    // An address no other test uses, so that the records of its credentials in the process-wide
+    // recorder are this test's alone.
+    let path_entry = PathSecretEntry::builder("127.0.0.1:44704".parse().unwrap())
+        .endpoint_type(endpoint::Type::Server)
+        .build(None);
+    let (mut frame_tx, frame_rx) = crate::endpoint::frame::submission_channel(1);
+    // The priority router ends, and its receiver drops, so the channel refuses the reset.
+    drop(frame_rx);
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    let slot = VarInt::from_u8(1);
+    reject_init(
+        &view,
+        &path_entry,
+        QueuePair {
+            source_queue_id: VarInt::from_u8(9),
+            dest_queue_id: slot,
+        },
+        VarInt::from_u8(1),
+        error::ACCEPTOR_NOT_FOUND,
+        &mut frame_tx,
+        |server| server.record_freed(slot, &path_entry, &mut freed_batch_tx),
+    );
+
+    assert_eq!(
+        resident_slot_holds(*path_entry.id()),
+        vec![
+            (1, 1, HoldOutcome::Held as u8),
+            (1, 1, HoldOutcome::Unheld as u8),
+        ],
+        "the reject holds slot 1, and the hold ends where the router refuses its reset"
+    );
+
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state
+        .freed
+        .take(&mut freed)
+        .expect("the slot is recorded as freed at once");
+    assert!(freed.contains(1), "slot 1 is recorded as freed");
+}
+
+/// What the server finds for the acceptor of a rejected init.
+#[derive(Clone, Copy, Debug)]
+enum InitAcceptor {
+    /// The registry doesn't hold the init's acceptor.
+    Missing,
+    /// The acceptor's receiver is dropped, so the acceptor is closed.
+    Closed,
+    /// The acceptor's receiver hasn't polled, so the acceptor doesn't have a slot for a stream.
+    WithoutSlots,
+}
+
+/// Sets the acceptor registry of `harness` up for an init of the acceptor id 9 as
+/// `init_acceptor` says, and returns the registry for the test to keep.
+fn use_acceptor(
+    harness: &mut FastPathHarness,
+    init_acceptor: InitAcceptor,
+) -> acceptor::Registry<Stream> {
+    let registry = acceptor::Registry::<Stream>::new();
+    match init_acceptor {
+        InitAcceptor::Missing => {}
+        InitAcceptor::Closed => {
+            let receiver = registry
+                .register(VarInt::from_u8(9), Default::default())
+                .expect("the acceptor registers");
+            drop(receiver);
+        }
+        InitAcceptor::WithoutSlots => {
+            let receiver = registry
+                .register(VarInt::from_u8(9), Default::default())
+                .expect("the acceptor registers");
+            // The receiver stays open for the rest of the test, and never polls.
+            core::mem::forget(receiver);
+        }
+    }
+    harness.acceptor_registry = registry.local();
+    registry
+}
+
+/// Takes the wakers that the slow path's handlers deliver, and drops them.
+struct WakerSink;
+
+impl channel::UnboundedSender<AutoWake> for WakerSink {
+    fn send(&mut self, waker: AutoWake) -> Result<(), AutoWake> {
+        drop(waker);
+        Ok(())
+    }
+}
+
+/// The slow path's context of a peer whose server queues `queue_view` holds.
+fn server_peer(path_entry: &Arc<PathSecretEntry>, queue_view: recv::QueueView) -> recv::Context {
+    recv::Context::new(
+        path_entry.clone(),
+        crate::endpoint::id::RemoteSenderId::new(VarInt::from_u8(7)),
+        crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(7)),
+        path_entry.secret().application_opener(VarInt::ZERO),
+        VarInt::ZERO,
+        crate::time::precision::Timestamp { nanos: 0 },
+        queue_view,
+    )
+}
+
+/// The slow path's handler of an init.
+#[derive(Clone, Copy, Debug)]
+#[allow(clippy::enum_variant_names)]
+enum SlowInit {
+    /// `handle_queue_msg_init`.
+    QueueMsg,
+    /// `handle_queue_data_init`.
+    QueueData,
+    /// `handle_queue_reset` with a reset that carries an init, which `bind_for_reset` binds.
+    QueueReset,
+}
+
+impl FastPathHarness {
+    /// Hands the init of `binding` on the server slot `slot`, from the peer's queue 7 for the
+    /// acceptor id 9, to the slow path's handler that `init` names.
+    fn slow_init(&mut self, init: SlowInit, peer: &mut recv::Context, slot: u8, binding: u8) {
+        let queue_pair = QueuePair {
+            source_queue_id: VarInt::from_u8(7),
+            dest_queue_id: VarInt::from_u8(slot),
+        };
+        let binding_id = VarInt::from_u8(binding);
+        let acceptor_id = VarInt::from_u8(9);
+        let payload = BytesMut::from(&b"queue-msg-payload"[..]);
+        let len = payload.len() as u64;
+        let priority = crate::credit::Priority::default();
+        let mut waker_sink = WakerSink;
+        match init {
+            SlowInit::QueueMsg => handle_queue_msg_init(
+                peer,
+                queue_pair,
+                binding_id,
+                acceptor_id,
+                VarInt::ZERO,
+                VarInt::ZERO,
+                len,
+                VarInt::new(len).unwrap(),
+                VarInt::new(len).unwrap(),
+                VarInt::ZERO,
+                true,
+                true,
+                false,
+                payload,
+                &mut self.acceptor_registry,
+                &mut self.frame_tx,
+                &mut self.freed_batch_tx,
+                &self.counters,
+                &mut waker_sink,
+                &self.stream_clock,
+                &self.reader_metrics,
+                &self.writer_metrics,
+                &self.send_credit_pool,
+                &self.recv_credit_pool,
+                priority,
+            ),
+            SlowInit::QueueData => handle_queue_data_init(
+                peer,
+                queue_pair,
+                binding_id,
+                VarInt::ZERO,
+                len,
+                true,
+                false,
+                acceptor_id,
+                payload,
+                &mut self.acceptor_registry,
+                &mut self.frame_tx,
+                &mut self.freed_batch_tx,
+                &self.counters,
+                &mut waker_sink,
+                &self.stream_clock,
+                &self.reader_metrics,
+                &self.writer_metrics,
+                &self.send_credit_pool,
+                &self.recv_credit_pool,
+                priority,
+            ),
+            SlowInit::QueueReset => handle_queue_reset(
+                peer,
+                queue_pair,
+                binding_id,
+                ResetTarget::Both,
+                VarInt::ZERO,
+                Some(crate::endpoint::frame::Init {
+                    dest_acceptor_id: acceptor_id,
+                    priority,
+                }),
+                &mut self.acceptor_registry,
+                &mut self.frame_tx,
+                &mut self.freed_batch_tx,
+                &self.counters,
+                &mut waker_sink,
+                &self.stream_clock,
+                &self.reader_metrics,
+                &self.writer_metrics,
+                &self.send_credit_pool,
+                &self.recv_credit_pool,
+            ),
+        }
+    }
+}
+
+/// Asserts that slot 1 of `state` waits on the reset of binding 1's rejected init, and that the
+/// release of the slot as that reset leaves records the slot as freed.
+fn assert_slot_1_waits_on_its_reset(
+    state: &crate::queue::ServerState,
+    harness: &mut FastPathHarness,
+    case: &str,
+) {
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    assert!(
+        state.freed.take(&mut freed).is_none(),
+        "{case}: the held slot waits on its reset"
+    );
+    state.freed.release(
+        VarInt::from_u8(1),
+        VarInt::from_u8(1),
+        &harness.path_entry,
+        &mut harness.freed_batch_tx,
+    );
+    let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+    state
+        .freed
+        .take(&mut freed)
+        .expect("the release records the slot as freed");
+    assert!(
+        freed.contains(1),
+        "{case}: the release records slot 1 as freed"
+    );
+}
+
+/// The fast path's rejected inits that `bind_for_msg` binds a slot for, where the acceptor is
+/// closed or doesn't have a slot for the stream, hold the slot as an init without an acceptor
+/// does: the slot gets the reset of its first rejected init alone, whatever the binding ids of
+/// the inits routed to it, until that reset leaves and releases the slot.
+#[test]
+fn fast_path_rejected_inits_of_a_bound_slot_leave_one_reset_until_it_leaves() {
+    for init_acceptor in [InitAcceptor::Closed, InitAcceptor::WithoutSlots] {
+        let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+        let mut view = recv::QueueView::Server(state.view());
+        let mut harness = FastPathHarness::new();
+        let _registry = use_acceptor(&mut harness, init_acceptor);
+
+        let init = |harness: &mut FastPathHarness, view: &mut recv::QueueView, binding: u8| {
+            let (mut packet, opener, decrypt_len) = sealed_queue_init_packet(
+                VarInt::from_u8(1),
+                VarInt::from_u8(binding),
+                VarInt::from_u8(9),
+            );
+            let header = single_queue_msg_header(&packet, decrypt_len);
+            let result = harness.call(header, &opener, &packet, decrypt_len, view);
+            let Err(FastPathError::RejectInit(rejected)) = result else {
+                panic!("{init_acceptor:?}: the server rejects the init");
+            };
+            assert!(
+                rejected.stream.is_some(),
+                "{init_acceptor:?}: the reject holds the stream it bound"
+            );
+            assert!(
+                harness.authenticate(rejected, &mut packet, &opener, view, true),
+                "{init_acceptor:?}: the init is sealed with its own header, so it authenticates"
+            );
+        };
+
+        // Bindings 1 and 2 each send an init to slot 1, and binding 1's reset doesn't leave.
+        init(&mut harness, &mut view, 1);
+        init(&mut harness, &mut view, 2);
+        assert_eq!(
+            take_resets(&mut harness.frame_rx),
+            vec![(1, 1)],
+            "{init_acceptor:?}: the slot gets the reset of its first rejected init alone"
+        );
+        assert_slot_1_waits_on_its_reset(&state, &mut harness, &format!("{init_acceptor:?}"));
+
+        // Once the reset leaves, the slot's next rejected init gets its reset.
+        init(&mut harness, &mut view, 3);
+        assert_eq!(
+            take_resets(&mut harness.frame_rx),
+            vec![(1, 3)],
+            "{init_acceptor:?}"
+        );
+    }
+}
+
+/// Each of the slow path's rejected inits holds its slot until its reset leaves, as the fast
+/// path's do, for each of the three handlers that bind a slot for an init and each of their
+/// three rejects: the slot gets the reset of its first rejected init alone, whatever the binding
+/// ids of the inits routed to it, until that reset leaves and releases the slot.
+#[test]
+fn slow_path_rejected_inits_leave_one_reset_for_each_slot_until_it_leaves() {
+    for init in [
+        SlowInit::QueueMsg,
+        SlowInit::QueueData,
+        SlowInit::QueueReset,
+    ] {
+        for init_acceptor in [
+            InitAcceptor::Missing,
+            InitAcceptor::Closed,
+            InitAcceptor::WithoutSlots,
+        ] {
+            let case = format!("{init:?} with {init_acceptor:?}");
+            let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+            let mut harness = FastPathHarness::new();
+            let _registry = use_acceptor(&mut harness, init_acceptor);
+            let mut peer = server_peer(&harness.path_entry, recv::QueueView::Server(state.view()));
+
+            // Bindings 1 and 2 each send an init to slot 1, and binding 1's reset doesn't leave.
+            harness.slow_init(init, &mut peer, 1, 1);
+            harness.slow_init(init, &mut peer, 1, 2);
+            assert_eq!(
+                take_resets(&mut harness.frame_rx),
+                vec![(1, 1)],
+                "{case}: the slot gets the reset of its first rejected init alone"
+            );
+            assert_slot_1_waits_on_its_reset(&state, &mut harness, &case);
+
+            // Once the reset leaves, the slot's next rejected init gets its reset.
+            harness.slow_init(init, &mut peer, 1, 3);
+            assert_eq!(take_resets(&mut harness.frame_rx), vec![(1, 3)], "{case}");
+        }
+    }
+}
+
+/// An init that `bind_for_init` binds a slot for, whose acceptor is closed or doesn't have a slot
+/// for the stream, and whose packet fails the AEAD check, doesn't hold the slot or send a reset,
+/// and the reject disables the stream it bound and puts back the slot's tombstone from before the
+/// bind, so that the slot doesn't stay bound and the genuine init of the same binding then gets
+/// its one reset.
+#[test]
+fn a_tampered_init_of_a_bound_slot_leaves_the_slot_unheld_and_unbound() {
+    for init_acceptor in [InitAcceptor::Closed, InitAcceptor::WithoutSlots] {
+        let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+        let mut view = recv::QueueView::Server(state.view());
+        let mut harness = FastPathHarness::new();
+        let _registry = use_acceptor(&mut harness, init_acceptor);
+
+        // Binding 1 of slot 1 ends, so the slot's tombstone is 1.
+        let bound = view
+            .as_server_mut()
+            .expect("server view")
+            .bind_for_msg(
+                VarInt::from_u8(1),
+                VarInt::from_u8(1),
+                &harness.path_entry,
+                &mut harness.freed_batch_tx,
+            )
+            .expect("slot 1 binds for binding 1");
+        assert!(
+            matches!(bound, crate::queue::BindResult::NewBinding { .. }),
+            "{init_acceptor:?}: binding 1 binds slot 1"
+        );
+        drop(bound);
+        assert!(
+            matches!(
+                view.slot_diag(VarInt::from_u8(1)),
+                Some(diag) if diag.unallocated && diag.stored_binding == 1
+            ),
+            "{init_acceptor:?}: binding 1's receivers drop, so slot 1's tombstone is 1"
+        );
+
+        // An init on slot 1 for binding 2 whose payload is changed on the network.
+        let (mut packet, opener, decrypt_len) =
+            sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(2), VarInt::from_u8(9));
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("{init_acceptor:?}: the server rejects the init");
+        };
+        assert!(
+            rejected.stream.is_some(),
+            "{init_acceptor:?}: the reject holds the stream it bound"
+        );
+        packet.payload_mut()[0] ^= 0xFF;
+        assert!(
+            !harness.authenticate(rejected, &mut packet, &opener, &mut view, true),
+            "{init_acceptor:?}: a tampered packet fails the AEAD check, so it isn't ACKed"
+        );
+        assert!(
+            take_resets(&mut harness.frame_rx).is_empty(),
+            "{init_acceptor:?}: a packet that fails the AEAD check doesn't send a reset"
+        );
+        assert!(
+            matches!(
+                view.slot_diag(VarInt::from_u8(1)),
+                Some(diag) if diag.unallocated && diag.stored_binding == 1
+            ),
+            "{init_acceptor:?}: the reject disables its stream and puts back the tombstone 1"
+        );
+        assert!(
+            state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)),
+            "{init_acceptor:?}: a packet that fails the AEAD check doesn't hold its slot"
+        );
+        state.freed.unhold(VarInt::from_u8(1), VarInt::from_u8(2));
+
+        // The client's genuine init on slot 1 for binding 2 then gets its one reset.
+        let (mut packet, opener, decrypt_len) =
+            sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(2), VarInt::from_u8(9));
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("{init_acceptor:?}: the server rejects the genuine init");
+        };
+        assert!(
+            rejected.stream.is_some(),
+            "{init_acceptor:?}: the genuine init binds the slot"
+        );
+        assert!(
+            harness.authenticate(rejected, &mut packet, &opener, &mut view, true),
+            "{init_acceptor:?}: the genuine init authenticates"
+        );
+        assert_eq!(
+            take_resets(&mut harness.frame_rx),
+            vec![(1, 2)],
+            "{init_acceptor:?}: the genuine init gets its one reset"
+        );
+    }
+}
+
+/// Where the priority router has ended, the submission channel refuses the reset of a rejected
+/// init, which then doesn't leave the router and release the slot: the reject doesn't hold the
+/// slot, so that the slot is recorded as freed at once.
+#[test]
+fn a_rejected_init_whose_reset_the_ended_router_refuses_leaves_the_slot_unheld() {
+    for init_acceptor in [InitAcceptor::Missing, InitAcceptor::Closed] {
+        let state = Arc::new(crate::queue::ServerState::new(VarInt::from_u8(4), 0));
+        let mut view = recv::QueueView::Server(state.view());
+        let mut harness = FastPathHarness::new();
+        let _registry = use_acceptor(&mut harness, init_acceptor);
+        // The priority router ends, and its receiver drops.
+        harness.frame_rx = crate::endpoint::frame::submission_channel(1).1;
+
+        let (mut packet, opener, decrypt_len) =
+            sealed_queue_init_packet(VarInt::from_u8(1), VarInt::from_u8(1), VarInt::from_u8(9));
+        let header = single_queue_msg_header(&packet, decrypt_len);
+        let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+        let Err(FastPathError::RejectInit(rejected)) = result else {
+            panic!("{init_acceptor:?}: the server rejects the init");
+        };
+        assert!(harness.authenticate(rejected, &mut packet, &opener, &mut view, true));
+
+        let mut freed = crate::bitset::HierarchicalBitSet::new(1);
+        state
+            .freed
+            .take(&mut freed)
+            .expect("the slot is recorded as freed at once");
+        assert!(
+            freed.contains(1),
+            "{init_acceptor:?}: slot 1 is recorded as freed"
+        );
+        assert!(
+            state.freed.hold(VarInt::from_u8(1), VarInt::from_u8(2)),
+            "{init_acceptor:?}: the slot isn't held"
+        );
+    }
 }
 
 /// Drops each value it's sent. The rejections the tests below check return from `process` before
