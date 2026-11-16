@@ -8,7 +8,7 @@ The system MUST keep one congestion controller for each sender.
 
 ### DC-0007-024 {#DC-0007-024}
 
-The data a sender has sent and not yet seen acknowledged MUST stay within a window that the sender sets from the path's bottleneck bandwidth and minimum round-trip time, as it measures them from the acknowledgements it receives.
+Except for data it sends as a fast retransmission or as a probe, the data a sender has sent and not yet seen acknowledged MUST stay within a window that the sender sets from the path's bottleneck bandwidth and minimum round-trip time, as it measures them from the acknowledgements it receives.
 
 ### DC-0007-040 {#DC-0007-040}
 
