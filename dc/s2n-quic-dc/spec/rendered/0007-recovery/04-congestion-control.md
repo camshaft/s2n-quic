@@ -36,7 +36,7 @@ A sender that is sending above its estimate of the path's bottleneck bandwidth t
 
 ### DC-0007-045 {#DC-0007-045}
 
-On an acknowledgement that ends a probe as DC-0007-044 describes, unless the sender had no application data queued when it sent the newest packet that acknowledgement acknowledges, the sender MUST set a limit that caps its window, and that never caps it below the sender's minimum window, to the larger of the data it had sent and not yet seen acknowledged when it sent that packet and seven tenths of the smaller of its window and its estimate of the path's bandwidth-delay product.
+On an acknowledgement that ends a probe as DC-0007-044 describes, the sender MUST set a limit that caps its window, and that never caps it below the sender's minimum window, to the larger of the data it had sent and not yet seen acknowledged when it sent the newest packet that acknowledgement acknowledges and seven tenths of the smaller of its window and its estimate of the path's bandwidth-delay product, unless it sent that packet within an application-limited period: one that opens when the sender runs out of queued application data while no such period is open, and that closes once the data the sender has seen acknowledged, declared lost or discarded since the period opened exceeds the data it had sent and not yet seen acknowledged when the period opened.
 
 ### DC-0007-028 {#DC-0007-028}
 
