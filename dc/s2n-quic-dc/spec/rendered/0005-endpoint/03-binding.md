@@ -24,7 +24,7 @@ A receiver MUST authenticate a packet whose frames it rejects for their routing 
 
 ### DC-0005-053 {#DC-0005-053}
 
-The reset that answers a frame under DC-0005-020 MUST carry the stream-not-found error code, which a reset for any other reason doesn't carry.
+The reset that answers a frame under DC-0005-020 MUST carry the stream-not-found error code.
 
 ### DC-0005-054 {#DC-0005-054}
 
@@ -37,3 +37,7 @@ A server MUST NOT answer with a reset a frame for a slot that a stream holds, or
 ### DC-0005-056 {#DC-0005-056}
 
 A client MUST NOT answer with a reset a reset that arrives for a stream it doesn't hold.
+
+### DC-0005-057 {#DC-0005-057}
+
+An endpoint MUST NOT carry the stream-not-found error code on a reset other than one that answers a frame under DC-0005-020.
