@@ -490,15 +490,21 @@ enum ServerSlot {
     Freed(u8),
     /// A stream bound the slot with this binding and holds it.
     Held(u8),
+    /// A stream bound the slot with this binding and holds it, and has dropped its control
+    /// receiver, so the slot's control half is closed.
+    ControlClosed(u8),
 }
 
 /// Sets up the server's slot for `SERVER_QUEUE_ID` on the path of `credentials` as `slot` says: a
 /// stream binds the slot, and for `ServerSlot::Freed` the stream's receivers are dropped, which
-/// frees the slot and keeps the stream's binding as the slot's last binding.
+/// frees the slot and keeps the stream's binding as the slot's last binding. For
+/// `ServerSlot::ControlClosed` the control receiver alone is dropped, which closes the slot's
+/// control half and leaves the stream holding the slot.
 fn set_up_slot(path_secret_map: &PathSecretMap, credentials: &Credentials, slot: ServerSlot) {
     let (binding_id, free) = match slot {
         ServerSlot::Freed(binding_id) => (binding_id, true),
         ServerSlot::Held(binding_id) => (binding_id, false),
+        ServerSlot::ControlClosed(binding_id) => (binding_id, false),
     };
     let entry = path_secret_map
         .get_by_id(&credentials.id)
@@ -527,7 +533,12 @@ fn set_up_slot(path_secret_map: &PathSecretMap, credentials: &Credentials, slot:
     } else {
         // The stream holds the slot while its receivers live: leak them for the short-lived test.
         std::mem::forget(stream);
-        std::mem::forget(control);
+        if matches!(slot, ServerSlot::ControlClosed(_)) {
+            // The stream receiver still holds the slot, so this closes the control half alone.
+            drop(control);
+        } else {
+            std::mem::forget(control);
+        }
     }
     std::mem::forget(freed_batch_rx);
     assert_eq!(
@@ -675,6 +686,46 @@ fn a_frame_for_a_held_slot_or_with_a_binding_that_isnt_newer_doesnt_get_a_reset(
             "{frame:?} with a binding newer than the free slot's last binding must get a reset"
         );
     }
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-055
+//= type=test
+//# A server MUST NOT answer with a reset a frame for a slot that a stream holds, or a frame whose binding identifier isn't newer than the last binding of its free slot.
+/// A control frame, a frame that raises the stream's flow-control limit, and a frame that says
+/// the writer is blocked, each with the binding of the stream that holds the slot, don't get a
+/// reset back, and the stream keeps the slot.
+#[test]
+fn a_frame_with_the_binding_of_the_stream_that_holds_the_slot_doesnt_get_a_reset() {
+    for frame in [
+        ClientFrame::Control,
+        ClientFrame::MaxData,
+        ClientFrame::DataBlocked,
+    ] {
+        let (headers, free) = answer(ServerSlot::Held(2), frame, 2);
+        assert!(
+            resets_in(&headers).is_empty(),
+            "{frame:?} with the binding of the stream that holds the slot must not get a reset"
+        );
+        assert!(!free, "{frame:?} must leave the slot held by its stream");
+    }
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-055
+//= type=test
+//# A server MUST NOT answer with a reset a frame for a slot that a stream holds, or a frame whose binding identifier isn't newer than the last binding of its free slot.
+/// A frame that raises the stream's flow-control limit, sent to a slot that a stream holds and
+/// whose control half is closed, doesn't get any frame back, and the stream keeps the slot.
+#[test]
+fn a_max_data_frame_for_a_half_closed_queue_doesnt_get_a_reset() {
+    let (headers, free) = answer(ServerSlot::ControlClosed(2), ClientFrame::MaxData, 2);
+    assert!(
+        headers.is_empty(),
+        "a max-data frame for a half-closed queue must not get any frame back"
+    );
+    assert!(
+        !free,
+        "a max-data frame for a half-closed queue must leave the slot held by its stream"
+    );
 }
 
 //= rendered/0005-endpoint/03-binding.md#DC-0005-057
