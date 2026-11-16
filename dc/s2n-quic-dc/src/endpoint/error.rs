@@ -31,6 +31,9 @@ pub const IDLE_TIMEOUT: VarInt = VarInt::from_u32(8);
 /// The sender cancelled the stream before completing a partially-sent message
 pub const SENDER_CANCELLED: VarInt = VarInt::from_u32(9);
 
+/// The receiver hasn't bound the stream a frame was sent for, and won't bind it from that frame
+pub const STREAM_NOT_FOUND: VarInt = VarInt::from_u32(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     AcceptorNotFound,
@@ -42,6 +45,7 @@ pub enum Error {
     QueueControlError,
     IdleTimeout,
     SenderCancelled,
+    StreamNotFound,
     Unknown(VarInt),
 }
 
@@ -64,6 +68,7 @@ impl Error {
             Self::QueueControlError => QUEUE_CONTROL_ERROR,
             Self::IdleTimeout => IDLE_TIMEOUT,
             Self::SenderCancelled => SENDER_CANCELLED,
+            Self::StreamNotFound => STREAM_NOT_FOUND,
             Self::Unknown(code) => code,
         }
     }
@@ -81,6 +86,7 @@ impl From<VarInt> for Error {
             QUEUE_CONTROL_ERROR => Self::QueueControlError,
             IDLE_TIMEOUT => Self::IdleTimeout,
             SENDER_CANCELLED => Self::SenderCancelled,
+            STREAM_NOT_FOUND => Self::StreamNotFound,
             _ => Self::Unknown(code),
         }
     }
@@ -98,6 +104,7 @@ impl fmt::Display for Error {
             Self::QueueControlError => write!(f, "sender exceeded receive window"),
             Self::IdleTimeout => write!(f, "peer idle timeout expired"),
             Self::SenderCancelled => write!(f, "sender cancelled mid-message"),
+            Self::StreamNotFound => write!(f, "stream not found at the receiver"),
             Self::Unknown(code) => write!(f, "unknown error ({})", code.as_u64()),
         }
     }
