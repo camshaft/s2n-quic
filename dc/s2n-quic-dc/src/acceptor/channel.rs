@@ -356,6 +356,31 @@ impl<T> Receiver<T> {
         self.slot.backlog()
     }
 
+    /// Waits until at least `len` items wait in this receiver's queue, or the
+    /// queue closes, without taking any of them. Each item that joins the queue
+    /// wakes the waiting task, as it wakes a task waiting in `recv`.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_backlog(&mut self, len: usize) {
+        self.ensure_registered();
+        std::future::poll_fn(|cx| {
+            let mut inner = self.slot.inner.lock();
+            // `push` counts an item under this lock, so an item that joins the
+            // queue after this check finds the waker below and wakes the task.
+            if self.slot.backlog() >= len || !inner.open {
+                return Poll::Ready(());
+            }
+            if inner
+                .waker
+                .as_ref()
+                .is_none_or(|w| !w.will_wake(cx.waker()))
+            {
+                inner.waker = Some(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
     /// Whether the channel is closed (all senders dropped).
     pub fn is_closed(&self) -> bool {
         !self.slot.inner.lock().open

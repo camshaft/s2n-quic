@@ -5732,10 +5732,9 @@ fn full_acceptor_queue_keeps_every_waiting_stream() {
             // waits in this receiver's queue while the application accepts none.
             acceptor.register();
 
-            // The queue doesn't report a stream joining it, so wait a settle
-            // window of simulated time, then check that every stream waits in
-            // the queue, past its capacity of 1.
-            1.s().sleep().await;
+            // Wait until every stream waits in the queue, past its capacity of
+            // 1: each stream that joins the queue wakes this task.
+            acceptor.wait_for_backlog(STREAMS).await;
             assert_eq!(
                 acceptor.backlog(),
                 STREAMS,
