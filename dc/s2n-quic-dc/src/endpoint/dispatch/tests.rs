@@ -190,8 +190,8 @@ fn bound_server_view(queue_id: VarInt, binding_id: VarInt) -> recv::QueueView {
     view
 }
 
-/// Assembles the auxiliary args `decrypt_fast_path` needs but that play no role in the
-/// reject path under test.
+/// Assembles the auxiliary args `decrypt_fast_path` and `process` need but that play no role in
+/// the reject path under test.
 struct FastPathHarness {
     acceptor_registry: acceptor::LocalRegistry<Stream>,
     frame_tx: SubmissionSender,
@@ -202,16 +202,21 @@ struct FastPathHarness {
     writer_metrics: Arc<crate::stream::metrics::WriterMetrics>,
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
     recv_credit_pool: crate::sync::Arc<crate::credit::Pool>,
-    path_entry: Arc<PathSecretEntry>,
     _freed_batch_rx: crate::queue::FreedBatchRx,
 }
 
 impl FastPathHarness {
     fn new() -> Self {
+        Self::with_frame_rx().0
+    }
+
+    /// Like [`Self::new`], and also returns the receiver of the frames the harness's `frame_tx`
+    /// submits, so that a test reads which frames `process` sent.
+    fn with_frame_rx() -> (Self, crate::endpoint::frame::SubmissionReceiver) {
         let registry = crate::counter::Registry::default();
-        let (frame_tx, _frame_rx) = crate::endpoint::frame::submission_channel(1);
+        let (frame_tx, frame_rx) = crate::endpoint::frame::submission_channel(1);
         let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
-        Self {
+        let harness = Self {
             acceptor_registry: acceptor::Registry::<Stream>::new().local(),
             frame_tx,
             freed_batch_tx,
@@ -225,14 +230,11 @@ impl FastPathHarness {
             recv_credit_pool: crate::sync::Arc::new(crate::credit::Pool::new(
                 crate::credit::Config::default(),
             )),
-            path_entry: PathSecretEntry::builder("127.0.0.1:4433".parse().unwrap())
-                .endpoint_type(endpoint::Type::Server)
-                .build(None),
             _freed_batch_rx,
-        }
+        };
+        (harness, frame_rx)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn call(
         &mut self,
         header: Header,
@@ -247,15 +249,7 @@ impl FastPathHarness {
             packet,
             decrypt_len,
             queue_view,
-            &mut self.acceptor_registry,
-            &mut self.frame_tx,
-            &mut self.freed_batch_tx,
             &self.counters,
-            &self.path_entry,
-            &self.stream_clock,
-            &self.reader_metrics,
-            &self.writer_metrics,
-            &self.send_credit_pool,
             &self.recv_credit_pool,
         )
     }
@@ -286,7 +280,7 @@ fn fast_path_unallocated_binding_requires_auth_before_ack() {
 
     let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
     assert!(
-        matches!(result, Err(FastPathError::AuthForDrop)),
+        matches!(result, Err(FastPathError::AuthForDrop { unbound: true })),
         "an un-authenticated binding reject must demand authentication before ACK, \
          not report success"
     );
@@ -310,7 +304,7 @@ fn fast_path_auth_for_drop_distinguishes_tampered_packet() {
         let mut harness = FastPathHarness::new();
 
         let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
-        assert!(matches!(result, Err(FastPathError::AuthForDrop)));
+        assert!(matches!(result, Err(FastPathError::AuthForDrop { unbound: true })));
         // The closure authenticates in place before ACKing; an authentic packet passes.
         assert!(
             packet.decrypt_in_place(&opener).is_ok(),
@@ -328,7 +322,7 @@ fn fast_path_auth_for_drop_distinguishes_tampered_packet() {
         let mut harness = FastPathHarness::new();
 
         let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
-        assert!(matches!(result, Err(FastPathError::AuthForDrop)));
+        assert!(matches!(result, Err(FastPathError::AuthForDrop { unbound: true })));
 
         // Corrupt an authenticated byte, then confirm in-place auth fails → ACK suppressed →
         // the genuine packet is retransmitted rather than freed by a spurious ACK.
@@ -407,7 +401,7 @@ fn fast_path_insert_reject_requires_auth_before_ack() {
 
     let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
     assert!(
-        matches!(result, Err(FastPathError::AuthForDrop)),
+        matches!(result, Err(FastPathError::AuthForDrop { unbound: false })),
         "a QueueMsg rejected by MsgTable::insert BEFORE the scatter-decrypt was never \
          authenticated, so the fast path must demand auth-before-ACK (AuthForDrop) rather than \
          report success and let `process` ACK an un-verified packet — got {}",
@@ -415,7 +409,7 @@ fn fast_path_insert_reject_requires_auth_before_ack() {
             Ok(_) => "Ok (packet would be ACKed un-authenticated — BUG)",
             Err(FastPathError::HeaderMismatch) => "HeaderMismatch",
             Err(FastPathError::WriteFailed) => "WriteFailed",
-            Err(FastPathError::AuthForDrop) => "AuthForDrop",
+            Err(FastPathError::AuthForDrop { .. }) => "AuthForDrop",
         }
     );
 }
@@ -477,6 +471,30 @@ fn sealed_client_packet(
     datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
     Credentials,
 ) {
+    sealed_client_frame(
+        peer,
+        key_id,
+        source_sender_id,
+        VarInt::ZERO,
+        VarInt::ZERO,
+        None,
+    )
+}
+
+/// Like [`sealed_client_packet`], with `packet_number` as the packet's number, the frame routed
+/// at `dest_queue_id`, and `dest_acceptor_id` as the acceptor the frame is for: `Some` makes it an
+/// opening frame.
+fn sealed_client_frame(
+    peer: SocketAddr,
+    key_id: VarInt,
+    source_sender_id: VarInt,
+    packet_number: VarInt,
+    dest_queue_id: VarInt,
+    dest_acceptor_id: Option<VarInt>,
+) -> (
+    datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    Credentials,
+) {
     let sealer_entry = PathSecretEntry::builder(peer)
         .endpoint_type(endpoint::Type::Client)
         .build(None);
@@ -491,7 +509,7 @@ fn sealed_client_packet(
     let header = Header::QueueMsg {
         queue_pair: QueuePair {
             source_queue_id: VarInt::from_u8(7),
-            dest_queue_id: VarInt::ZERO,
+            dest_queue_id,
         },
         binding_id: VarInt::from_u8(1),
         msg_id: VarInt::ZERO,
@@ -503,7 +521,7 @@ fn sealed_client_packet(
         is_fin: true,
         is_wakeup: true,
         blocked: false,
-        dest_acceptor_id: None,
+        dest_acceptor_id,
         priority: crate::credit::Priority::default(),
     };
 
@@ -521,7 +539,7 @@ fn sealed_client_packet(
         s2n_codec::EncoderBuffer::new(&mut buf),
         443,
         datagram::RoutingInfo::SenderId { source_sender_id },
-        Some(VarInt::ZERO),
+        Some(packet_number),
         VarInt::try_from(header_buf.len() as u64).unwrap(),
         &mut header_reader,
         payload_len,
@@ -560,11 +578,22 @@ fn process_uncached(
 ) -> Result<(), Error> {
     let mut harness = FastPathHarness::new();
     let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+    process_with(packet, path_secret_map, &mut harness, &mut recv_cache)
+}
+
+/// Runs `process` on `packet` with the acceptors and the frame sender of `harness`, and with
+/// `recv_cache`, which keeps the receive state of the packets processed before it.
+fn process_with(
+    packet: datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    path_secret_map: &PathSecretMap,
+    harness: &mut FastPathHarness,
+    recv_cache: &mut recv::Cache,
+) -> Result<(), Error> {
     let clock = crate::time::testing::Clock::new(Duration::from_secs(1));
     let route = <routing::ModuloRoute as routing::SenderRoute>::new(1);
     process(
         Entry::new(packet),
-        &mut recv_cache,
+        recv_cache,
         &mut Discard,
         &mut Discard,
         path_secret_map,
@@ -687,3 +716,272 @@ fn stale_key_carries_the_rejected_packets_sender_id() {
         );
     }
 }
+
+/// The acceptor the opening frames below are for.
+const ACCEPTOR_ID: u8 = 5;
+
+/// A path secret map that holds the server entry for `peer`, as the receiver of the client's
+/// packets holds it.
+fn server_map(peer: SocketAddr) -> PathSecretMap {
+    let path_secret_map = crate::path::secret::map::testing::new(16);
+    path_secret_map.test_insert(peer, endpoint::Type::Server);
+    path_secret_map
+}
+
+/// An opening frame for `ACCEPTOR_ID`, routed at `dest_queue_id`, as the client for `peer` sends
+/// it with `packet_number`. Where `forged`, a byte of the sealed payload is changed afterwards, so
+/// that the packet fails authentication, as a forged packet, or one corrupted on the way, does.
+fn opening_frame(
+    peer: SocketAddr,
+    packet_number: u8,
+    dest_queue_id: u8,
+    forged: bool,
+) -> (
+    datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    Credentials,
+) {
+    let (mut packet, credentials) = sealed_client_frame(
+        peer,
+        VarInt::ZERO,
+        VarInt::from_u8(3),
+        VarInt::from_u8(packet_number),
+        VarInt::from_u8(dest_queue_id),
+        Some(VarInt::from_u8(ACCEPTOR_ID)),
+    );
+    if forged {
+        packet.payload_mut()[0] ^= 0xFF;
+    }
+    (packet, credentials)
+}
+
+/// Registers `ACCEPTOR_ID` with a backlog of `capacity` streams, makes it the acceptor that
+/// `harness` hands streams to, and returns the registry and the acceptor's receiver.
+fn register_acceptor(
+    harness: &mut FastPathHarness,
+    capacity: usize,
+) -> (acceptor::Registry<Stream>, acceptor::channel::Receiver<Stream>) {
+    let registry = acceptor::Registry::<Stream>::new();
+    let mut receiver = registry
+        .register(
+            VarInt::from_u8(ACCEPTOR_ID),
+            acceptor::channel::Config {
+                capacity,
+                eviction: acceptor::channel::Eviction::Front,
+            },
+        )
+        .expect("the acceptor id must be free");
+    receiver.register();
+    harness.acceptor_registry = registry.local();
+    (registry, receiver)
+}
+
+/// Whether the receiver's slot for `queue_id` on the path of `credentials` is free: unallocated,
+/// with no stream receiver attached.
+fn slot_is_free(path_secret_map: &PathSecretMap, credentials: &Credentials, queue_id: u8) -> bool {
+    let entry = path_secret_map
+        .get_by_id(&credentials.id)
+        .expect("the map must hold the server entry for the packet's credential");
+    let crate::path::secret::map::entry::QueueState::Server(state) = entry.queue_state() else {
+        panic!("a server entry must have a server queue state");
+    };
+    let mut view = recv::QueueView::Server(state.view());
+    view.slot_diag(VarInt::from_u8(queue_id))
+        .is_none_or(|diag| diag.unallocated && !diag.stream_has_receiver)
+}
+
+/// The headers of the frames `frame_rx` holds, taken out of it.
+fn submitted_headers(frame_rx: &mut crate::endpoint::frame::SubmissionReceiver) -> Vec<Header> {
+    let waker = s2n_quic_core::task::waker::noop();
+    let mut cx = core::task::Context::from_waker(&waker);
+    let mut headers = Vec::new();
+    loop {
+        let mut batch = crate::endpoint::frame::PriorityStorage::default();
+        match frame_rx.poll_swap(&mut cx, &mut batch) {
+            core::task::Poll::Ready(Some(())) => {
+                headers.extend(batch.iter().map(|frame| frame.header));
+                // Leak the frames rather than drop them: they are never sent, and a frame dropped
+                // while its writer still waits for its outcome fails a debug assertion.
+                core::mem::forget(batch);
+            }
+            _ => return headers,
+        }
+    }
+}
+
+/// Whether `header` is a reset with `code` as its error code.
+fn is_reset(header: &Header, code: VarInt) -> bool {
+    match header {
+        Header::QueueReset { error_code, .. } => *error_code == code,
+        _ => false,
+    }
+}
+
+/// An opening frame (one that names its acceptor) never takes the fast path: `process` sends it
+/// to the slow path, which authenticates the whole packet before it binds a slot. One that
+/// reaches the fast path anyway is a header mismatch, which binds nothing and isn't ACKed.
+#[test]
+fn fast_path_refuses_an_opening_frame() {
+    let (packet, opener, decrypt_len) =
+        sealed_queue_msg_packet(VarInt::from_u8(0), VarInt::from_u8(1));
+    let mut header = single_queue_msg_header(&packet, decrypt_len);
+    let Header::QueueMsg {
+        dest_acceptor_id, ..
+    } = &mut header
+    else {
+        unreachable!("single_queue_msg_header returns a QueueMsg header");
+    };
+    *dest_acceptor_id = Some(VarInt::from_u8(ACCEPTOR_ID));
+    assert!(is_opening_frame(&header));
+
+    let mut view = fresh_server_view();
+    let mut harness = FastPathHarness::new();
+    let result = harness.call(header, &opener, &packet, decrypt_len, &mut view);
+    assert!(
+        matches!(result, Err(FastPathError::HeaderMismatch)),
+        "the fast path must refuse an opening frame"
+    );
+    assert!(
+        view.slot_diag(VarInt::from_u8(0))
+            .is_none_or(|diag| diag.unallocated && !diag.stream_has_receiver),
+        "a refused opening frame must not bind its slot"
+    );
+}
+
+/// An opening frame whose packet fails authentication doesn't bind a slot, doesn't hand a stream
+/// to the acceptor and doesn't send a frame. The same frame, authentic, binds the slot and reaches
+/// the acceptor, so the checks read the state an opening frame changes.
+#[test]
+fn an_opening_frame_that_fails_authentication_doesnt_bind_a_slot_or_reach_the_acceptor() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+    let (_acceptors, mut accepted) = register_acceptor(&mut harness, 1);
+
+    let (forged, credentials) = opening_frame(peer, 0, 0, true);
+    let result = process_with(forged, &path_secret_map, &mut harness, &mut recv_cache);
+    let got = outcome(&result);
+    assert!(
+        matches!(result, Err(Error::Decryption { .. })),
+        "a packet that fails authentication must be rejected as Decryption, not {got}"
+    );
+    assert!(
+        slot_is_free(&path_secret_map, &credentials, 0),
+        "an opening frame whose packet fails authentication must not bind its slot"
+    );
+    assert_eq!(
+        accepted.backlog(),
+        0,
+        "an opening frame whose packet fails authentication must not reach the acceptor"
+    );
+    assert!(
+        submitted_headers(&mut frame_rx).is_empty(),
+        "an opening frame whose packet fails authentication must not send a frame"
+    );
+
+    let (authentic, _) = opening_frame(peer, 0, 0, false);
+    let _ = process_with(authentic, &path_secret_map, &mut harness, &mut recv_cache);
+    assert!(
+        !slot_is_free(&path_secret_map, &credentials, 0),
+        "an authentic opening frame must bind its slot"
+    );
+    assert!(
+        accepted.try_recv().is_some(),
+        "an authentic opening frame must reach the acceptor"
+    );
+}
+
+/// An opening frame for an acceptor the receiver doesn't have gets a reset (DC-0005-020) only
+/// where its packet authenticates: a packet that fails authentication doesn't get a reset, and
+/// doesn't free its slot.
+#[test]
+fn an_opening_frame_that_fails_authentication_doesnt_get_a_reset() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+
+    let (forged, credentials) = opening_frame(peer, 0, 0, true);
+    let result = process_with(forged, &path_secret_map, &mut harness, &mut recv_cache);
+    let got = outcome(&result);
+    assert!(
+        matches!(result, Err(Error::Decryption { .. })),
+        "a packet that fails authentication must be rejected as Decryption, not {got}"
+    );
+    assert!(
+        submitted_headers(&mut frame_rx).is_empty(),
+        "an opening frame whose packet fails authentication must not get a reset"
+    );
+    assert!(
+        slot_is_free(&path_secret_map, &credentials, 0),
+        "an opening frame whose packet fails authentication must leave its slot free"
+    );
+
+    let (authentic, _) = opening_frame(peer, 0, 0, false);
+    let _ = process_with(authentic, &path_secret_map, &mut harness, &mut recv_cache);
+    let headers = submitted_headers(&mut frame_rx);
+    assert!(
+        headers
+            .iter()
+            .any(|header| is_reset(header, error::ACCEPTOR_NOT_FOUND)),
+        "an authentic opening frame for an acceptor the receiver doesn't have must get a reset"
+    );
+}
+
+/// An opening frame whose packet fails authentication doesn't evict a stream from a full acceptor
+/// backlog: the authentic stream stays queued with its slot bound, the forged frame's slot stays
+/// free, and the receiver doesn't send a frame, such as the evicted stream's reset.
+#[test]
+fn an_opening_frame_that_fails_authentication_doesnt_evict_a_queued_stream() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+    let (_acceptors, accepted) = register_acceptor(&mut harness, 1);
+
+    let (authentic, credentials) = opening_frame(peer, 0, 0, false);
+    let _ = process_with(authentic, &path_secret_map, &mut harness, &mut recv_cache);
+    assert_eq!(
+        accepted.backlog(),
+        1,
+        "the authentic opening frame must fill the acceptor's backlog"
+    );
+    assert!(
+        !slot_is_free(&path_secret_map, &credentials, 0),
+        "the authentic opening frame must bind its slot"
+    );
+    assert!(
+        submitted_headers(&mut frame_rx).is_empty(),
+        "the authentic opening frame must not send a frame"
+    );
+
+    let (forged, _) = opening_frame(peer, 1, 1, true);
+    let result = process_with(forged, &path_secret_map, &mut harness, &mut recv_cache);
+    let got = outcome(&result);
+    assert!(
+        matches!(result, Err(Error::Decryption { .. })),
+        "a packet that fails authentication must be rejected as Decryption, not {got}"
+    );
+    assert_eq!(
+        accepted.backlog(),
+        1,
+        "an opening frame whose packet fails authentication must not take a backlog place"
+    );
+    assert!(
+        !slot_is_free(&path_secret_map, &credentials, 0),
+        "an opening frame whose packet fails authentication must not evict the queued stream"
+    );
+    assert!(
+        slot_is_free(&path_secret_map, &credentials, 1),
+        "an opening frame whose packet fails authentication must not bind its slot"
+    );
+    assert!(
+        submitted_headers(&mut frame_rx).is_empty(),
+        "an opening frame whose packet fails authentication must not reset the queued stream"
+    );
+}
+
+/// The tests of the reset that answers a frame for a stream the server hasn't bound
+/// (DC-0005-020), apart from the binding tests.
+#[path = "unbound_reset_tests.rs"]
+mod unbound_reset_tests;
