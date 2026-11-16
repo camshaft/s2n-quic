@@ -126,6 +126,8 @@ where
                 break;
             }
 
+            //= rendered/0005-endpoint/05-assembly.md#DC-0005-032
+            //# A sender MUST NOT send a packet larger than the maximum packet size of the path.
             let max_segment_len = {
                 let remaining_total =
                     segment::MAX_TOTAL as usize - offset.min(segment::MAX_TOTAL as usize);
@@ -140,6 +142,8 @@ where
                 break;
             }
 
+            //= rendered/0005-endpoint/01-frames.md#DC-0005-001
+            //# A sender MAY carry several frames, of one or more streams to the same peer, in one packet.
             let mut packet_frames = Queue::new();
             let mut metadata = MetadataEstimate::new();
             let mut is_ack_eliciting = false;
@@ -154,6 +158,10 @@ where
             // the segment is registered in the inflight map.
             let mut probe_from_pn: Option<PacketNumber> = None;
 
+            //= rendered/0005-endpoint/04-acknowledgement.md#DC-0005-030
+            //# When a sender has no packet that carries data awaiting acknowledgement, it MAY mark one acknowledgement it sends as ack-eliciting to measure the round-trip time.
+            //= rendered/0005-endpoint/04-acknowledgement.md#DC-0005-031
+            //# After an acknowledgement that a sender marked ack-eliciting to measure the round-trip time yields a sample, the sender MUST NOT mark another acknowledgement as ack-eliciting until it has sent a packet that carries data.
             // When there is no data in the inflight map, we want to obtain an RTT
             // sample by making one ACK-only packet ack-eliciting (PING-style probe).
             // `make_ack_eliciting` is true only for the first probe in a cycle;
@@ -167,6 +175,8 @@ where
             // suppresses further probing until new data enters the inflight map.
             let make_ack_eliciting = rtt_sample_needed && !context.rtt_tracker.is_pending();
 
+            //= rendered/0005-endpoint/01-frames.md#DC-0005-006
+            //# A sender MUST NOT hold back an acknowledgement because the congestion window is full.
             // Phase 1: drain direct ACK submissions (from pending_acks queue).
             // Each entry carries an already-encoded ACK body from recv worker; stamp
             // wire-time ack_delay here. These bypass CWND like Phase 1 frames.
@@ -180,6 +190,10 @@ where
                 let ack_delay_micros = ack_delay_duration.as_micros() as u64;
                 let ack_delay = VarInt::new(ack_delay_micros).unwrap_or(VarInt::from_u32(u32::MAX));
 
+                //= rendered/0005-endpoint/04-acknowledgement.md#DC-0005-026
+                //# An acknowledgement MUST carry the sender identifier of the packets it acknowledges.
+                //= rendered/0005-endpoint/04-acknowledgement.md#DC-0005-027
+                //# An acknowledgement MUST carry the counts of explicit congestion notification marks on the packets received from its sender.
                 let header = frame::Header::Ack {
                     dest_sender_id: submission.remote_sender_id.as_varint(),
                     ack_delay,
@@ -271,6 +285,8 @@ where
             // (ProbeTwice → ProbeOnce → Idle) so the peer receives enough contiguous PNs
             // to satisfy the loss detection threshold (PN-threshold = 2). If only one
             // inflight entry is available, the second segment is a Ping frame.
+            //= rendered/0005-endpoint/05-assembly.md#DC-0005-036
+            //# When its probe timeout fires, a sender MUST send two ack-eliciting packets to the peer.
             if context.pto.probe_state.is_requested() && !context.has_pending_data() {
                 match assemble_probe(
                     context,
@@ -354,6 +370,8 @@ where
             //
             // PTO probes are exempt in all cases: RFC 9002 §6.2.4 requires probes
             // to bypass both CWND and pacing so tail-loss recovery is not delayed.
+            //= rendered/0005-endpoint/05-assembly.md#DC-0005-038
+            //# A sender SHOULD send waiting acknowledgements and probes without holding them behind paced data frames.
             let edt_elapsed = !context.tx_wheel.is_scheduled()
                 || context.tx_wheel.target_time.is_some_and(|t| now >= t);
             let can_piggyback_data = match immediate_queue_status {
@@ -367,6 +385,8 @@ where
 
             if can_send_pending {
                 while let Some(mut frame) = context.pop_pending() {
+                    //= rendered/0005-endpoint/01-frames.md#DC-0005-003
+                    //# The endpoint MUST NOT transmit a frame whose writer has cancelled it or gone away.
                     if !frame.should_transmit() {
                         // The emitting handle is gone — this frame dies at assembly, before the
                         // wire. Distinct from a post-send AckCancelled; `next_packet_number` is the
@@ -478,6 +498,8 @@ where
                 break;
             }
 
+            //= rendered/0005-endpoint/05-assembly.md#DC-0005-033
+            //# A sender MUST number each packet it sends under one sender identifier higher than every packet it sent before under that identifier.
             // Assign packet number
             let packet_number = context.next_packet_number;
             context.next_packet_number += 1;
@@ -650,6 +672,8 @@ where
                         context.last_peer_activity = now;
                     }
 
+                    //= rendered/0005-endpoint/05-assembly.md#DC-0005-035
+                    //# A sender MUST record which frames each packet carried until the packet is acknowledged or declared lost.
                     let pn = PacketNumberSpace::Initial.new_packet_number(packet_number);
                     context
                         .inflight
@@ -962,6 +986,8 @@ fn assemble_probe(
     cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
     counters: &AssemblerCounters,
 ) -> ProbeResult {
+    //= rendered/0005-endpoint/05-assembly.md#DC-0005-037
+    //# When a probe is due and no frames are pending for the peer, the sender MUST make the probe from frames of the oldest packet still awaiting acknowledgement, sent again under a new packet number.
     while let Some((old_pn, mut probe_frames)) = context.inflight.take_oldest_for_probe() {
         let mut probe_metadata = *metadata;
         let mut has_frame = false;
@@ -1090,6 +1116,10 @@ impl MetadataEstimate {
     }
 }
 
+//= rendered/0005-endpoint/05-assembly.md#DC-0005-034
+//# A sender MUST encrypt the frame payloads of each packet.
+//= rendered/0005-endpoint/05-assembly.md#DC-0005-052
+//# A sender MUST authenticate every byte of each packet that carries frames, its unencrypted header and frame metadata among them.
 /// Encode a single segment containing one or more frames.
 ///
 /// Wire layout:

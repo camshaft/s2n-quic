@@ -165,6 +165,8 @@ impl Client {
         handshake_timer.record(handshake_elapsed);
 
         let now = self.endpoint.clock.now();
+        //= rendered/0005-endpoint/06-peers.md#DC-0005-050
+        //# The endpoint MUST NOT open a new stream to a peer during the cooldown that follows the peer being declared dead.
         if path_secret_entry.is_dead_during_cooldown(now, self.endpoint.dead_peer_cooldown) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,

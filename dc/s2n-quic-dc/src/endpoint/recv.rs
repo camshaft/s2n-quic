@@ -358,6 +358,8 @@ impl Context {
         &mut self,
         recv_worker_id: RecvDispatchWorkerId,
     ) -> Option<ack_state::Submission> {
+        //= rendered/0005-endpoint/04-acknowledgement.md#DC-0005-024
+        //# A receiver MUST have at most one acknowledgement for each sender waiting to be sent at any time.
         if !self.ack_state.is_scheduled() {
             return None;
         }
@@ -423,6 +425,8 @@ impl Context {
         );
         self.flushed_at = None;
         let ranges_culled = self.ack_ranges.on_completion();
+        //= rendered/0005-endpoint/04-acknowledgement.md#DC-0005-025
+        //# When an ack-eliciting packet arrives while an acknowledgement for its sender is waiting to be sent, the receiver MUST send a further acknowledgement that covers it after the waiting one is sent.
         let submission = self.encode_and_flush(recv_worker_id);
         self.invariants();
         (submission, ranges_culled)
@@ -432,6 +436,8 @@ impl Context {
 /// Key for sender state lookup — keyed by peer identity (stable) + sender_id,
 /// NOT by full Credentials (which includes the per-packet key_id).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+//= rendered/0005-endpoint/02-receive.md#DC-0005-007
+//# A receiver MUST keep separate packet number and acknowledgement state for each pair of peer credential and sender identifier.
 pub(crate) struct Key {
     pub id: credentials::Id,
     pub remote_sender_id: RemoteSenderId,
@@ -563,6 +569,8 @@ impl Cache {
                         control_out,
                     )
                     .map_err(|_| CacheError::ReplayDetected)?;
+                //= rendered/0005-endpoint/02-receive.md#DC-0005-013
+                //# A receiver MUST NOT keep receive state for a new key until a packet under that key has passed both authentication and the replay check.
 
                 // Packet is authentic — replace the entry with a fresh context.
                 // Key advancement means the peer abandoned its old sender context
@@ -657,6 +665,8 @@ impl Cache {
                     queue_view,
                 )));
                 ctx.borrow().invariants();
+                //= rendered/0005-endpoint/02-receive.md#DC-0005-013
+                //# A receiver MUST NOT keep receive state for a new key until a packet under that key has passed both authentication and the replay check.
                 entry.insert(ctx.clone());
                 Ok((r, ctx, false))
             }

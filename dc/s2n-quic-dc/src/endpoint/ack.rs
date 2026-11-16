@@ -198,6 +198,8 @@ pub(crate) fn process_ack<Clk, Rand>(
                         }
                     });
 
+                    //= rendered/0005-endpoint/04-acknowledgement.md#DC-0005-028
+                    //# On an acknowledgement, a sender MUST report each frame of each newly acknowledged packet to its writer as acknowledged.
                     entry.status = TransmissionStatus::Acknowledged;
                     let _ = completed.send(entry);
                 }
@@ -607,6 +609,8 @@ fn detect_loss<Rand>(
             );
         }
 
+        //= rendered/0005-endpoint/04-acknowledgement.md#DC-0005-029
+        //# When a packet is declared lost, the sender MUST queue each of its frames for retransmission, except a frame that has been cancelled or has reached its bound on transmissions.
         for mut entry in packet.frames {
             // A QueueDbg marker can meet three fates in this loop — cancelled (writer/reader gone),
             // TTL-exhausted (dropped for good), or lost-and-retransmitted. Record the fate with a
@@ -651,6 +655,8 @@ fn detect_loss<Rand>(
                 continue;
             }
 
+            //= rendered/0005-endpoint/01-frames.md#DC-0005-051
+            //# When a frame reaches its bound on transmissions without an acknowledgement, the endpoint MUST report the frame to its writer as failed with the transmission error reason.
             if entry.ttl == 0 {
                 debug_assert_ne!(entry.ttl, 0, "frame TTL should never be exhausted");
                 error!(

@@ -943,6 +943,8 @@ impl Context {
         interest
     }
 
+    //= rendered/0005-endpoint/01-frames.md#DC-0005-005
+    //# A sender MUST send a peer's pending frames of a higher priority class before its pending frames of a lower priority class.
     /// Pop the next pending frame, draining from highest priority first.
     #[inline]
     pub fn pop_pending(&mut self) -> Option<intrusive::Entry<Frame>> {
@@ -1566,6 +1568,8 @@ impl Cache {
             return None;
         };
 
+        //= rendered/0005-endpoint/06-peers.md#DC-0005-044
+        //# A sender MUST NOT discard or retransmit the frames of a send state whose key is newer than the key a stale key or replay notice rejects.
         // If the send context's key_id is already past the rejected one, this
         // invalidation is stale (e.g. a delayed/replayed control packet) — ignore it.
         if ctx.borrow().credentials.key_id > rejected_key_id {
@@ -1590,6 +1594,8 @@ impl Cache {
             rejected_key_id = rejected_key_id.as_u64(),
             "invalidating stale/replay send context for retransmission"
         );
+        //= rendered/0005-endpoint/06-peers.md#DC-0005-043
+        //# On a validated stale key or replay notice, the sender MUST queue for retransmission the pending and unacknowledged frames of the send state that used the rejected key.
         Some(ctx.drain_frames(None, retransmit))
     }
 }
