@@ -536,6 +536,13 @@ fn set_up_slot(path_secret_map: &PathSecretMap, credentials: &Credentials, slot:
         if matches!(slot, ServerSlot::ControlClosed(_)) {
             // The stream receiver still holds the slot, so this closes the control half alone.
             drop(control);
+            let diag = view
+                .slot_diag(VarInt::from_u8(SERVER_QUEUE_ID))
+                .expect("the bound slot must be mapped");
+            assert!(
+                diag.stream_has_receiver && !diag.control_has_receiver,
+                "the stream must hold the slot with its control receiver closed"
+            );
         } else {
             std::mem::forget(control);
         }
