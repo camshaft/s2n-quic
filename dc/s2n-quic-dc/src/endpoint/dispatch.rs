@@ -68,7 +68,10 @@ pub(crate) enum Error {
 /// Result of the decrypt closure: either the fast path completed dispatch inline,
 /// or we have a BytesMut that needs multi-frame dispatch.
 enum DecryptResult {
-    FastPath(AutoWake),
+    /// The fast path dispatched the frame. The flag is true where the frame's binding is one the
+    /// receiver hasn't bound, so `process` answers the frame with a reset once the packet
+    /// authenticates (DC-0005-020).
+    FastPath(AutoWake, bool),
     SlowPath(BytesMut),
 }
 
@@ -87,7 +90,11 @@ enum FastPathError {
     /// would make the sender free that packet number and stop retransmitting, leaving a permanent
     /// hole on the real stream. Authenticating means a tampered packet fails the AEAD tag check
     /// and the ACK is suppressed, so the genuine packet is retransmitted and recovers.
-    AuthForDrop,
+    ///
+    /// `unbound` is true where the slot check answered `Unallocated`: the receiver never bound the
+    /// frame's binding, so once the packet authenticates `process` answers the frame with a reset
+    /// (DC-0005-020).
+    AuthForDrop { unbound: bool },
 }
 
 /// Whether `header` opens a stream: a `QueueMsg` that names the acceptor it is for.
@@ -181,14 +188,19 @@ fn decrypt_fast_path(
         // `send_msg` rejected on binding validation *before* invoking the scatter-decrypt
         // write callback, so the packet was never authenticated. Caller must authenticate
         // before ACKing — see `AuthForDrop`.
-        Err(crate::queue::MsgError::Queue(_)) => return Err(FastPathError::AuthForDrop),
+        Err(crate::queue::MsgError::Queue(error)) => {
+            let unbound = matches!(error, crate::queue::Error::Unallocated(_));
+            return Err(FastPathError::AuthForDrop { unbound });
+        }
         // The `MsgTable` rejected the chunk's geometry *before* the scatter-decrypt ran, so the
         // packet is likewise un-authenticated. Geometry fields (`msg_id`, `chunk_index`,
         // `message_size`, `chunk_size`, …) are cleartext AEAD associated data, so an in-flight
         // corruption of any of them lands here for an otherwise-valid live-stream packet —
         // authenticate before ACKing so a tampered packet is dropped (→ retransmit) rather than
         // ACKed into a permanent stream hole. See `AuthForDrop`.
-        Err(crate::queue::MsgError::InsertRejected) => return Err(FastPathError::AuthForDrop),
+        Err(crate::queue::MsgError::InsertRejected) => {
+            return Err(FastPathError::AuthForDrop { unbound: false });
+        }
         Err(crate::queue::MsgError::Write(_)) => return Err(FastPathError::WriteFailed),
     })
 }
@@ -333,15 +345,17 @@ where
                 counters,
                 recv_credit_pool,
             ) {
-                Ok(waker) => Some(DecryptResult::FastPath(waker)),
+                Ok(waker) => Some(DecryptResult::FastPath(waker, false)),
                 // The packet routed to a binding we are rejecting, so the scatter-decrypt
                 // never ran. Authenticate it in place before the caller ACKs: a tampered
                 // packet fails here and returns `None` → `CacheError::DecryptFailed` → no ACK
                 // → the genuine packet is retransmitted. See `FastPathError::AuthForDrop`.
-                Err(FastPathError::AuthForDrop) => match packet.decrypt_in_place(opener) {
-                    Ok(()) => Some(DecryptResult::FastPath(AutoWake::default())),
-                    Err(_) => None,
-                },
+                Err(FastPathError::AuthForDrop { unbound }) => {
+                    match packet.decrypt_in_place(opener) {
+                        Ok(()) => Some(DecryptResult::FastPath(AutoWake::default(), unbound)),
+                        Err(_) => None,
+                    }
+                }
                 Err(FastPathError::HeaderMismatch) | Err(FastPathError::WriteFailed) => None,
             };
         }
@@ -471,10 +485,22 @@ where
 
     // Fast path: single QueueMsg already dispatched during decrypt — just send the waker.
     let payload_storage = match decrypt_result {
-        DecryptResult::FastPath(waker) => {
+        DecryptResult::FastPath(waker, unbound) => {
             let _ = waker_sink.send(waker);
             counters.on_received_frame(&single_queue_msg.unwrap());
             counters.rx_frames_per_packet.record_value(1);
+            // The packet authenticated above, so a frame for a binding this receiver never bound
+            // is answered with a reset now (DC-0005-020, DC-0005-021).
+            if unbound {
+                if let Some(Header::QueueMsg {
+                    queue_pair,
+                    binding_id,
+                    ..
+                }) = single_queue_msg
+                {
+                    reset_unbound_frame(&peer, queue_pair, binding_id, frame_tx);
+                }
+            }
 
             // QueueMsg is always ack-eliciting — drive the ACK state machine.
             match peer.ack_state.on_ack_eliciting() {
@@ -703,6 +729,11 @@ fn dispatch_decoded_frame(
                 waker_sink,
                 recv_credit_pool,
             ) {
+                // A frame for a stream this server never bound is answered with a reset
+                // (DC-0005-020); the packet authenticated before dispatch (DC-0005-021).
+                if matches!(reason, frame_trace::DropReason::Unallocated) {
+                    reset_unbound_frame(peer, queue_pair, binding_id, frame_tx);
+                }
                 // Authenticated and decoded but rejected before reaching the application — record
                 // where it died so the drop isn't a blind spot. `header` is still the authentic
                 // wire frame (it is `Copy`, untouched by the match binding above).
@@ -870,6 +901,10 @@ fn dispatch_decoded_frame(
                 waker_sink,
                 recv_credit_pool,
             ) {
+                // See the QueueData arm: answer a frame for an unbound stream with a reset.
+                if matches!(reason, frame_trace::DropReason::Unallocated) {
+                    reset_unbound_frame(peer, queue_pair, binding_id, frame_tx);
+                }
                 // See the QueueData arm: record the post-decode drop against the authentic header.
                 frame_trace::wire(
                     frame_trace::Lifecycle::RxDropped,
@@ -1943,6 +1978,33 @@ fn handle_queue_data_blocked(
 
 // ── QueueReset ─────────────────────────────────────────────────────────────
 
+//= rendered/0005-endpoint/03-binding.md#DC-0005-020
+//# A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
+/// Answer an authenticated frame whose slot check found its binding unallocated with a reset to
+/// the frame's sender.
+///
+/// Only a server answers: a client's queues hold only the streams it opened, and a client that
+/// answered a server's reset could send resets back and forth with it. The reset echoes the
+/// frame's binding id, so a client that has since freed or bound the slot again drops the reset
+/// at its slot check. Callers send it only once the packet authenticated (DC-0005-021).
+fn reset_unbound_frame(
+    peer: &recv::Context,
+    queue_pair: QueuePair,
+    binding_id: VarInt,
+    frame_tx: &mut SubmissionSender,
+) {
+    if !matches!(peer.queue_view, recv::QueueView::Server(_)) {
+        return;
+    }
+    send_reset(
+        &peer.path_entry,
+        queue_pair,
+        binding_id,
+        error::STREAM_NOT_FOUND,
+        frame_tx,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_queue_reset(
     peer: &mut recv::Context,
@@ -1963,6 +2025,7 @@ fn handle_queue_reset(
     recv_credit_pool: &crate::sync::Arc<crate::credit::Pool>,
 ) {
     let dest_queue_id = queue_pair.dest_queue_id;
+    let is_plain_reset = init.is_none();
 
     // An init reset (one carrying the acceptor id + priority, alongside the
     // sender's queue id in `queue_pair`) can arrive before the QueueInit that
@@ -1993,21 +2056,24 @@ fn handle_queue_reset(
         );
     }
 
+    let mut unbound = false;
     match reset_target {
         ResetTarget::Both => {
             counters.rx_reset_both.add(1);
             let stream_entry = msg::Stream::Reset { error_code }.into();
             let control_entry = msg::Control::Reset { error_code }.into();
-            if let Ok((waker, _)) =
-                peer.queue_view
-                    .send_stream(dest_queue_id, binding_id, stream_entry)
-            {
+            let result = peer
+                .queue_view
+                .send_stream(dest_queue_id, binding_id, stream_entry);
+            unbound |= matches!(result, Err(crate::queue::Error::Unallocated(_)));
+            if let Ok((waker, _)) = result {
                 let _ = waker_sink.send(waker);
             }
-            if let Ok(waker) =
-                peer.queue_view
-                    .send_control(dest_queue_id, binding_id, control_entry)
-            {
+            let result = peer
+                .queue_view
+                .send_control(dest_queue_id, binding_id, control_entry);
+            unbound |= matches!(result, Err(crate::queue::Error::Unallocated(_)));
+            if let Ok(waker) = result {
                 let _ = waker_sink.send(waker);
             }
             debug!(
@@ -2020,10 +2086,11 @@ fn handle_queue_reset(
         ResetTarget::Stream => {
             counters.rx_reset_stream.add(1);
             let stream_entry = msg::Stream::Reset { error_code }.into();
-            if let Ok((waker, _)) =
-                peer.queue_view
-                    .send_stream(dest_queue_id, binding_id, stream_entry)
-            {
+            let result = peer
+                .queue_view
+                .send_stream(dest_queue_id, binding_id, stream_entry);
+            unbound |= matches!(result, Err(crate::queue::Error::Unallocated(_)));
+            if let Ok((waker, _)) = result {
                 let _ = waker_sink.send(waker);
             }
             debug!(
@@ -2036,10 +2103,11 @@ fn handle_queue_reset(
         ResetTarget::Control => {
             counters.rx_reset_control.add(1);
             let control_entry = msg::Control::Reset { error_code }.into();
-            if let Ok(waker) =
-                peer.queue_view
-                    .send_control(dest_queue_id, binding_id, control_entry)
-            {
+            let result = peer
+                .queue_view
+                .send_control(dest_queue_id, binding_id, control_entry);
+            unbound |= matches!(result, Err(crate::queue::Error::Unallocated(_)));
+            if let Ok(waker) = result {
                 let _ = waker_sink.send(waker);
             }
             debug!(
@@ -2049,6 +2117,12 @@ fn handle_queue_reset(
                 "QueueReset(Control) dispatched"
             );
         }
+    }
+
+    // A plain reset for a stream this server never bound is answered with a reset too
+    // (DC-0005-020). An init reset binds the slot above, so it isn't answered here.
+    if is_plain_reset && unbound {
+        reset_unbound_frame(peer, queue_pair, binding_id, frame_tx);
     }
 }
 
