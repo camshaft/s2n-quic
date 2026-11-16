@@ -133,10 +133,21 @@ fn open_once(
     seen: &mut SeenFilter,
     packet: &mut [u8],
 ) -> Result<Vec<u8>, recv::Error> {
+    let (result, payload) = open_once_into(receiver, seen, packet);
+    result.map(|()| payload)
+}
+
+/// Opens and records `packet` as `open_once` does, and returns the payload buffer as the call
+/// left it, whatever the result. The buffer starts filled with 0xff.
+fn open_once_into(
+    receiver: &mut Receiver<awslc::open::Application>,
+    seen: &mut SeenFilter,
+    packet: &mut [u8],
+) -> (Result<(), recv::Error>, Vec<u8>) {
     let packet = parse(packet);
-    let mut payload = vec![0; packet.payload().len()];
-    receiver.recv_into_checked(seen, &packet, UninitSlice::new(&mut payload))?;
-    Ok(payload)
+    let mut payload = vec![0xff; packet.payload().len()];
+    let result = receiver.recv_into_checked(seen, &packet, UninitSlice::new(&mut payload));
+    (result, payload)
 }
 
 /// Opens a payload from its parts with the receiver's key and the given packet number.
@@ -619,10 +630,11 @@ fn a_packet_number_is_accepted_once_and_only_after_its_tag_verifies() {
         open_once(&mut receiver, &mut seen, &mut packet.clone()).unwrap(),
         b"payload"
     );
-    assert_eq!(
-        open_once(&mut receiver, &mut seen, &mut packet.clone()),
-        Err(recv::Error::ReplayDefinitelyDetected)
-    );
+
+    // The repeat is refused, and its plaintext doesn't stay in the caller's buffer.
+    let (result, payload) = open_once_into(&mut receiver, &mut seen, &mut packet.clone());
+    assert_eq!(result, Err(recv::Error::ReplayDefinitelyDetected));
+    assert_eq!(payload, vec![0; b"payload".len()]);
 }
 
 //= rendered/0009-tunneled-datagrams/04-replay.md#DC-0009-022
@@ -642,10 +654,14 @@ fn a_packet_number_older_than_the_window_is_rejected() {
         open_once(&mut receiver, &mut seen, &mut new).unwrap(),
         b"new"
     );
+
+    // The old packet is refused, and its plaintext doesn't stay in the caller's buffer.
+    let (result, payload) = open_once_into(&mut receiver, &mut seen, &mut old);
     assert_eq!(
-        open_once(&mut receiver, &mut seen, &mut old),
+        result,
         Err(recv::Error::ReplayPotentiallyDetected { gap: None })
     );
+    assert_eq!(payload, vec![0; b"old".len()]);
 }
 
 //= rendered/0009-tunneled-datagrams/04-replay.md#DC-0009-023

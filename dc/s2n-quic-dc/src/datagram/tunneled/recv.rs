@@ -88,7 +88,9 @@ impl<K: open::Application> Receiver<K> {
     }
 
     /// Opens `packet` into `payload_out`, then checks its packet number against `seen` and
-    /// records it there. The payload is the application's only where both succeed.
+    /// records it there. The payload is the application's only where both succeed. Where the
+    /// replay check refuses the packet, `payload_out` holds zeros on return, so the refused
+    /// packet's plaintext doesn't stay in it.
     pub fn recv_into_checked(
         &mut self,
         seen: &mut SeenFilter,
@@ -101,9 +103,16 @@ impl<K: open::Application> Receiver<K> {
         //# A receiver MUST, once a packet's authentication tag verifies, check its packet number
         //# against its replay window and record it there in one step, and reject the packet where
         //# that step finds the number accepted before.
-        seen.on_packet(packet).map_err(|error| match error {
-            SlidingWindowError::Duplicate => Error::ReplayDefinitelyDetected,
-            SlidingWindowError::TooOld => Error::ReplayPotentiallyDetected { gap: None },
+        seen.on_packet(packet).map_err(|error| {
+            // The tag verified, so `payload_out` holds the refused packet's plaintext: clear it.
+            for index in 0..payload_out.len() {
+                payload_out.write_byte(index, 0);
+            }
+
+            match error {
+                SlidingWindowError::Duplicate => Error::ReplayDefinitelyDetected,
+                SlidingWindowError::TooOld => Error::ReplayPotentiallyDetected { gap: None },
+            }
         })
     }
 }
