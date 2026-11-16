@@ -8,7 +8,7 @@ The system MUST give each sender one window and one sending rate, set from the a
 
 ### DC-0007-024 {#DC-0007-024}
 
-Except when it sends a fast retransmission or a probe, a sender MUST send only a packet that keeps the total size of its outstanding packets whose frames no probe has carried again within a window that it sets from the path's bottleneck bandwidth and minimum round-trip time, as it measures them from the acknowledgements it receives.
+Except when it sends a fast retransmission or a probe, a sender MUST send a packet that becomes outstanding only where the total size of its outstanding packets whose frames no probe has carried again, that packet included, stays within a window that it sets from the path's bottleneck bandwidth and minimum round-trip time, as it measures them from the acknowledgements it receives.
 
 ### DC-0007-040 {#DC-0007-040}
 
