@@ -2,4 +2,4 @@ target = "rendered/0006-streams/05-accepting.md#DC-0006-076"
 
 [[spec]]
 level = "MUST"
-quote = "Once the memory that holds waiting streams gives room for one queue slot while clients wait for their first slot, the server MUST add that slot to the grant of the client that has waited longest."
+quote = "While a client waits for its first queue slot, the server MUST keep a request for that slot's room open with the memory that holds waiting streams."
