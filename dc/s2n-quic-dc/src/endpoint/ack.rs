@@ -29,6 +29,9 @@ use s2n_quic_core::{
 
 pub(crate) mod state;
 
+#[cfg(test)]
+mod requirement_tests;
+
 /// Process an ACK against the send context.
 ///
 /// The first range (`ack_range..=largest_acknowledged`) comes from the header.
