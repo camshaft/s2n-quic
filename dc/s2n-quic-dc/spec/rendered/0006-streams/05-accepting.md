@@ -32,7 +32,7 @@ The server MUST NOT evict a waiting stream from a receiver's queue to make room 
 
 ### DC-0006-059 {#DC-0006-059}
 
-The server MUST NOT give a client back the credit of a stream until the application has finished with the stream.
+The server MUST NOT return a stream's queue slot to the client, or take it out of the client's grant, until the application has finished with the stream.
 
 ### DC-0006-060 {#DC-0006-060}
 
@@ -112,7 +112,7 @@ The server MUST hand each room that the memory holding waiting streams frees to 
 
 ### DC-0006-079 {#DC-0006-079}
 
-While the memory that holds waiting streams refuses room for a slot, the server MUST withdraw from each client's grant each granted slot that holds no stream, except the last slot of that client's grant.
+While the memory that holds waiting streams refuses room for a slot, the server MUST withdraw from each client's grant each granted slot that holds no stream, except the last slot of that client's grant that no withdrawal frame names.
 
 ### DC-0006-080 {#DC-0006-080}
 

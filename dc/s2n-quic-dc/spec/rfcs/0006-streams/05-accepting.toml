@@ -66,8 +66,8 @@ id = "DC-0006-059"
 level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
-statement = "The server MUST NOT give a client back the credit of a stream until the application has finished with the stream."
-rationale = "Each waiting stream then holds the queue slot and the credit its client opened it with, so a slow application holds new streams back at the client, as a reader's window holds back data, and the server's grant of queue slots bounds the streams that wait."
+statement = "The server MUST NOT return a stream's queue slot to the client, or take it out of the client's grant, until the application has finished with the stream."
+rationale = "Each waiting stream then holds the queue slot its client opened it on, so a slow application holds new streams back at the client, as a reader's window holds back data, and the server's grant of queue slots bounds the streams that wait."
 
 [[requirement]]
 id = "DC-0006-060"
@@ -226,7 +226,7 @@ id = "DC-0006-079"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "While the memory that holds waiting streams refuses room for a slot, the server MUST withdraw from each client's grant each granted slot that holds no stream, except the last slot of that client's grant."
+statement = "While the memory that holds waiting streams refuses room for a slot, the server MUST withdraw from each client's grant each granted slot that holds no stream, except the last slot of that client's grant that no withdrawal frame names."
 rationale = "A slot that holds no stream still holds its room (DC-0006-074), so a client that grew its grant and then stopped opening streams would keep room that other clients, and clients that wait for their first slot, need. Withdrawing empty slots returns that room, and each client keeps the one slot that lets its grant grow again. The server keeps, for each client, the granted slots that don't hold a stream, and the clients that hold such a slot beyond their last, so a withdrawal reads only the slots it withdraws."
 
 [[requirement]]
