@@ -5,6 +5,8 @@
 //! reset sent back to the frame's sender: a data frame and a message frame that don't open a
 //! stream, and a plain reset. The answer follows the packet's authentication, and only a server
 //! answers, so a client doesn't answer the server's reset with another reset.
+//! A reset that carries init fields opens a stream, so the server binds the stream from it
+//! instead.
 
 use super::*;
 use s2n_codec::Encoder as _;
@@ -37,6 +39,21 @@ fn sealed_frame(
     datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
     Credentials,
 ) {
+    sealed_frames(peer, sealer_type, packet_number, &[(header, payload)])
+}
+
+/// `frames`, each a header and its payload, sealed into one packet as `sealed_frame` seals one
+/// frame: the headers in order in the packet's application header, and their payloads in the
+/// same order in its payload.
+fn sealed_frames(
+    peer: SocketAddr,
+    sealer_type: endpoint::Type,
+    packet_number: u8,
+    frames: &[(Header, &[u8])],
+) -> (
+    datagram::decoder::Packet<crate::socket::pool::descriptor::Filled>,
+    Credentials,
+) {
     let sealer_entry = PathSecretEntry::builder(peer)
         .endpoint_type(sealer_type)
         .build(None);
@@ -46,19 +63,29 @@ fn sealed_frame(
         key_id: VarInt::ZERO,
     };
 
-    let payload_len = VarInt::new(payload.len() as u64).unwrap();
-    let mut header_buf = vec![0u8; header.metadata_len(payload.len())];
+    let header_len = frames
+        .iter()
+        .map(|(header, payload)| header.metadata_len(payload.len()))
+        .sum::<usize>();
+    let mut header_buf = vec![0u8; header_len];
     {
         let mut enc = s2n_codec::EncoderBuffer::new(&mut header_buf);
-        enc.encode(&header);
-        if header.has_payload_length() {
-            enc.encode(&payload_len);
+        for (header, payload) in frames {
+            enc.encode(header);
+            if header.has_payload_length() {
+                enc.encode(&VarInt::new(payload.len() as u64).unwrap());
+            }
         }
     }
+    let payload = frames
+        .iter()
+        .flat_map(|(_, payload)| payload.iter().copied())
+        .collect::<Vec<u8>>();
+    let payload_len = VarInt::new(payload.len() as u64).unwrap();
 
     let mut buf = vec![0u8; 65536];
     let mut header_reader = &header_buf[..];
-    let mut payload_reader = payload;
+    let mut payload_reader = &payload[..];
     let encoded_len = datagram::encoder::encode(
         s2n_codec::EncoderBuffer::new(&mut buf),
         443,
@@ -287,7 +314,12 @@ fn a_client_doesnt_answer_a_reset_for_an_unbound_stream() {
         path_secret_map.get_by_id(&credentials.id).is_some(),
         "the map must hold the client entry for the packet's credential"
     );
-    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+    let result = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+    let got = outcome(&result);
+    assert!(
+        matches!(result, Ok(())),
+        "the client must authenticate and dispatch the server's reset, not reject it as {got}"
+    );
 
     assert!(
         submitted_headers(&mut frame_rx).is_empty(),
@@ -610,5 +642,117 @@ fn a_reset_for_another_reason_doesnt_carry_the_stream_not_found_code() {
     assert!(
         !stream_not_found,
         "a reset for another reason must not carry the stream-not-found code"
+    );
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-020
+//= type=test
+//# A server MUST answer a frame for a free slot whose binding identifier is newer than the slot's last binding, and that it won't bind from that frame, with a reset sent back to the frame's sender.
+/// A message frame that doesn't open a stream, sent with a ping in one packet, isn't a single
+/// message frame, so it takes the slow path, which authenticates the whole packet before it
+/// dispatches the frame. For a queue the server hasn't bound, it gets a reset back there too, and
+/// doesn't bind the queue.
+#[test]
+fn a_message_frame_on_the_slow_path_for_an_unbound_stream_gets_a_reset() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+
+    let (message, payload) = ClientFrame::Message.header(BINDING_ID);
+    let no_payload: &[u8] = &[];
+    let (packet, credentials) = sealed_frames(
+        peer,
+        endpoint::Type::Client,
+        0,
+        &[(message, payload), (Header::Ping, no_payload)],
+    );
+    let decrypt_len = packet.decrypt_into_len();
+    let single = decode::detect_single_queue_msg(packet.application_header(), decrypt_len);
+    assert!(
+        single.is_none(),
+        "a message frame sent with a ping must not take the fast path"
+    );
+    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+
+    assert_answered_with_reset(&submitted_headers(&mut frame_rx), "a slow-path message frame");
+    assert!(
+        slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
+        "a slow-path message frame for a stream the server hasn't bound must not bind its slot"
+    );
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-020
+//= type=test
+//# A server MUST answer a frame for a free slot whose binding identifier is newer than the slot's last binding, and that it won't bind from that frame, with a reset sent back to the frame's sender.
+/// A plain reset of one half of a stream, its stream half or its control half, for a queue the
+/// server hasn't bound gets a reset back and doesn't bind the queue, as a reset of both halves
+/// does.
+#[test]
+fn a_reset_of_one_half_of_an_unbound_stream_gets_a_reset() {
+    for (frame, reset_target) in [
+        ("a reset of the stream half", ResetTarget::Stream),
+        ("a reset of the control half", ResetTarget::Control),
+    ] {
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let path_secret_map = server_map(peer);
+        let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+        let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+
+        let header = Header::QueueReset {
+            queue_pair: client_queue_pair(),
+            binding_id: VarInt::from_u8(BINDING_ID),
+            reset_target,
+            error_code: error::STOP_SENDING,
+            init: None,
+        };
+        let (packet, credentials) = sealed_frame(peer, endpoint::Type::Client, 0, header, &[]);
+        let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+
+        assert_answered_with_reset(&submitted_headers(&mut frame_rx), frame);
+        assert!(
+            slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
+            "{frame} for a stream the server hasn't bound must not bind its slot"
+        );
+    }
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-017
+//= type=test
+//# A server MUST bind a new stream on the first opening frame for it that arrives, whether that frame is a data frame, a message frame or a reset.
+/// A reset that carries init fields is an opening frame: for a queue the server hasn't bound, it
+/// binds the queue and hands the stream to its acceptor, and doesn't get a reset back.
+#[test]
+fn a_reset_with_init_fields_for_an_unbound_stream_binds_it() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+    let (_acceptors, mut accepted) = register_acceptor(&mut harness, 1);
+
+    let header = Header::QueueReset {
+        queue_pair: client_queue_pair(),
+        binding_id: VarInt::from_u8(BINDING_ID),
+        reset_target: ResetTarget::Both,
+        error_code: error::STOP_SENDING,
+        init: Some(crate::endpoint::frame::Init {
+            dest_acceptor_id: VarInt::from_u8(ACCEPTOR_ID),
+            priority: crate::credit::Priority::default(),
+        }),
+    };
+    let (packet, credentials) = sealed_frame(peer, endpoint::Type::Client, 0, header, &[]);
+    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+
+    assert!(
+        resets_in(&submitted_headers(&mut frame_rx)).is_empty(),
+        "a reset with init fields opens its stream, so it must not get a reset back"
+    );
+    assert!(
+        !slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
+        "a reset with init fields for a stream the server hasn't bound must bind its slot"
+    );
+    assert!(
+        accepted.try_recv().is_some(),
+        "a reset with init fields must hand the stream it opens to its acceptor"
     );
 }
