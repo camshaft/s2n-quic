@@ -68,12 +68,16 @@ impl std::fmt::Debug for Inner {
 }
 
 impl FreeList {
+    /// Returns a free list of the peer's queue IDs below `initial_max_queues`, bounded at
+    /// `HierarchicalBitSet::MAX_CAPACITY`, the most IDs that `release` and `free` take back.
     pub fn new(initial_max_queues: VarInt) -> Self {
         let max = initial_max_queues.as_u64();
+        // `release` and `free` take back only an ID below `MAX_CAPACITY`, and the server binds
+        // only a slot below it, so fresh allocation doesn't hand out an ID at or past it.
         let capacity = max.min(HierarchicalBitSet::MAX_CAPACITY as u64) as u32;
         Self {
             high_water_mark: AtomicU64::new(0),
-            max_queues: AtomicU64::new(max),
+            max_queues: AtomicU64::new(capacity as u64),
             inner: Mutex::new(Inner {
                 freed: HierarchicalBitSet::new(capacity.max(1)),
                 seen_requests: IntervalSet::new(),
@@ -641,6 +645,29 @@ mod tests {
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(0)));
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(1)));
         assert_eq!(list.try_alloc(), Some(VarInt::from_u8(2)));
+        assert_eq!(list.try_alloc(), None);
+    }
+
+    #[test]
+    fn fresh_allocation_stops_at_the_freed_set_capacity() {
+        let capacity = crate::bitset::HierarchicalBitSet::MAX_CAPACITY as u64;
+        // Below `MAX_CAPACITY`, fresh allocation hands out each of the peer's queues, and past
+        // it, fresh allocation stops at `MAX_CAPACITY`.
+        for (max_queues, expected) in [
+            (10, 10),
+            (capacity, capacity),
+            (capacity + 1, capacity),
+            (VarInt::MAX.as_u64(), capacity),
+        ] {
+            let list = FreeList::new(VarInt::new(max_queues).unwrap());
+            assert_eq!(list.max_queues.load(Ordering::Relaxed), expected);
+        }
+
+        // The peer's queues reach past `MAX_CAPACITY`: the last ID below it is handed out,
+        // and the ID at it isn't.
+        let list = FreeList::new(VarInt::new(capacity + 1).unwrap());
+        list.high_water_mark.store(capacity - 1, Ordering::Relaxed);
+        assert_eq!(list.try_alloc(), Some(VarInt::new(capacity - 1).unwrap()));
         assert_eq!(list.try_alloc(), None);
     }
 
