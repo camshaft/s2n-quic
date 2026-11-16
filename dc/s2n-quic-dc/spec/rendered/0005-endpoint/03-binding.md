@@ -16,7 +16,7 @@ A server MUST NOT bind a stream again when an opening frame arrives for a stream
 
 ### DC-0005-020 {#DC-0005-020}
 
-A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
+A server MUST answer a frame for a free slot whose binding identifier is newer than the slot's last binding, and that it won't bind from that frame, with a reset sent back to the frame's sender.
 
 ### DC-0005-021 {#DC-0005-021}
 
