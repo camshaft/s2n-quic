@@ -31,6 +31,8 @@ use std::{
     time::Duration,
 };
 
+mod opening_frames;
+
 fn test_writer_metrics() -> Arc<WriterMetrics> {
     Arc::new(WriterMetrics::new(
         &crate::counter::Registry::default(),
