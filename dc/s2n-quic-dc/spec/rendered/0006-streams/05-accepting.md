@@ -88,7 +88,7 @@ The server MUST NOT grant a client a queue slot that the memory holding waiting 
 
 ### DC-0006-073 {#DC-0006-073}
 
-While the memory that holds waiting streams refuses room for a slot, the server MUST take each freed slot that no withdrawal frame names out of its client's grant instead of returning it, except the last such slot of that client's grant.
+While the memory that holds waiting streams refuses room for a slot, the server MUST take each freed slot that no withdrawal frame names out of its client's grant instead of returning it, except the last slot of that client's grant that no withdrawal frame names.
 
 ### DC-0006-074 {#DC-0006-074}
 

@@ -178,7 +178,7 @@ id = "DC-0006-073"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "While the memory that holds waiting streams refuses room for a slot, the server MUST take each freed slot that no withdrawal frame names out of its client's grant instead of returning it, except the last such slot of that client's grant."
+statement = "While the memory that holds waiting streams refuses room for a slot, the server MUST take each freed slot that no withdrawal frame names out of its client's grant instead of returning it, except the last slot of that client's grant that no withdrawal frame names."
 rationale = "The room the grants hold then falls as streams finish, and DC-0006-077 returns it to the memory, so a client whose application keeps up, or one that waits for its first slot, can take it; each client keeps the one slot that lets its grant grow again. A freed slot that a withdrawal frame names stays in the grant until the client confirms the withdrawal or acknowledges it (DC-0006-083), so that a stream the client opened on it before it read the frame still finds it granted, and it leaves the grant under DC-0006-088."
 
 [[requirement]]
