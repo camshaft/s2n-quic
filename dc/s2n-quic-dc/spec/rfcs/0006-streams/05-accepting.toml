@@ -2,7 +2,7 @@
 anchor = "accepting"
 title = "Accepting streams"
 problem = "A server needs to hand each incoming stream to the part of the application that serves it, and to keep a slow consumer from holding an unbounded number of streams."
-motivation = "Routing by acceptor identifier lets one endpoint serve several services, bounded queues with a chosen eviction policy keep memory bounded under load, and spreading streams over receivers lets the application scale out."
+motivation = "Routing by acceptor identifier lets one endpoint serve several services, stream credit holds new streams back at the client while the application is slow, so the server keeps every stream it accepted, and spreading streams over receivers lets the application scale out."
 prose = "A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor."
 
 [[requirement]]
@@ -46,28 +46,28 @@ statement = "A server MUST reject a stream whose acceptor identifier doesn't nam
 rationale = "The client then learns of its mistake instead of waiting on a stream that nobody reads."
 
 [[requirement]]
-id = "DC-0006-042"
+id = "DC-0006-057"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "Each receiver of an acceptor MUST hold its waiting streams in a queue whose capacity the application configures."
-rationale = "A bounded queue keeps a slow consumer from holding unbounded memory."
+statement = "Each receiver of an acceptor MUST keep every stream that waits for it until the application takes the stream or drops the receiver."
+rationale = "A stream the server accepted is work it took on, and dropping it because many streams wait would lose that work."
 
 [[requirement]]
-id = "DC-0006-043"
+id = "DC-0006-058"
 level = "MUST"
-polarity = "required"
+polarity = "forbidden"
 binds_to = "system"
-statement = "When a receiver's queue is full, the server MUST evict either the oldest or the newest waiting stream, as the application configures."
-rationale = "Some services favor the newest requests under overload and others the oldest, and the choice is the application's."
+statement = "The server MUST NOT evict a waiting stream from a receiver's queue to make room for a new stream."
+rationale = "Eviction would drop a stream the server had already accepted; the client's stream credit, and not the queue, holds new streams back."
 
 [[requirement]]
-id = "DC-0006-044"
+id = "DC-0006-059"
 level = "MUST"
-polarity = "required"
+polarity = "forbidden"
 binds_to = "system"
-statement = "The server MUST reset each stream it evicts from a receiver's queue."
-rationale = "The client of an evicted stream then learns that it won't be served, instead of waiting on it."
+statement = "The server MUST NOT give a client back the credit of a stream until the application has finished with the stream."
+rationale = "Each waiting stream then holds the credit its client opened it with, so a slow application holds new streams back at the client, as a reader's window holds back data, and the streams that wait stay bounded."
 
 [[requirement]]
 id = "DC-0006-045"
@@ -83,7 +83,7 @@ level = "MUST"
 polarity = "forbidden"
 binds_to = "system"
 statement = "The server MUST NOT give streams to a receiver that hasn't yet polled for a stream or registered to take one."
-rationale = "Streams sent to a receiver that nobody polls would wait in its queue and be evicted while other receivers are idle; a receiver that registers says that it is ready to take them."
+rationale = "Streams sent to a receiver that nobody polls would wait in its queue while other receivers are idle; a receiver that registers says that it is ready to take them."
 
 [[requirement]]
 id = "DC-0006-054"
