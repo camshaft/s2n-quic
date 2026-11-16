@@ -56,7 +56,7 @@ The server MUST NOT grow a client's grant while streams of that client wait in a
 
 ### DC-0006-065 {#DC-0006-065}
 
-While streams of a client wait in a receiver's queue, the server MAY shrink that client's grant by keeping freed slots instead of returning them to the client, down to half the grant the client held when its streams began to wait.
+While streams of a client wait in a receiver's queue, the server MAY shrink that client's grant by keeping freed slots instead of returning them to the client, down to half the grant the client held when its streams began to wait, or further where DC-0006-073 asks.
 
 ### DC-0006-066 {#DC-0006-066}
 

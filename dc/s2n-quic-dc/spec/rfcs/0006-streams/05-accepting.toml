@@ -114,7 +114,7 @@ id = "DC-0006-065"
 level = "MAY"
 polarity = "required"
 binds_to = "system"
-statement = "While streams of a client wait in a receiver's queue, the server MAY shrink that client's grant by keeping freed slots instead of returning them to the client, down to half the grant the client held when its streams began to wait."
+statement = "While streams of a client wait in a receiver's queue, the server MAY shrink that client's grant by keeping freed slots instead of returning them to the client, down to half the grant the client held when its streams began to wait, or further where DC-0006-073 asks."
 rationale = "A grant that grew while the application was fast then follows the application down when it slows, as fast as it grew."
 
 [[requirement]]
