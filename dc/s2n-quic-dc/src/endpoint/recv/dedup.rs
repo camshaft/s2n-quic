@@ -17,4 +17,12 @@ impl StreamFilter {
         let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
         self.window.insert(packet_number)
     }
+
+    /// Checks `packet_number` against the packet numbers this filter accepted, without
+    /// recording it.
+    #[inline]
+    pub fn check(&self, packet_number: VarInt) -> Result<(), SlidingWindowError> {
+        let packet_number = PacketNumberSpace::Initial.new_packet_number(packet_number);
+        self.window.check(packet_number)
+    }
 }
