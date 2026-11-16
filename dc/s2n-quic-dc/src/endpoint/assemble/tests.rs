@@ -373,6 +373,7 @@ fn assemble_accounts_for_header_overhead() {
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
     let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -413,6 +414,7 @@ fn assemble_accounts_for_header_overhead() {
         pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
         &mut header_buf,
         &mut cancelled,
+        &mut completed,
         &mut ack_completions,
         &mut freed_batch_tx,
         &counters,
@@ -483,6 +485,7 @@ fn assemble_batches_full_mtu_data_frames() {
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
     let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -512,6 +515,7 @@ fn assemble_batches_full_mtu_data_frames() {
         pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
         &mut header_buf,
         &mut cancelled,
+        &mut completed,
         &mut ack_completions,
         &mut freed_batch_tx,
         &counters,
@@ -557,6 +561,7 @@ fn assemble_does_not_pad_small_control_only_batch() {
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
     let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -598,6 +603,7 @@ fn assemble_does_not_pad_small_control_only_batch() {
         pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
         &mut header_buf,
         &mut cancelled,
+        &mut completed,
         &mut ack_completions,
         &mut freed_batch_tx,
         &counters,
@@ -671,6 +677,7 @@ fn assemble_fuzz_respects_gso_invariants() {
             let pool = pool::Pool::new(u16::MAX);
             let mut header_buf = Vec::new();
             let mut cancelled = Queue::new();
+            let mut completed = Queue::new();
             let mut ack_completions = Queue::new();
             let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -690,6 +697,7 @@ fn assemble_fuzz_respects_gso_invariants() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &counters,
@@ -761,6 +769,7 @@ fn assemble_full_mtu_bursts_match_oracle() {
             let pool = pool::Pool::new(u16::MAX);
             let mut header_buf = Vec::new();
             let mut cancelled = Queue::new();
+            let mut completed = Queue::new();
             let mut ack_completions = Queue::new();
             let (mut freed_batch_tx, _r) = crate::queue::freed_batch_channel();
             for f in &frames {
@@ -777,6 +786,7 @@ fn assemble_full_mtu_bursts_match_oracle() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &counters,
@@ -1044,6 +1054,7 @@ fn assemble_probe_fuzz() {
             let pool = pool::Pool::new(u16::MAX);
             let mut header_buf = Vec::new();
             let mut cancelled = Queue::new();
+            let mut completed = Queue::new();
             let mut ack_completions = Queue::new();
             let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -1064,6 +1075,7 @@ fn assemble_probe_fuzz() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &counters,
@@ -1091,6 +1103,7 @@ fn assemble_probe_fuzz() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &counters,
@@ -1340,6 +1353,7 @@ fn orphaned_shell_survives_cancelled_probe_tail() {
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
     let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -1364,6 +1378,7 @@ fn orphaned_shell_survives_cancelled_probe_tail() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &AssemblerCounters::new(&registry),
@@ -1441,6 +1456,105 @@ fn orphaned_shell_survives_cancelled_probe_tail() {
         0,
         "no bytes should remain in flight once the only frame was cancelled"
     );
+}
+
+/// A PTO probe sends a frame again, so each probe counts toward the frame's bound on
+/// transmissions, as the retransmission of a lost frame does. A frame that the peer never
+/// acknowledges is sent once, then once by each probe until it reaches its bound, and the
+/// next probe fails it with the transmission error for its writer instead of sending it.
+//= rendered/0005-endpoint/01-frames.md#DC-0005-004
+//= type=test
+//# The endpoint MUST bound the number of transmissions of each frame.
+//= rendered/0005-endpoint/01-frames.md#DC-0005-051
+//= type=test
+//# When a frame reaches its bound on transmissions without an acknowledgement, the endpoint MUST
+//# report the frame to its writer as failed with the transmission error reason.
+#[test]
+fn probes_count_toward_a_frames_bound_on_transmissions() {
+    use crate::{endpoint::frame::FailureReason, stream::endpoint::send::ProbeState};
+
+    // The number of times the frame may be sent again after its first transmission.
+    const TTL: u16 = 2;
+
+    let mtu = 1500;
+    let registry = Registry::new();
+    let (mut context, entry) = make_context(mtu, &registry);
+
+    let clock = Clock::new(Duration::from_micros(1));
+    let gso = make_gso(1);
+    let pool = pool::Pool::new(u16::MAX);
+    let mut header_buf = Vec::new();
+    let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
+    let mut ack_completions = Queue::new();
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    let send_counters = crate::endpoint::counters::Send::new(
+        &crate::counter::Registry::default(),
+        crate::endpoint::id::LocalSenderId::from_index(0),
+    );
+    let source_sender_id = crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1));
+    let source_control_port = 443;
+
+    let credit_pool = unused_credit_pool();
+    // Helper to run one assembly round with the shared arguments.
+    macro_rules! run_assemble {
+        () => {
+            assemble::<SyncRecycler, _>(
+                &mut context,
+                ImmediateQueueStatus::Empty,
+                &clock,
+                source_sender_id,
+                source_control_port,
+                &gso,
+                pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
+                &mut header_buf,
+                &mut cancelled,
+                &mut completed,
+                &mut ack_completions,
+                &mut freed_batch_tx,
+                &AssemblerCounters::new(&registry),
+                &send_counters,
+                &credit_pool,
+            )
+        };
+    }
+
+    // The first transmission. `completion_rx` keeps the frame's writer listening.
+    let completion_rx = crate::endpoint::frame::completion_channel();
+    let mut frame = make_data_frame(&entry, completion_rx.sender());
+    frame.ttl = TTL;
+    context.push_back_frame(frame);
+    let _ = run_assemble!().expect("initial data should assemble");
+    assert!(context.inflight.has_inflight(), "the frame waits for an acknowledgement");
+    let mut last_pn = context.inflight.get_range().end().as_u64();
+
+    // Each PTO probe within the bound sends the frame again, at a higher PN.
+    for probe in 1..=TTL {
+        context.pto.probe_state = ProbeState::ProbeTwice;
+        let _ = run_assemble!();
+        let pn = context.inflight.get_range().end().as_u64();
+        assert!(pn > last_pn, "probe {probe} sends the frame again");
+        last_pn = pn;
+        assert!(completed.is_empty(), "probe {probe} is within the bound");
+    }
+
+    // The frame has been sent TTL + 1 times, its bound. The next probe fails it with the
+    // transmission error instead of sending it again.
+    context.pto.probe_state = ProbeState::ProbeTwice;
+    let _ = run_assemble!();
+    assert!(
+        !context.inflight.has_inflight(),
+        "a frame at its bound isn't sent again"
+    );
+    let failed = completed
+        .pop_front()
+        .expect("a frame at its bound is reported to its writer");
+    assert_eq!(
+        failed.status,
+        TransmissionStatus::Failed(FailureReason::TransmissionError)
+    );
+    assert!(completed.is_empty(), "the frame is reported once");
 }
 
 /// Builds a QueueData frame carrying a `payload_len`-byte payload, near a full MTU.

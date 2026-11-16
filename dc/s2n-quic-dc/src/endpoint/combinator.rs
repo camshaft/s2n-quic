@@ -690,6 +690,9 @@ pub(crate) struct Assembler<R, Clk, C, A> {
     pool: crate::socket::pool::Pool,
     header_buf: Vec<u8>,
     cancelled_tx: C,
+    /// Receives the frames that a probe fails because they reached their bound on
+    /// transmissions.
+    completed_tx: C,
     ack_completions_tx: A,
     freed_batch_tx: crate::queue::FreedBatchTx,
     pub(crate) counters: AssemblerCounters,
@@ -852,6 +855,7 @@ impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
         gso: s2n_quic_platform::features::Gso,
         pool: crate::socket::pool::Pool,
         cancelled_tx: C,
+        completed_tx: C,
         ack_completions_tx: A,
         freed_batch_tx: crate::queue::FreedBatchTx,
         counters: AssemblerCounters,
@@ -870,6 +874,7 @@ impl<R, Clk, C, A> Assembler<R, Clk, C, A> {
             pool,
             header_buf: Vec::new(),
             cancelled_tx,
+            completed_tx,
             ack_completions_tx,
             freed_batch_tx,
             counters,
@@ -906,6 +911,7 @@ where
         let (segments, wheel_interest) = {
             let mut context = context.borrow_mut();
             let mut cancelled = Queue::new();
+            let mut completed = Queue::new();
             let mut ack_completions = Queue::new();
             let segments = pre_alloc.and_then(|unfilled| {
                 assemble::assemble::<UnsyncRecycler, _>(
@@ -918,6 +924,7 @@ where
                     unfilled,
                     &mut self.header_buf,
                     &mut cancelled,
+                    &mut completed,
                     &mut ack_completions,
                     &mut self.freed_batch_tx,
                     &self.counters,
@@ -927,6 +934,9 @@ where
             });
             if !cancelled.is_empty() {
                 let _ = self.cancelled_tx.send(cancelled);
+            }
+            if !completed.is_empty() {
+                let _ = self.completed_tx.send(completed);
             }
             if !ack_completions.is_empty() {
                 let _ = self.ack_completions_tx.send(ack_completions);

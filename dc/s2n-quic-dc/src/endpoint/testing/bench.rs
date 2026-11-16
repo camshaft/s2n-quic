@@ -82,6 +82,7 @@ impl AssembleBenchmark {
 
     pub fn run(mut self) -> u64 {
         let mut total_segments = 0u64;
+        let mut completed = Queue::new();
         loop {
             let Some(unfilled) = self.recycle_pool.alloc_or_reuse(&self.pool) else {
                 break;
@@ -97,6 +98,7 @@ impl AssembleBenchmark {
                 unfilled,
                 &mut self.header_buf,
                 &mut self.cancelled,
+                &mut completed,
                 &mut self.ack_completions,
                 &mut self.freed_batch_tx,
                 &self.assembler_counters,
@@ -110,6 +112,7 @@ impl AssembleBenchmark {
 
         total_segments
             .saturating_add(self.cancelled.len() as u64)
+            .saturating_add(completed.len() as u64)
             .saturating_add(self.ack_completions.len() as u64)
             .saturating_add(self.context.inflight.has_inflight() as u64)
     }
