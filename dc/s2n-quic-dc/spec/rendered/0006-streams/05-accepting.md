@@ -1,6 +1,6 @@
 ## Accepting streams {#accepting}
 
-A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor. A queue slot is the room the server holds for one stream of one client: the client opens each stream on a slot it holds, each write of the stream names that slot until the server confirms the stream, and the stream keeps its slot until the application has finished with it. The server then returns the freed slot to the client in a frame that names the slot, and the client may open another stream on it. The server starts each client with one slot, doubles the client's grant while its receivers take that client's streams as fast as they arrive, and holds it while streams wait or halves it by keeping freed slots. The memory that waiting streams hold is under pressure while the allocator or pool that holds them refuses or delays room for a stream; while it is, no grant grows and the server keeps freed slots.
+A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor. A queue slot is the room the server holds for one stream of one client: the client opens each stream on a slot it holds, each write of the stream names that slot until the server confirms the stream, and the stream keeps its slot until the application has finished with it. The server then returns the freed slot to the client in a frame that names the slot, and the client may open another stream on it. The server starts each client with one slot, grows the client's grant, up to doubling it, while its receivers take that client's streams as fast as they arrive, and holds it while streams wait or halves it by keeping freed slots. The server takes room for each slot from the memory that holds waiting streams when it grants the slot, so a stream on a granted slot always has room, and gives that room back when the slot leaves the grant; while that memory refuses room for a slot, no grant grows and the server takes each freed slot back, except a client's last.
 
 ### DC-0006-037 {#DC-0006-037}
 
@@ -44,11 +44,11 @@ At the handshake, the server MUST advertise to each client a starting grant of o
 
 ### DC-0006-062 {#DC-0006-062}
 
-The server MUST derive each client's grant of queue slots from how its acceptors' receivers take that client's streams and from the memory its waiting streams hold, and not from a fixed number.
+The server MUST derive each client's grant of queue slots from how its acceptors' receivers take that client's streams and from the room that the memory holding waiting streams gives for slots, and not from a fixed number.
 
 ### DC-0006-063 {#DC-0006-063}
 
-Where a receiver takes a stream of a client that holds every slot of its grant, no stream of that client waits in any receiver's queue after the take, and the memory waiting streams hold isn't under pressure, the server MUST double that client's grant.
+Where a receiver takes a stream of a client that holds every slot of its grant and no stream of that client waits in any receiver's queue after the take, the server MUST grow that client's grant by as many slots as the memory that holds waiting streams gives room for, up to doubling the grant.
 
 ### DC-0006-064 {#DC-0006-064}
 
@@ -80,15 +80,19 @@ The server MUST keep each client's grant of queue slots at one slot or more.
 
 ### DC-0006-071 {#DC-0006-071}
 
-The server MUST refuse a stream whose first write to reach the server names a queue slot that holds a stream the server hasn't freed.
+The server MUST refuse a stream whose first write to reach the server names a queue slot that holds another stream the server hasn't freed.
 
 ### DC-0006-072 {#DC-0006-072}
 
-While the memory that waiting streams hold is under pressure, the server MUST NOT grow any client's grant.
+The server MUST NOT grant a client a queue slot that the memory holding waiting streams hasn't given room for.
 
 ### DC-0006-073 {#DC-0006-073}
 
-While the memory that waiting streams hold is under pressure, the server MUST keep each freed slot instead of returning it to its client, except the last slot of that client's grant.
+While the memory that holds waiting streams refuses room for a slot, the server MUST take each freed slot out of its client's grant instead of returning it, except the last slot of that client's grant, and give that slot's room back.
+
+### DC-0006-074 {#DC-0006-074}
+
+The server MUST keep the room it took for a granted slot until the slot leaves the client's grant.
 
 ### DC-0006-045 {#DC-0006-045}
 
