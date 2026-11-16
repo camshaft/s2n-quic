@@ -751,7 +751,10 @@ fn dispatch_decoded_frame(
             queue_pair,
             binding_id,
         } => {
-            handle_queue_control(peer, queue_pair, binding_id, payload, counters, waker_sink);
+            // See the QueueData arm: answer a frame for an unbound stream with a reset.
+            if handle_queue_control(peer, queue_pair, binding_id, payload, counters, waker_sink) {
+                reset_unbound_frame(peer, queue_pair, binding_id, frame_tx);
+            }
         }
         Header::QueueMaxData {
             queue_pair,
@@ -1818,6 +1821,8 @@ fn send_reset(
 
 // ── QueueControl ───────────────────────────────────────────────────────────
 
+/// Returns whether the slot check found the frame's binding unallocated, which the caller answers
+/// with a reset (DC-0005-020).
 fn handle_queue_control(
     peer: &mut recv::Context,
     queue_pair: QueuePair,
@@ -1825,7 +1830,7 @@ fn handle_queue_control(
     buf: BytesMut,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
-) {
+) -> bool {
     let local_queue_id = queue_pair.dest_queue_id;
     let payload_len = buf.len();
     let entry = msg::Control::Frames { payload: buf }.into();
@@ -1843,6 +1848,7 @@ fn handle_queue_control(
                 payload_len,
                 "QueueControl dispatched"
             );
+            false
         }
         Err(crate::queue::Error::Unallocated(_)) => {
             counters.rx_queue_control_unallocated.add(1);
@@ -1851,6 +1857,7 @@ fn handle_queue_control(
                 queue_id = local_queue_id.as_u64(),
                 "QueueControl for unallocated queue - dropping"
             );
+            true
         }
         Err(crate::queue::Error::HalfClosed(_)) => {
             counters.rx_queue_control_half_closed.add(1);
@@ -1859,6 +1866,7 @@ fn handle_queue_control(
                 queue_id = local_queue_id.as_u64(),
                 "QueueControl for half-closed queue - dropping"
             );
+            false
         }
         Err(_) => {
             trace!(
@@ -1866,6 +1874,7 @@ fn handle_queue_control(
                 queue_id = local_queue_id.as_u64(),
                 "QueueControl dispatch error - dropping"
             );
+            false
         }
     }
 }

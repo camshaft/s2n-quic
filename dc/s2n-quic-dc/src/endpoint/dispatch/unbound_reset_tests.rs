@@ -3,8 +3,8 @@
 
 //! A server answers a frame for a stream it hasn't bound, and won't bind from that frame, with a
 //! reset sent back to the frame's sender: a data frame and a message frame that don't open a
-//! stream, and a plain reset. The answer follows the packet's authentication, and only a server
-//! answers, so a client doesn't answer the server's reset with another reset.
+//! stream, a control frame, and a plain reset. The answer follows the packet's authentication,
+//! and only a server answers, so a client doesn't answer the server's reset with another reset.
 
 use super::*;
 use s2n_codec::Encoder as _;
@@ -256,6 +256,33 @@ fn a_reset_for_an_unbound_stream_gets_a_reset() {
     assert!(
         slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
         "a reset for a stream the server hasn't bound must not bind its slot"
+    );
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-020
+//= type=test
+//# A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
+/// A control frame for a queue the server hasn't bound gets a reset back and doesn't bind the
+/// queue.
+#[test]
+fn a_control_frame_for_an_unbound_stream_gets_a_reset() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+
+    let payload = b"queue-control-payload";
+    let header = Header::QueueControl {
+        queue_pair: client_queue_pair(),
+        binding_id: VarInt::from_u8(BINDING_ID),
+    };
+    let (packet, credentials) = sealed_frame(peer, endpoint::Type::Client, 0, header, payload);
+    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+
+    assert_answered_with_reset(&submitted_headers(&mut frame_rx), "a control frame");
+    assert!(
+        slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
+        "a control frame for a stream the server hasn't bound must not bind its slot"
     );
 }
 
