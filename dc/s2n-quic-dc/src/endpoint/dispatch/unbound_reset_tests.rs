@@ -3,7 +3,8 @@
 
 //! A server answers a frame for a stream it hasn't bound, and won't bind from that frame, with a
 //! reset sent back to the frame's sender: a data frame and a message frame that don't open a
-//! stream, a control frame, and a plain reset. The answer follows the packet's authentication,
+//! stream, a control frame, a frame that raises the stream's flow-control limit, a frame that
+//! says the writer is blocked, and a plain reset. The answer follows the packet's authentication,
 //! and only a server answers, so a client doesn't answer the server's reset with another reset.
 
 use super::*;
@@ -260,6 +261,60 @@ fn a_control_frame_for_an_unbound_stream_gets_a_reset() {
 //= rendered/0005-endpoint/03-binding.md#DC-0005-020
 //= type=test
 //# A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
+/// A frame that raises the flow-control limit of a queue the server hasn't bound gets a reset
+/// back and doesn't bind the queue.
+#[test]
+fn a_max_data_frame_for_an_unbound_stream_gets_a_reset() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+
+    let header = Header::QueueMaxData {
+        queue_pair: client_queue_pair(),
+        binding_id: VarInt::from_u8(BINDING_ID),
+        maximum_data: VarInt::from_u32(4096),
+    };
+    let (packet, credentials) = sealed_frame(peer, endpoint::Type::Client, 0, header, &[]);
+    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+
+    assert_answered_with_reset(&submitted_headers(&mut frame_rx), "a max data frame");
+    assert!(
+        slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
+        "a max data frame for a stream the server hasn't bound must not bind its slot"
+    );
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-020
+//= type=test
+//# A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
+/// A frame that says the writer is blocked, for a queue the server hasn't bound, gets a reset
+/// back and doesn't bind the queue.
+#[test]
+fn a_data_blocked_frame_for_an_unbound_stream_gets_a_reset() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+
+    let header = Header::QueueDataBlocked {
+        queue_pair: client_queue_pair(),
+        binding_id: VarInt::from_u8(BINDING_ID),
+        desired_offset: VarInt::from_u32(4096),
+    };
+    let (packet, credentials) = sealed_frame(peer, endpoint::Type::Client, 0, header, &[]);
+    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+
+    assert_answered_with_reset(&submitted_headers(&mut frame_rx), "a data blocked frame");
+    assert!(
+        slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
+        "a data blocked frame for a stream the server hasn't bound must not bind its slot"
+    );
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-020
+//= type=test
+//# A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
 /// A plain reset, one without init fields, for a queue the server hasn't bound gets a reset back
 /// and doesn't bind the queue.
 #[test]
@@ -329,12 +384,25 @@ enum ClientFrame {
     Data,
     /// A message frame that doesn't open a stream, which takes the fast path.
     Message,
+    /// A control frame.
+    Control,
+    /// A frame that raises the stream's flow-control limit.
+    MaxData,
+    /// A frame that says the writer is blocked on the stream's flow-control limit.
+    DataBlocked,
     /// A plain reset, one without init fields.
     Reset,
 }
 
 impl ClientFrame {
-    const ALL: [Self; 3] = [Self::Data, Self::Message, Self::Reset];
+    const ALL: [Self; 6] = [
+        Self::Data,
+        Self::Message,
+        Self::Control,
+        Self::MaxData,
+        Self::DataBlocked,
+        Self::Reset,
+    ];
 
     /// The frame's header, carrying `binding_id`, and its payload.
     fn header(self, binding_id: u8) -> (Header, &'static [u8]) {
@@ -371,6 +439,32 @@ impl ClientFrame {
                     blocked: false,
                     dest_acceptor_id: None,
                     priority: crate::credit::Priority::default(),
+                };
+                (header, payload)
+            }
+            Self::Control => {
+                let payload: &[u8] = b"queue-control-payload";
+                let header = Header::QueueControl {
+                    queue_pair: client_queue_pair(),
+                    binding_id,
+                };
+                (header, payload)
+            }
+            Self::MaxData => {
+                let payload: &[u8] = &[];
+                let header = Header::QueueMaxData {
+                    queue_pair: client_queue_pair(),
+                    binding_id,
+                    maximum_data: VarInt::from_u32(4096),
+                };
+                (header, payload)
+            }
+            Self::DataBlocked => {
+                let payload: &[u8] = &[];
+                let header = Header::QueueDataBlocked {
+                    queue_pair: client_queue_pair(),
+                    binding_id,
+                    desired_offset: VarInt::from_u32(4096),
                 };
                 (header, payload)
             }
@@ -474,8 +568,8 @@ fn resets_in(headers: &[Header]) -> Vec<Header> {
 //= rendered/0005-endpoint/03-binding.md#DC-0005-053
 //= type=test
 //# The reset that answers a frame under DC-0005-020 MUST carry the stream-not-found error code.
-/// A data frame, a message frame and a plain reset for a free slot, each carrying a binding newer
-/// than the slot's last binding, each get a reset back that carries the stream-not-found code.
+/// Each kind of frame the client sends to a free slot, carrying a binding newer than the slot's
+/// last binding, gets a reset back that carries the stream-not-found code.
 #[test]
 fn the_reset_for_an_unbound_stream_carries_the_stream_not_found_code() {
     for frame in ClientFrame::ALL {

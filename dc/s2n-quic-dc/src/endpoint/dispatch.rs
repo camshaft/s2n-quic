@@ -761,14 +761,17 @@ fn dispatch_decoded_frame(
             binding_id,
             maximum_data,
         } => {
-            handle_queue_max_data(
+            // See the QueueData arm: answer a frame for an unbound stream with a reset.
+            if handle_queue_max_data(
                 peer,
                 queue_pair,
                 binding_id,
                 maximum_data,
                 counters,
                 waker_sink,
-            );
+            ) {
+                reset_unbound_frame(peer, queue_pair, binding_id, frame_tx);
+            }
         }
         Header::QueueReset {
             queue_pair,
@@ -925,14 +928,17 @@ fn dispatch_decoded_frame(
             binding_id,
             desired_offset,
         } => {
-            handle_queue_data_blocked(
+            // See the QueueData arm: answer a frame for an unbound stream with a reset.
+            if handle_queue_data_blocked(
                 peer,
                 queue_pair,
                 binding_id,
                 desired_offset,
                 counters,
                 waker_sink,
-            );
+            ) {
+                reset_unbound_frame(peer, queue_pair, binding_id, frame_tx);
+            }
         }
         Header::QueueDbg {
             dump_id,
@@ -1881,6 +1887,8 @@ fn handle_queue_control(
 
 // ── QueueMaxData ───────────────────────────────────────────────────────────
 
+/// Returns whether the slot check found the frame's binding unallocated, which the caller answers
+/// with a reset (DC-0005-020).
 fn handle_queue_max_data(
     peer: &mut recv::Context,
     queue_pair: QueuePair,
@@ -1888,7 +1896,7 @@ fn handle_queue_max_data(
     maximum_data: VarInt,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
-) {
+) -> bool {
     let local_queue_id = queue_pair.dest_queue_id;
     let entry = msg::Control::MaxData { maximum_data }.into();
 
@@ -1905,6 +1913,7 @@ fn handle_queue_max_data(
                 maximum_data = maximum_data.as_u64(),
                 "QueueMaxData dispatched"
             );
+            false
         }
         Err(crate::queue::Error::Unallocated(_)) => {
             counters.rx_queue_control_unallocated.add(1);
@@ -1913,6 +1922,7 @@ fn handle_queue_max_data(
                 queue_id = local_queue_id.as_u64(),
                 "QueueMaxData for unallocated queue - dropping"
             );
+            true
         }
         Err(crate::queue::Error::HalfClosed(_)) => {
             counters.rx_queue_control_half_closed.add(1);
@@ -1921,6 +1931,7 @@ fn handle_queue_max_data(
                 queue_id = local_queue_id.as_u64(),
                 "QueueMaxData for half-closed queue - dropping"
             );
+            false
         }
         Err(_) => {
             trace!(
@@ -1928,6 +1939,7 @@ fn handle_queue_max_data(
                 queue_id = local_queue_id.as_u64(),
                 "QueueMaxData dispatch error - dropping"
             );
+            false
         }
     }
 }
@@ -1940,6 +1952,9 @@ fn handle_queue_max_data(
 /// the reader drains only the stream half, so it rides the stream queue as `msg::Stream::Blocked`.
 /// `send_stream` returns an `AutoWake` so a reader parked in `poll_read_into` with no pending data
 /// is still woken to process the signal.
+///
+/// Returns whether the slot check found the frame's binding unallocated, which the caller answers
+/// with a reset (DC-0005-020).
 fn handle_queue_data_blocked(
     peer: &mut recv::Context,
     queue_pair: QueuePair,
@@ -1947,7 +1962,7 @@ fn handle_queue_data_blocked(
     desired_offset: VarInt,
     counters: &counters::Dispatch,
     waker_sink: &mut impl channel::UnboundedSender<AutoWake>,
-) {
+) -> bool {
     let local_queue_id = queue_pair.dest_queue_id;
     // A real `QueueDataBlocked` frame from the peer writer: streaming back-pressure, open-ended
     // demand → `synthetic: false` so the reader applies multiplicative slow-start growth.
@@ -1973,14 +1988,24 @@ fn handle_queue_data_blocked(
                 desired_offset = desired_offset.as_u64(),
                 "QueueDataBlocked dispatched"
             );
+            false
+        }
+        Err(crate::queue::Error::Unallocated(_)) => {
+            debug!(
+                binding_id = binding_id.as_u64(),
+                queue_id = local_queue_id.as_u64(),
+                "QueueDataBlocked for unallocated queue - dropping"
+            );
+            true
         }
         Err(_) => {
-            // Unallocated / half-closed / stale binding — the signal is advisory, so drop it.
+            // Half-closed queue, stale or future binding: the signal is advisory, so drop it.
             trace!(
                 binding_id = binding_id.as_u64(),
                 queue_id = local_queue_id.as_u64(),
                 "QueueDataBlocked dispatch error - dropping"
             );
+            false
         }
     }
 }
