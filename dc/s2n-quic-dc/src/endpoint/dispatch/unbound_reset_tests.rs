@@ -233,6 +233,33 @@ fn a_message_frame_for_an_unbound_stream_gets_a_reset_once_its_packet_authentica
 //= rendered/0005-endpoint/03-binding.md#DC-0005-020
 //= type=test
 //# A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
+/// A control frame for a queue the server hasn't bound gets a reset back and doesn't bind the
+/// queue.
+#[test]
+fn a_control_frame_for_an_unbound_stream_gets_a_reset() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+
+    let payload = b"queue-control-payload";
+    let header = Header::QueueControl {
+        queue_pair: client_queue_pair(),
+        binding_id: VarInt::from_u8(BINDING_ID),
+    };
+    let (packet, credentials) = sealed_frame(peer, endpoint::Type::Client, 0, header, payload);
+    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+
+    assert_answered_with_reset(&submitted_headers(&mut frame_rx), "a control frame");
+    assert!(
+        slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
+        "a control frame for a stream the server hasn't bound must not bind its slot"
+    );
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-020
+//= type=test
+//# A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
 /// A plain reset, one without init fields, for a queue the server hasn't bound gets a reset back
 /// and doesn't bind the queue.
 #[test]
@@ -256,33 +283,6 @@ fn a_reset_for_an_unbound_stream_gets_a_reset() {
     assert!(
         slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
         "a reset for a stream the server hasn't bound must not bind its slot"
-    );
-}
-
-//= rendered/0005-endpoint/03-binding.md#DC-0005-020
-//= type=test
-//# A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
-/// A control frame for a queue the server hasn't bound gets a reset back and doesn't bind the
-/// queue.
-#[test]
-fn a_control_frame_for_an_unbound_stream_gets_a_reset() {
-    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-    let path_secret_map = server_map(peer);
-    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
-    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
-
-    let payload = b"queue-control-payload";
-    let header = Header::QueueControl {
-        queue_pair: client_queue_pair(),
-        binding_id: VarInt::from_u8(BINDING_ID),
-    };
-    let (packet, credentials) = sealed_frame(peer, endpoint::Type::Client, 0, header, payload);
-    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
-
-    assert_answered_with_reset(&submitted_headers(&mut frame_rx), "a control frame");
-    assert!(
-        slot_is_free(&path_secret_map, &credentials, SERVER_QUEUE_ID),
-        "a control frame for a stream the server hasn't bound must not bind its slot"
     );
 }
 
