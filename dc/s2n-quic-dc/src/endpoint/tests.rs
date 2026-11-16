@@ -5706,3 +5706,112 @@ fn write_msg_fin_small_complete_in_probe_delivers_full_despite_drop() {
         .spawn();
     });
 }
+
+/// A receiver whose queue is full keeps every stream that waits for the
+/// application. Three streams reach an acceptor registered with a capacity of
+/// 1 before the application accepts any of them; the application then accepts
+/// all three, each one's data arrives, and none of them is reset with the
+/// server-busy error.
+#[test]
+fn full_acceptor_queue_keeps_every_waiting_stream() {
+    use crate::endpoint::error::Error as EndpointError;
+
+    // Snapshot disabled: the test's value is in its assertions.
+    let _guard = crate::testing::without_snapshots();
+    sim(|| {
+        const STREAMS: usize = 3;
+        let acceptor_id = VarInt::from_u8(1);
+
+        // Server
+        async move {
+            let server = Server::new();
+            let mut acceptor = server
+                .register_acceptor_channel(acceptor_id, 1)
+                .expect("acceptor registration failed");
+            // Join the load balancing before the first poll, so that each stream
+            // waits in this receiver's queue while the application accepts none.
+            acceptor.register();
+
+            // Wait until every stream waits in the queue, past its capacity of
+            // 1: each stream that joins the queue wakes this task.
+            acceptor.wait_for_backlog(STREAMS).await;
+            assert_eq!(
+                acceptor.backlog(),
+                STREAMS,
+                "every stream should wait in the queue, past its capacity of 1"
+            );
+
+            for _ in 0..STREAMS {
+                let stream = acceptor.recv().await.expect("acceptor closed");
+                async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut buf = BytesMut::with_capacity(16);
+                    loop {
+                        let n = reader.read_into(&mut buf).await.expect("server read");
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    let mut echo = buf.freeze();
+                    writer
+                        .write_all_from_fin(&mut echo)
+                        .await
+                        .expect("server write");
+                }
+                .primary()
+                .spawn();
+            }
+        }
+        .group("server")
+        .spawn();
+
+        // Client
+        async move {
+            let mut client = Client::new();
+
+            // Open every stream, and send its data, before the server's
+            // application accepts one.
+            let mut streams = Vec::with_capacity(STREAMS);
+            for i in 0..STREAMS {
+                let stream = client
+                    .connect("server:0", acceptor_id)
+                    .await
+                    .expect("connect failed");
+                let (reader, mut writer) = stream.into_split();
+                let payload = Bytes::from(format!("stream {i}"));
+                let mut data = payload.clone();
+                writer
+                    .write_all_from_fin(&mut data)
+                    .await
+                    .expect("client write");
+                streams.push((payload, reader, writer));
+            }
+
+            for (i, (payload, mut reader, _writer)) in streams.into_iter().enumerate() {
+                let mut buf = BytesMut::with_capacity(16);
+                loop {
+                    match reader.read_into(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(err) => {
+                            let code = err
+                                .get_ref()
+                                .and_then(|cause| cause.downcast_ref::<EndpointError>())
+                                .copied();
+                            assert_ne!(
+                                code,
+                                Some(EndpointError::ServerBusy),
+                                "stream {i} was reset with the server-busy error"
+                            );
+                            panic!("stream {i} read failed: {err:?}");
+                        }
+                    }
+                }
+                assert_eq!(&buf[..], &payload[..], "stream {i} should echo its data");
+            }
+        }
+        .group("client")
+        .primary()
+        .spawn();
+    });
+}

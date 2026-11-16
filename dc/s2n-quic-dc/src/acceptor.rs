@@ -296,8 +296,9 @@ pub enum SendResult<T> {
     Closed(T, AutoWake),
     /// Receivers exist but none have polled yet (no registered slots).
     NoSlots(T),
-    /// Successfully sent. Contains an evicted item (if queue was full) and a waker.
-    Ok { evicted: Option<T>, waker: AutoWake },
+    /// Successfully sent. Contains a waker. The item always joins a receiver's queue:
+    /// a full queue grows instead of evicting a waiting item.
+    Ok { waker: AutoWake },
 }
 
 impl<T> LocalRegistry<T> {
@@ -330,8 +331,7 @@ impl<T> LocalRegistry<T> {
         };
 
         match sender.send(item) {
-            Ok((evicted, waker)) => SendResult::Ok {
-                evicted,
+            Ok(waker) => SendResult::Ok {
                 waker: AutoWake::new(waker),
             },
             Err(channel::SendError::Closed(item)) => {
@@ -418,7 +418,7 @@ mod tests {
         let mut local = registry.local();
 
         let result = local.send(acceptor_id, "hello".into());
-        assert!(matches!(result, SendResult::Ok { evicted: None, .. }));
+        assert!(matches!(result, SendResult::Ok { .. }));
 
         let item = rx.try_recv().unwrap();
         assert_eq!(item, "hello");
