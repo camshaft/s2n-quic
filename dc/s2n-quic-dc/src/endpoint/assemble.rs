@@ -69,6 +69,11 @@ mod tests;
 ///
 /// Cancelled frames (where `should_transmit()` returns false) are sent to `cancelled`
 /// for completion notification.
+///
+/// A PTO probe sends a frame again, so each probe of a frame counts toward its bound on
+/// transmissions (`Frame::ttl`), as the retransmission of a lost frame does. A frame that
+/// has reached its bound fails with the transmission error and is sent to `completed` for
+/// completion notification.
 pub(crate) fn assemble<R: Recycler, Clk>(
     context: &mut Context,
     immediate_queue_status: ImmediateQueueStatus,
@@ -79,6 +84,7 @@ pub(crate) fn assemble<R: Recycler, Clk>(
     unfilled: Unfilled<R>,
     header_buf: &mut Vec<u8>,
     cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
+    completed: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
     ack_completions: &mut impl UnboundedSender<intrusive::Entry<msg::Sender>>,
     freed_batch_tx: &mut FreedBatchTx,
     counters: &AssemblerCounters,
@@ -280,7 +286,9 @@ where
                     source_control_port,
                     max_segment_len,
                     cancelled,
+                    completed,
                     counters,
+                    send_counters,
                 ) {
                     ProbeResult::Assembled { old_pn } => {
                         is_ack_eliciting = true;
@@ -949,9 +957,16 @@ fn assemble_queue_free(
     })
 }
 
-/// Skips packets whose frames have all been cancelled (writer dropped). If a
-/// transmittable packet is found, its frames are added to `packet_frames` using
-/// the next contiguous PN (no gap). The outer loop assigns the PN at encoding time.
+/// Skips packets whose frames have all been cancelled (writer dropped) or have reached
+/// their bound on transmissions. If a transmittable packet is found, its frames are added
+/// to `packet_frames` using the next contiguous PN (no gap). The outer loop assigns the PN
+/// at encoding time.
+///
+/// A probe sends its frames again, and puts the frames of the packet that don't fit back
+/// in the pending queue to be sent again later. Each of those counts toward the frame's
+/// bound on transmissions, as the retransmission of a lost frame does in loss detection:
+/// its `ttl` is lowered by one, and a frame whose `ttl` is already zero fails with the
+/// transmission error and is sent to `completed` instead.
 fn assemble_probe(
     context: &mut Context,
     metadata: &mut MetadataEstimate,
@@ -960,15 +975,22 @@ fn assemble_probe(
     source_control_port: u16,
     max_segment_len: usize,
     cancelled: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
+    completed: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
     counters: &AssemblerCounters,
+    send_counters: &crate::endpoint::counters::Send,
 ) -> ProbeResult {
     while let Some((old_pn, mut probe_frames)) = context.inflight.take_oldest_for_probe() {
         let mut probe_metadata = *metadata;
         let mut has_frame = false;
 
-        while let Some(frame) = probe_frames.pop_front() {
+        while let Some(mut frame) = probe_frames.pop_front() {
             if !frame.should_transmit() {
                 let _ = cancelled.send(frame);
+                continue;
+            }
+
+            if frame.ttl == 0 {
+                fail_at_transmission_bound(frame, completed, send_counters);
                 continue;
             }
 
@@ -982,6 +1004,7 @@ fn assemble_probe(
             if est_len <= max_segment_len {
                 probe_metadata = next;
                 has_frame = true;
+                frame.ttl -= 1;
                 counters.on_tx_frame(&frame.header);
                 counters.on_probe_frame(&frame.header);
                 packet_frames.push_back(frame);
@@ -999,8 +1022,9 @@ fn assemble_probe(
         }
 
         if !has_frame {
-            // All frames were cancelled — remove the now-empty shell that has no
-            // probed_to link, otherwise it violates the inflight invariant.
+            // All frames were cancelled or failed at their bound on transmissions, so
+            // remove the now-empty shell that has no probed_to link, otherwise it
+            // violates the inflight invariant.
             // We must also inform the CCA so it releases the bytes from `bytes_in_flight`,
             // otherwise the window is permanently inflated and the context becomes
             // un-schedulable.
@@ -1021,7 +1045,17 @@ fn assemble_probe(
 
         *metadata = probe_metadata;
 
-        for frame in probe_frames {
+        // The frames that don't fit in the probe go back to the pending queue to be sent
+        // again, which counts toward their bound on transmissions as it does for the frames
+        // the probe carries.
+        for mut frame in probe_frames {
+            if frame.should_transmit() {
+                if frame.ttl == 0 {
+                    fail_at_transmission_bound(frame, completed, send_counters);
+                    continue;
+                }
+                frame.ttl -= 1;
+            }
             context.push_back_frame(frame);
         }
 
@@ -1029,6 +1063,19 @@ fn assemble_probe(
     }
 
     ProbeResult::NothingToProbe
+}
+
+/// Fails `entry`, which has reached its bound on transmissions, with the transmission error,
+/// and sends it to `completed` to report it to its writer, as loss detection does for a lost
+/// frame at its bound.
+fn fail_at_transmission_bound(
+    mut entry: intrusive::Entry<Frame>,
+    completed: &mut impl UnboundedSender<intrusive::Entry<Frame>>,
+    send_counters: &crate::endpoint::counters::Send,
+) {
+    entry.status = frame::TransmissionStatus::Failed(frame::FailureReason::TransmissionError);
+    send_counters.ttl_exhausted.add(1);
+    let _ = completed.send(entry);
 }
 
 #[derive(Clone, Copy, Debug)]

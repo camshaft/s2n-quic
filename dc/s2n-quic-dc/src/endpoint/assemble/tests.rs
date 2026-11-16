@@ -373,6 +373,7 @@ fn assemble_accounts_for_header_overhead() {
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
     let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -413,6 +414,7 @@ fn assemble_accounts_for_header_overhead() {
         pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
         &mut header_buf,
         &mut cancelled,
+        &mut completed,
         &mut ack_completions,
         &mut freed_batch_tx,
         &counters,
@@ -483,6 +485,7 @@ fn assemble_batches_full_mtu_data_frames() {
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
     let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -512,6 +515,7 @@ fn assemble_batches_full_mtu_data_frames() {
         pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
         &mut header_buf,
         &mut cancelled,
+        &mut completed,
         &mut ack_completions,
         &mut freed_batch_tx,
         &counters,
@@ -557,6 +561,7 @@ fn assemble_does_not_pad_small_control_only_batch() {
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
     let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -598,6 +603,7 @@ fn assemble_does_not_pad_small_control_only_batch() {
         pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
         &mut header_buf,
         &mut cancelled,
+        &mut completed,
         &mut ack_completions,
         &mut freed_batch_tx,
         &counters,
@@ -671,6 +677,7 @@ fn assemble_fuzz_respects_gso_invariants() {
             let pool = pool::Pool::new(u16::MAX);
             let mut header_buf = Vec::new();
             let mut cancelled = Queue::new();
+            let mut completed = Queue::new();
             let mut ack_completions = Queue::new();
             let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -690,6 +697,7 @@ fn assemble_fuzz_respects_gso_invariants() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &counters,
@@ -761,6 +769,7 @@ fn assemble_full_mtu_bursts_match_oracle() {
             let pool = pool::Pool::new(u16::MAX);
             let mut header_buf = Vec::new();
             let mut cancelled = Queue::new();
+            let mut completed = Queue::new();
             let mut ack_completions = Queue::new();
             let (mut freed_batch_tx, _r) = crate::queue::freed_batch_channel();
             for f in &frames {
@@ -777,6 +786,7 @@ fn assemble_full_mtu_bursts_match_oracle() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &counters,
@@ -1044,6 +1054,7 @@ fn assemble_probe_fuzz() {
             let pool = pool::Pool::new(u16::MAX);
             let mut header_buf = Vec::new();
             let mut cancelled = Queue::new();
+            let mut completed = Queue::new();
             let mut ack_completions = Queue::new();
             let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -1064,6 +1075,7 @@ fn assemble_probe_fuzz() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &counters,
@@ -1091,6 +1103,7 @@ fn assemble_probe_fuzz() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &counters,
@@ -1340,6 +1353,7 @@ fn orphaned_shell_survives_cancelled_probe_tail() {
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
     let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -1364,6 +1378,7 @@ fn orphaned_shell_survives_cancelled_probe_tail() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &AssemblerCounters::new(&registry),
@@ -1441,6 +1456,244 @@ fn orphaned_shell_survives_cancelled_probe_tail() {
         0,
         "no bytes should remain in flight once the only frame was cancelled"
     );
+}
+
+/// A PTO probe sends a frame again, so each probe counts toward the frame's bound on
+/// transmissions, as the retransmission of a lost frame does. A frame that the peer never
+/// acknowledges is sent once, then once by each probe until it reaches its bound, and the
+/// next probe fails it with the transmission error for its writer instead of sending it.
+//= rendered/0005-endpoint/01-frames.md#DC-0005-004
+//= type=test
+//# The endpoint MUST bound the number of transmissions of each frame.
+//= rendered/0005-endpoint/01-frames.md#DC-0005-051
+//= type=test
+//# When a frame reaches its bound on transmissions without an acknowledgement, the endpoint MUST
+//# report the frame to its writer as failed with the transmission error reason.
+#[test]
+fn probes_count_toward_a_frames_bound_on_transmissions() {
+    use crate::{endpoint::frame::FailureReason, stream::endpoint::send::ProbeState};
+
+    // The number of times the frame may be sent again after its first transmission.
+    const TTL: u16 = 2;
+
+    let mtu = 1500;
+    let registry = Registry::new();
+    let (mut context, entry) = make_context(mtu, &registry);
+
+    let clock = Clock::new(Duration::from_micros(1));
+    let gso = make_gso(1);
+    let pool = pool::Pool::new(u16::MAX);
+    let mut header_buf = Vec::new();
+    let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
+    let mut ack_completions = Queue::new();
+    let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+    let send_counters = crate::endpoint::counters::Send::new(
+        &crate::counter::Registry::default(),
+        crate::endpoint::id::LocalSenderId::from_index(0),
+    );
+    let source_sender_id = crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1));
+    let source_control_port = 443;
+
+    let credit_pool = unused_credit_pool();
+    // Helper to run one assembly round with the shared arguments.
+    macro_rules! run_assemble {
+        () => {
+            assemble::<SyncRecycler, _>(
+                &mut context,
+                ImmediateQueueStatus::Empty,
+                &clock,
+                source_sender_id,
+                source_control_port,
+                &gso,
+                pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
+                &mut header_buf,
+                &mut cancelled,
+                &mut completed,
+                &mut ack_completions,
+                &mut freed_batch_tx,
+                &AssemblerCounters::new(&registry),
+                &send_counters,
+                &credit_pool,
+            )
+        };
+    }
+
+    // The first transmission. `completion_rx` keeps the frame's writer listening.
+    let completion_rx = crate::endpoint::frame::completion_channel();
+    let mut frame = make_data_frame(&entry, completion_rx.sender());
+    frame.ttl = TTL;
+    context.push_back_frame(frame);
+    let _ = run_assemble!().expect("initial data should assemble");
+    assert!(context.inflight.has_inflight(), "the frame waits for an acknowledgement");
+    let mut last_pn = context.inflight.get_range().end().as_u64();
+
+    // Each PTO probe within the bound sends the frame again, at a higher PN.
+    for probe in 1..=TTL {
+        context.pto.probe_state = ProbeState::ProbeTwice;
+        let _ = run_assemble!();
+        let pn = context.inflight.get_range().end().as_u64();
+        assert!(pn > last_pn, "probe {probe} sends the frame again");
+        last_pn = pn;
+        assert!(completed.is_empty(), "probe {probe} is within the bound");
+    }
+
+    // The frame has been sent TTL + 1 times, its bound. The next probe fails it with the
+    // transmission error instead of sending it again.
+    context.pto.probe_state = ProbeState::ProbeTwice;
+    let _ = run_assemble!();
+    assert!(
+        !context.inflight.has_inflight(),
+        "a frame at its bound isn't sent again"
+    );
+    let failed = completed
+        .pop_front()
+        .expect("a frame at its bound is reported to its writer");
+    assert_eq!(
+        failed.status,
+        TransmissionStatus::Failed(FailureReason::TransmissionError)
+    );
+    assert!(completed.is_empty(), "the frame is reported once");
+}
+
+/// A probe that doesn't have room for every frame of the packet it sends again puts the
+/// frames that don't fit back in the queue, to be sent again later. Each such return counts
+/// toward the frame's bound on transmissions too: the frame's `ttl` is lowered by one, and a
+/// frame already at its bound fails with the transmission error for its writer instead.
+//= rendered/0005-endpoint/01-frames.md#DC-0005-004
+//= type=test
+//# The endpoint MUST bound the number of transmissions of each frame.
+//= rendered/0005-endpoint/01-frames.md#DC-0005-051
+//= type=test
+//# When a frame reaches its bound on transmissions without an acknowledgement, the endpoint MUST
+//# report the frame to its writer as failed with the transmission error reason.
+#[test]
+fn probes_count_the_frames_they_return_to_the_queue_toward_their_bound() {
+    use crate::{endpoint::frame::FailureReason, stream::endpoint::send::ProbeState};
+
+    // The frame the probe sends again, small enough to fit beside an ACK.
+    const CARRIED_PAYLOAD_LEN: usize = 5;
+
+    // A frame with one transmission left goes back in the queue with none left, and a frame
+    // at its bound fails instead.
+    for returned_ttl in [1u16, 0] {
+        let mtu = 1500;
+        let registry = Registry::new();
+        let (mut context, entry) = make_context(mtu, &registry);
+
+        let clock = Clock::new(Duration::from_micros(1));
+        let gso = make_gso(1);
+        let pool = pool::Pool::new(u16::MAX);
+        let mut header_buf = Vec::new();
+        let mut cancelled = Queue::new();
+        let mut completed = Queue::new();
+        let mut ack_completions = Queue::new();
+        let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+
+        let send_counters = crate::endpoint::counters::Send::new(
+            &crate::counter::Registry::default(),
+            crate::endpoint::id::LocalSenderId::from_index(0),
+        );
+        let source_sender_id = crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(1));
+        let source_control_port = 443;
+
+        let credit_pool = unused_credit_pool();
+        macro_rules! run_assemble {
+            () => {
+                assemble::<SyncRecycler, _>(
+                    &mut context,
+                    ImmediateQueueStatus::Empty,
+                    &clock,
+                    source_sender_id,
+                    source_control_port,
+                    &gso,
+                    pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
+                    &mut header_buf,
+                    &mut cancelled,
+                    &mut completed,
+                    &mut ack_completions,
+                    &mut freed_batch_tx,
+                    &AssemblerCounters::new(&registry),
+                    &send_counters,
+                    &credit_pool,
+                )
+            };
+        }
+
+        // The largest frame that fits in one packet beside the carried frame, so that the ACK
+        // of the next round leaves the probe room for the carried frame alone.
+        let max_datagram_size = context.path_info(&gso).max_datagram_size as usize;
+        let fits_beside_carried = |payload_len: usize| {
+            let len = MetadataEstimate::new()
+                .with_frame(&make_sized_data_frame(&entry, CARRIED_PAYLOAD_LEN))
+                .with_frame(&make_sized_data_frame(&entry, payload_len))
+                .estimate_packet_len(
+                    source_sender_id,
+                    source_control_port,
+                    &context.credentials,
+                    seal::Application::tag_len(&context.sealer),
+                );
+            len <= max_datagram_size
+        };
+        let returned_payload_len = (0..max_datagram_size)
+            .rev()
+            .find(|&payload_len| fits_beside_carried(payload_len))
+            .expect("a frame fits beside the carried frame");
+
+        // Round 1: one packet carries both frames.
+        context.push_back_frame(make_sized_data_frame(&entry, CARRIED_PAYLOAD_LEN));
+        let mut returned = make_sized_data_frame(&entry, returned_payload_len);
+        returned.ttl = returned_ttl;
+        context.push_back_frame(returned);
+        let _ = run_assemble!().expect("initial data should assemble");
+        let range = context.inflight.get_range();
+        assert_eq!(
+            range.start(),
+            range.end(),
+            "both frames are sent in one packet"
+        );
+        assert!(
+            !context.has_pending_data(),
+            "the returned frame fits beside the carried frame"
+        );
+        let last_pn = range.end().as_u64();
+
+        // Round 2: a probe while an ACK is pending. The ACK and the carried frame fill the
+        // probe, so the probe puts the other frame back in the queue.
+        context.pto.probe_state = ProbeState::ProbeTwice;
+        context
+            .pending_acks
+            .push_back(make_pending_ack(&entry, clock.get_time()));
+        let _ = run_assemble!();
+        let pn = context.inflight.get_range().end().as_u64();
+        assert!(pn > last_pn, "the probe sends the carried frame again");
+
+        let requeued = context.pop_pending();
+        if returned_ttl == 0 {
+            assert!(
+                requeued.is_none(),
+                "a frame at its bound isn't put back in the queue"
+            );
+            let failed = completed
+                .pop_front()
+                .expect("a frame at its bound is reported to its writer");
+            assert_eq!(failed.payload_len(), returned_payload_len);
+            assert_eq!(
+                failed.status,
+                TransmissionStatus::Failed(FailureReason::TransmissionError)
+            );
+        } else {
+            let requeued = requeued.expect("the frame goes back in the queue");
+            assert_eq!(requeued.payload_len(), returned_payload_len);
+            assert_eq!(
+                requeued.ttl,
+                returned_ttl - 1,
+                "putting the frame back in the queue counts toward its bound"
+            );
+        }
+        assert!(completed.is_empty(), "no other frame fails");
+    }
 }
 
 /// Builds a QueueData frame carrying a `payload_len`-byte payload, near a full MTU.
@@ -1540,6 +1793,7 @@ fn ack_only_segment_must_not_consume_pto_probe_budget() {
     let pool = pool::Pool::new(u16::MAX);
     let mut header_buf = Vec::new();
     let mut cancelled = Queue::new();
+    let mut completed = Queue::new();
     let mut ack_completions = Queue::new();
     let (mut freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
 
@@ -1563,6 +1817,7 @@ fn ack_only_segment_must_not_consume_pto_probe_budget() {
                 pool.alloc::<SyncRecycler>().expect("pool alloc failed"),
                 &mut header_buf,
                 &mut cancelled,
+                &mut completed,
                 &mut ack_completions,
                 &mut freed_batch_tx,
                 &AssemblerCounters::new(&registry),
