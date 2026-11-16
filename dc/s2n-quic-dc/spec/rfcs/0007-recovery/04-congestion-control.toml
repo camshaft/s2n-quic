@@ -50,8 +50,8 @@ id = "DC-0007-027"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "Except while it is starting up, a sender MUST lower a limit that caps its window, and that never caps it below the sender's minimum window, within the round trip after one in which the peer's count of packets marked congestion experienced increased, unless the sender was probing for more bandwidth when that round trip ended."
-rationale = "Congestion marks show a queue building before it drops packets. The cap falls rather than the window itself, since in some states the window already sits below the cap, and at the minimum window the sender keeps enough data in flight to go on measuring the path. A sender probing for more bandwidth expects a short queue while it probes, so this requirement leaves its marks out."
+statement = "A sender MUST lower a limit that caps its window, and that never caps it below the sender's minimum window, within the round trip after one in which the peer's count of packets marked congestion experienced increased, unless at some point in that round trip the sender was starting up, draining the queue its start-up built, probing for more bandwidth, or probing its round-trip time."
+rationale = "Congestion marks show a queue building before it drops packets. The cap falls rather than the window itself, since in some states the window already sits below the cap, and at the minimum window the sender keeps enough data in flight to go on measuring the path. A round trip in which the sender starts up, drains, or probes builds or empties a short queue on purpose, and the sender starts its next phase with fresh congestion signals, so this requirement leaves those round trips out."
 
 [[requirement]]
 id = "DC-0007-043"
