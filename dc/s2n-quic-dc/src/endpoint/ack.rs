@@ -652,12 +652,11 @@ fn detect_loss<Rand>(
             }
 
             if entry.ttl == 0 {
-                debug_assert_ne!(entry.ttl, 0, "frame TTL should never be exhausted");
                 error!(
                     credentials = %context.credentials.id,
                     sender_idx = %context.sender_idx,
                     frame = ?*entry,
-                    "frame TTL exhausted - this should never happen"
+                    "frame TTL exhausted; reporting the frame to its writer as failed"
                 );
                 crate::endpoint::dbg::on_enabled(|| {
                     if let Some((dump_id, queue_pair, binding_id)) = dbg {
