@@ -3,7 +3,7 @@ anchor = "accepting"
 title = "Accepting streams"
 problem = "A server needs to hand each incoming stream to the part of the application that serves it, and to keep a slow consumer from holding an unbounded number of streams."
 motivation = "Routing by acceptor identifier lets one endpoint serve several services, the queue slots the server grants each client hold new streams back at the client while the application is slow, so the server keeps every stream it accepted, and spreading streams over receivers lets the application scale out."
-prose = "A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor. A queue slot is the room the server holds for one stream of one client: the client opens each stream on a slot it holds, each write of the stream names that slot until the server confirms the stream, and the stream keeps its slot until the application has finished with it. The server then returns the freed slot to the client in a frame that names the slot, and the client may open another stream on it. The server starts each client with one slot where the memory that holds waiting streams has room for it, and otherwise with none until that memory has room for one, which goes to the client that has waited longest, ahead of any grant that grows; it then grows the client's grant, up to doubling it, while its receivers take that client's streams as fast as they arrive, and holds it while streams wait or halves it by keeping freed slots. The server takes room for each slot from the memory that holds waiting streams when it grants the slot, so a stream on a granted slot always has room, and returns that room when the slot leaves the grant. A slot's room is the memory for one stream's state and for the bytes the client may send on that stream before the application takes it: up to the read half's starting limit on what the client may send, since the read half raises that limit only as the application consumes data. While that memory refuses room for a slot, no grant grows, the server takes each freed slot back, and it withdraws each granted slot that holds no stream, in a frame that names the slot, keeping in each case a client's last slot; a withdrawn slot leaves the grant once the client confirms the withdrawal."
+prose = "A server registers acceptors on its endpoint, each under an identifier. Each incoming stream goes to the acceptor its identifier names, and waits in a receiver's queue until the application takes it. A stream that arrives before any receiver has polled for one or registered to take one is turned away as busy. The application clones a receiver to add workers, and drops every receiver to retire the acceptor. A queue slot is the room the server holds for one stream of one client: the client opens each stream on a slot it holds, each write of the stream names that slot until the server confirms the stream, and the stream keeps its slot until the application has finished with it. The server then returns the freed slot to the client in a frame that names the slot, and the client may open another stream on it. The server starts each client with one slot where the memory that holds waiting streams has room for it and no client waits for its first slot, and otherwise with none until that memory has room for one, which goes to the client that has waited longest, ahead of any grant that grows; it then grows the client's grant, up to doubling it, while its receivers take that client's streams as fast as they arrive, and holds it while streams wait or halves it by keeping freed slots. The server takes room for each slot from the memory that holds waiting streams when it grants the slot, so a stream on a granted slot always has room, and returns that room when the slot leaves the grant. A slot's room is the memory for one stream's state and for the bytes the client may send on that stream before the application takes it: up to the read half's starting limit on what the client may send, since the read half raises that limit only as the application consumes data. While that memory refuses room for a slot, no grant grows, the server takes each freed slot back, and it withdraws each granted slot that holds no stream, in a frame that names the slot, keeping in each case a client's last slot; a withdrawn slot leaves the grant once it holds no stream of the client and the client confirms the withdrawal or acknowledges a packet that carried it. The server never returns a withdrawn slot to the client, and resets a later stream on it with an error that tells the client to open the stream on another slot."
 
 [[requirement]]
 id = "DC-0006-037"
@@ -82,7 +82,7 @@ id = "DC-0006-061"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "At the handshake, the server MUST advertise to each client a starting grant of one queue slot where the memory that holds waiting streams gives room for that slot."
+statement = "At the handshake, the server MUST advertise to each client a starting grant of one queue slot where the memory that holds waiting streams gives room for that slot and no client waits for its first slot."
 rationale = "The client can open a stream at once, and the server learns how fast its receivers take that client's streams before it lets the client hold more; DC-0006-075 says what the server does where that memory has no room for the slot."
 
 [[requirement]]
@@ -178,7 +178,7 @@ id = "DC-0006-073"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "While the memory that holds waiting streams refuses room for a slot, the server MUST take each freed slot out of its client's grant instead of returning it, except the last slot of that client's grant."
+statement = "While the memory that holds waiting streams refuses room for a slot, the server MUST take each freed slot out of its client's grant instead of returning it, except the last slot of that client's grant that no withdrawal frame names."
 rationale = "The room the grants hold then falls as streams finish, and DC-0006-077 returns it to the memory, so a client whose application keeps up, or one that waits for its first slot, can take it; each client keeps the one slot that lets its grant grow again."
 
 [[requirement]]
@@ -194,15 +194,15 @@ id = "DC-0006-075"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "Where the memory that holds waiting streams refuses room for a client's first queue slot at the handshake, the server MUST advertise to that client a starting grant of no slots."
-rationale = "A first slot that the memory can't hold would let each new client add a waiting stream the memory doesn't have room for. Without a slot, the client holds its new streams back as DC-0006-068 asks, as it does while every slot of a full grant holds a stream, and the server neither refuses the client nor drops its work."
+statement = "Where the memory that holds waiting streams refuses room for a client's first queue slot at the handshake, or another client waits for its first slot, the server MUST advertise to that client a starting grant of no slots."
+rationale = "A first slot that the memory can't hold would let each new client add a waiting stream the memory doesn't have room for. Without a slot, the client holds its new streams back as DC-0006-068 asks, as it does while every slot of a full grant holds a stream, and the server neither refuses the client nor drops its work. A new client waits behind each client that began to wait before it (DC-0006-078)."
 
 [[requirement]]
 id = "DC-0006-076"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "While a client waits for its first queue slot, the server MUST keep a request for that slot's room open with the memory that holds waiting streams."
+statement = "While a client waits for its first queue slot, the server MUST keep one request for a slot's room open with the memory that holds waiting streams, for the client that has waited longest."
 rationale = "The memory's answer to the open request is the event that ends the wait, so the server doesn't ask it again on a timer; DC-0006-078 says which waiting client takes the room, DC-0006-066 tells the client of the slot, and DC-0006-067 has the client take it."
 
 [[requirement]]
@@ -227,7 +227,7 @@ level = "MUST"
 polarity = "required"
 binds_to = "system"
 statement = "While the memory that holds waiting streams refuses room for a slot, the server MUST withdraw from each client's grant each granted slot that holds no stream, except the last slot of that client's grant."
-rationale = "A slot that holds no stream still holds its room (DC-0006-074), so a client that grew its grant and then stopped opening streams would keep room that other clients, and clients that wait for their first slot, need. Withdrawing empty slots returns that room, and each client keeps the one slot that lets its grant grow again."
+rationale = "A slot that holds no stream still holds its room (DC-0006-074), so a client that grew its grant and then stopped opening streams would keep room that other clients, and clients that wait for their first slot, need. Withdrawing empty slots returns that room, and each client keeps the one slot that lets its grant grow again. The server keeps, for each client, the granted slots that don't hold a stream, and the clients that hold such a slot beyond their last, so a withdrawal reads only the slots it withdraws."
 
 [[requirement]]
 id = "DC-0006-080"
@@ -250,16 +250,32 @@ id = "DC-0006-082"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The client MUST confirm to the server the withdrawal of each slot that a withdrawal frame names and that holds no stream of the client."
-rationale = "The confirmation tells the server that no stream of the client can still arrive on the slot. A slot whose stream the client opened before it read the frame stays that stream's, and leaves the grant once the stream is freed while the memory still refuses room (DC-0006-073)."
+statement = "The client MUST confirm to the server the withdrawal of each slot that a withdrawal frame names, once that slot holds no stream of the client, with the retransmission the frame that withdraws slots has."
+rationale = "The confirmation tells the server that no stream of the client can still arrive on the slot. A slot whose stream the client opened before it read the frame stays that stream's until the server frees it, and the client confirms its withdrawal then; a lost confirmation is sent again, so it doesn't keep the slot in the grant."
 
 [[requirement]]
 id = "DC-0006-083"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The server MUST keep each slot it withdraws in the client's grant until the client confirms that slot's withdrawal."
-rationale = "A stream the client opened on the slot before it read the withdrawal frame can still be on its way, and it then finds the slot granted and its room kept (DC-0006-074); once the client confirms, the slot leaves the grant, DC-0006-077 returns its room, and DC-0006-069 refuses a later stream on it."
+statement = "The server MUST keep each slot it withdraws in the client's grant until that slot holds no stream of the client and the client has confirmed the slot's withdrawal or acknowledged a packet that carried a withdrawal frame naming the slot."
+rationale = "A stream the client opened on the slot before it read the withdrawal frame finds the slot granted and its room kept (DC-0006-074) until the server frees it. The server reads the client's acknowledgement itself, so a client that ignores withdrawal frames can't keep a withdrawn slot's room; the withdrawal ends on these events alone, and not on a timer. Once the slot leaves the grant, DC-0006-077 returns its room, and DC-0006-069 refuses a later stream on it, with the error of DC-0006-085."
+
+[[requirement]]
+id = "DC-0006-084"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "The server MUST NOT return to the client a slot it has withdrawn."
+rationale = "DC-0006-081 forbids the client to open a stream on a withdrawn slot, and a slot that a grant adds is one the client hasn't held (DC-0006-067), so a withdrawn slot that came back would hold room that no stream of the client can use."
+
+[[requirement]]
+id = "DC-0006-085"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Where the server refuses under DC-0006-069 a stream whose first write names a slot whose withdrawal has ended, the server MUST reset that stream with an error that tells the client to open the stream on another slot."
+rationale = "A client that opened the stream after the slot left its grant, such as one that ignored the withdrawal frame, then learns why the server refused the stream and that a granted slot can carry its work."
 
 [[requirement]]
 id = "DC-0006-045"
