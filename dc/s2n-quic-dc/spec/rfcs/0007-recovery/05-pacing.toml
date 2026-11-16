@@ -52,3 +52,11 @@ polarity = "forbidden"
 binds_to = "system"
 statement = "A sender's published load score MUST NOT show an acknowledgement's effect on its window or its pacing rate until every update that acknowledgement makes is applied."
 rationale = "A score read between an acknowledgement's updates would steer work by a state the sender never holds."
+
+[[requirement]]
+id = "DC-0007-042"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Once every update an acknowledgement makes to a sender's window and pacing rate is applied, the sender's published load score MUST reflect them."
+rationale = "A score that never shows an acknowledgement's effect would steer work by a window and a pacing rate the sender no longer holds."

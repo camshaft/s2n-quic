@@ -25,3 +25,7 @@ A sender's published load score MUST reflect its queue as it stands after each c
 ### DC-0007-041 {#DC-0007-041}
 
 A sender's published load score MUST NOT show an acknowledgement's effect on its window or its pacing rate until every update that acknowledgement makes is applied.
+
+### DC-0007-042 {#DC-0007-042}
+
+Once every update an acknowledgement makes to a sender's window and pacing rate is applied, the sender's published load score MUST reflect them.
