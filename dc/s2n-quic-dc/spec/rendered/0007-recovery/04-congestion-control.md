@@ -24,7 +24,7 @@ A sender MUST count a run of consecutive lost packet numbers as one loss event w
 
 ### DC-0007-027 {#DC-0007-027}
 
-A sender MUST lower its sending rate or its window in response to an increase of the peer's count of packets marked congestion experienced.
+A sender MUST lower its window within the round trip after one in which the peer's count of packets marked congestion experienced increased, unless the sender was probing for more bandwidth in that round trip and the marked packets, each counted at the path's maximum datagram size, made up at most half of the data delivered in it.
 
 ### DC-0007-028 {#DC-0007-028}
 
