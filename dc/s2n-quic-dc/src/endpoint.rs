@@ -67,6 +67,17 @@ pub const DEFAULT_DEAD_PEER_COOLDOWN: Duration = Duration::from_secs(30);
 /// The maximum length of a single packet
 pub const MAX_DATAGRAM_SIZE: usize = 1 << 15; // 32k
 
+/// The default [`Config::ups_queue_limit`]: the UnknownPathSecret responses that `ups_rate`
+/// sends in one burst without waiting, each counted at the largest control packet, and at least
+/// one. With that many responses in the queue, the last one waits at most the time `ups_rate`
+/// takes to send one burst, so a response still answers a recent packet when the peer receives
+/// it. The ReplayDetected and StaleKey responses, which the limit doesn't count, can add to that
+/// wait.
+pub fn default_ups_queue_limit(ups_rate: crate::socket::rate::Rate) -> usize {
+    let per_burst = ups_rate.burst_bytes() / packet::secret_control::MAX_PACKET_SIZE as u64;
+    (per_burst as usize).max(1)
+}
+
 type BatchSender =
     GaugedSender<sync_queue::Sender<combinator::FrameBatch>, Entry<combinator::FrameBatch>>;
 type BatchReceiver = sync_queue::Receiver<combinator::FrameBatch>;
@@ -423,6 +434,11 @@ pub struct Config {
     pub submission_shards: usize,
     /// Rate limit for UnknownPathSecret responses (pacing rate).
     pub ups_rate: crate::socket::rate::Rate,
+    /// The most UnknownPathSecret responses that wait in the UPS queue together, for all
+    /// credentials and peer sender ids; the endpoint drops each one past it. The ReplayDetected
+    /// and StaleKey responses don't count against it, and the endpoint doesn't drop one for it.
+    /// [`default_ups_queue_limit`] derives it from `ups_rate`.
+    pub ups_queue_limit: usize,
     /// Dedup LRU capacity for UnknownPathSecret responses.
     pub ups_dedup_capacity: usize,
     /// Dedup suppression window for UnknownPathSecret responses.
@@ -573,6 +589,7 @@ where
         budgets,
         submission_shards,
         ups_rate,
+        ups_queue_limit,
         ups_dedup_capacity,
         ups_dedup_window,
         dead_peer_cooldown,
@@ -700,12 +717,16 @@ where
     // UPS channel: recv_dispatch workers → background (UnknownPathSecret responses)
     // It carries the ReplayDetected and StaleKey responses too, and `ups::Pending` keeps at most
     // one response in it for each credential and peer sender id, with a shard of keys for each
-    // recv_dispatch worker.
+    // recv_dispatch worker, and at most `ups_queue_limit` UnknownPathSecret responses in it for
+    // all of them together, since the credential id and the sender id of an unknown path secret
+    // come from a packet the endpoint can't authenticate.
     let (ups_tx, ups_rx) = intrusive::sync::new::<ups::Response>();
     let ups_queue_gauge = counter_registry.register_queue_gauge("q.ups");
     let ups_pending = ups::Pending::new(
         layout.recv_dispatch.len(),
+        ups_queue_limit,
         counter_registry.register("ups.pending_suppressed"),
+        counter_registry.register("ups.pending_dropped"),
     );
     let ups_tx = ups_pending.sender(GaugedSender::new(ups_tx, ups_queue_gauge.clone()));
     let ups_rx = ups_pending.receiver(ups_rx);
