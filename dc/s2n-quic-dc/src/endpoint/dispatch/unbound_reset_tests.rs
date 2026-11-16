@@ -314,7 +314,12 @@ fn a_control_frame_for_a_half_closed_queue_doesnt_get_a_reset() {
         "the stream must hold the slot with its control receiver closed"
     );
 
-    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+    let result = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+    let got = outcome(&result);
+    assert!(
+        result.is_ok(),
+        "the control frame must reach dispatch, not {got}"
+    );
 
     assert!(
         submitted_headers(&mut frame_rx).is_empty(),
@@ -364,7 +369,12 @@ fn a_client_doesnt_answer_a_control_frame_for_an_unbound_stream() {
         "the client must not hold a stream at the frame's queue"
     );
 
-    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+    let result = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+    let got = outcome(&result);
+    assert!(
+        result.is_ok(),
+        "the server's control frame must reach the client's dispatch, not {got}"
+    );
 
     assert!(
         submitted_headers(&mut frame_rx).is_empty(),
