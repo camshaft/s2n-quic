@@ -1017,6 +1017,9 @@ mod tests {
 
     /// A ring whose pool answers `None` from the start, so that none of its descriptors is out to
     /// recycle, asks the pool again until it answers, and receives once the test opens the pool.
+    /// The test opens it only after the ring's first pass and two retries, so it fails where the
+    /// ring waits for a recycle instead: that ring passes once at startup and once for the
+    /// `-ENOBUFS` completion of its first receive, and then waits.
     /// Skipped (passes trivially) if io_uring is unavailable.
     #[test]
     fn uring_recv_starts_once_an_exhausted_pool_opens() {
@@ -1033,12 +1036,19 @@ mod tests {
         let router = HoldRouter { segments };
 
         let open = Arc::new(AtomicBool::new(false));
-        let (descriptors, _) = GatedDescriptors::new(0, open.clone());
+        let (descriptors, passes) = GatedDescriptors::new(0, open.clone());
         let ring = spawn_with(0, BusyPoll(recv_sock), 4, descriptors, router)
             .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
 
         let send_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         send_sock.send_to(b"first", recv_addr).unwrap();
+        // The ring passes its loop with every bid empty and asks the pool again each time: keep
+        // the pool closed until its first pass and two retries.
+        for _ in 0..3 {
+            passes
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the ring asks the pool again while none of its descriptors is out");
+        }
         open.store(true, Ordering::Release);
 
         let first = held
