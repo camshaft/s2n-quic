@@ -10,7 +10,9 @@
 //! the three outcomes: clean completion, stale re-submission, and graceful handling of
 //! evicted contexts.
 
-use super::helpers::{RecvContextBuilder, TestReceiver, TestReceiverExt as _};
+use super::helpers::{
+    event_count, test_map_with_subscriber, RecvContextBuilder, TestReceiver, TestReceiverExt as _,
+};
 use crate::{
     endpoint::{ack::state as ack_state, msg, recv, tasks},
     socket::channel::{intrusive::unsync, ReceiverExt as _},
@@ -30,7 +32,15 @@ struct Harness {
 /// Creates a recv context in Flushed state (ACK in-flight) and returns both the
 /// context and the submission that was sent.
 fn setup_flushed_context() -> (Rc<RefCell<recv::Context>>, ack_state::Submission) {
-    let ctx = RecvContextBuilder::default().build();
+    flushed_context(RecvContextBuilder::default())
+}
+
+/// Builds a recv context with `builder`, puts it in Flushed state, with its ACK sent and its
+/// completion not yet back, and returns both the context and the submission that was sent.
+fn flushed_context(
+    builder: RecvContextBuilder,
+) -> (Rc<RefCell<recv::Context>>, ack_state::Submission) {
+    let ctx = builder.build();
     let submission = {
         let mut c = ctx.borrow_mut();
         let clock = Clock::default();
@@ -48,10 +58,20 @@ fn setup(
     cache: Rc<RefCell<recv::Cache>>,
     entries: impl IntoIterator<Item = crate::intrusive::Entry<msg::Sender>>,
 ) -> Harness {
+    setup_with_map(cache, entries, None)
+}
+
+/// Spawns the ack_completion task as `setup` does, and publishes its events through
+/// `path_secret_map` where one is set.
+fn setup_with_map(
+    cache: Rc<RefCell<recv::Cache>>,
+    entries: impl IntoIterator<Item = crate::intrusive::Entry<msg::Sender>>,
+    path_secret_map: Option<crate::path::secret::Map>,
+) -> Harness {
     let (sender, output_rx) = unsync::new::<msg::Sender>();
     let input = TestReceiver::new(entries);
     let counters = crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
-    let rx = tasks::ack_completion(input, cache, sender, counters);
+    let rx = tasks::ack_completion(input, cache, sender, counters, path_secret_map);
     async move { rx.drain_budgeted(Some(32)).await }
         .primary()
         .spawn();
@@ -235,6 +255,48 @@ fn stale_resubmit_then_next_completion_settles() {
                 "second completion should not re-submit again without new data"
             );
             assert_eq!(ctx.borrow().ack_state, recv::AckState::Idle);
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A stale completion whose replacement the lost mark of its context's sender moves to another
+/// sender publishes a `PathSecretMapAcknowledgementMoved` event through the path secret map.
+#[test]
+fn stale_completion_moved_off_a_lost_sender_publishes_an_event() {
+    sim(|| {
+        let builder = RecvContextBuilder::default().socket_sender_count(4);
+        let (ctx, submission) = flushed_context(builder);
+        // New packets arrive before the completion of the ACK comes back, and the pair of the
+        // context's sender is marked lost.
+        {
+            let mut c = ctx.borrow_mut();
+            let clock = Clock::default();
+            let now = clock.get_time();
+            c.ack_ranges.on_packet_received(VarInt::from_u8(2), now);
+            c.ack_state.on_ack_eliciting().unwrap();
+            let sender = c.local_sender_id;
+            assert!(c.path_entry.set_sender_lost(sender, true));
+        }
+
+        let cache = cache_with_context(ctx, &submission);
+        let entry = crate::intrusive::Entry::new(msg::Sender::PendingAck(submission));
+        let (map, subscriber) = test_map_with_subscriber();
+        let Harness { mut output_rx } = setup_with_map(cache, [entry], Some(map));
+
+        async move {
+            let first = output_rx
+                .recv()
+                .await
+                .expect("stale completion should re-submit pending ack");
+            let msg::Sender::PendingAck(submission) = &*first else {
+                panic!("expected a pending-ack submission");
+            };
+            let delivering = crate::endpoint::id::LocalSenderId::new(VarInt::from_u8(2));
+            assert_eq!(submission.local_sender_id, delivering);
+            let moves = event_count(&subscriber.path_secret_map_acknowledgement_moved);
+            assert_eq!(moves, 1);
         }
         .primary()
         .spawn();

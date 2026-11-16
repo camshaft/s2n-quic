@@ -314,7 +314,7 @@ fn ack_completion_after_recv_invalidation_does_not_resurrect_context() {
         let counters =
             crate::endpoint::counters::Dispatch::new(&crate::counter::Registry::default());
         let mut completion =
-            tasks::ack_completion(completion_rx, recv_cache.clone(), sender, counters);
+            tasks::ack_completion(completion_rx, recv_cache.clone(), sender, counters, None);
 
         async move {
             invalidation.recv().await;
@@ -348,6 +348,7 @@ fn ack_burst_after_recv_invalidation_emits_nothing() {
             sender,
             crate::endpoint::id::RecvDispatchWorkerId::new(0),
             counters,
+            None,
         );
 
         async move {

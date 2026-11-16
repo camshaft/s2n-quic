@@ -2054,6 +2054,13 @@ impl Inner {
         // the send pipeline — the first sighting, before aggregation/credit/pacing/assembly. Pairs
         // with the Outbound record at assembly. PN is not assigned yet.
         crate::endpoint::frame_trace::app_send(&frame.header, *self.path_secret_entry.id());
+        // As in the writer's `send_frame`: a stream submits a frame without a completion sender
+        // only as a reset, which the priority router keeps one copy of while it waits.
+        debug_assert!(
+            frame.completion.is_some() || matches!(frame.header, Header::QueueReset { .. }),
+            "a stream frame without a completion sender must be a QueueReset: {:?}",
+            frame.header
+        );
         self.frame_tx
             .send_batch(intrusive::Entry::new(frame))
             .map_err(|mut returned| {
