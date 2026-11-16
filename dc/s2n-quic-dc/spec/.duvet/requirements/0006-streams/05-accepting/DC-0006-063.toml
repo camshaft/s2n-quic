@@ -2,4 +2,4 @@ target = "rendered/0006-streams/05-accepting.md#DC-0006-063"
 
 [[spec]]
 level = "MUST"
-quote = "Where a receiver takes a stream of a client that holds every slot of its grant and the receiver's queue is empty after the take, the server MUST grow that client's grant."
+quote = "Where a receiver takes a stream of a client that holds every slot of its grant, no stream of that client waits in any receiver's queue after the take, and the memory waiting streams hold isn't under pressure, the server MUST double that client's grant."
