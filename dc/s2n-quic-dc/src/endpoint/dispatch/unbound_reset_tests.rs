@@ -257,6 +257,121 @@ fn a_control_frame_for_an_unbound_stream_gets_a_reset() {
     );
 }
 
+//= rendered/0005-endpoint/03-binding.md#DC-0005-055
+//= type=test
+//# A server MUST NOT answer with a reset a frame for a slot that a stream holds, or a frame whose binding identifier isn't newer than the last binding of its free slot.
+/// A control frame for a slot that a stream holds, after the stream's control receiver closed,
+/// doesn't get a reset back: the stream still holds the slot, so the server drops the frame.
+#[test]
+fn a_control_frame_for_a_half_closed_queue_doesnt_get_a_reset() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = server_map(peer);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+
+    let payload = b"queue-control-payload";
+    let header = Header::QueueControl {
+        queue_pair: client_queue_pair(),
+        binding_id: VarInt::from_u8(BINDING_ID),
+    };
+    let (packet, credentials) = sealed_frame(peer, endpoint::Type::Client, 0, header, payload);
+
+    let entry = path_secret_map
+        .get_by_id(&credentials.id)
+        .expect("the map must hold the server entry for the packet's credential");
+    let crate::path::secret::map::entry::QueueState::Server(state) = entry.queue_state() else {
+        panic!("a server entry must have a server queue state");
+    };
+    let mut view = recv::QueueView::Server(state.view());
+    let (mut freed_batch_tx, freed_batch_rx) = crate::queue::freed_batch_channel();
+    let server = view.as_server_mut().expect("server view");
+    let result = server.bind_for_msg(
+        VarInt::from_u8(SERVER_QUEUE_ID),
+        VarInt::from_u8(BINDING_ID),
+        &entry,
+        &mut freed_batch_tx,
+    );
+    let crate::queue::BindResult::NewBinding {
+        stream, control, ..
+    } = result.expect("the slot must bind for the test's setup")
+    else {
+        panic!("a slot that never held a stream must take a new binding");
+    };
+    // Close the control receiver alone. The stream holds the slot while its receiver lives: leak
+    // it for the short-lived test.
+    drop(control);
+    std::mem::forget(stream);
+    std::mem::forget(freed_batch_rx);
+    let diag = view
+        .slot_diag(VarInt::from_u8(SERVER_QUEUE_ID))
+        .expect("the bound slot must be mapped");
+    assert!(
+        !diag.unallocated && diag.stored_binding == u64::from(BINDING_ID),
+        "the slot must hold the control frame's binding"
+    );
+    assert!(
+        diag.stream_has_receiver && diag.control_has_sender && !diag.control_has_receiver,
+        "the stream must hold the slot with its control receiver closed"
+    );
+
+    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+
+    assert!(
+        submitted_headers(&mut frame_rx).is_empty(),
+        "a control frame for a slot that a stream holds must not get a reset"
+    );
+    let diag = view
+        .slot_diag(VarInt::from_u8(SERVER_QUEUE_ID))
+        .expect("the bound slot must be mapped");
+    assert!(
+        !diag.unallocated && diag.stream_has_receiver && diag.control_depth == 0,
+        "the stream must still hold the slot, and the server must drop the control frame"
+    );
+}
+
+//= rendered/0005-endpoint/03-binding.md#DC-0005-056
+//= type=test
+//# A client MUST NOT answer with a reset a reset that arrives for a stream it doesn't hold.
+/// A control frame from the server, for a queue the client doesn't hold, doesn't get a reset back:
+/// only a server answers a frame for a stream it hasn't bound.
+#[test]
+fn a_client_doesnt_answer_a_control_frame_for_an_unbound_stream() {
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let path_secret_map = crate::path::secret::map::testing::new(16);
+    path_secret_map.test_insert(peer, endpoint::Type::Client);
+    let (mut harness, mut frame_rx) = FastPathHarness::with_frame_rx();
+    let mut recv_cache = recv::Cache::new(crate::endpoint::id::RecvDispatchWorkerId::new(0));
+
+    let payload = b"queue-control-payload";
+    let header = Header::QueueControl {
+        queue_pair: QueuePair {
+            source_queue_id: VarInt::from_u8(SERVER_QUEUE_ID),
+            dest_queue_id: VarInt::from_u8(CLIENT_QUEUE_ID),
+        },
+        binding_id: VarInt::from_u8(BINDING_ID),
+    };
+    let (packet, credentials) = sealed_frame(peer, endpoint::Type::Server, 0, header, payload);
+    let entry = path_secret_map
+        .get_by_id(&credentials.id)
+        .expect("the map must hold the client entry for the packet's credential");
+    let crate::path::secret::map::entry::QueueState::Client(state) = entry.queue_state() else {
+        panic!("a client entry must have a client queue state");
+    };
+    let mut view = recv::QueueView::Client(crate::queue::ClientDispatch::new(state.clone()));
+    assert!(
+        view.slot_diag(VarInt::from_u8(CLIENT_QUEUE_ID))
+            .is_none_or(|diag| diag.unallocated && diag.stored_binding < u64::from(BINDING_ID)),
+        "the client must not hold a stream at the frame's queue"
+    );
+
+    let _ = process_with(packet, &path_secret_map, &mut harness, &mut recv_cache);
+
+    assert!(
+        submitted_headers(&mut frame_rx).is_empty(),
+        "a client must not answer the server's control frame with a reset"
+    );
+}
+
 //= rendered/0005-endpoint/03-binding.md#DC-0005-020
 //= type=test
 //# A server MUST answer a frame for a stream it hasn't bound, and won't bind from that frame, with a reset sent back to the frame's sender.
