@@ -232,6 +232,16 @@ pub(crate) struct Send {
     pub tx_acked_frame_queue_free: Counter,
     pub tx_acked_frame_queue_msg: Counter,
     pub tx_acked_frame_queue_dbg: Counter,
+
+    // The lost-pair counts: a pair marked lost, a lost pair that delivers again, the frames a
+    // lost pair moves to the pairs that deliver, the end of the preference for the senders that
+    // deliver since a pair was lost, and an idle expiry that doesn't mark the peer dead because
+    // another pair delivers.
+    pub tx_interface_pair_lost: Counter,
+    pub tx_interface_pair_delivering: Counter,
+    pub tx_interface_pair_frames_moved: Counter,
+    pub tx_interface_pair_preference_ended: Counter,
+    pub dead_mark_skipped: Counter,
 }
 
 impl Send {
@@ -287,6 +297,14 @@ impl Send {
             tx_acked_frame_queue_free: counters.register_nominal("tx.acked.frame.queue_free", &v),
             tx_acked_frame_queue_msg: counters.register_nominal("tx.acked.frame.queue_msg", &v),
             tx_acked_frame_queue_dbg: counters.register_nominal("tx.acked.frame.queue_dbg", &v),
+            tx_interface_pair_lost: counters.register_nominal("tx.interface_pair.lost", &v),
+            tx_interface_pair_delivering: counters
+                .register_nominal("tx.interface_pair.delivering", &v),
+            tx_interface_pair_frames_moved: counters
+                .register_nominal("tx.interface_pair.frames_moved", &v),
+            tx_interface_pair_preference_ended: counters
+                .register_nominal("tx.interface_pair.preference_ended", &v),
+            dead_mark_skipped: counters.register_nominal("send.dead_mark_skipped", &v),
         })
     }
 
@@ -373,6 +391,31 @@ impl Send {
     #[inline]
     pub fn on_probe_no_response(&self) {
         self.probe_no_response.add(1);
+    }
+
+    #[inline]
+    pub fn on_interface_pair_lost(&self) {
+        self.tx_interface_pair_lost.add(1);
+    }
+
+    #[inline]
+    pub fn on_interface_pair_delivering(&self) {
+        self.tx_interface_pair_delivering.add(1);
+    }
+
+    #[inline]
+    pub fn on_interface_pair_frames_moved(&self, frames: u64) {
+        self.tx_interface_pair_frames_moved.add(frames);
+    }
+
+    #[inline]
+    pub fn on_interface_pair_preference_ended(&self) {
+        self.tx_interface_pair_preference_ended.add(1);
+    }
+
+    #[inline]
+    pub fn on_dead_mark_skipped(&self) {
+        self.dead_mark_skipped.add(1);
     }
 
     #[inline]

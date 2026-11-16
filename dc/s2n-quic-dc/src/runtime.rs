@@ -495,6 +495,33 @@ pub mod inspector {
         send_socket_count: usize,
         recv_socket_count: usize,
     ) -> crate::counter::Topology {
+        build_endpoint(config, send_socket_count, recv_socket_count)
+            .counters
+            .topology()
+    }
+
+    /// Builds an endpoint with panic-only sockets and returns its local interfaces: each
+    /// interface with its send rate, and the interface of each socket.
+    ///
+    /// The sockets are bound to 127.0.0.1, so an interface that `config` names is read from the
+    /// host the test runs on.
+    pub fn endpoint_interfaces(
+        config: Config,
+        send_socket_count: usize,
+        recv_socket_count: usize,
+    ) -> crate::socket::interface::Table {
+        build_endpoint(config, send_socket_count, recv_socket_count)
+            .interfaces
+            .clone()
+    }
+
+    /// Builds an endpoint with panic-only sockets, on a runtime that holds its tasks without
+    /// running them.
+    fn build_endpoint(
+        config: Config,
+        send_socket_count: usize,
+        recv_socket_count: usize,
+    ) -> endpoint::Endpoint {
         let worker_count = required_worker_count(&config.layout);
         let runtime = Handle::new(worker_count);
         let send_sockets = (0..send_socket_count)
@@ -511,8 +538,6 @@ pub mod inspector {
             addr: socket_addr(30_000, 0),
         };
         endpoint::setup_endpoint(runtime, config, send_sockets, recv_sockets, ups_socket)
-            .counters
-            .topology()
     }
 
     impl Default for Handle {
