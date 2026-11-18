@@ -4,6 +4,8 @@ on:
   workflow_run:
     workflows: ["ci"]
     types: [completed]
+    # The dispatch gate acts only on a failed ci run of a push to main, so a ci run on any other branch doesn't start this.
+    branches: [main]
   pull_request_target:
     types: [opened, reopened, synchronize, edited, labeled, unlabeled]
   schedule:
