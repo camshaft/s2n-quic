@@ -86,7 +86,15 @@ impl Adapt {
 
     /// An operation of `cost` stops waiting, because it was granted or is gone.
     pub(crate) fn on_wait_end(&mut self, cost: u64) {
-        if let Entry::Occupied(mut entry) = self.waiting.entry(cost) {
+        let entry = self.waiting.entry(cost);
+        // Each wait ends once. An end of a cost at which no operation waits is a second end of
+        // one wait, which, beside another waiter of the same cost, would drop that waiter's cost
+        // from the waiting costs that bound a decrease (DC-0011-046).
+        debug_assert!(
+            matches!(entry, Entry::Occupied(_)),
+            "a wait of cost {cost} ended, and no operation of that cost waits"
+        );
+        if let Entry::Occupied(mut entry) = entry {
             *entry.get_mut() -= 1;
             if *entry.get() == 0 {
                 entry.remove();
@@ -289,6 +297,16 @@ mod tests {
         assert_eq!(adapt.on_wait(64), None);
         adapt.on_wait_end(64);
         assert_eq!(adapt.on_would_block(0), Some(32));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no operation of that cost waits")]
+    fn a_second_end_of_one_wait_fails_a_debug_build() {
+        let mut adapt = Adapt::new(64, None);
+        assert_eq!(adapt.on_wait(40), None);
+        adapt.on_wait_end(40);
+        adapt.on_wait_end(40);
     }
 
     fn config(capacity: u64) -> Config {
