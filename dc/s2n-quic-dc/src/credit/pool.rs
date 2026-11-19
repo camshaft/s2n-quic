@@ -1089,6 +1089,11 @@ impl Distributor {
                 let req = unsafe { front.requested() };
 
                 if front.is_dead() {
+                    //= rendered/0011-storage/02-admission.md#DC-0011-046
+                    //# On a would-block answer to an operation, the device MUST lower the capacity
+                    //# of the pool the operation drew from to half its value, rounded up, or to the
+                    //# largest cost among the operations waiting for that pool's credit where that
+                    //# cost is higher.
                     // An abandon through an adaptive pool ended the slot's wait already.
                     let wait_ended = front.wait_ended();
                     let ptr = local.pop_front().unwrap().take();
@@ -1141,6 +1146,11 @@ impl Distributor {
                     // parked list. The un-granted remainder (`req - grant_amount`) is refunded
                     // below; the slot's caller re-acquires for the rest.
                     self.paid_demand += req;
+                    //= rendered/0011-storage/02-admission.md#DC-0011-046
+                    //# On a would-block answer to an operation, the device MUST lower the capacity
+                    //# of the pool the operation drew from to half its value, rounded up, or to the
+                    //# largest cost among the operations waiting for that pool's credit where that
+                    //# cost is higher.
                     // The grant ends the slot's wait. Where the abandon won the race through an
                     // adaptive pool, the abandon ended the wait already.
                     if res.is_some() || !slot.wait_ended() {

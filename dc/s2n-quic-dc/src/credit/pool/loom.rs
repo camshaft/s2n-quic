@@ -629,6 +629,11 @@ fn grant_races_abandon_reads_exact_granted() {
 /// reap or raced grant leaves it as it is. Only a pool close leaves the wait in place.
 #[test]
 fn adaptive_abandon_races_grant_ends_the_wait_once() {
+    //= rendered/0011-storage/02-admission.md#DC-0011-046
+    //= type=test
+    //# On a would-block answer to an operation, the device MUST lower the capacity of the pool the
+    //# operation drew from to half its value, rounded up, or to the largest cost among the
+    //# operations waiting for that pool's credit where that cost is higher.
     loom::model(|| {
         const CAP: u64 = 10;
         let config = Config {
