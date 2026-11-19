@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/02-admission.md#DC-0011-048"
+
+[[spec]]
+level = "MUST"
+quote = "A pool's capacity MUST NOT be lower than the cost of an operation that waits for the pool's credit."
