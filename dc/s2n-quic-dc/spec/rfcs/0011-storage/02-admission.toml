@@ -98,8 +98,8 @@ id = "DC-0011-057"
 level = "MUST"
 polarity = "required"
 binds_to = "system"
-statement = "The device MUST grant an operation whose cost is higher than its pool's shown capacity only while no other operation holds credit from that pool, and MUST NOT grant another operation from that pool while that operation waits."
-rationale = "An operation's cost bounds the credit it holds and, for a buffered operation, the buffer it fills, so an operation whose cost passes the most the device has shown that it takes would, beside other work, raise the capacity past it, as DC-0011-048 says, and hold the device deeper than any answer of the device has supported. Granting it alone keeps the device's work to that one operation while it runs, and the pool doesn't grant other work while it waits, so the credit that DC-0011-048 raises for it as it begins to wait doesn't admit other work, and its wait ends once the operations that hold credit complete. The operation waits for its pool rather than being refused at a value the pool holds now, so the work is kept and the device's answer to it decides how much the pool takes at once from then on."
+statement = "The device MUST grant an operation whose cost is higher than its pool's shown capacity only while no other operation holds credit from that pool."
+rationale = "An operation's cost bounds the credit it holds and, for a buffered operation, the buffer it fills, so an operation whose cost passes the most the device has shown that it takes would, beside other work, raise the capacity past it, as DC-0011-048 says, and hold the device deeper than any answer of the device has supported. Granting it alone keeps the device's work to that one operation while it runs. The operation waits for its pool rather than being refused at a value the pool holds now, so the work is kept and the device's answer to it decides how much the pool takes at once from then on."
 
 [[requirement]]
 id = "DC-0011-058"
@@ -124,6 +124,14 @@ polarity = "forbidden"
 binds_to = "system"
 statement = "The device MUST NOT allocate the buffer of a buffered operation before the operation's pool grants its credit."
 rationale = "A buffered operation's buffer is as large as its length, so allocating it only at the grant bounds the buffers held at once by the credit that the pool grants, and an operation that waits for credit doesn't hold any buffer."
+
+[[requirement]]
+id = "DC-0011-061"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "The device MUST NOT grant another operation from a pool while an operation whose cost is higher than that pool's shown capacity waits for that pool's credit."
+rationale = "DC-0011-048 raises the pool's capacity to the waiting operation's cost as it begins to wait, so without this rule the credit that raise frees would admit other operations beside it, and the pool might never empty for DC-0011-057 to grant it alone. Holding other grants while it waits keeps that credit for the waiting operation, and its wait ends once the operations that hold credit complete."
 
 [[requirement]]
 id = "DC-0011-055"

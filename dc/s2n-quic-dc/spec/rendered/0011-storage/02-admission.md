@@ -48,7 +48,7 @@ When an operation whose cost is higher than its pool's capacity begins to wait f
 
 ### DC-0011-057 {#DC-0011-057}
 
-The device MUST grant an operation whose cost is higher than its pool's shown capacity only while no other operation holds credit from that pool, and MUST NOT grant another operation from that pool while that operation waits.
+The device MUST grant an operation whose cost is higher than its pool's shown capacity only while no other operation holds credit from that pool.
 
 ### DC-0011-058 {#DC-0011-058}
 
@@ -61,6 +61,10 @@ The device MUST NOT reject an operation because its cost is higher than its pool
 ### DC-0011-060 {#DC-0011-060}
 
 The device MUST NOT allocate the buffer of a buffered operation before the operation's pool grants its credit.
+
+### DC-0011-061 {#DC-0011-061}
+
+The device MUST NOT grant another operation from a pool while an operation whose cost is higher than that pool's shown capacity waits for that pool's credit.
 
 ### DC-0011-055 {#DC-0011-055}
 
