@@ -169,6 +169,7 @@ async fn run_workload(cfg: Config) {
         cost_model: CostModel::Bytes,
         op_weights: OpWeights::default(),
         lane_count: cfg.lanes.max(1),
+        capacity_bounds: Default::default(),
     };
 
     let mut spawn = Local::new(0);
