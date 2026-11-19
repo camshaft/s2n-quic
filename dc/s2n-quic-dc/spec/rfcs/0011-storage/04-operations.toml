@@ -30,14 +30,6 @@ statement = "The device MUST reject, with an invalid-input error and before it a
 rationale = "A direct transfer needs an aligned offset and length, and 4096 bytes covers every common page and sector size, so a misaligned operation would fail only after it held credit."
 
 [[requirement]]
-id = "DC-0011-022"
-level = "MUST"
-polarity = "required"
-binds_to = "system"
-statement = "Where the device's configuration sets an upper bound for the capacity of the pool an operation draws from, the device MUST reject, with an invalid-input error and before it acquires any credit, an operation whose cost exceeds that upper bound."
-rationale = "A pool's capacity never rises past the upper bound its device's configuration sets, so such an operation could never be granted its whole cost. A pool without an upper bound raises its capacity to an operation's cost as the operation begins to wait, as DC-0011-048 says, so the configured capacity, the value the capacity starts at, doesn't limit an operation's cost, and a check against the upper bound answers the same operation the same way whatever the pool's capacity is at the time."
-
-[[requirement]]
 id = "DC-0011-023"
 level = "MUST"
 polarity = "required"
