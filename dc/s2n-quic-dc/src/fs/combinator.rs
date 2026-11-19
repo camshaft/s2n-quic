@@ -21,6 +21,7 @@
 //!
 //! Step 2 **must** precede step 3 — see the ordering note on [`complete`].
 
+use core::time::Duration;
 use crate::{
     fs::op::{IoOp, IoStatus},
     intrusive::Entry,
@@ -86,7 +87,15 @@ pub fn complete(mut op: Entry<IoOp>) {
                 pool.on_would_block(op.grant_epoch);
             }
             IoStatus::Done(_) => {
-                pool.on_clean_completion(op.flow_credits);
+                // The time from the op's grant to this completion, which the pool compares
+                // across its runs of clean completions.
+                let time = match op.granted_at {
+                    Some(granted_at) => DefaultClock::default().now().nanos_since(granted_at),
+                    None => 0,
+                };
+                let time = Duration::from_nanos(time);
+                let (cost, epoch) = (op.flow_credits, op.grant_epoch);
+                pool.on_clean_completion(cost, epoch, time);
             }
             _ => {}
         }

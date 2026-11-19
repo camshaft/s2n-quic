@@ -474,10 +474,11 @@ impl Pool {
         }
     }
 
-    /// An operation of `cost` completed without a would-block answer. An adaptive pool counts it
-    /// toward a run of clean completions while a submitter waits; a fixed pool ignores it.
-    pub fn on_clean_completion(&self, cost: u64) {
-        if self.adapt_with(|adapt| adapt.on_clean_completion(cost).is_some()) {
+    /// An operation of `cost`, which the pool granted in decrease `epoch`, completed without a
+    /// would-block answer `time` after its grant. An adaptive pool counts it toward a run of clean
+    /// completions while a submitter waits; a fixed pool ignores it.
+    pub fn on_clean_completion(&self, cost: u64, epoch: u64, time: core::time::Duration) {
+        if self.adapt_with(|adapt| adapt.on_clean_completion(cost, epoch, time).is_some()) {
             self.waker.wake();
         }
     }
