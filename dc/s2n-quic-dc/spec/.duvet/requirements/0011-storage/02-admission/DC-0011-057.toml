@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/02-admission.md#DC-0011-057"
+
+[[spec]]
+level = "MUST"
+quote = "The device MUST reject, with an invalid-input error and before it acquires any credit, an operation whose cost is higher than the largest capacity its pool has held at its configured capacity or after a raise that DC-0011-055 requires."
