@@ -492,7 +492,8 @@ impl Pool {
         let changed = f(&mut *adapt);
         if changed {
             self.epoch.store(adapt.epoch(), Ordering::Release);
-            self.capacity_target.store(adapt.capacity(), Ordering::Release);
+            self.capacity_target
+                .store(adapt.capacity(), Ordering::Release);
         }
         changed
     }
@@ -524,7 +525,8 @@ impl Pool {
             //= rendered/0011-storage/02-admission.md#DC-0011-052
             //# A decrease of a pool's capacity MUST NOT take credit from an operation that holds
             //# it.
-            self.available.fetch_sub((current - target) as i64, Ordering::Release);
+            self.available
+                .fetch_sub((current - target) as i64, Ordering::Release);
             self.capacity.store(target, Ordering::Relaxed);
         }
         0

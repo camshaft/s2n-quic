@@ -314,7 +314,7 @@ mod tests {
     use crate::{
         counter::Registry,
         fs::{
-            config::{CostModel, DeviceConfig, OpWeights, PoolMode},
+            config::{CapacityBounds, CostModel, DeviceConfig, OpWeights, PoolMode},
             device::Device,
             direct::{File, Options},
             materialize::materialize_direct,
@@ -347,6 +347,7 @@ mod tests {
             cost_model: CostModel::Bytes,
             op_weights: OpWeights::default(),
             lane_count: 2,
+            capacity_bounds: CapacityBounds::shared(capacity),
         }
     }
 

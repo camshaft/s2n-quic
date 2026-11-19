@@ -265,7 +265,9 @@ mod tests {
     #[test]
     fn a_capacity_bound_below_the_configured_capacity_is_refused() {
         let shared = DeviceConfig::shared_iops(8, 4096, Rate::new(100.0));
-        let low = shared.clone().with_capacity_bounds(CapacityBounds::shared(7));
+        let low = shared
+            .clone()
+            .with_capacity_bounds(CapacityBounds::shared(7));
         assert_eq!(
             low.validate().unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
@@ -289,7 +291,9 @@ mod tests {
     fn a_capacity_bound_at_or_above_the_configured_capacity_or_none_is_taken() {
         let shared = DeviceConfig::shared_iops(8, 4096, Rate::new(100.0));
         assert!(shared.validate().is_ok());
-        let at = shared.clone().with_capacity_bounds(CapacityBounds::shared(8));
+        let at = shared
+            .clone()
+            .with_capacity_bounds(CapacityBounds::shared(8));
         assert!(at.validate().is_ok());
         let above = shared.with_capacity_bounds(CapacityBounds::split(Some(64), None));
         assert!(above.validate().is_ok());
