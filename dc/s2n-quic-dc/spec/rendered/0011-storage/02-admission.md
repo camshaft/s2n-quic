@@ -69,4 +69,3 @@ A decrease of a pool's capacity MUST NOT take credit from an operation that hold
 ### DC-0011-054 {#DC-0011-054}
 
 When a run of a pool's clean completions ends, its clean completions are all of operations that the pool granted after its last decrease, and its completion time is at least twice the shortest completion time above zero among the pool's earlier runs since that decrease whose clean completions are all of such operations, the device MUST lower the pool's capacity, at the completion that ends the run, to half its value, rounded up, or to the largest cost among the operations waiting for that pool's credit where that cost is higher.
-
