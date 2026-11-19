@@ -493,8 +493,9 @@ impl Device {
         let mut alloc = SubmitterAlloc::new();
         alloc.set_trace_ctx(self.index, kind);
         alloc.acquire(&pool, cost, priority).await?;
-        // The pool's decrease epoch at the grant: a would-block answer to this op lowers the
-        // capacity only where no decrease came after the grant.
+        // The pool's decrease epoch, read just after the grant: a would-block answer to this
+        // op lowers the capacity only where no decrease came after this read. A decrease between
+        // the grant and this read isn't seen, so the answer can lower the capacity once more.
         let grant_epoch = pool.decrease_epoch();
 
         Ok(Reservation {
@@ -510,8 +511,8 @@ impl Device {
         })
     }
 
-    /// [`Self::enqueue_with_epoch`], reading the pool's decrease epoch now, for a caller that
-    /// doesn't keep the epoch of its grant.
+    /// [`Self::enqueue_with_epoch`], reading the pool's decrease epoch at the enqueue, for a
+    /// caller that doesn't keep an epoch read just after its grant.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue(
         self: &Arc<Self>,
@@ -549,7 +550,8 @@ impl Device {
     /// [flight recorder](crate::fs::trace) ([`NO_STREAM`](crate::fs::trace::NO_STREAM) for a one-off);
     /// it is only stored in the trace builds.
     ///
-    /// `grant_epoch` is the pool's decrease epoch at the grant of the op's credit.
+    /// `grant_epoch` is the pool's decrease epoch, read just after the grant of the op's
+    /// credit, or at the enqueue where the caller doesn't keep one.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_with_epoch(
         self: &Arc<Self>,
@@ -654,8 +656,8 @@ pub struct Reservation {
     /// Whether the eventual buffer is a zero-copy `O_DIRECT` buffer — validated at `reserve` time and
     /// re-checked against the submitted buffer so the two cannot disagree.
     is_direct: bool,
-    /// The pool's decrease epoch at the grant, which the op carries so a would-block answer to it
-    /// lowers the capacity only where no decrease came after the grant.
+    /// The pool's decrease epoch, read just after the grant, which the op carries so a
+    /// would-block answer to it lowers the capacity only where no decrease came after that read.
     grant_epoch: u64,
 }
 

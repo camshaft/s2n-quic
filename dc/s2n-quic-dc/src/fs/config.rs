@@ -3,8 +3,8 @@
 
 //! Configuration for the IO scheduler.
 //!
-//! A pool's capacity adapts at run time from the device's answers, starting at the capacity the
-//! configuration sets and rising no higher than the [`CapacityBounds`] it sets, while the pacer
+//! A pool's capacity adapts at run time from the device's answers: it starts at the capacity
+//! the configuration sets and doesn't rise above the [`CapacityBounds`] it sets, while the pacer
 //! rate stays a configured constant per device. The two budgeting axes are orthogonal:
 //!
 //! * [`CostModel`] decides the *currency* a device's budget is denominated in — raw bytes

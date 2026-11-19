@@ -181,7 +181,8 @@ pub struct Pool {
     /// The capacity an adaptive pool's last change decided, which the distributor's next pass
     /// applies to `available`.
     capacity_target: AtomicU64,
-    /// The adaptive pool's decrease epoch, mirrored for the lock-free read at each grant.
+    /// The adaptive pool's decrease epoch, mirrored for the lock-free read just after each
+    /// grant.
     epoch: AtomicU64,
     /// The adaptive capacity, or `None` for a pool whose capacity stays at its configured value.
     adapt: Option<Mutex<Adapt>>,
@@ -458,7 +459,7 @@ impl Pool {
     }
 
     /// The number of decreases of an adaptive pool's capacity so far, always 0 for a fixed pool.
-    /// An operation keeps the value read as its credit is granted and passes it back to
+    /// An operation reads it just after its credit is granted and passes the value back to
     /// [`on_would_block`](Self::on_would_block).
     #[inline]
     pub fn decrease_epoch(&self) -> u64 {
