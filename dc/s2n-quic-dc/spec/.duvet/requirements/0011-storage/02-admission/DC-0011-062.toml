@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/02-admission.md#DC-0011-062"
+
+[[spec]]
+level = "MUST"
+quote = "When the device lowers a pool's capacity as DC-0011-046 or DC-0011-054 requires, the device MUST lower the pool's shown capacity to half its value, rounded up."
