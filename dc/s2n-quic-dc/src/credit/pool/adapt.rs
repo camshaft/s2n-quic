@@ -144,6 +144,13 @@ impl Adapt {
         self.start_run();
         changed.then_some(self.capacity)
     }
+
+    /// The number of operations waiting for the pool's credit.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn debug_waiting(&self) -> usize {
+        self.waiting.values().sum()
+    }
 }
 
 #[cfg(all(test, not(feature = "loom")))]

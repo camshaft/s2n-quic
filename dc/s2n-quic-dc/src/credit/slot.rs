@@ -46,6 +46,15 @@ const RC_APP: u32 = 1;
 const RC_LINKED: u32 = 2;
 /// Refcount value when the application abandoned the slot while linked.
 const RC_DEAD: u32 = 0;
+/// Refcount value when the application abandoned the slot while linked, through the pool, which
+/// ended the slot's wait for the pool's credit.
+const RC_DEAD_WAIT_ENDED: u32 = 3;
+
+/// Whether `rc` is the refcount value of a slot the application abandoned while linked.
+#[inline]
+const fn is_dead_rc(rc: u32) -> bool {
+    matches!(rc, RC_DEAD | RC_DEAD_WAIT_ENDED)
+}
 
 /// Sentinel value written to `granted` when the pool is closed/dropped.
 /// The application checks for this to distinguish "granted 0 bytes" from "pool gone."
@@ -79,7 +88,7 @@ unsafe impl Sync for Slot {}
 impl Slot {
     /// Create a new idle slot with the given drop function.
     ///
-    /// The `drop_fn` is called when the pool pops a dead slot (refcount=0).
+    /// The `drop_fn` is called when the pool pops a dead slot.
     /// It must cast the pointer to the outer type, drop_in_place, and dealloc.
     #[inline]
     pub fn new(drop_fn: unsafe fn(NonNull<Slot>)) -> Self {
@@ -214,7 +223,7 @@ impl Slot {
         ) {
             Ok(_) => waker,
             Err(rc) => {
-                debug_assert_eq!(rc, RC_DEAD, "unexpected refcount {rc} in grant");
+                debug_assert!(is_dead_rc(rc), "unexpected refcount {rc} in grant");
                 // App abandoned. Drop the waker we took (it would never be
                 // useful). The pool will free the slot.
                 drop(waker);
@@ -227,7 +236,8 @@ impl Slot {
     ///
     /// # Safety
     ///
-    /// Must be called while holding the tier mutex, with the slot linked (rc=2 or rc=0).
+    /// Must be called while holding the tier mutex with the slot linked or dead, or by the
+    /// application side before it abandons the slot.
     #[inline]
     pub unsafe fn requested(&self) -> u64 {
         *self.requested.get()
@@ -236,7 +246,14 @@ impl Slot {
     /// Check if the slot is dead (application abandoned it).
     #[inline]
     pub fn is_dead(&self) -> bool {
-        self.refcount.load(Ordering::Relaxed) == RC_DEAD
+        is_dead_rc(self.refcount.load(Ordering::Relaxed))
+    }
+
+    /// Check if the slot is dead from an abandon through the pool, which ended its wait for the
+    /// pool's credit: the pool's reap or its raced grant doesn't end the wait again.
+    #[inline]
+    pub fn wait_ended(&self) -> bool {
+        self.refcount.load(Ordering::Relaxed) == RC_DEAD_WAIT_ENDED
     }
 
     /// Abandon the slot from the application side. Safe to call in any APP-owned or LINKED state.
@@ -263,12 +280,30 @@ impl Slot {
     /// [`poll_granted`]: Slot::poll_granted
     #[inline]
     pub unsafe fn abandon(&self) -> AbandonResult {
+        self.abandon_to(RC_DEAD)
+    }
+
+    /// Abandon the slot from the application side through its pool, as [`Slot::abandon`] does,
+    /// with a dead refcount value that records that the pool ended the slot's wait.
+    ///
+    /// # Safety
+    ///
+    /// As [`Slot::abandon`]. After [`AbandonResult::Abandoned`] the caller must end the slot's
+    /// wait, since the pool's reap of the dead slot leaves the wait as it is.
+    #[inline]
+    pub unsafe fn abandon_wait_ended(&self) -> AbandonResult {
+        self.abandon_to(RC_DEAD_WAIT_ENDED)
+    }
+
+    /// Move a LINKED slot to the dead refcount value `dead`, as [`Slot::abandon`] describes.
+    #[inline]
+    unsafe fn abandon_to(&self, dead: u32) -> AbandonResult {
         // Try to transition LINKED → DEAD. If the slot is APP-owned (never parked, or the pool just
         // raced us to APP), the CAS fails and the caller owns the allocation. The expected-current
         // value is `RC_LINKED` so a successful CAS proves we transitioned a live LINKED slot.
         match self.refcount.compare_exchange(
             RC_LINKED,
-            RC_DEAD,
+            dead,
             Ordering::Release,
             Ordering::Acquire,
         ) {
@@ -307,7 +342,7 @@ impl Slot {
     ///
     /// # Safety
     ///
-    /// Must only be called when the pool owns the slot (rc=0) and has popped
+    /// Must only be called when the pool owns the slot (dead) and has popped
     /// it from all lists. The pointer must not be used after this call.
     #[inline]
     pub unsafe fn call_drop_fn(ptr: NonNull<Slot>) {
@@ -333,7 +368,7 @@ impl Slot {
 /// An owning handle to a linked slot in the pool's wait list.
 ///
 /// On drop (pool shutdown), writes `GRANT_CLOSED` as the sentinel, transitions
-/// refcount 2→1, and wakes the task. If the slot is dead (rc=0), calls `drop_fn`.
+/// refcount 2 to 1, and wakes the task. If the slot is dead, calls `drop_fn`.
 ///
 /// In the normal grant path, the pool calls `take()` to suppress this drop
 /// behavior before writing the real grant.
@@ -385,7 +420,7 @@ impl Drop for SlotPtr {
                     }
                 }
                 Err(rc) => {
-                    debug_assert_eq!(rc, RC_DEAD, "unexpected refcount {rc} in SlotPtr::drop");
+                    debug_assert!(is_dead_rc(rc), "unexpected refcount {rc} in SlotPtr::drop");
                     drop(waker);
                     Slot::call_drop_fn(self.0);
                 }
@@ -443,7 +478,7 @@ impl DeadSlot {
     ///
     /// # Safety
     ///
-    /// The slot must have refcount=0 and must not be linked in any list.
+    /// The slot must be dead and must not be linked in any list.
     #[inline]
     pub unsafe fn new(ptr: NonNull<Slot>) -> Self {
         Self(ptr)

@@ -623,3 +623,73 @@ fn grant_races_abandon_reads_exact_granted() {
         unsafe { free_slot(drain) };
     });
 }
+
+/// An application's abandon through an adaptive pool races the distributor's grant. Whichever
+/// wins, the slot's wait ends once: the grant ends it, or the abandon does and the distributor's
+/// reap or raced grant leaves it as it is. Only a pool close leaves the wait in place.
+#[test]
+fn adaptive_abandon_races_grant_ends_the_wait_once() {
+    loom::model(|| {
+        const CAP: u64 = 10;
+        let config = Config {
+            capacity: CAP,
+            max_single_acquire: [100; Priority::LEVELS],
+            min_grant_slice: [100; Priority::LEVELS],
+            refill: None,
+        };
+        let pool = Pool::with_counters_adaptive(config, Counters::default(), None);
+        let pool = Arc::new(pool);
+
+        let drain = alloc_slot();
+        let dwaker = noop();
+        let mut dcx = Context::from_waker(&dwaker);
+        let r = unsafe { pool.poll_acquire(&mut dcx, drain, CAP, Priority::Medium) };
+        assert!(matches!(r, Poll::Ready(n) if n == CAP));
+
+        let w = alloc_slot();
+        let wwaker = noop();
+        let mut wcx = Context::from_waker(&wwaker);
+        let r = unsafe { pool.poll_acquire(&mut wcx, w, CAP, Priority::Medium) };
+        assert!(matches!(r, Poll::Pending));
+        assert_eq!(pool.debug_waiting(), 1);
+
+        pool.release(CAP);
+
+        let dist = {
+            let pool = pool.clone();
+            loom::thread::spawn(move || {
+                let mut dist = Distributor::new(pool);
+                let granted = Arc::new(crate::sync::AtomicUsize::new(0));
+                let mut wakers = CountWake(granted);
+                let mut budget = Budget::new(1 << 16);
+                let dwaker = noop();
+                dist.pool.waker.register(&dwaker);
+                let _ = dist.poll_distribute(&mut budget, &mut wakers);
+            })
+        };
+
+        let app = {
+            let pool = pool.clone();
+            loom::thread::spawn(move || {
+                let res = unsafe { pool.abandon(w) };
+                if let AbandonResult::Granted(n) = res {
+                    pool.release(n);
+                }
+                res
+            })
+        };
+
+        dist.join().unwrap();
+        let res = app.join().unwrap();
+
+        // Only a close, from the distributor's drop, leaves the wait in place.
+        let waiting = usize::from(res == AbandonResult::Closed);
+        assert_eq!(pool.debug_waiting(), waiting);
+
+        drop(pool);
+        if res != AbandonResult::Abandoned {
+            unsafe { free_slot(w) };
+        }
+        unsafe { free_slot(drain) };
+    });
+}
