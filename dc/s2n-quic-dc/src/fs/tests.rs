@@ -15,7 +15,7 @@ use crate::{
             bach::{BachBackend, Latency},
             Backend, LaneSetup,
         },
-        config::{CostModel, DeviceConfig, OpWeights, PoolMode},
+        config::{CapacityBounds, CostModel, DeviceConfig, OpWeights, PoolMode},
         device::Device,
         materialize::materialize,
         op::{IoOp, IoStatus},
@@ -233,6 +233,9 @@ fn iops_device(queue_depth: u64) -> DeviceConfig {
         cost_model: CostModel::Iops { io_unit: 4096 },
         op_weights: OpWeights::default(),
         lane_count: 1,
+        // Pin the capacity at `queue_depth`: these tests observe fair share and conservation at a
+        // fixed concurrency, not the adaptive capacity.
+        capacity_bounds: CapacityBounds::shared(queue_depth),
     }
 }
 
