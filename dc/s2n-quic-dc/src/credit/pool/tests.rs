@@ -669,6 +669,45 @@ fn an_abandoned_waiter_doesnt_make_completions_clean() {
 }
 
 #[test]
+fn a_close_frees_an_abandoned_waiters_slot_once() {
+    //= rendered/0011-storage/02-admission.md#DC-0011-011
+    //= type=test
+    //# The device MUST return an operation's credit to the pool it came from exactly once, whether
+    //# the operation succeeds, fails or is cancelled.
+    //= rendered/0011-storage/02-admission.md#DC-0011-046
+    //= type=test
+    //# On a would-block answer to an operation, the device MUST lower the capacity of the pool the
+    //# operation drew from to half its value, rounded up, or to the largest cost among the
+    //# operations waiting for that pool's credit where that cost is higher.
+    let _drop_guard = drop_count_guard();
+
+    let h = Harness::adaptive(cfg(64, 64));
+    let counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(counter.clone());
+    let holder = alloc_test_slot();
+    let a = alloc_test_slot();
+
+    let r = unsafe { h.poll_acquire(holder, 64, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Ready(64)));
+    let r = unsafe { h.poll_acquire(a, 40, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Pending));
+    assert_eq!(h.pool.debug_waiting(), 1);
+
+    // The cancel ends the waiter's wait and leaves its slot linked for the distributor to free.
+    assert_eq!(unsafe { h.pool.abandon(a) }, AbandonResult::Abandoned);
+    assert_eq!(h.pool.debug_waiting(), 0);
+    assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 0);
+
+    // A close without a distribution pass, while the harness still holds the pool, frees the
+    // cancelled slot once, doesn't wake it, and leaves the pool's count of waiters at 0.
+    drop(h.dist);
+    assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(h.pool.debug_waiting(), 0);
+    assert_eq!(counter.wakeups(), 0);
+    unsafe { free_test_slot(holder) };
+}
+
+#[test]
 fn drop_while_idle() {
     let _drop_guard = drop_count_guard();
 
