@@ -3,8 +3,9 @@
 
 //! Configuration for the IO scheduler.
 //!
-//! v1 uses **static caps only** — pool capacity and pacer rate are configured constants per device,
-//! with no adaptive estimation loop. The two budgeting axes are orthogonal:
+//! A pool's capacity adapts at run time from the device's answers, starting at the capacity the
+//! configuration sets and rising no higher than the [`CapacityBounds`] it sets, while the pacer
+//! rate stays a configured constant per device. The two budgeting axes are orthogonal:
 //!
 //! * [`CostModel`] decides the *currency* a device's budget is denominated in — raw bytes
 //!   (bandwidth-limited) or fixed-unit IOPS (SSD/EBS, where one I/O up to `io_unit` bytes counts as
@@ -110,6 +111,49 @@ pub enum PoolMode {
     },
 }
 
+/// The upper bounds of a device's pool capacities. A pool's capacity adapts at run time and
+/// never rises above its bound where one is set; `None` leaves it unbounded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CapacityBounds {
+    read: Option<u64>,
+    write: Option<u64>,
+}
+
+impl CapacityBounds {
+    /// No upper bound on either pool.
+    #[inline]
+    pub fn unbounded() -> Self {
+        Self::default()
+    }
+
+    /// One bound for both kinds, for a [`PoolMode::Shared`] pool.
+    #[inline]
+    pub fn shared(max: u64) -> Self {
+        Self {
+            read: Some(max),
+            write: Some(max),
+        }
+    }
+
+    /// Separate bounds for the read and write pools of a [`PoolMode::Split`] device.
+    #[inline]
+    pub fn split(read: Option<u64>, write: Option<u64>) -> Self {
+        Self { read, write }
+    }
+
+    /// The bound of the read pool, or of the shared pool.
+    #[inline]
+    pub fn read(&self) -> Option<u64> {
+        self.read
+    }
+
+    /// The bound of the write pool. A shared pool reads [`read`](Self::read).
+    #[inline]
+    pub fn write(&self) -> Option<u64> {
+        self.write
+    }
+}
+
 /// The default number of execution lanes a device gets when [`DeviceConfig`] does not override it.
 /// One lane is the simplest shape (a single ring / one blocking thread); raise it for a device that
 /// benefits from spreading work across several rings/threads.
@@ -137,6 +181,9 @@ pub struct DeviceConfig {
     /// Number of execution lanes (rings / blocking-pool threads) this device's ops fan out across.
     /// Per-device and independent of the credit-pool queue depth. Defaults to [`DEFAULT_LANE_COUNT`].
     pub lane_count: usize,
+    /// The upper bounds of the pools' adaptive capacities, which a raise never passes. Unbounded
+    /// by default.
+    pub capacity_bounds: CapacityBounds,
 }
 
 impl DeviceConfig {
@@ -148,6 +195,7 @@ impl DeviceConfig {
             cost_model: CostModel::Bytes,
             op_weights: OpWeights::default(),
             lane_count: DEFAULT_LANE_COUNT,
+            capacity_bounds: CapacityBounds::unbounded(),
         }
     }
 
@@ -160,6 +208,7 @@ impl DeviceConfig {
             cost_model: CostModel::Iops { io_unit },
             op_weights: OpWeights::default(),
             lane_count: DEFAULT_LANE_COUNT,
+            capacity_bounds: CapacityBounds::unbounded(),
         }
     }
 
@@ -167,5 +216,82 @@ impl DeviceConfig {
     pub fn with_lane_count(mut self, lane_count: usize) -> Self {
         self.lane_count = lane_count.max(1);
         self
+    }
+
+    /// Override the upper bounds of the pools' adaptive capacities (builder style).
+    pub fn with_capacity_bounds(mut self, capacity_bounds: CapacityBounds) -> Self {
+        self.capacity_bounds = capacity_bounds;
+        self
+    }
+
+    /// Check the configuration before the registry builds a device from it.
+    //= rendered/0011-storage/02-admission.md#DC-0011-050
+    //# The registry MUST refuse, with an invalid-input error, to create a device whose
+    //# configuration sets an upper bound for a pool's capacity below that pool's configured
+    //# capacity.
+    pub(crate) fn validate(&self) -> std::io::Result<()> {
+        let (read, write) = match &self.pool_mode {
+            PoolMode::Shared(c) => (c.capacity, c.capacity),
+            PoolMode::Split { read, write } => (read.capacity, write.capacity),
+        };
+        check_bound("read", read, self.capacity_bounds.read)?;
+        check_bound("write", write, self.capacity_bounds.write)
+    }
+}
+
+/// Refuse a pool's capacity bound below its configured capacity.
+fn check_bound(pool: &str, capacity: u64, bound: Option<u64>) -> std::io::Result<()> {
+    match bound {
+        Some(max) if max < capacity => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "io scheduler: the {pool} pool's capacity bound {max} is below its configured \
+                 capacity {capacity}"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    //= rendered/0011-storage/02-admission.md#DC-0011-050
+    //= type=test
+    //# The registry MUST refuse, with an invalid-input error, to create a device whose
+    //# configuration sets an upper bound for a pool's capacity below that pool's configured
+    //# capacity.
+    #[test]
+    fn a_capacity_bound_below_the_configured_capacity_is_refused() {
+        let shared = DeviceConfig::shared_iops(8, 4096, Rate::new(100.0));
+        let low = shared.clone().with_capacity_bounds(CapacityBounds::shared(7));
+        assert_eq!(
+            low.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+
+        let split = DeviceConfig {
+            pool_mode: PoolMode::Split {
+                read: CreditConfig::new(8),
+                write: CreditConfig::new(4),
+            },
+            ..shared
+        }
+        .with_capacity_bounds(CapacityBounds::split(Some(8), Some(3)));
+        assert_eq!(
+            split.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_capacity_bound_at_or_above_the_configured_capacity_or_none_is_taken() {
+        let shared = DeviceConfig::shared_iops(8, 4096, Rate::new(100.0));
+        assert!(shared.validate().is_ok());
+        let at = shared.clone().with_capacity_bounds(CapacityBounds::shared(8));
+        assert!(at.validate().is_ok());
+        let above = shared.with_capacity_bounds(CapacityBounds::split(Some(64), None));
+        assert!(above.validate().is_ok());
     }
 }
