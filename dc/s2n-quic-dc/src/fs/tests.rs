@@ -314,8 +314,26 @@ fn drop_future_while_parked_on_credit_conserves_and_recovers() {
             {
                 let mut fut = core::pin::pin!(dev.read(fd(), 4096, 4096, TierPriority::Medium));
                 poll_parks(fut.as_mut());
+                // The suspended read's cost counts among the operations waiting for the pool's credit.
+                assert_eq!(
+                    dev.pools.all().map(|p| p.debug_waiting()).sum::<usize>(),
+                    1,
+                    "precondition: the suspended read should wait for credit"
+                );
                 // `fut` (and its buffer) drops at the end of this block, abandoning the slot.
             }
+
+            //= rendered/0011-storage/02-admission.md#DC-0011-046
+            //= type=test
+            //# On a would-block answer to an operation, the device MUST lower the capacity of the
+            //# pool the operation drew from to half its value, rounded up, or to the largest cost among
+            //# the operations waiting for that pool's credit where that cost is higher.
+            // The drop ended the cancelled read's wait at once, before the distributor's next pass
+            // reaps its slot, so its cost no longer counts among the waiting operations.
+            assert!(
+                dev.pools.all().all(|p| p.debug_waiting() == 0),
+                "a dropped waiter's cost still counts among the waiting operations"
+            );
 
             // Occupant completes and releases its credit; the abandoned waiter slot is reclaimed by
             // the distributor's grant walk rather than being handed (and losing) the credit.
