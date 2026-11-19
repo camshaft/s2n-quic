@@ -159,11 +159,10 @@ impl Adapt {
     /// An operation of `cost`, which the pool granted in `grant_epoch`, completed without a
     /// would-block answer `completion_time` after its grant, and returned its credit. Returns the
     /// changed capacity where its completion ends a run that raises or lowers it.
-    //= rendered/0011-storage/02-admission.md#DC-0011-049
+    //= rendered/0011-storage/02-admission.md#DC-0011-055
     //# When a clean completion from a pool brings the summed cost of the clean completions in the
     //# pool's current run to at least the capacity the pool had when that run began, the device
-    //# MUST raise the pool's capacity by the cost of that completion's operation, up to the upper
-    //# bound the device's configuration sets for the pool where it sets one, except where
+    //# MUST raise the pool's capacity by the cost of that completion's operation, except where
     //# DC-0011-054 lowers the pool's capacity at that completion.
     //= rendered/0011-storage/02-admission.md#DC-0011-054
     //# When a run of a pool's clean completions ends, its clean completions are all of
@@ -297,12 +296,11 @@ mod tests {
         assert_eq!(adapt.capacity(), 48);
     }
 
-    //= rendered/0011-storage/02-admission.md#DC-0011-049
+    //= rendered/0011-storage/02-admission.md#DC-0011-055
     //= type=test
     //# When a clean completion from a pool brings the summed cost of the clean completions in the
     //# pool's current run to at least the capacity the pool had when that run began, the device
-    //# MUST raise the pool's capacity by the cost of that completion's operation, up to the upper
-    //# bound the device's configuration sets for the pool where it sets one, except where
+    //# MUST raise the pool's capacity by the cost of that completion's operation, except where
     //# DC-0011-054 lowers the pool's capacity at that completion.
     #[test]
     fn a_run_of_clean_completions_raises_by_the_last_cost() {
@@ -370,12 +368,11 @@ mod tests {
     //# the pool's capacity, at the completion that ends the run, to half its value, rounded up,
     //# or to the largest cost among the operations waiting for that pool's credit where that
     //# cost is higher.
-    //= rendered/0011-storage/02-admission.md#DC-0011-049
+    //= rendered/0011-storage/02-admission.md#DC-0011-055
     //= type=test
     //# When a clean completion from a pool brings the summed cost of the clean completions in the
     //# pool's current run to at least the capacity the pool had when that run began, the device
-    //# MUST raise the pool's capacity by the cost of that completion's operation, up to the upper
-    //# bound the device's configuration sets for the pool where it sets one, except where
+    //# MUST raise the pool's capacity by the cost of that completion's operation, except where
     //# DC-0011-054 lowers the pool's capacity at that completion.
     #[test]
     fn a_run_twice_as_slow_as_the_shortest_halves_the_capacity() {
@@ -401,12 +398,11 @@ mod tests {
     //# the pool's capacity, at the completion that ends the run, to half its value, rounded up,
     //# or to the largest cost among the operations waiting for that pool's credit where that
     //# cost is higher.
-    //= rendered/0011-storage/02-admission.md#DC-0011-049
+    //= rendered/0011-storage/02-admission.md#DC-0011-055
     //= type=test
     //# When a clean completion from a pool brings the summed cost of the clean completions in the
     //# pool's current run to at least the capacity the pool had when that run began, the device
-    //# MUST raise the pool's capacity by the cost of that completion's operation, up to the upper
-    //# bound the device's configuration sets for the pool where it sets one, except where
+    //# MUST raise the pool's capacity by the cost of that completion's operation, except where
     //# DC-0011-054 lowers the pool's capacity at that completion.
     #[test]
     fn a_run_under_twice_the_shortest_raises_the_capacity() {
@@ -501,12 +497,11 @@ mod tests {
         assert_eq!(adapt.epoch(), 1);
     }
 
-    //= rendered/0011-storage/02-admission.md#DC-0011-049
+    //= rendered/0011-storage/02-admission.md#DC-0011-055
     //= type=test
     //# When a clean completion from a pool brings the summed cost of the clean completions in the
     //# pool's current run to at least the capacity the pool had when that run began, the device
-    //# MUST raise the pool's capacity by the cost of that completion's operation, up to the upper
-    //# bound the device's configuration sets for the pool where it sets one, except where
+    //# MUST raise the pool's capacity by the cost of that completion's operation, except where
     //# DC-0011-054 lowers the pool's capacity at that completion.
     #[test]
     fn a_slow_run_that_halving_wouldnt_lower_raises_the_capacity() {
@@ -587,12 +582,11 @@ mod tests {
         pool.end_wait(80);
     }
 
-    //= rendered/0011-storage/02-admission.md#DC-0011-049
+    //= rendered/0011-storage/02-admission.md#DC-0011-055
     //= type=test
     //# When a clean completion from a pool brings the summed cost of the clean completions in the
     //# pool's current run to at least the capacity the pool had when that run began, the device
-    //# MUST raise the pool's capacity by the cost of that completion's operation, up to the upper
-    //# bound the device's configuration sets for the pool where it sets one, except where
+    //# MUST raise the pool's capacity by the cost of that completion's operation, except where
     //# DC-0011-054 lowers the pool's capacity at that completion.
     #[test]
     fn a_pool_raises_after_a_run_of_clean_completions() {
