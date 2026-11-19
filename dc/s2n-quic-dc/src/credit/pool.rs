@@ -33,6 +33,10 @@
 //! (which needs `prev >= n > 0` to succeed) cannot acquire while waiters exist. That is the no-snipe
 //! guarantee. `available` rises above zero only once the parked queue fully drains.
 //!
+//! An adaptive pool ([`Pool::with_counters_adaptive`]) changes its capacity at run time, and the
+//! distributor changes `available` by the same amount at each change, so the invariant holds
+//! against the current capacity.
+//!
 //! # Distribution
 //!
 //! A single [`Distributor`] owns all distribution. It keeps a task-local mirror — one
@@ -71,6 +75,9 @@ use core::{
 };
 use crossbeam_utils::CachePadded;
 use std::{collections::VecDeque, ptr::NonNull};
+
+mod adapt;
+use adapt::Adapt;
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests;
@@ -168,6 +175,16 @@ pub struct Pool {
     /// Observability handles. Default is a no-op `Registry` (every emit is dropped on the floor).
     /// Wire in real counters via [`Pool::with_counters`].
     counters: Counters,
+    /// The capacity `available` is reconciled against now. The distributor alone writes it, as it
+    /// applies `capacity_target`; a fixed pool keeps its configured capacity.
+    capacity: AtomicU64,
+    /// The capacity an adaptive pool's last change decided, which the distributor's next pass
+    /// applies to `available`.
+    capacity_target: AtomicU64,
+    /// The adaptive pool's decrease epoch, mirrored for the lock-free read at each grant.
+    epoch: AtomicU64,
+    /// The adaptive capacity, or `None` for a pool whose capacity stays at its configured value.
+    adapt: Option<Mutex<Adapt>>,
 }
 
 /// A single priority tier: the wait list plus a closed flag, both protected by the same mutex.
@@ -192,12 +209,30 @@ impl Pool {
 
     /// Construct a pool with externally-registered observability counters.
     pub fn with_counters(config: Config, counters: Counters) -> Self {
+        Self::build(config, counters, None)
+    }
+
+    /// Construct a pool whose capacity adapts at run time from the device's answers, starting at
+    /// `config.capacity` and never rising above `max_capacity` where it is set.
+    pub fn with_counters_adaptive(
+        config: Config,
+        counters: Counters,
+        max_capacity: Option<u64>,
+    ) -> Self {
+        Self::build(config, counters, Some(max_capacity))
+    }
+
+    fn build(config: Config, counters: Counters, adapt: Option<Option<u64>>) -> Self {
         let config = config.normalized();
 
         Self {
             available: CachePadded::new(AtomicI64::new(config.capacity as i64)),
             returned: CachePadded::new(AtomicU64::new(0)),
             parked_demand: CachePadded::new(AtomicU64::new(0)),
+            capacity: AtomicU64::new(config.capacity),
+            capacity_target: AtomicU64::new(config.capacity),
+            epoch: AtomicU64::new(0),
+            adapt: adapt.map(|max| Mutex::new(Adapt::new(config.capacity, max))),
             config,
             waker: TaskWaker::new(),
             tiers: std::array::from_fn(|_| CachePadded::new(Mutex::new(Tier::new()))),
@@ -261,6 +296,14 @@ impl Pool {
                 weak.upgrade().map_or(0, |p| p.observed_in_flight())
             });
         }
+        //= rendered/0011-storage/08-observability.md#DC-0011-053
+        //# The device MUST report the current capacity of each of its pools.
+        {
+            let weak = Arc::downgrade(self);
+            registry.register_gauge_callback(format!("{prefix}.capacity"), move || {
+                weak.upgrade().map_or(0, |p| p.capacity() as i64)
+            });
+        }
     }
 
     /// Parked demand not yet granted, recovered from the monotonic `parked_demand` minus the
@@ -279,7 +322,7 @@ impl Pool {
     /// diagnostic value is its steady state. Observability only.
     #[inline]
     fn observed_in_flight(&self) -> i64 {
-        self.config.capacity as i64
+        self.capacity() as i64
             - self.available.load(Ordering::Relaxed)
             - self.observed_outstanding() as i64
             - self.returned.load(Ordering::Relaxed) as i64
@@ -331,6 +374,9 @@ impl Pool {
         // `-n` and thus never over-counts free credit. See `Distributor::pass`.
         let slot_ref = &*slot.as_ptr();
         slot_ref.prepare_park(n, cx.waker());
+        // A waiter whose cost is higher than an adaptive pool's capacity raises it to its cost; the
+        // distributor applies the raise to `available` once woken, after the slot links below.
+        let raised = self.adapt_with(|adapt| adapt.on_wait(n).is_some());
 
         let mut tier = lock(&self.tiers[priority as usize]);
         // Once the distributor has marked this tier closed, the drain walk has either run or is
@@ -344,6 +390,7 @@ impl Pool {
             // Refund the speculative debit; the slot never linked, so this credit is "as if" the
             // poll had never happened.
             self.available.fetch_add(n as i64, Ordering::Release);
+            self.end_wait(n);
             slot_ref.signal_closed_idle();
             trace!(target: "credit::pool", n, "poll_acquire on closed pool");
             cx.waker().wake_by_ref();
@@ -352,6 +399,10 @@ impl Pool {
         self.parked_demand.fetch_add(n, Ordering::Release);
         tier.list.push_back(SlotPtr::new(slot));
         slot_ref.transition_to_linked();
+        drop(tier);
+        if raised {
+            self.waker.wake();
+        }
 
         self.counters.acquire_parked[priority as usize].add(1);
         // The bytes counter is incremented at park time (not grant time) so the metric reflects
@@ -397,6 +448,88 @@ impl Pool {
         self.config.max_single_acquire[priority as usize]
     }
 
+    /// The pool's current capacity: the configured capacity of a fixed pool, and the capacity an
+    /// adaptive pool's distributor applied last.
+    //= rendered/0011-storage/08-observability.md#DC-0011-053
+    //# The device MUST report the current capacity of each of its pools.
+    #[inline]
+    pub fn capacity(&self) -> u64 {
+        self.capacity.load(Ordering::Relaxed)
+    }
+
+    /// The number of decreases of an adaptive pool's capacity so far, always 0 for a fixed pool.
+    /// An operation keeps the value read as its credit is granted and passes it back to
+    /// [`on_would_block`](Self::on_would_block).
+    #[inline]
+    pub fn decrease_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// The device answered would-block to an operation whose credit the pool granted in
+    /// `grant_epoch`. An adaptive pool lowers its capacity; a fixed pool ignores the answer.
+    pub fn on_would_block(&self, grant_epoch: u64) {
+        if self.adapt_with(|adapt| adapt.on_would_block(grant_epoch).is_some()) {
+            self.waker.wake();
+        }
+    }
+
+    /// An operation of `cost` completed without a would-block answer. An adaptive pool counts it
+    /// toward a run of clean completions while a submitter waits; a fixed pool ignores it.
+    pub fn on_clean_completion(&self, cost: u64) {
+        if self.adapt_with(|adapt| adapt.on_clean_completion(cost).is_some()) {
+            self.waker.wake();
+        }
+    }
+
+    /// Run `f` on an adaptive pool's capacity state, and publish its epoch and capacity target
+    /// where `f` reports a change. Returns whether it changed; a fixed pool never changes.
+    fn adapt_with(&self, f: impl FnOnce(&mut Adapt) -> bool) -> bool {
+        let adapt = match &self.adapt {
+            Some(adapt) => adapt,
+            None => return false,
+        };
+        let mut adapt = lock(adapt);
+        let changed = f(&mut *adapt);
+        if changed {
+            self.epoch.store(adapt.epoch(), Ordering::Release);
+            self.capacity_target.store(adapt.capacity(), Ordering::Release);
+        }
+        changed
+    }
+
+    /// An operation of `cost` that waited for the pool's credit stops waiting.
+    fn end_wait(&self, cost: u64) {
+        if let Some(adapt) = &self.adapt {
+            lock(adapt).on_wait_end(cost);
+        }
+    }
+
+    /// Apply an adaptive pool's capacity target. A raise returns its difference for the
+    /// distributor's pass to add to its pull; a decrease takes its difference from `available` at
+    /// once, which lowers only the free credit. The distributor alone calls it.
+    //= rendered/0011-storage/02-admission.md#DC-0011-051
+    //# The device MUST change a pool's free credit by the same amount as each change of the pool's
+    //# capacity.
+    fn apply_capacity_target(&self) -> u64 {
+        if self.adapt.is_none() {
+            return 0;
+        }
+        let target = self.capacity_target.load(Ordering::Acquire);
+        let current = self.capacity.load(Ordering::Relaxed);
+        if target > current {
+            self.capacity.store(target, Ordering::Relaxed);
+            return target - current;
+        }
+        if target < current {
+            //= rendered/0011-storage/02-admission.md#DC-0011-052
+            //# A decrease of a pool's capacity MUST NOT take credit from an operation that holds
+            //# it.
+            self.available.fetch_sub((current - target) as i64, Ordering::Release);
+            self.capacity.store(target, Ordering::Relaxed);
+        }
+        0
+    }
+
     // Used by the deterministic suite (compiled out under the loom feature, hence allow(dead_code)).
     #[cfg(test)]
     #[allow(dead_code)]
@@ -428,11 +561,11 @@ impl Pool {
         self.available.load(Ordering::Relaxed) + self.returned.load(Ordering::Relaxed) as i64
     }
 
-    /// The configured capacity, for conservation assertions.
+    /// The current capacity, for conservation assertions.
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn debug_capacity(&self) -> u64 {
-        self.config.capacity
+        self.capacity()
     }
 }
 
@@ -673,7 +806,7 @@ impl Distributor {
     /// injected credit rides the granting pass the caller runs immediately after.
     fn pacer_tick(&mut self, quantum: u64) {
         let available = self.pool.available.load(Ordering::Relaxed);
-        let capacity = self.pool.config.capacity;
+        let capacity = self.pool.capacity();
         let released = core::mem::take(&mut self.released_since_tick);
 
         // Headroom must count credit already in the system but not yet reflected in `available`:
@@ -827,9 +960,12 @@ impl Distributor {
         // the next pacer tick can subtract it from its quantum (a round where releases met the rate
         // injects nothing). Then add any pacer injection: it joins `pull` and is governed by the
         // same no-snipe writeback cap as a real release, so it needs no separate handling.
+        // Apply an adaptive pool's capacity change first: a decrease lowers `available` now, and a
+        // raise joins `pull` as returned credit does, under the same no-snipe writeback cap.
+        let raised = self.pool.apply_capacity_target();
         let released = self.pool.returned.swap(0, Ordering::Acquire);
         self.released_since_tick = self.released_since_tick.saturating_add(released);
-        let pull = released + self.carry + core::mem::take(&mut self.refill_pending);
+        let pull = released + raised + self.carry + core::mem::take(&mut self.refill_pending);
         self.carry = 0;
         let outstanding =
             (self.pool.parked_demand.load(Ordering::Acquire) - self.paid_demand) as i64;
@@ -911,6 +1047,7 @@ impl Distributor {
                 if front.is_dead() {
                     let ptr = local.pop_front().unwrap().take();
                     self.paid_demand += req;
+                    self.pool.end_wait(req);
                     reclaimed_avail += req;
                     free += req as i64;
                     self.pool.counters.distributor_reaped.add(1);
@@ -956,6 +1093,7 @@ impl Distributor {
                     // parked list. The un-granted remainder (`req - grant_amount`) is refunded
                     // below; the slot's caller re-acquires for the rest.
                     self.paid_demand += req;
+                    self.pool.end_wait(req);
 
                     match res {
                         Some(waker) => {
@@ -1057,7 +1195,7 @@ impl Distributor {
             // Only a genuine overrun (`prev + writeback > capacity`) is clamped; the normal
             // negative/at-cap path is untouched, so liveness is preserved.
             let new = prev + writeback as i64;
-            let cap = self.pool.config.capacity as i64;
+            let cap = self.pool.capacity() as i64;
             if new > cap {
                 // Subtract exactly the overrun. Racing fast-path `fetch_sub`s between our add and
                 // this correction only make the value smaller, so this can never push `available`
