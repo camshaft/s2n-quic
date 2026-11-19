@@ -497,6 +497,8 @@ impl Device {
         // op lowers the capacity only where no decrease came after this read. A decrease between
         // the grant and this read isn't seen, so the answer can lower the capacity once more.
         let grant_epoch = pool.decrease_epoch();
+        // The time of that read: the op's completion time runs from it.
+        let granted_at = self.clock.now();
 
         Ok(Reservation {
             device: self.clone(),
@@ -508,6 +510,7 @@ impl Device {
             cost,
             is_direct,
             grant_epoch,
+            granted_at,
         })
     }
 
@@ -527,6 +530,7 @@ impl Device {
         stream_id: u64,
     ) -> std::io::Result<()> {
         let grant_epoch = self.pool_for(kind).decrease_epoch();
+        let granted_at = self.clock.now();
         self.enqueue_with_epoch(
             kind,
             fd,
@@ -537,6 +541,7 @@ impl Device {
             user_data,
             granted,
             grant_epoch,
+            granted_at,
             stream_id,
         )
     }
@@ -552,6 +557,8 @@ impl Device {
     ///
     /// `grant_epoch` is the pool's decrease epoch, read just after the grant of the op's
     /// credit, or at the enqueue where the caller doesn't keep one.
+    /// `granted_at` is the time of that read, from which the op's clean completion measures its
+    /// completion time.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_with_epoch(
         self: &Arc<Self>,
@@ -564,6 +571,7 @@ impl Device {
         user_data: u64,
         granted: u64,
         grant_epoch: u64,
+        granted_at: crate::time::precision::Timestamp,
         stream_id: u64,
     ) -> std::io::Result<()> {
         // Per-device admission counters (the caller holds the `Arc<Device>`, so no extra plumbing):
@@ -585,6 +593,7 @@ impl Device {
             status: IoStatus::Pending,
             flow_credits: granted,
             grant_epoch,
+            granted_at: Some(granted_at),
             // `LocalRingId::UNSET` until the dispatch task picks a lane (which overwrites it).
             ring_id: LocalRingId::UNSET,
             user_data,
@@ -659,6 +668,9 @@ pub struct Reservation {
     /// The pool's decrease epoch, read just after the grant, which the op carries so a
     /// would-block answer to it lowers the capacity only where no decrease came after that read.
     grant_epoch: u64,
+    /// The time the pool's decrease epoch was read, from which the op's clean completion
+    /// measures its completion time.
+    granted_at: crate::time::precision::Timestamp,
 }
 
 impl Reservation {
@@ -738,6 +750,7 @@ impl Reservation {
             user_data,
             granted,
             self.grant_epoch,
+            self.granted_at,
             crate::fs::trace::NO_STREAM,
         )
     }
