@@ -501,6 +501,31 @@ mod tests {
         assert_eq!(adapt.epoch(), 1);
     }
 
+    //= rendered/0011-storage/02-admission.md#DC-0011-049
+    //= type=test
+    //# When a clean completion from a pool brings the summed cost of the clean completions in the
+    //# pool's current run to at least the capacity the pool had when that run began, the device
+    //# MUST raise the pool's capacity by the cost of that completion's operation, up to the upper
+    //# bound the device's configuration sets for the pool where it sets one, except where
+    //# DC-0011-054 lowers the pool's capacity at that completion.
+    #[test]
+    fn a_slow_run_that_halving_wouldnt_lower_raises_the_capacity() {
+        let mut adapt = Adapt::new(4, None);
+        assert_eq!(adapt.on_wait(4), None);
+        // This run sets the shortest completion time, 10 ms, and raises the capacity to 8.
+        assert_eq!(adapt.on_clean_completion(4, 0, ms(10)), Some(8));
+        // An operation of cost 8 waits, so halving the capacity of 8 wouldn't lower it.
+        assert_eq!(adapt.on_wait(8), None);
+        // This run takes 20 ms, twice the shortest, and halving wouldn't lower the capacity, so
+        // the run raises it by the completion's cost.
+        assert_eq!(adapt.on_clean_completion(8, 0, ms(20)), Some(16));
+        assert_eq!(adapt.epoch(), 0);
+        // Once the operation of cost 8 stops waiting, a run of 20 ms halves the capacity of 16.
+        adapt.on_wait_end(8);
+        assert_eq!(adapt.on_clean_completion(16, 0, ms(20)), Some(8));
+        assert_eq!(adapt.epoch(), 1);
+    }
+
     fn config(capacity: u64) -> Config {
         Config {
             capacity,

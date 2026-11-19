@@ -62,8 +62,10 @@ pub fn complete(mut op: Entry<IoOp>) {
     }
     // Sojourn: the end-to-end submit→complete latency. `enqueued_at` is stamped at admission; a
     // missing stamp (synthetic op) just skips the sample.
+    //
+    // One read of the clock serves both the sojourn sample and the completion time below.
+    let now = DefaultClock::default().now();
     if let Some(enqueued_at) = op.enqueued_at {
-        let now = DefaultClock::default().now();
         dev.sojourn_us
             .record_value(now.nanos_since(enqueued_at) / 1_000);
     }
@@ -90,7 +92,7 @@ pub fn complete(mut op: Entry<IoOp>) {
                 // The time from the op's grant to this completion, which the pool compares
                 // across its runs of clean completions.
                 let time = match op.granted_at {
-                    Some(granted_at) => DefaultClock::default().now().nanos_since(granted_at),
+                    Some(granted_at) => now.nanos_since(granted_at),
                     None => 0,
                 };
                 let time = Duration::from_nanos(time);
