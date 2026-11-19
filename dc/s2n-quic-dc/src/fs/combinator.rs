@@ -21,12 +21,12 @@
 //!
 //! Step 2 **must** precede step 3 — see the ordering note on [`complete`].
 
-use core::time::Duration;
 use crate::{
     fs::op::{IoOp, IoStatus},
     intrusive::Entry,
     time::DefaultClock,
 };
+use core::time::Duration;
 
 /// Budget per poll cycle for the pipeline tasks — how many ops a task processes before yielding.
 pub(crate) const DRAIN_BUDGET: usize = 1024;
