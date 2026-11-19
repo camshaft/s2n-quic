@@ -1,7 +1,7 @@
 [section]
 anchor = "operations"
 title = "Operations and their validation"
-problem = "A submitter describes an operation by its device, its file, its offset, its length and its buffer. An operation that can never succeed, such as one whose cost is larger than the upper bound its device's configuration sets for its pool's capacity, would wait for credit forever if it were admitted."
+problem = "A submitter describes an operation by its device, its file, its offset, its length and its buffer. An operation that can never succeed, such as one whose offset plus length passes the largest file offset the platform can address, would take credit that operations that can succeed need, if it were admitted."
 motivation = "Rejecting such operations before they wait for credit keeps them from contending for the pool, and keeping the file open for the whole operation keeps an operation from touching a file its caller has closed."
 prose = "The kinds of operation are read, write, full flush, data flush and trim. A buffered operation uses a buffer the scheduler fills or reads from; a direct operation uses a caller-owned buffer aligned to the direct alignment of 4096 bytes, in place, without a copy. Each operation carries an opaque token its caller chooses, which its completion returns."
 
