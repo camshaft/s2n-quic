@@ -161,7 +161,7 @@ impl Device {
         // gauge leaf names, so counters and gauges coexist cleanly under one subtree. This mirrors
         // the send/recv credit pools in `endpoint.rs`.
         let with_counters = |cfg, idx: usize| {
-            Pool::with_counters(
+            Pool::with_counters_adaptive(
                 cfg,
                 Counters::new_with_prefix(registry, &format!("fs.credit.{label}.pool{idx}")),
             )
@@ -238,7 +238,11 @@ impl Device {
     /// can never overflow or wrap — it just clamps to `0` or `u64::MAX`. See [`pool_load`].
     #[inline]
     pub fn load(&self, kind: IoKind) -> u64 {
-        pool_load(self.capacity_for(kind), self.pool_for(kind).available())
+        //= rendered/0011-storage/08-observability.md#DC-0011-042
+        //# The device MUST report its load as its pool capacity less its available credit,
+        //# counting the credit that waiting submitters ask for, and never less than zero.
+        let pool = self.pool_for(kind);
+        pool_load(pool.capacity(), pool.available())
     }
 
     /// Validate a prospective op against this device and resolve the pool it draws from plus its
@@ -304,6 +308,16 @@ impl Device {
         }
 
         let cost = self.cost(kind, len);
+        //= rendered/0011-storage/02-admission.md#DC-0011-057
+        //= type=exception
+        //= reason=the device still rejects such an op until a later change grants it alone
+        //# The device MUST grant an operation whose cost is higher than its pool's shown
+        //# capacity only while no other operation holds credit from that pool.
+        //= rendered/0011-storage/02-admission.md#DC-0011-059
+        //= type=exception
+        //= reason=the device still rejects such an op until a later change grants it alone
+        //# The device MUST NOT reject an operation because its cost is higher than its pool's
+        //# capacity or its pool's shown capacity.
         if cost > self.capacity_for(kind) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -487,6 +501,10 @@ impl Device {
         let mut alloc = SubmitterAlloc::new();
         alloc.set_trace_ctx(self.index, kind);
         alloc.acquire(&pool, cost, priority).await?;
+        // The pool's decrease epoch, read just after the grant: a would-block answer to this
+        // op lowers the capacity only where no decrease came after this read. A decrease between
+        // the grant and this read isn't seen, so the answer can lower the capacity once more.
+        let grant_epoch = pool.decrease_epoch();
 
         Ok(Reservation {
             device: self.clone(),
@@ -497,17 +515,12 @@ impl Device {
             len,
             cost,
             is_direct,
+            grant_epoch,
         })
     }
 
-    /// Build an admitted op (credit already `granted`) carrying this `Arc<Device>` and push it into
-    /// the device's submission channel; the device's dispatch task routes it to one of its lanes. On a
-    /// closed channel (device torn down) the credit is released and an error returned, since no
-    /// completion can arrive. Shared by the [`Reservation`] submit path and the materialize reactor.
-    ///
-    /// `stream_id` groups this op with the other ops of a multi-op submitter for the
-    /// [flight recorder](crate::fs::trace) ([`NO_STREAM`](crate::fs::trace::NO_STREAM) for a one-off);
-    /// it is only stored in the trace builds.
+    /// [`Self::enqueue_with_epoch`], reading the pool's decrease epoch at the enqueue, for a
+    /// caller that doesn't keep an epoch read just after its grant.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue(
         self: &Arc<Self>,
@@ -519,6 +532,46 @@ impl Device {
         completion: CompletionSender,
         user_data: u64,
         granted: u64,
+        stream_id: u64,
+    ) -> std::io::Result<()> {
+        let grant_epoch = self.pool_for(kind).decrease_epoch();
+        self.enqueue_with_epoch(
+            kind,
+            fd,
+            offset,
+            len,
+            buf,
+            completion,
+            user_data,
+            granted,
+            grant_epoch,
+            stream_id,
+        )
+    }
+
+    /// Build an admitted op (credit already `granted`) carrying this `Arc<Device>` and push it into
+    /// the device's submission channel; the device's dispatch task routes it to one of its lanes. On a
+    /// closed channel (device torn down) the credit is released and an error returned, since no
+    /// completion can arrive. Shared by the [`Reservation`] submit path and the materialize reactor.
+    ///
+    /// `stream_id` groups this op with the other ops of a multi-op submitter for the
+    /// [flight recorder](crate::fs::trace) ([`NO_STREAM`](crate::fs::trace::NO_STREAM) for a one-off);
+    /// it is only stored in the trace builds.
+    ///
+    /// `grant_epoch` is the pool's decrease epoch, read just after the grant of the op's
+    /// credit, or at the enqueue where the caller doesn't keep one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_with_epoch(
+        self: &Arc<Self>,
+        kind: IoKind,
+        fd: Fd,
+        offset: u64,
+        len: u32,
+        buf: IoBuf,
+        completion: CompletionSender,
+        user_data: u64,
+        granted: u64,
+        grant_epoch: u64,
         stream_id: u64,
     ) -> std::io::Result<()> {
         // Per-device admission counters (the caller holds the `Arc<Device>`, so no extra plumbing):
@@ -539,6 +592,7 @@ impl Device {
             completion: Some(completion),
             status: IoStatus::Pending,
             flow_credits: granted,
+            grant_epoch,
             // `LocalRingId::UNSET` until the dispatch task picks a lane (which overwrites it).
             ring_id: LocalRingId::UNSET,
             user_data,
@@ -610,6 +664,9 @@ pub struct Reservation {
     /// Whether the eventual buffer is a zero-copy `O_DIRECT` buffer — validated at `reserve` time and
     /// re-checked against the submitted buffer so the two cannot disagree.
     is_direct: bool,
+    /// The pool's decrease epoch, read just after the grant, which the op carries so a
+    /// would-block answer to it lowers the capacity only where no decrease came after that read.
+    grant_epoch: u64,
 }
 
 impl Reservation {
@@ -679,7 +736,7 @@ impl Reservation {
 
         // A one-shot reservation submit is not part of a multi-op stream — `NO_STREAM` (the trace
         // builds map it to SQL NULL); the materialize reactor passes its own shared id.
-        self.device.enqueue(
+        self.device.enqueue_with_epoch(
             self.kind,
             self.fd.clone(),
             self.offset,
@@ -688,6 +745,7 @@ impl Reservation {
             completion,
             user_data,
             granted,
+            self.grant_epoch,
             crate::fs::trace::NO_STREAM,
         )
     }

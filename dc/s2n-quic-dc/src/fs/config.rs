@@ -3,8 +3,9 @@
 
 //! Configuration for the IO scheduler.
 //!
-//! v1 uses **static caps only** — pool capacity and pacer rate are configured constants per device,
-//! with no adaptive estimation loop. The two budgeting axes are orthogonal:
+//! A pool's capacity adapts at run time from the device's answers: it starts at the capacity the
+//! configuration sets, while the pacer rate stays a configured constant per device. The two
+//! budgeting axes are orthogonal:
 //!
 //! * [`CostModel`] decides the *currency* a device's budget is denominated in — raw bytes
 //!   (bandwidth-limited) or fixed-unit IOPS (SSD/EBS, where one I/O up to `io_unit` bytes counts as

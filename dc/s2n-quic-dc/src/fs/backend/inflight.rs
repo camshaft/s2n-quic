@@ -151,6 +151,7 @@ mod tests {
             completion: None,
             status: IoStatus::Pending,
             flow_credits: 0,
+            grant_epoch: 0,
             ring_id: crate::fs::device::LocalRingId(0),
             user_data: 0,
             enqueued_at: None,
