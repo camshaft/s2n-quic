@@ -142,8 +142,9 @@ fn lowering_the_limit_holds_back_credit_until_streams_close() {
                 .unwrap();
 
             // closing two streams brings the open streams down to the new limit, which
-            // doesn't give the client new credit
-            for stream in &mut streams[..2] {
+            // doesn't give the client new credit. A stream closes once the server finishes
+            // its sending side and drops the stream.
+            for mut stream in streams.drain(..2) {
                 stream.finish().unwrap();
             }
             delay(Duration::from_secs(1)).await;
@@ -151,7 +152,9 @@ fn lowering_the_limit_holds_back_credit_until_streams_close() {
             server_observed.lock().unwrap().push(count);
 
             // closing a third stream lets the client open one more stream
-            streams[2].finish().unwrap();
+            let mut stream = streams.remove(0);
+            stream.finish().unwrap();
+            drop(stream);
             let stream = connection.accept_bidirectional_stream().await.unwrap();
             let mut stream = stream.unwrap();
             while stream.receive().await.unwrap().is_some() {}
