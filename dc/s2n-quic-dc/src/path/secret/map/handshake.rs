@@ -519,6 +519,9 @@ mod tests {
             path.on_path_secrets_ready(&StubTlsSession).unwrap();
         }
 
-        assert_eq!(*seen.lock().unwrap(), [endpoint::Type::Server, endpoint::Type::Client]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [endpoint::Type::Server, endpoint::Type::Client]
+        );
     }
 }

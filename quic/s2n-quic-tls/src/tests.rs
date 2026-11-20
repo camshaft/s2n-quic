@@ -405,7 +405,10 @@ fn s2n_client_s2n_server_psk_identity_test() {
     let pair = run_result(&mut server_endpoint, &mut client_endpoint, None).unwrap();
 
     let expected = tls::NegotiatedPskIdentity(PSK_IDENTITY.to_vec());
-    for tls_context in [&pair.server.context.tls_context, &pair.client.context.tls_context] {
+    for tls_context in [
+        &pair.server.context.tls_context,
+        &pair.client.context.tls_context,
+    ] {
         let identity = tls_context
             .as_deref()
             .and_then(|context| context.downcast_ref::<tls::NegotiatedPskIdentity>());
@@ -433,8 +436,14 @@ fn s2n_client_s2n_server_certificate_psk_identity_test() {
 
     assert!(pair.server.context.tls_context.is_none());
     assert!(pair.client.context.tls_context.is_none());
-    assert_eq!(tls::TlsSession::negotiated_psk_identity(&pair.server.session), None);
-    assert_eq!(tls::TlsSession::negotiated_psk_identity(&pair.client.session), None);
+    assert_eq!(
+        tls::TlsSession::negotiated_psk_identity(&pair.server.session),
+        None
+    );
+    assert_eq!(
+        tls::TlsSession::negotiated_psk_identity(&pair.client.session),
+        None
+    );
 }
 
 #[test]

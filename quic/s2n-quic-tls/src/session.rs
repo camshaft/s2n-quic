@@ -141,7 +141,9 @@ impl tls::TlsSession for Session {
             return None;
         }
         let mut identity = vec![0; length];
-        self.connection.negotiated_psk_identity(&mut identity).ok()?;
+        self.connection
+            .negotiated_psk_identity(&mut identity)
+            .ok()?;
         Some(identity)
     }
 }
