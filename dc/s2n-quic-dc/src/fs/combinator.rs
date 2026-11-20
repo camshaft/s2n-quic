@@ -76,6 +76,21 @@ pub fn complete(mut op: Entry<IoOp>) {
     // 2. Release the borrowed credit back to the op's own device pool — exactly once. The op carries
     //    the `Arc<Device>`, so this needs no table lookup. (See the load-bearing ordering note above:
     //    this MUST happen before step 3.)
+    //
+    //    The pool's capacity adapts first: a would-block answer may lower it, and a clean
+    //    completion counts toward the run of clean completions that raises it.
+    if op.flow_credits > 0 {
+        let pool = op.device.pool_for(kind);
+        match op.status {
+            IoStatus::Failed(std::io::ErrorKind::WouldBlock) => {
+                pool.on_would_block(op.grant_epoch);
+            }
+            IoStatus::Done(_) => {
+                pool.on_clean_completion(op.flow_credits);
+            }
+            _ => {}
+        }
+    }
     op.release_credits();
 
     // 3. Route the op to its submitter. Take the completion sender out of the op so the op (with its
