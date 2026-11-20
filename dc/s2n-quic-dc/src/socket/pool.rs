@@ -4,11 +4,17 @@
 use crate::{
     intrusive::List,
     socket::{
-        channel::intrusive::{sync, unsync},
+        channel::{
+            intrusive::{sync, unsync},
+            Budget, Receiver as _,
+        },
         pool::descriptor::{RecycleAdapter, Recycler, SyncRecycler, Unfilled, UnsyncRecycler},
     },
 };
-use core::fmt;
+use core::{
+    fmt,
+    task::{Context, Poll, Waker},
+};
 use std::{cell::RefCell, rc::Rc};
 
 pub mod descriptor;
@@ -279,6 +285,23 @@ impl SyncReuseRing {
         }
         pool.alloc_with_recycler(&self.recycle_weak)
     }
+
+    /// Wakes `waker` once a descriptor recycles into this ring, so that a caller whose
+    /// [`alloc_or_reuse`](Self::alloc_or_reuse) answered `None` waits for one. A descriptor that
+    /// has recycled already moves to the local list, for the next `alloc_or_reuse` to reuse, and
+    /// `waker` is woken at once; otherwise the recycle channel keeps `waker` and wakes it on the
+    /// next recycle. The io_uring recv ring calls this while every bid is empty, instead of
+    /// re-arming a receive that the kernel would answer with `-ENOBUFS`.
+    #[inline]
+    pub fn wake_on_recycle(&mut self, waker: &Waker) {
+        let mut cx = Context::from_waker(waker);
+        if let Poll::Ready(recycled) = self.recycle_rx.poll_recv(&mut cx, &mut Budget::new(1)) {
+            if let Some(mut recycled) = recycled {
+                self.local_pool.append(&mut recycled);
+            }
+            waker.wake_by_ref();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -530,5 +553,61 @@ mod tests {
             .primary()
             .spawn();
         });
+    }
+
+    /// A [`SyncReuseRing`] wakes the waker that `wake_on_recycle` registered once a descriptor
+    /// recycles, and wakes it at once where a descriptor has recycled already, moving that
+    /// descriptor to its local list.
+    #[test]
+    fn sync_reuse_ring_wakes_on_recycle() {
+        use std::{
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            task::Wake,
+        };
+
+        /// Counts the wakes of a waker.
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+
+        impl Wakes {
+            fn count(&self) -> usize {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let pool = Pool::new(1500);
+        let mut ring = SyncReuseRing::new();
+
+        // Nothing has recycled yet: the ring keeps the waker, and doesn't wake it.
+        let unfilled = ring.alloc_or_reuse(&pool).unwrap();
+        ring.wake_on_recycle(&waker);
+        assert_eq!(wakes.count(), 0);
+
+        // The descriptor recycles and wakes the waker.
+        drop(unfilled);
+        assert_eq!(wakes.count(), 1);
+
+        // The recycled descriptor wakes the waker at once, and moves to the local list.
+        ring.wake_on_recycle(&waker);
+        assert_eq!(wakes.count(), 2);
+        assert_eq!(ring.local_pool.len(), 1);
+        let reused = ring.alloc_or_reuse(&pool).unwrap();
+        assert!(ring.local_pool.is_empty());
+        drop(reused);
     }
 }
