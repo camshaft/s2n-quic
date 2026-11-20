@@ -105,7 +105,7 @@ fn lowering_the_limit_holds_back_credit_until_streams_close() {
 
     test(model.clone(), |handle| {
         let limits = Limits::new()
-            .with_max_open_remote_unidirectional_streams(4)
+            .with_max_open_remote_bidirectional_streams(4)
             .unwrap();
         let mut server = Server::builder()
             .with_io(handle.builder().build()?)?
@@ -121,34 +121,38 @@ fn lowering_the_limit_holds_back_credit_until_streams_close() {
         spawn(async move {
             let mut connection = server.accept().await.unwrap();
 
-            // read each of the client's four streams to its end, and hold it open
+            // read each of the client's four streams to its end. The server's sending side of
+            // each stream stays open, so each stream stays open.
             let mut streams = vec![];
             for _ in 0..4 {
-                let stream = connection.accept_receive_stream().await.unwrap();
+                let stream = connection.accept_bidirectional_stream().await.unwrap();
                 let mut stream = stream.unwrap();
                 while stream.receive().await.unwrap().is_some() {}
                 streams.push(stream);
             }
 
+            // the limit holds back the client's fifth stream
+            delay(Duration::from_secs(1)).await;
             let count = server_opened.load(Ordering::SeqCst);
             server_observed.lock().unwrap().push(count);
 
             // lowering the limit leaves the client's credit as it is
             connection
-                .set_max_open_remote_streams(Type::Unidirectional, 2)
+                .set_max_open_remote_streams(Type::Bidirectional, 2)
                 .unwrap();
 
             // closing two streams brings the open streams down to the new limit, which
             // doesn't give the client new credit
-            drop(streams.remove(0));
-            drop(streams.remove(0));
+            for stream in &mut streams[..2] {
+                stream.finish().unwrap();
+            }
             delay(Duration::from_secs(1)).await;
             let count = server_opened.load(Ordering::SeqCst);
             server_observed.lock().unwrap().push(count);
 
-            // closing a third stream gives the client credit for one more stream
-            drop(streams.remove(0));
-            let stream = connection.accept_receive_stream().await.unwrap();
+            // closing a third stream lets the client open one more stream
+            streams[2].finish().unwrap();
+            let stream = connection.accept_bidirectional_stream().await.unwrap();
             let mut stream = stream.unwrap();
             while stream.receive().await.unwrap().is_some() {}
             streams.push(stream);
@@ -170,7 +174,7 @@ fn lowering_the_limit_holds_back_credit_until_streams_close() {
 
             // open streams until the server closes the connection
             let mut streams = vec![];
-            while let Ok(mut stream) = connection.open_send_stream().await {
+            while let Ok(mut stream) = connection.open_bidirectional_stream().await {
                 if stream.send(Bytes::from_static(b"a")).await.is_err() {
                     break;
                 }
