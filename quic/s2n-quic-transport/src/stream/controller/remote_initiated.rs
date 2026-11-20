@@ -161,14 +161,9 @@ impl RemoteInitiated {
     }
 
     /// Returns the number of streams currently open
-    #[inline]
+    #[cfg(test)]
     pub fn open_stream_count(&self) -> VarInt {
         self.opened_streams - self.closed_streams
-    }
-
-    #[inline]
-    pub fn total_open_stream_count(&self) -> VarInt {
-        self.opened_streams
     }
 
     #[inline]
