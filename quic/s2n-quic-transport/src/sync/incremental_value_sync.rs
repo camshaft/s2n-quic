@@ -73,6 +73,35 @@ impl<
         self.request_delivery_if_necessary();
     }
 
+    /// Sets the new value that needs to get synchronized to the peer, and requests its
+    /// delivery whatever the `threshold` says.
+    ///
+    /// This is used for an update the peer needs at once, such as credit the application
+    /// raised.
+    pub fn update_latest_value_now(&mut self, value: T) {
+        debug_assert!(value >= self.latest_value);
+        self.latest_value = value;
+
+        if self.delivery.is_cancelled() || self.latest_value == self.value_ackd_up_to {
+            return;
+        }
+
+        // the value is already on its way to the peer
+        if let DeliveryState::InFlight(in_flight) = self.delivery {
+            if in_flight.value == self.latest_value {
+                return;
+            }
+        }
+
+        self.delivery = DeliveryState::Requested(self.latest_value);
+    }
+
+    /// Sets the difference to the acknowledged value that an update needs before it's sent
+    pub fn set_threshold(&mut self, threshold: T) {
+        self.threshold = threshold;
+        self.request_delivery_if_necessary();
+    }
+
     /// Stop to synchronize the value to the peer
     pub fn stop_sync(&mut self) {
         self.delivery.cancel();

@@ -990,6 +990,12 @@ impl<S: 'static + StreamTrait> stream::Manager for AbstractStreamManager<S> {
         )
     }
 
+    fn set_max_open_remote_streams(&mut self, stream_type: StreamType, limit: VarInt) {
+        self.inner
+            .stream_controller
+            .set_max_open_remote_streams(stream_type, limit);
+    }
+
     fn has_pending_streams(&self) -> bool {
         self.inner.streams.has_pending_streams()
     }

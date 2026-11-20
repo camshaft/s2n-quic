@@ -314,6 +314,14 @@ impl connection::Trait for TestConnection {
         todo!()
     }
 
+    fn set_max_open_remote_streams(
+        &mut self,
+        _stream_type: stream::StreamType,
+        _limit: s2n_quic_core::varint::VarInt,
+    ) -> Result<(), connection::Error> {
+        todo!()
+    }
+
     fn local_address(&self) -> Result<SocketAddress, connection::Error> {
         todo!()
     }

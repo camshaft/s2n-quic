@@ -328,6 +328,14 @@ impl<C: connection::Trait, L: connection::Lock<C>> ConnectionApiProvider for Con
         self.api_write_call(|conn| conn.keep_alive(enabled))
     }
 
+    fn set_max_open_remote_streams(
+        &self,
+        stream_type: stream::StreamType,
+        limit: s2n_quic_core::varint::VarInt,
+    ) -> Result<(), connection::Error> {
+        self.api_write_call(|conn| conn.set_max_open_remote_streams(stream_type, limit))
+    }
+
     fn local_address(&self) -> Result<SocketAddress, connection::Error> {
         self.api_read_call(|conn| conn.local_address())
     }

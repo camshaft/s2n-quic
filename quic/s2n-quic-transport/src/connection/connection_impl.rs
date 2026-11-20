@@ -2082,6 +2082,27 @@ impl<Config: endpoint::Config> connection::Trait for ConnectionImpl<Config> {
         Ok(())
     }
 
+    fn set_max_open_remote_streams(
+        &mut self,
+        stream_type: stream::StreamType,
+        limit: s2n_quic_core::varint::VarInt,
+    ) -> Result<(), connection::Error> {
+        self.error?;
+
+        let (space, _) = self
+            .space_manager
+            .application_mut()
+            .ok_or_else(connection::Error::unspecified)?;
+
+        space
+            .stream_manager
+            .set_max_open_remote_streams(stream_type, limit);
+
+        self.wakeup_handle.wakeup();
+
+        Ok(())
+    }
+
     fn local_address(&self) -> Result<SocketAddress, connection::Error> {
         Ok(*self.path_manager.active_path().handle.local_address())
     }

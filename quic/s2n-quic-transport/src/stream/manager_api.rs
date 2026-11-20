@@ -140,6 +140,9 @@ pub trait Manager:
         context: Option<&Context>,
     ) -> Result<ops::Response, StreamError>;
 
+    /// Sets the number of streams of `stream_type` the peer may have open at once
+    fn set_max_open_remote_streams(&mut self, stream_type: StreamType, limit: VarInt);
+
     /// Returns whether or not streams have data to send
     fn has_pending_streams(&self) -> bool;
 }

@@ -72,6 +72,39 @@ impl TokenBucket {
         }
     }
 
+    /// Sets the maximum number of tokens for the bucket
+    ///
+    /// Raising the maximum adds the difference to the current tokens. Lowering it caps the
+    /// current tokens at the new maximum.
+    #[inline]
+    pub fn set_max(&mut self, max: u64) {
+        if self.max == max {
+            return;
+        }
+
+        if max > self.max {
+            let raise = max - self.max;
+            self.current = max.min(self.current.saturating_add(raise));
+        } else {
+            self.current = self.current.min(max);
+        }
+
+        self.max = max;
+
+        // the refill timer is only armed while the bucket isn't full
+        if self.current == self.max {
+            self.refill_timer.cancel();
+        }
+
+        self.invariants();
+    }
+
+    /// Sets the number of tokens to refill per interval
+    #[inline]
+    pub fn set_refill_amount(&mut self, amount: u64) {
+        self.refill_amount = amount;
+    }
+
     #[inline]
     pub fn on_timeout(&mut self, now: Timestamp) {
         while self.current < self.max {
@@ -214,5 +247,49 @@ mod tests {
 
         assert_eq!(bucket.take(100, clock.get_time()), 15);
         assert!(bucket.refill_timer.is_armed());
+    }
+
+    #[test]
+    fn set_max_test() {
+        let clock = Clock::default();
+
+        // raising the max of a full bucket fills it to the new max
+        let mut bucket = TokenBucket::default();
+        bucket.set_max(200);
+        assert!(!bucket.refill_timer.is_armed());
+        assert_eq!(bucket.take(250, clock.get_time()), 200);
+        assert!(bucket.refill_timer.is_armed());
+
+        // raising the max of a bucket that isn't full adds the difference
+        bucket.set_max(210);
+        assert!(bucket.refill_timer.is_armed());
+        assert_eq!(bucket.take(250, clock.get_time()), 10);
+
+        // lowering the max of a full bucket caps its tokens at the new max
+        let mut bucket = TokenBucket::default();
+        bucket.set_max(20);
+        assert!(!bucket.refill_timer.is_armed());
+        assert_eq!(bucket.take(250, clock.get_time()), 20);
+
+        // lowering the max below the tokens of a bucket that isn't full fills it
+        let mut bucket = TokenBucket::default();
+        assert_eq!(bucket.take(90, clock.get_time()), 90);
+        assert!(bucket.refill_timer.is_armed());
+        bucket.set_max(5);
+        assert!(!bucket.refill_timer.is_armed());
+        assert_eq!(bucket.take(250, clock.get_time()), 5);
+    }
+
+    #[test]
+    fn set_refill_amount_test() {
+        let mut bucket = TokenBucket::default();
+        let mut clock = Clock::default();
+
+        assert_eq!(bucket.take(100, clock.get_time()), 100);
+
+        bucket.set_refill_amount(20);
+        clock.inc_by(Duration::from_secs(1));
+
+        assert_eq!(bucket.take(100, clock.get_time()), 20);
     }
 }

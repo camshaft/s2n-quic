@@ -206,6 +206,23 @@ macro_rules! impl_handle_api {
             self.0.keep_alive(enabled)
         }
 
+        /// Sets the number of streams of `stream_type` the peer may have open at once
+        ///
+        /// This replaces the limit the connection's limits provider set. Raising the limit
+        /// sends the additional credit to the peer at once. Lowering the limit takes effect
+        /// as the peer closes streams, since QUIC doesn't take back credit the peer already
+        /// received. Values above 2^60 are capped at 2^60.
+        #[inline]
+        pub fn set_max_open_remote_streams(
+            &mut self,
+            stream_type: $crate::stream::Type,
+            value: u64,
+        ) -> $crate::connection::Result<()> {
+            use s2n_quic_core::varint::VarInt;
+            let value = VarInt::new(value).unwrap_or(VarInt::MAX);
+            self.0.set_max_open_remote_streams(stream_type, value)
+        }
+
         /// Closes the Connection with the provided error code
         ///
         /// This will immediately terminate all outstanding streams.

@@ -67,6 +67,12 @@ pub(crate) trait ConnectionApiProvider: Sync + Send {
 
     fn keep_alive(&self, enabled: bool) -> Result<(), connection::Error>;
 
+    fn set_max_open_remote_streams(
+        &self,
+        stream_type: StreamType,
+        limit: s2n_quic_core::varint::VarInt,
+    ) -> Result<(), connection::Error>;
+
     fn local_address(&self) -> Result<SocketAddress, connection::Error>;
 
     fn remote_address(&self) -> Result<SocketAddress, connection::Error>;

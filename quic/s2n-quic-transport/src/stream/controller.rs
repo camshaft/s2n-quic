@@ -98,6 +98,18 @@ impl Controller {
         }
     }
 
+    /// Sets the number of streams of `stream_type` the peer may have open at once
+    ///
+    /// Raising the limit advertises the additional credit to the peer at once. Lowering the
+    /// limit takes effect as the peer closes streams, since the credit the peer received can't
+    /// be taken back.
+    pub fn set_max_open_remote_streams(&mut self, stream_type: StreamType, limit: VarInt) {
+        match stream_type {
+            StreamType::Bidirectional => self.remote_bidi_controller.set_max_local_limit(limit),
+            StreamType::Unidirectional => self.remote_uni_controller.set_max_local_limit(limit),
+        }
+    }
+
     /// This method is called when the local application wishes to open the next stream
     /// of a type (Bidirectional/Unidirectional).
     ///
@@ -271,22 +283,20 @@ impl Controller {
             self.local_endpoint_type,
             StreamType::Bidirectional
         );
-        on_transmit!(
-            remote_bidi_controller,
-            peer_endpoint_type,
-            StreamType::Bidirectional
-        );
+
+        // A MAX_STREAMS frame carries the stream type alone, so the remote controllers transmit
+        // before the peer opens its first stream, such as after the application raises a limit
+        let id = StreamId::initial(peer_endpoint_type, StreamType::Bidirectional);
+        self.remote_bidi_controller.on_transmit(id, context)?;
 
         on_transmit!(
             local_uni_controller,
             self.local_endpoint_type,
             StreamType::Unidirectional
         );
-        on_transmit!(
-            remote_uni_controller,
-            peer_endpoint_type,
-            StreamType::Unidirectional
-        );
+
+        let id = StreamId::initial(peer_endpoint_type, StreamType::Unidirectional);
+        self.remote_uni_controller.on_transmit(id, context)?;
 
         Ok(())
     }

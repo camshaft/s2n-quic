@@ -69,6 +69,56 @@ impl RemoteInitiated {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+    //# Once a receiver advertises a stream limit using the MAX_STREAMS
+    //# frame, advertising a smaller limit has no effect.
+
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+    //# As with stream and connection flow control, this document leaves
+    //# implementations to decide when and how many streams should be
+    //# advertised to a peer via MAX_STREAMS.
+    /// Sets the max stream limit specified by the local endpoint while the connection runs
+    ///
+    /// Raising the limit advertises the additional credit to the peer at once. Lowering the
+    /// limit doesn't take back credit the peer received: the peer gets new credit again once
+    /// the streams it has open, together with the credit it hasn't used yet, are fewer than
+    /// the new limit.
+    pub fn set_max_local_limit(&mut self, limit: VarInt) {
+        // the peer doesn't get new credit once the controller is closed
+        if self.max_streams_sync.is_cancelled() {
+            return;
+        }
+
+        let limit = limit.min(MAX_STREAMS_MAX_VALUE);
+
+        if limit == self.max_local_limit {
+            return;
+        }
+
+        let raise = limit.saturating_sub(self.max_local_limit);
+        self.max_local_limit = limit;
+
+        let threshold = limit / MAX_STREAMS_SYNC_FRACTION;
+        self.max_streams_sync.set_threshold(threshold);
+        self.rtt_refill.set_max(limit.as_u64());
+        self.rtt_refill.set_refill_amount(limit.as_u64());
+
+        if raise > VarInt::ZERO {
+            let latest_value = self.max_streams_sync.latest_value();
+
+            // The raise moves the advertised limit by the raise alone: credit for closed
+            // streams that waits on the refill keeps waiting on it.
+            let raised = latest_value.saturating_add(raise);
+            let max_streams = self.credit_target().min(raised);
+
+            if max_streams > latest_value {
+                self.max_streams_sync.update_latest_value_now(max_streams);
+            }
+        }
+
+        self.check_integrity();
+    }
+
     pub fn on_remote_open_stream(&mut self, stream_id: StreamId) -> Result<(), transport::Error> {
         // get the total number of streams that are allowed
         let max_allowed_stream_limit = self.max_streams_sync.latest_value().as_u64();
@@ -143,11 +193,9 @@ impl RemoteInitiated {
 
     #[inline]
     pub fn on_timeout(&mut self, now: Timestamp) {
-        let synced_closed_streams = self.synced_closed_streams();
+        let pending_credit = self.pending_credit();
 
-        let refill = self.closed_streams - synced_closed_streams;
-
-        let refill = self.rtt_refill.take(refill.as_u64(), now);
+        let refill = self.rtt_refill.take(pending_credit.as_u64(), now);
 
         // we don't have any refill credits at this time
         if refill == 0 {
@@ -156,11 +204,8 @@ impl RemoteInitiated {
 
         let refill = VarInt::new(refill).unwrap_or(VarInt::MAX);
 
-        // `synced_closed_streams` subtracts `self.max_local_limit` to get the the number of streams
-        // that have actually been communicated as closed so we need to add it back to the total
-        // here
-        let max_streams = synced_closed_streams
-            .saturating_add(self.max_local_limit)
+        let latest_value = self.max_streams_sync.latest_value();
+        let max_streams = latest_value
             .saturating_add(refill)
             .min(MAX_STREAMS_MAX_VALUE);
 
@@ -186,17 +231,28 @@ impl RemoteInitiated {
                 "Cannot close more streams than previously opened"
             );
             assert!(
-                self.open_stream_count() <= self.max_local_limit,
-                "Cannot have more incoming streams open concurrently than
-                the max_local_limit"
+                self.opened_streams <= self.max_streams_sync.latest_value(),
+                "Cannot open more incoming streams than the peer was given credit for"
             );
         }
     }
 
-    /// Returns the number of closed streams we've set for the incremental value sync
+    /// Returns the max_streams value the peer is owed: the streams it closed plus the
+    /// max_local_limit
     #[inline]
-    fn synced_closed_streams(&self) -> VarInt {
-        self.max_streams_sync.latest_value() - self.max_local_limit
+    fn credit_target(&self) -> VarInt {
+        let credit = self.closed_streams.saturating_add(self.max_local_limit);
+        credit.min(MAX_STREAMS_MAX_VALUE)
+    }
+
+    /// Returns the credit the peer is owed that hasn't been advertised yet
+    ///
+    /// After the max_local_limit is lowered, this stays zero until the peer closes enough
+    /// streams for the credit it holds to fall below the new limit.
+    #[inline]
+    fn pending_credit(&self) -> VarInt {
+        let latest_value = self.max_streams_sync.latest_value();
+        self.credit_target().saturating_sub(latest_value)
     }
 
     #[cfg(test)]
@@ -224,7 +280,7 @@ impl transmission::interest::Provider for RemoteInitiated {
         self.max_streams_sync.transmission_interest(query)?;
 
         // check if we need to kick off the token bucket refill timer
-        if self.closed_streams > self.synced_closed_streams()
+        if self.pending_credit() > VarInt::ZERO
             && !self.rtt_refill.is_armed()
             && !self.max_streams_sync.is_cancelled()
         {

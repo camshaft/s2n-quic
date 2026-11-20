@@ -193,6 +193,20 @@ impl Connection {
         self.api.keep_alive(enabled)
     }
 
+    /// Sets the number of streams of `stream_type` the peer may have open at once
+    ///
+    /// Raising the limit advertises the additional credit to the peer at once. Lowering the
+    /// limit takes effect as the peer closes streams, since QUIC doesn't take back credit the
+    /// peer already received. Values above 2^60 are capped at 2^60.
+    #[inline]
+    pub fn set_max_open_remote_streams(
+        &self,
+        stream_type: StreamType,
+        limit: s2n_quic_core::varint::VarInt,
+    ) -> Result<(), connection::Error> {
+        self.api.set_max_open_remote_streams(stream_type, limit)
+    }
+
     #[inline]
     pub fn local_address(&self) -> Result<SocketAddress, connection::Error> {
         self.api.local_address()

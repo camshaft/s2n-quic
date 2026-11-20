@@ -829,6 +829,175 @@ fn peer_closing_streams_transmits_max_streams() {
 
 //= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
 //= type=test
+//# An endpoint MUST NOT wait
+//# to receive this signal before advertising additional credit, since
+//# doing so will mean that the peer will be blocked for at least an
+//# entire round trip
+#[test]
+fn raising_the_remote_stream_limit_transmits_max_streams_at_once() {
+    let mut manager = create_stream_manager(endpoint::Type::Server);
+
+    for stream_type in [StreamType::Bidirectional, StreamType::Unidirectional] {
+        let mut limit = manager.with_stream_controller(|ctrl| {
+            ctrl.remote_initiated_max_streams_latest_value(stream_type)
+        });
+
+        let mut frame_buffer = OutgoingFrameBuffer::new();
+        let mut write_context = MockWriteContext::new(
+            time::now(),
+            &mut frame_buffer,
+            transmission::Constraint::None,
+            transmission::Mode::Normal,
+            endpoint::Type::Server,
+        );
+
+        // The peer hasn't opened a stream of this type yet, and each raise is below the share
+        // of the limit that closed streams wait for before they return credit
+        for raise in [VarInt::from_u8(1), VarInt::from_u8(10)] {
+            limit = limit + raise;
+            manager.set_max_open_remote_streams(stream_type, limit);
+
+            assert_eq!(
+                transmission::Interest::NewData,
+                manager.get_transmission_interest()
+            );
+
+            let packet_number = write_context.packet_number();
+            assert!(manager.on_transmit(&mut write_context).is_ok());
+
+            let expected_frame = Frame::MaxStreams(MaxStreams {
+                stream_type,
+                maximum_streams: limit,
+            });
+
+            assert_eq!(
+                expected_frame,
+                write_context.frame_buffer.pop_front().unwrap().as_frame()
+            );
+
+            manager.on_packet_ack(&PacketNumberRange::new(packet_number, packet_number));
+
+            assert_eq!(
+                transmission::Interest::None,
+                manager.get_transmission_interest()
+            );
+        }
+
+        // The peer opens streams up to the raised limit
+        for i in 0..*limit {
+            let stream_id = StreamId::nth(endpoint::Type::Client, stream_type, i).unwrap();
+            assert_eq!(
+                Ok(()),
+                manager.on_data(&stream_data(stream_id, VarInt::from_u32(0), &[], false))
+            );
+        }
+
+        // A stream past the raised limit is refused
+        let stream_id = StreamId::nth(endpoint::Type::Client, stream_type, *limit).unwrap();
+        assert_eq!(
+            Err(transport::Error::STREAM_LIMIT_ERROR),
+            manager.with_stream_controller(|ctrl| {
+                let stream_iter = StreamIter::new(stream_id, stream_id);
+                ctrl.on_open_remote_stream(stream_iter)
+            })
+        );
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+//= type=test
+//# As with stream and connection flow control, this document leaves
+//# implementations to decide when and how many streams should be
+//# advertised to a peer via MAX_STREAMS.
+#[test]
+fn lowering_the_remote_stream_limit_holds_back_credit_until_streams_close() {
+    let mut manager = create_stream_manager(endpoint::Type::Server);
+
+    for stream_type in [StreamType::Bidirectional, StreamType::Unidirectional] {
+        let current_max_streams = manager.with_stream_controller(|ctrl| {
+            ctrl.remote_initiated_max_streams_latest_value(stream_type)
+        });
+
+        // The peer opens up to the current max streams limit
+        for i in 0..*current_max_streams {
+            let stream_id = StreamId::nth(endpoint::Type::Client, stream_type, i).unwrap();
+            assert_eq!(
+                Ok(()),
+                manager.on_data(&stream_data(stream_id, VarInt::from_u32(0), &[], false))
+            );
+        }
+
+        // Lowering the limit doesn't take back the credit the peer received
+        let limit = current_max_streams / VarInt::from_u8(4);
+        manager.set_max_open_remote_streams(stream_type, limit);
+
+        assert_eq!(
+            current_max_streams,
+            manager.with_stream_controller(
+                |ctrl| ctrl.remote_initiated_max_streams_latest_value(stream_type)
+            )
+        );
+        assert_eq!(
+            transmission::Interest::None,
+            manager.get_transmission_interest()
+        );
+
+        // The peer closes streams until its open streams fit within the lowered limit, which
+        // doesn't return any credit
+        let streams_to_close = current_max_streams - limit;
+
+        for i in 0..*streams_to_close {
+            let stream_id = StreamId::nth(endpoint::Type::Client, stream_type, i).unwrap();
+            manager.with_asserted_stream(stream_id, |stream| {
+                stream.interests.retained = false;
+            });
+        }
+
+        assert_eq!(
+            transmission::Interest::None,
+            manager.get_transmission_interest()
+        );
+
+        // The peer closes MAX_STREAMS_SYNC_FRACTION of the lowered limit, which returns credit
+        let more_streams_to_close = limit / MAX_STREAMS_SYNC_FRACTION;
+        let closed_streams = streams_to_close + more_streams_to_close;
+
+        for i in *streams_to_close..*closed_streams {
+            let stream_id = StreamId::nth(endpoint::Type::Client, stream_type, i).unwrap();
+            manager.with_asserted_stream(stream_id, |stream| {
+                stream.interests.retained = false;
+            });
+        }
+
+        assert_eq!(
+            transmission::Interest::NewData,
+            manager.get_transmission_interest()
+        );
+
+        let mut frame_buffer = OutgoingFrameBuffer::new();
+        let mut write_context = MockWriteContext::new(
+            time::now(),
+            &mut frame_buffer,
+            transmission::Constraint::None,
+            transmission::Mode::Normal,
+            endpoint::Type::Server,
+        );
+        assert!(manager.on_transmit(&mut write_context).is_ok());
+
+        let expected_frame = Frame::MaxStreams(MaxStreams {
+            stream_type,
+            maximum_streams: current_max_streams + more_streams_to_close,
+        });
+
+        assert_eq!(
+            expected_frame,
+            write_context.frame_buffer.pop_front().unwrap().as_frame()
+        );
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9000#section-4.6
+//= type=test
 //# An endpoint that is unable to open a new stream due to the peer's
 //# limits SHOULD send a STREAMS_BLOCKED frame (Section 19.14).
 
