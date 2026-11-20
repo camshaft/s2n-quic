@@ -490,7 +490,7 @@ impl Pool {
             None => return false,
         };
         let mut adapt = lock(adapt);
-        let changed = f(&mut *adapt);
+        let changed = f(&mut adapt);
         if changed {
             self.epoch.store(adapt.epoch(), Ordering::Release);
             self.capacity_target
