@@ -1096,8 +1096,14 @@ impl Distributor {
                     if !wait_ended {
                         self.pool.end_wait(req);
                     }
+                    //= rendered/0011-storage/02-admission.md#DC-0011-011
+                    //# The device MUST return an operation's credit to the pool it came from
+                    //# exactly once, whether the operation succeeds, fails or is cancelled.
+                    // The reap leaves `free` as it is: the slot's debit of `available` and its
+                    // share of `outstanding` cancel in `free`, and `reclaimed_avail` returns the
+                    // debit to `available` at the writeback. Adding `req` to `free` here would
+                    // count the cancelled slot's credit twice and grant credit the pool lacks.
                     reclaimed_avail += req;
-                    free += req as i64;
                     self.pool.counters.distributor_reaped.add(1);
                     // SAFETY: a dead slot has been popped from every list and is owned
                     // by us; wrapping it in `DeadSlot` transfers ownership to the dead queue, which
@@ -1172,7 +1178,7 @@ impl Distributor {
                             // `grant` returning None means the slot is dead and ours to free.
                             // Push into the dead queue; its drop at end-of-poll frees the slot.
                             reclaimed_avail += req;
-                            free += req as i64;
+                            // `free` stays as it is, as in a dead-slot reap above.
                             self.pool.counters.abandon_granted_race.add(1);
                             trace!(target: "credit::pool", req, "abandon_granted_race");
                             dead.push_back(DeadSlot::new(ptr));
