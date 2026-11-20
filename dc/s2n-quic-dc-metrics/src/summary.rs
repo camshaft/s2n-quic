@@ -75,9 +75,7 @@ fn zeroed_buckets() -> Box<[u64; BUCKETS]> {
     // FIXME: Replace with https://doc.rust-lang.org/nightly/std/boxed/struct.Box.html#method.into_array
     // once it's stabilized.
     unsafe {
-        Box::from_raw(
-            Box::into_raw(vec![0u64; BUCKETS].into_boxed_slice()) as *mut [u64; BUCKETS]
-        )
+        Box::from_raw(Box::into_raw(vec![0u64; BUCKETS].into_boxed_slice()) as *mut [u64; BUCKETS])
     }
 }
 
