@@ -1,7 +1,10 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::intrusive::{Adapter, Links};
+use crate::{
+    intrusive::{Adapter, Links},
+    time::precision::Timestamp,
+};
 use core::cell::UnsafeCell;
 use std::{
     ptr::NonNull,
@@ -71,6 +74,9 @@ pub struct Slot {
     waker: UnsafeCell<Option<Waker>>,
     requested: UnsafeCell<u64>,
     granted: UnsafeCell<u64>,
+    /// When the slot started waiting. Written while the application owns the slot, before it is
+    /// linked, and read by the pool while it is linked, for the per-priority wait metrics.
+    wait_start: UnsafeCell<Timestamp>,
 }
 
 unsafe impl Send for Slot {}
@@ -90,6 +96,7 @@ impl Slot {
             waker: UnsafeCell::new(None),
             requested: UnsafeCell::new(0),
             granted: UnsafeCell::new(0),
+            wait_start: UnsafeCell::new(Timestamp { nanos: 0 }),
         }
     }
 
@@ -106,6 +113,29 @@ impl Slot {
         *self.waker.get() = Some(waker.clone());
         *self.requested.get() = requested;
         *self.granted.get() = 0;
+    }
+
+    /// Record when the slot starts waiting, for the pool's per-priority wait metrics.
+    ///
+    /// # Safety
+    ///
+    /// Caller must hold refcount=1 (exclusive app ownership). After this call, the caller must
+    /// link the slot into the pool under the tier mutex.
+    #[inline]
+    pub(crate) unsafe fn set_wait_start(&self, now: Timestamp) {
+        debug_assert_eq!(self.refcount.load(Ordering::Relaxed), RC_APP);
+        *self.wait_start.get() = now;
+    }
+
+    /// When the slot started waiting, as [`Self::set_wait_start`] recorded it.
+    ///
+    /// # Safety
+    ///
+    /// Must be called with the slot linked (rc=2 or rc=0): under the tier mutex while the slot is
+    /// in a shared tier list, or by the distributor while the slot is in its mirror.
+    #[inline]
+    pub(crate) unsafe fn wait_start(&self) -> Timestamp {
+        *self.wait_start.get()
     }
 
     /// Cancel a park that was prepared but not committed (CAS succeeded under lock).
