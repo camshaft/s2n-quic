@@ -853,7 +853,7 @@ mod tests {
     use crate::{
         counter::Registry,
         fs::{
-            config::{CostModel, DeviceConfig, OpWeights, PoolMode},
+            config::{CapacityBounds, CostModel, DeviceConfig, OpWeights, PoolMode},
             direct::{File, Options},
             scheduler::DeviceRegistry,
         },
@@ -881,6 +881,7 @@ mod tests {
             cost_model: CostModel::Bytes,
             op_weights: OpWeights::default(),
             lane_count: 1,
+            capacity_bounds: CapacityBounds::shared(capacity),
         }
     }
 

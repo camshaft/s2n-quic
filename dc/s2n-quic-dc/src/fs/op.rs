@@ -223,6 +223,11 @@ pub struct IoOp {
     /// Credit borrowed from the device pool, recorded so it is released exactly once. Mirrors
     /// `Frame::flow_credits`.
     pub flow_credits: u64,
+    /// The pool's decrease epoch, read just after the pool granted `flow_credits`: a
+    /// would-block answer to the op lowers the pool's capacity only where no decrease came
+    /// after that read. A decrease between the grant and the read isn't seen, so the answer can
+    /// lower the capacity once more.
+    pub grant_epoch: u64,
     /// Execution lane assigned by `PickRing` (the send-socket analog). `LocalRingId::UNSET` until
     /// routed.
     pub ring_id: LocalRingId,
