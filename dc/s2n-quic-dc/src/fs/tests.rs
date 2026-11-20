@@ -80,12 +80,14 @@ fn build(
         .iter()
         .enumerate()
         .map(|(i, cfg)| {
-            registry
+            let device = registry
                 .register_device(
                     format!("dev{i}").as_str(),
                     &cfg.clone().with_lane_count(lane_count),
                 )
-                .unwrap()
+                .unwrap();
+            hold_capacity(&device);
+            device
         })
         .collect();
     (registry, devices)
@@ -100,6 +102,14 @@ fn assert_conserved(device: &Arc<Device>) {
             "credit leaked on device {:?}",
             device.label
         );
+    }
+}
+
+/// Hold each pool of `device` at its configured capacity: these tests observe fair share and
+/// conservation at a fixed concurrency, which an adaptive capacity would change as they run.
+fn hold_capacity(device: &Arc<Device>) {
+    for pool in device.pools.all() {
+        pool.hold_capacity();
     }
 }
 
@@ -120,6 +130,7 @@ fn lane_send_failure_fails_submit_and_conserves_credit() {
         let scheduler =
             DeviceRegistry::new(DeadLaneBackend, &mut spawn, &Registry::default(), clock);
         let dev = scheduler.register_device("busy", &iops_device(8)).unwrap();
+        hold_capacity(&dev);
 
         async move {
             // Each read acquires credit, fails to push to the dead lane, and must resolve to Err
@@ -412,6 +423,7 @@ fn reservation_drop_cancels_without_io() {
         let mut spawn = bach_spawner();
         let scheduler = DeviceRegistry::new(backend, &mut spawn, &Registry::default(), clock);
         let dev = scheduler.register_device("dev0", &iops_device(8)).unwrap();
+        hold_capacity(&dev);
 
         async move {
             let _scheduler = scheduler;
@@ -478,6 +490,7 @@ fn reservation_parked_drop_cancels_without_io() {
         let mut spawn = bach_spawner();
         let scheduler = DeviceRegistry::new(backend, &mut spawn, &Registry::default(), clock);
         let dev = scheduler.register_device("dev0", &iops_device(1)).unwrap();
+        hold_capacity(&dev);
 
         // Occupant: holds the single credit in flight for 50ms so the second reserve parks on credit.
         {
@@ -1093,6 +1106,7 @@ fn failed_completion_surfaces_as_err() {
         let mut spawn = bach_spawner();
         let scheduler = DeviceRegistry::new(backend, &mut spawn, &Registry::default(), clock);
         let dev = scheduler.register_device("dev0", &iops_device(8)).unwrap();
+        hold_capacity(&dev);
 
         async move {
             let read = dev.read(fd(), 0, 4096, TierPriority::Medium).await;
@@ -1169,6 +1183,7 @@ fn cancelled_op_skips_execution_and_conserves_credit() {
         let mut spawn = bach_spawner();
         let scheduler = DeviceRegistry::new(backend, &mut spawn, &Registry::default(), clock);
         let dev = scheduler.register_device("dev0", &iops_device(8)).unwrap();
+        hold_capacity(&dev);
 
         async move {
             // Enqueue one read against a completion receiver we own, then drop the receiver before the
@@ -1427,6 +1442,7 @@ fn device_credit_pool_records_into_passed_in_registry() {
         let registry = Registry::new();
         let scheduler = DeviceRegistry::new(backend, &mut spawn, &registry, clock);
         let dev = scheduler.register_device("dev0", &iops_device(8)).unwrap();
+        hold_capacity(&dev);
 
         async move {
             let _scheduler = scheduler;

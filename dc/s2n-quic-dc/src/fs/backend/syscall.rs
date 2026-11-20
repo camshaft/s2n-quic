@@ -622,7 +622,10 @@ mod tests {
     /// the real syscall backend (not just the bach mock).
     #[test]
     fn materialize_direct_streams_in_order() {
-        use crate::fs::{direct::ALIGNMENT, scheduler::BlockRef};
+        use crate::fs::{
+            direct::{AlignedBuf, ALIGNMENT},
+            scheduler::BlockRef,
+        };
         let path = temp_path("materialize-direct");
         let file = std::sync::Arc::new(
             File::open(
@@ -640,8 +643,11 @@ mod tests {
         // Pre-fill 8 aligned blocks with a per-block pattern (block k -> byte value k).
         let nblocks = 8usize;
         for k in 0..nblocks {
-            let buf = vec![k as u8; ALIGNMENT];
-            file.write_at(&buf, (k * ALIGNMENT) as u64).unwrap();
+            // `O_DIRECT` needs an `ALIGNMENT`-aligned buffer, which a `Vec` doesn't promise.
+            let mut buf = AlignedBuf::new(ALIGNMENT);
+            buf.as_mut_slice().fill(k as u8);
+            file.write_at(buf.as_slice(), (k * ALIGNMENT) as u64)
+                .unwrap();
         }
         file.sync().unwrap();
 
