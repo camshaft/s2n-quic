@@ -25,9 +25,16 @@ use std::{
 };
 
 pub mod bach_handshake;
+pub mod counted_lost;
 pub mod deterministic;
 pub mod fair_share;
 pub mod half_close;
+pub mod interface_loss;
+pub mod interface_pacing;
+pub mod interface_pairing;
+pub mod interface_priority;
+pub mod interfaces;
+pub mod moved_off_lost;
 pub mod unidirectional;
 
 #[test]
@@ -61,6 +68,7 @@ fn topology_snapshot_uses_dc_tester_layout() {
             gso: endpoint::Gso::default(),
             acceptor_registry: acceptor::Registry::new(),
             overall_send_rate: Rate::new(25.0),
+            interfaces: Vec::new(),
             budgets: endpoint::Budgets::default(),
             submission_shards: 128,
             ups_rate: Rate::new(0.001),

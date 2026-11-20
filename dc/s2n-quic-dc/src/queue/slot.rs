@@ -318,6 +318,23 @@ impl Slot {
             .store(prev | UNALLOCATED_BIT, Ordering::Relaxed);
     }
 
+    /// Puts back `tombstone`, the binding word the slot held before `binding_id` allocated it,
+    /// once the receivers of that binding are dropped without its packet, so that an init whose
+    /// packet doesn't authenticate doesn't leave its binding as the tombstone, which would refuse
+    /// the genuine init of that binding as stale. A slot whose binding word has changed since, as
+    /// where a later binding allocated it, is left as it is. It runs once both receivers are
+    /// dropped, so the only writer it can race is an allocation, which stores its own binding over
+    /// the word whichever runs first, and the compare-and-swap doesn't need the half locks.
+    #[inline]
+    pub(crate) fn restore_tombstone(&self, binding_id: VarInt, tombstone: u64) {
+        let _ = self.binding_id.compare_exchange(
+            binding_id.as_u64() | UNALLOCATED_BIT,
+            tombstone | UNALLOCATED_BIT,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
     /// Publish the reader's currently-advertised receive window so dispatch can
     /// clamp its per-arrival credit release to it. Lock-free; called by the
     /// reader off the stream-half lock. `fetch_max` keeps the published value
@@ -653,12 +670,26 @@ impl Slot {
         binding_id: VarInt,
         initial_window: u64,
     ) -> Result<AllocateOutcome, half::Closed> {
+        self.allocate_and_open_with_tombstone(binding_id, initial_window)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// [`Self::allocate_and_open`], which also returns the tombstone the slot held, read under
+    /// the locks: for `Allocated`, the binding word that [`Self::restore_tombstone`] puts back
+    /// where the new binding is torn down without its packet. It is 0 for `AlreadyBound`, which
+    /// doesn't read it.
+    #[inline]
+    pub(crate) fn allocate_and_open_with_tombstone(
+        &self,
+        binding_id: VarInt,
+        initial_window: u64,
+    ) -> Result<(AllocateOutcome, u64), half::Closed> {
         let mut s = self.stream.inner.lock();
         let mut c = self.control.inner.lock();
 
         // Re-check inside the lock: a concurrent caller may have already bound.
         if s.flags.contains(Flags::HAS_RECEIVER) && c.flags.contains(Flags::HAS_RECEIVER) {
-            return Ok(AllocateOutcome::AlreadyBound);
+            return Ok((AllocateOutcome::AlreadyBound, 0));
         }
 
         // Re-validate the binding_id against the slot's tombstone *under the lock*.
@@ -673,7 +704,7 @@ impl Slot {
         // slot under a zombie binding_id below its own tombstone.
         let tombstone = self.binding_id.load(Ordering::Relaxed) & !UNALLOCATED_BIT;
         if binding_id.as_u64() <= tombstone {
-            return Ok(AllocateOutcome::Stale);
+            return Ok((AllocateOutcome::Stale, tombstone));
         }
 
         Self::allocate_and_open_locked(&mut s, &mut c, &self.binding_id, binding_id)?;
@@ -683,7 +714,7 @@ impl Slot {
         // halves are locked, so this plain store can't race a reader.
         self.advertised_window
             .store(initial_window, Ordering::Release);
-        Ok(AllocateOutcome::Allocated)
+        Ok((AllocateOutcome::Allocated, tombstone))
     }
 
     /// Bind the slot (if unallocated) and push the first stream entry atomically.
@@ -1199,6 +1230,59 @@ mod tests {
         let raw = slot.binding_id.load(Ordering::Relaxed);
         assert_eq!(raw & UNALLOCATED_BIT, 0, "slot must now be allocated");
         assert_eq!(raw & !UNALLOCATED_BIT, 6);
+    }
+
+    #[test]
+    fn allocate_and_open_with_tombstone_returns_the_tombstone_it_replaced() {
+        let slot = Slot::with_queue_id(v(0));
+        slot.allocate_and_open(v(5), 0).unwrap();
+        simulate_receiver_drop(&slot); // tombstone = 5
+        assert_eq!(
+            slot.allocate_and_open_with_tombstone(v(6), 0),
+            Ok((AllocateOutcome::Allocated, 5)),
+            "an allocation returns the tombstone its binding replaced"
+        );
+    }
+
+    #[test]
+    fn restore_tombstone_puts_back_the_tombstone_of_a_torn_down_binding() {
+        let slot = Slot::with_queue_id(v(0));
+        slot.allocate_and_open(v(5), 0).unwrap();
+        simulate_receiver_drop(&slot); // tombstone = 5
+        slot.allocate_and_open(v(6), 0).unwrap();
+        simulate_receiver_drop(&slot); // tombstone = 6
+        slot.restore_tombstone(v(6), 5);
+        let raw = slot.binding_id.load(Ordering::Relaxed);
+        assert_ne!(raw & UNALLOCATED_BIT, 0, "slot must remain unallocated");
+        assert_eq!(raw & !UNALLOCATED_BIT, 5, "the tombstone from before binding 6 is back");
+        assert_eq!(
+            slot.allocate_and_open(v(6), 0),
+            Ok(AllocateOutcome::Allocated),
+            "binding 6 allocates the slot again"
+        );
+    }
+
+    #[test]
+    fn restore_tombstone_keeps_a_later_binding() {
+        let slot = Slot::with_queue_id(v(0));
+        slot.allocate_and_open(v(5), 0).unwrap();
+        simulate_receiver_drop(&slot); // tombstone = 5
+        slot.allocate_and_open(v(6), 0).unwrap();
+        simulate_receiver_drop(&slot); // tombstone = 6
+        slot.allocate_and_open(v(7), 0).unwrap();
+        slot.restore_tombstone(v(6), 5);
+        assert_eq!(
+            slot.binding_id.load(Ordering::Relaxed),
+            7,
+            "a later binding that allocated the slot stays"
+        );
+        simulate_receiver_drop(&slot); // tombstone = 7
+        slot.restore_tombstone(v(6), 5);
+        assert_eq!(
+            slot.binding_id.load(Ordering::Relaxed),
+            7 | UNALLOCATED_BIT,
+            "a later binding's tombstone stays"
+        );
     }
 
     #[test]

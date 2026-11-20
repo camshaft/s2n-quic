@@ -324,6 +324,27 @@ impl<A: intrusive::Adapter, Q: Storage<A>> Receiver<A, Q> {
         self.shared.recv_waker.register(waker);
     }
 
+    /// Closes each shard to senders, and passes `f` the storage each shard still holds.
+    ///
+    /// Each shard is closed and its queue taken under the shard's lock, so a batch that a sender
+    /// submits once its shard is closed is refused and returned to that sender, and no batch is
+    /// left in a closed shard. The receiver isn't polled after this call.
+    pub fn close(&mut self, mut f: impl FnMut(Q)) {
+        for (index, shard) in self.shared.shards.iter().enumerate() {
+            let mut guard = lock(shard);
+            guard.is_open = false;
+            let queue = core::mem::take(&mut guard.queue);
+            drop(guard);
+
+            let (word, bit) = Shared::<A, Q>::occupancy_word_and_bit(index);
+            self.shared.occupancy[word].fetch_and(!bit, Ordering::Relaxed);
+            if !<Q as Storage<A>>::is_empty(&queue) {
+                f(queue);
+            }
+        }
+        self.local_occupancy.fill(0);
+    }
+
     #[inline(always)]
     fn try_swap(&mut self, batch: &mut Q) -> TrySwap {
         // Only consume one occupied bit per receive attempt so stale occupancy bookkeeping stays
@@ -794,6 +815,26 @@ mod tests {
         drop(rx);
 
         assert_eq!(tx.send(list([1])).unwrap_err().len(), 1);
+    }
+
+    #[test]
+    fn close_takes_each_shard_and_refuses_later_sends() {
+        let (mut tx, mut rx) = new::<u32>(2);
+        register(&mut rx);
+        tx.send(list([1, 2])).unwrap();
+        tx.send(list([3])).unwrap();
+
+        let mut taken = Vec::new();
+        rx.close(|queue| taken.extend(values(&queue)));
+        taken.sort_unstable();
+        assert_eq!(taken, vec![1, 2, 3]);
+
+        // While the receiver is still alive, a send after the close is refused, and the sender
+        // keeps its batch, so no batch is left in a closed shard.
+        assert_eq!(tx.send(list([4])).unwrap_err().len(), 1);
+        let mut later = Vec::new();
+        rx.close(|queue| later.extend(values(&queue)));
+        assert!(later.is_empty());
     }
 
     // Under the real loom model checker (`--features loom`) this model deadlocks — a pre-existing
