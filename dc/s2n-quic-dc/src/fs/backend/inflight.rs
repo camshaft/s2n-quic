@@ -104,7 +104,7 @@ mod tests {
             device::Device,
             op::{IoBuf, IoKind, IoOp, IoStatus},
         },
-        sched::{CreditConfig, Rate},
+        sched::CreditConfig,
         sync::Arc,
     };
 
@@ -119,7 +119,6 @@ mod tests {
             &crate::counter::Registry::default(),
             &DeviceConfig {
                 pool_mode: PoolMode::Shared(CreditConfig::new(1 << 20)),
-                rate: Rate::new(100.0),
                 cost_model: CostModel::Bytes,
                 op_weights: OpWeights::default(),
                 lane_count: 1,

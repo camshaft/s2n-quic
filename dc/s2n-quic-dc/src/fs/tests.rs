@@ -22,7 +22,7 @@ use crate::{
         op::{IoOp, IoStatus},
         scheduler::{BlockRef, DeviceRegistry},
     },
-    sched::{CreditConfig, Rate, TierPriority},
+    sched::{CreditConfig, TierPriority},
     testing::{ext::*, sim},
     time::bach::Clock,
     tracing::*,
@@ -173,7 +173,7 @@ fn op_larger_than_max_single_acquire_grants_atomically() {
     sim(|| {
         // Public constructor → default (non-uniform, capacity-scaled) caps. Refill off so only the
         // grant machinery (not the liveness pacer) can make progress — isolating the wedge.
-        let mut cfg = DeviceConfig::shared_bytes(256 * 1024, Rate::new(1_000_000.0));
+        let mut cfg = DeviceConfig::shared_bytes(256 * 1024);
         let PoolMode::Shared(c) = cfg.pool_mode else {
             unreachable!()
         };
@@ -229,8 +229,8 @@ fn op_larger_than_max_single_acquire_grants_atomically() {
     });
 }
 
-/// A tiny IOPS device: `queue_depth` outstanding ops, one IOP per 4 KiB, paced generously so the
-/// credit pool (not the pacer) governs concurrency in these tests.
+/// A tiny IOPS device: `queue_depth` outstanding ops, one IOP per 4 KiB; its credit pool governs
+/// concurrency in these tests.
 fn iops_device(queue_depth: u64) -> DeviceConfig {
     DeviceConfig {
         // Floor the fair-share slice at 1 op and cap a single acquire at 1 op so each block read is
@@ -241,7 +241,6 @@ fn iops_device(queue_depth: u64) -> DeviceConfig {
                 .with_min_grant_slice_uniform(1)
                 .without_refill(),
         ),
-        rate: Rate::new(100.0),
         cost_model: CostModel::Iops { io_unit: 4096 },
         op_weights: OpWeights::default(),
         lane_count: 1,

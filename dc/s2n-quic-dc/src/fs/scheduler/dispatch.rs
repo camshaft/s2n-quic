@@ -55,7 +55,7 @@ impl Router {
     fn new(lanes: usize) -> Self {
         // EDT scores lane *occupancy* in time. A nominal unit rate suffices: only relative deltas
         // between lanes drive selection, and `byte_cost` (the credit cost) is the work unit advanced
-        // per op. (The real device pacing already happened at admission.)
+        // per op. (A device has no rate: its credit pools bound the work admitted to it.)
         let lane_edts = edt::Local::new(lanes, Rate::new(1.0));
         Self {
             lane_edts,
