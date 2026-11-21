@@ -89,8 +89,7 @@ impl DevicePools {
 /// A device: its budget pool(s), cost model, weights, **and its own submission channel** — so a read
 /// or write is a method *on the device* and the op it builds carries the `Arc<Device>` straight
 /// through the device's own pipeline (the storage analog of `Arc<PathSecretEntry>`), finishing itself
-/// with no table lookup. The pacer ([`crate::sched::Rate`]) is applied by the device's dispatch
-/// load-balancing stage; the rate is stored here so the pipeline can read it.
+/// with no table lookup.
 ///
 /// The submit API lives here as methods taking `self: &Arc<Device>` ([`Device::read`],
 /// [`Device::write`], [`Device::submit`], …): a holder of the `Arc<Device>` submits against it
@@ -109,7 +108,6 @@ pub struct Device {
     pub pools: DevicePools,
     pub cost_model: CostModel,
     pub op_weights: OpWeights,
-    pub rate: crate::sched::Rate,
     /// Per-device nominal counters (`fs.device.*{device=label}`). Because the op carries this
     /// `Arc<Device>`, both the submit path and the in-place completion path bump these directly — no
     /// extra plumbing — giving per-device IOPS / bytes / failure visibility.
@@ -193,7 +191,6 @@ impl Device {
             pools,
             cost_model: cfg.cost_model,
             op_weights: cfg.op_weights,
-            rate: cfg.rate,
             counters,
             submission,
             clock,

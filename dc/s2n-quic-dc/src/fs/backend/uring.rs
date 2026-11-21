@@ -858,7 +858,7 @@ mod tests {
             scheduler::DeviceRegistry,
         },
         runtime::tokio::Local,
-        sched::{CreditConfig, Rate, TierPriority},
+        sched::{CreditConfig, TierPriority},
     };
     use std::rc::Rc;
 
@@ -877,7 +877,6 @@ mod tests {
                     .with_max_single_acquire_uniform(capacity.max(1))
                     .without_refill(),
             ),
-            rate: Rate::new(100.0),
             cost_model: CostModel::Bytes,
             op_weights: OpWeights::default(),
             lane_count: 1,

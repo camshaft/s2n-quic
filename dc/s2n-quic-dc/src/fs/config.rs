@@ -4,8 +4,8 @@
 //! Configuration for the IO scheduler.
 //!
 //! A pool's capacity adapts at run time from the device's answers: it starts at the capacity the
-//! configuration sets, while the pacer rate stays a configured constant per device. The two
-//! budgeting axes are orthogonal:
+//! configuration sets. A device's configuration doesn't hold a rate: its pools' capacities bound
+//! the work admitted to it. The two budgeting axes are orthogonal:
 //!
 //! * [`CostModel`] decides the *currency* a device's budget is denominated in — raw bytes
 //!   (bandwidth-limited) or fixed-unit IOPS (SSD/EBS, where one I/O up to `io_unit` bytes counts as
@@ -17,7 +17,7 @@
 //! enforces one combined IOPS/throughput limit) or two split read/write budgets (for instance/raw
 //! NVMe, which publish separate ceilings).
 
-use crate::sched::{CreditConfig, Rate};
+use crate::sched::CreditConfig;
 
 /// How a device's budget is denominated.
 #[derive(Clone, Copy, Debug)]
@@ -118,7 +118,7 @@ pub const DEFAULT_LANE_COUNT: usize = 1;
 
 /// Per-device configuration.
 ///
-/// Each device now **owns its own execution**: its credit pool(s), cost model, pacer rate, and its
+/// Each device now **owns its own execution**: its credit pool(s), cost model, and its
 /// own set of execution lanes. `lane_count` is therefore a per-device knob — the maximum number of
 /// rings / blocking-pool threads this device's ops fan out across — decoupled from any other device.
 /// The device's *queue depth* (max ops concurrently in flight) is governed separately by the credit
@@ -128,8 +128,6 @@ pub const DEFAULT_LANE_COUNT: usize = 1;
 pub struct DeviceConfig {
     /// The credit budget(s) for this device.
     pub pool_mode: PoolMode,
-    /// The pacer rate enforcing the device's IOPS/bandwidth ceiling (in the cost-model currency).
-    pub rate: Rate,
     /// How the budget is denominated.
     pub cost_model: CostModel,
     /// Read-vs-write cost weighting (applies within a shared pool; in split mode each pool already
@@ -141,11 +139,10 @@ pub struct DeviceConfig {
 }
 
 impl DeviceConfig {
-    /// A simple bandwidth-limited device: one shared pool of `capacity` bytes, paced at `rate`.
-    pub fn shared_bytes(capacity: u64, rate: Rate) -> Self {
+    /// A simple bandwidth-limited device: one shared pool of `capacity` bytes.
+    pub fn shared_bytes(capacity: u64) -> Self {
         Self {
             pool_mode: PoolMode::Shared(CreditConfig::new(capacity)),
-            rate,
             cost_model: CostModel::Bytes,
             op_weights: OpWeights::default(),
             lane_count: DEFAULT_LANE_COUNT,
@@ -153,11 +150,10 @@ impl DeviceConfig {
     }
 
     /// An IOPS-limited device: one shared pool of `queue_depth` outstanding ops, where each op
-    /// counts `ceil(len / io_unit)` operations, paced at `rate` (ops/sec expressed as a [`Rate`]).
-    pub fn shared_iops(queue_depth: u64, io_unit: u32, rate: Rate) -> Self {
+    /// counts `ceil(len / io_unit)` operations.
+    pub fn shared_iops(queue_depth: u64, io_unit: u32) -> Self {
         Self {
             pool_mode: PoolMode::Shared(CreditConfig::new(queue_depth)),
-            rate,
             cost_model: CostModel::Iops { io_unit },
             op_weights: OpWeights::default(),
             lane_count: DEFAULT_LANE_COUNT,
