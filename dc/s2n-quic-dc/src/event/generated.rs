@@ -584,6 +584,7 @@ pub mod api {
     #[non_exhaustive]
     #[doc = " Emitted when credential replay was definitely detected"]
     pub struct ReplayDefinitelyDetected<'a> {
+        pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
         pub key_id: u64,
     }
@@ -591,6 +592,7 @@ pub mod api {
     impl<'a> crate::event::snapshot::Fmt for ReplayDefinitelyDetected<'a> {
         fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
             let mut fmt = fmt.debug_struct("ReplayDefinitelyDetected");
+            fmt.field("peer_address", &self.peer_address);
             fmt.field("credential_id", &"[HIDDEN]");
             fmt.field("key_id", &self.key_id);
             fmt.finish()
@@ -604,6 +606,7 @@ pub mod api {
     #[doc = " Emitted when credential replay was potentially detected, but could not be verified"]
     #[doc = " due to a limiting tracking window"]
     pub struct ReplayPotentiallyDetected<'a> {
+        pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
         pub key_id: u64,
         pub gap: u64,
@@ -612,6 +615,7 @@ pub mod api {
     impl<'a> crate::event::snapshot::Fmt for ReplayPotentiallyDetected<'a> {
         fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
             let mut fmt = fmt.debug_struct("ReplayPotentiallyDetected");
+            fmt.field("peer_address", &self.peer_address);
             fmt.field("credential_id", &"[HIDDEN]");
             fmt.field("key_id", &self.key_id);
             fmt.field("gap", &self.gap);
@@ -1385,10 +1389,11 @@ pub mod tracing {
         ) {
             let parent = self.parent(meta);
             let api::ReplayDefinitelyDetected {
+                peer_address,
                 credential_id,
                 key_id,
             } = event;
-            tracing :: event ! (target : "replay_definitely_detected" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (credential_id) , key_id = tracing :: field :: debug (key_id) });
+            tracing :: event ! (target : "replay_definitely_detected" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) , key_id = tracing :: field :: debug (key_id) });
         }
         #[inline]
         fn on_replay_potentially_detected(
@@ -1398,11 +1403,12 @@ pub mod tracing {
         ) {
             let parent = self.parent(meta);
             let api::ReplayPotentiallyDetected {
+                peer_address,
                 credential_id,
                 key_id,
                 gap,
             } = event;
-            tracing :: event ! (target : "replay_potentially_detected" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (credential_id) , key_id = tracing :: field :: debug (key_id) , gap = tracing :: field :: debug (gap) });
+            tracing :: event ! (target : "replay_potentially_detected" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) , key_id = tracing :: field :: debug (key_id) , gap = tracing :: field :: debug (gap) });
         }
         #[inline]
         fn on_replay_detected_packet_sent(
@@ -2222,6 +2228,7 @@ pub mod builder {
     #[derive(Clone, Debug)]
     #[doc = " Emitted when credential replay was definitely detected"]
     pub struct ReplayDefinitelyDetected<'a> {
+        pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
         pub key_id: u64,
     }
@@ -2229,10 +2236,12 @@ pub mod builder {
         #[inline]
         fn into_event(self) -> api::ReplayDefinitelyDetected<'a> {
             let ReplayDefinitelyDetected {
+                peer_address,
                 credential_id,
                 key_id,
             } = self;
             api::ReplayDefinitelyDetected {
+                peer_address: peer_address.into_event(),
                 credential_id: credential_id.into_event(),
                 key_id: key_id.into_event(),
             }
@@ -2242,6 +2251,7 @@ pub mod builder {
     #[doc = " Emitted when credential replay was potentially detected, but could not be verified"]
     #[doc = " due to a limiting tracking window"]
     pub struct ReplayPotentiallyDetected<'a> {
+        pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
         pub key_id: u64,
         pub gap: u64,
@@ -2250,11 +2260,13 @@ pub mod builder {
         #[inline]
         fn into_event(self) -> api::ReplayPotentiallyDetected<'a> {
             let ReplayPotentiallyDetected {
+                peer_address,
                 credential_id,
                 key_id,
                 gap,
             } = self;
             api::ReplayPotentiallyDetected {
+                peer_address: peer_address.into_event(),
                 credential_id: credential_id.into_event(),
                 key_id: key_id.into_event(),
                 gap: gap.into_event(),

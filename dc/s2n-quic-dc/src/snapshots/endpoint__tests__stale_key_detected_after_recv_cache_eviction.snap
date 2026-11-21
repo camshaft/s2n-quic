@@ -28080,7 +28080,7 @@ expression: logs
 0:00:03.002061000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:03.002061000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=3.00206s
 0:00:03.002061000 [client] DEBUG check_dedup: replay definitely detected credential_id=0x7da2b021bc51ec6a354acc13cf843ec7 key_id=1 queue_id=Some(VarInt(1))
-0:00:03.002061000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] key_id=1
+0:00:03.002061000 [client] DEBUG s2n_quic_dc: peer_address=10.0.0.1:4433 credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] key_id=1
 0:00:03.002061000 [client] TRACE c#!rx.process.err.stale_key=1
 0:00:03.002061000 [client] TRACE c#q.ups.enq=1
 0:00:03.002061000 [client] TRACE g#q.ups.depth=1
@@ -28136,7 +28136,7 @@ expression: logs
 0:00:03.002081000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] hit=true
 0:00:03.002081000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] age=3.00208s
 0:00:03.002081000 [client] DEBUG check_dedup: replay definitely detected credential_id=0x7da2b021bc51ec6a354acc13cf843ec7 key_id=1 queue_id=Some(VarInt(1))
-0:00:03.002081000 [client] DEBUG s2n_quic_dc: credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] key_id=1
+0:00:03.002081000 [client] DEBUG s2n_quic_dc: peer_address=10.0.0.1:4433 credential_id=[125, 162, 176, 33, 188, 81, 236, 106, 53, 74, 204, 19, 207, 132, 62, 199] key_id=1
 0:00:03.002081000 [client] TRACE c#!rx.process.err.stale_key=1
 0:00:03.002081000 [client] TRACE c#q.ups.enq=1
 0:00:03.002081000 [client] TRACE g#q.ups.depth=1

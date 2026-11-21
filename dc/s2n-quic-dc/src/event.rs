@@ -35,6 +35,7 @@ impl Meta for api::EndpointMeta {
     }
 }
 
+pub mod peer_log;
 pub mod subscriber;
 
 mod generated;
