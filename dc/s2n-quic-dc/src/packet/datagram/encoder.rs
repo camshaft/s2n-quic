@@ -77,10 +77,18 @@ where
     P: buffer::reader::Storage<Error = core::convert::Infallible>,
     C: seal::Application,
 {
+    //= rendered/0009-tunneled-datagrams/02-packet.md#DC-0009-007
+    //# The first byte of a tunneled datagram packet MUST hold 0100 in its high four bits, and in
+    //# its low four bits, from the highest, the routing information bit, the packet number bit, the
+    //# application header bit and the key phase bit.
     let mut tag = super::Tag::default();
     tag.set_has_routing_info(!matches!(routing_info, RoutingInfo::None));
     tag.set_has_packet_number(packet_number.is_some());
     tag.set_payload_encrypted(header_len != super::HeaderLen::ZERO);
+
+    //= rendered/0009-tunneled-datagrams/02-packet.md#DC-0009-030
+    //# A sender MUST write the phase of the key that seals a packet in the packet's key phase
+    //# bit.
     tag.set_key_phase(crypto.key_phase());
     encoder.encode(&tag);
 
@@ -88,8 +96,16 @@ where
     let payload_len_usize = *payload_len as usize;
     let nonce = *packet_number.unwrap_or(super::PacketNumber::ZERO);
 
+    //= rendered/0009-tunneled-datagrams/02-packet.md#DC-0009-011
+    //# A tunneled datagram packet MUST carry, after its first byte and in this order, the
+    //# credentials of the key that sealed it, the wire version, the sender's control port, the
+    //# packet number, the payload's length, the payload and the authentication tag.
+
     // encode the credentials being used
     encoder.encode(credentials);
+
+    //= rendered/0009-tunneled-datagrams/02-packet.md#DC-0009-012
+    //# A sender MUST write wire version zero in each tunneled datagram packet it sends.
 
     // wire version - we only support `0` currently
     encoder.encode(&WireVersion::ZERO);
@@ -148,6 +164,12 @@ where
         slice.split_at_mut(payload_offset)
     };
 
+    //= rendered/0009-tunneled-datagrams/02-packet.md#DC-0009-014
+    //# A sender MUST encrypt the whole payload of each packet.
+    //= rendered/0009-tunneled-datagrams/02-packet.md#DC-0009-028
+    //# A sender MUST authenticate the whole header of each packet together with its payload.
+    //= rendered/0009-tunneled-datagrams/02-packet.md#DC-0009-029
+    //# A sender MUST use the packet's packet number as the nonce of its encryption.
     crypto.encrypt(nonce, header, last_chunk, payload_and_tag);
 
     packet_len
