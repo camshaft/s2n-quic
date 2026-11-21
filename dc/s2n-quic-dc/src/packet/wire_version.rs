@@ -15,6 +15,9 @@ decoder_value!(
     impl<'a> WireVersion {
         fn decode(buffer: Buffer) -> Result<Self> {
             let (version, buffer) = buffer.decode::<u8>()?;
+
+            //= rendered/0009-tunneled-datagrams/03-receiving.md#DC-0009-031
+            //# A receiver MUST reject a packet whose wire version isn't zero.
             decoder_invariant!(version == 0, "only wire version 0 is supported currently");
             let version = Self(version as _);
             Ok((version, buffer))

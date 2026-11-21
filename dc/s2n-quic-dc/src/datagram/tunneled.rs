@@ -4,5 +4,8 @@
 pub mod recv;
 pub mod send;
 
+#[cfg(test)]
+mod tests;
+
 pub use recv::Receiver;
 pub use send::Sender;
