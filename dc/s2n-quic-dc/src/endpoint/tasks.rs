@@ -1666,6 +1666,7 @@ fn on_packet_dispatch_error(
                         credential_id: credentials.id,
                         sender_id,
                     },
+                    kind: endpoint::ups::Kind::UnknownPathSecret,
                 };
                 let _ = ups_tx.send(Entry::new(response));
             }
@@ -1715,6 +1716,7 @@ fn on_packet_dispatch_error(
                         credential_id: credentials.id,
                         sender_id,
                     },
+                    kind: endpoint::ups::Kind::Rejection,
                 };
                 let _ = ups_tx.send(Entry::new(response));
             }
