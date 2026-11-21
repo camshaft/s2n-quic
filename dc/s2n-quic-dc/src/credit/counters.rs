@@ -28,7 +28,7 @@
 //! registry via [`Counters::new_with_prefix`] for anything a distributor drives.
 
 use crate::{
-    counter::{Counter, Gauge, Registry},
+    counter::{Counter, Gauge, Registry, Timer},
     credit::pool::Priority,
 };
 
@@ -43,6 +43,13 @@ pub struct Counters {
     /// Acquires that parked (exhausted the fast path), per priority. The variant name is the
     /// `Priority` enum's debug representation (e.g. `Highest`, `Background`).
     pub acquire_parked: [Counter; Priority::LEVELS],
+    /// Time each acquire that waited spent between the start of its wait and its grant, per
+    /// priority, in microseconds, with the same variant names. Recorded at each grant; a waiter
+    /// abandoned before its grant isn't recorded.
+    pub acquire_wait: [Timer; Priority::LEVELS],
+    /// Age in microseconds of each priority's oldest waiter, as the distributor last published it
+    /// once per poll cycle; 0 while no live waiter waits at that priority.
+    pub acquire_oldest_wait_us: [Gauge; Priority::LEVELS],
     /// Bytes acquired (sum of fast-path grants and parked grants).
     pub acquire_bytes: Counter,
     /// Bytes returned to the pool via [`Pool::release`].
@@ -132,10 +139,25 @@ impl Counters {
             };
             registry.register_nominal(format!("{prefix}.acquire.parked"), priority)
         });
+        let acquire_wait = std::array::from_fn(|i| {
+            let priority = Priority::ALL[i];
+            registry
+                .register_nominal_timer(format!("{prefix}.acquire.wait"), format!("{priority:?}"))
+                .unsampled()
+        });
+        let acquire_oldest_wait_us = std::array::from_fn(|i| {
+            let priority = Priority::ALL[i];
+            registry.register_nominal_gauge(
+                format!("{prefix}.acquire.oldest_wait_us"),
+                format!("{priority:?}"),
+            )
+        });
 
         Self {
             acquire_fast_path: registry.register(format!("{prefix}.acquire.fast_path")),
             acquire_parked,
+            acquire_wait,
+            acquire_oldest_wait_us,
             acquire_bytes: registry.register_bytes(format!("{prefix}.acquire.bytes")),
             release_bytes: registry.register_bytes(format!("{prefix}.release.bytes")),
             release_calls: registry.register(format!("{prefix}.release.calls")),
