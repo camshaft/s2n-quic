@@ -1659,14 +1659,14 @@ fn on_packet_dispatch_error(
         } => {
             counters.rx_process_err_peer_lookup.add(1);
             if !control_out.is_empty() {
-                let response = endpoint::ups::Response {
+                let response = endpoint::ups::Response::unknown_path_secret(
                     dest_addr,
-                    packet: control_out,
-                    key: endpoint::ups::Key {
+                    control_out,
+                    endpoint::ups::Key {
                         credential_id: credentials.id,
                         sender_id,
                     },
-                };
+                );
                 let _ = ups_tx.send(Entry::new(response));
             }
             debug!(
@@ -1707,15 +1707,16 @@ fn on_packet_dispatch_error(
             if !control_out.is_empty() {
                 // In the endpoint `ups_tx` is a `ups::PendingSender`, which keeps one response
                 // in the queue for each credential and sender id, however many of the peer's
-                // packets on the key arrive before the pacer sends.
-                let response = endpoint::ups::Response {
+                // packets on the key arrive before the pacer sends, and doesn't count it against
+                // the limit of UnknownPathSecret responses.
+                let response = endpoint::ups::Response::stale_key(
                     dest_addr,
-                    packet: control_out,
-                    key: endpoint::ups::Key {
+                    control_out,
+                    endpoint::ups::Key {
                         credential_id: credentials.id,
                         sender_id,
                     },
-                };
+                );
                 let _ = ups_tx.send(Entry::new(response));
             }
             debug!(

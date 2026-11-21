@@ -493,6 +493,7 @@ pub fn setup_sim_endpoint(
         budgets,
         submission_shards,
         ups_rate,
+        ups_queue_limit: crate::endpoint::default_ups_queue_limit(ups_rate),
         ups_dedup_capacity: 1024,
         ups_dedup_window: core::time::Duration::from_secs(1),
         dead_peer_cooldown,

@@ -64,6 +64,7 @@ fn topology_snapshot_uses_dc_tester_layout() {
             budgets: endpoint::Budgets::default(),
             submission_shards: 128,
             ups_rate: Rate::new(0.001),
+            ups_queue_limit: crate::endpoint::default_ups_queue_limit(Rate::new(0.001)),
             ups_dedup_capacity: 1024,
             ups_dedup_window: core::time::Duration::from_secs(1),
             dead_peer_cooldown: endpoint::DEFAULT_DEAD_PEER_COOLDOWN,

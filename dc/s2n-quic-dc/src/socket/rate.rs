@@ -47,6 +47,12 @@ impl Rate {
         self.burst_nanos
     }
 
+    /// Returns the burst capacity in bytes: the bytes a sender sends at once, after an idle
+    /// period, before the rate paces it.
+    pub fn burst_bytes(&self) -> u64 {
+        (self.burst_nanos as f64 / self.nanos_per_byte).round() as u64
+    }
+
     /// Returns this rate with a burst allowance of `bytes` in place of the 64 KiB default. A
     /// test passes 0 so that its pacer waits after each send, the first one included.
     #[cfg(test)]
