@@ -35,18 +35,29 @@ macro_rules! static_bytevec_tag {
             }
         }
 
+        /// The bytes this handle counts against the tag: `increment` and `decrement` keep them
+        /// in step with the bytes its buffer holds, so a clone counts, and a drop releases, the
+        /// bytes the buffer holds now, and not the length it was tagged with.
         #[derive(Debug)]
         pub struct Handle(usize);
 
+        //= rendered/0012-runtime/07-buffers.md#DC-0012-052
+        //# A tagged buffer MUST count against its owner the bytes it holds, for as long as it holds
+        //# them.
         impl $($tagged_path)*::Handle for Handle {
             fn increment(&mut self, len: usize) {
                 if len > 0 {
+                    self.0 = self.0.saturating_add(len);
                     COUNT.fetch_add(len as _, core::sync::atomic::Ordering::Relaxed);
                 }
             }
 
             fn decrement(&mut self, len: usize) {
+                // A handle releases at most the bytes it counts, so the counter never falls below
+                // the bytes the other handles hold.
+                let len = len.min(self.0);
                 if len > 0 {
+                    self.0 -= len;
                     COUNT.fetch_sub(len as _, core::sync::atomic::Ordering::Relaxed);
                 }
             }
