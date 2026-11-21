@@ -179,6 +179,10 @@ mod tests {
         static_bytevec_tag!(crate::byte_vec::tagged);
     }
 
+    mod tag_c {
+        static_bytevec_tag!(crate::byte_vec::tagged);
+    }
+
     #[test]
     fn tag_test() {
         let chunk = ByteVec::from(b"hello!");
@@ -205,5 +209,40 @@ mod tests {
 
         assert_eq!(tag_a::Tag::current(), 0);
         assert_eq!(tag_b::Tag::current(), 0);
+    }
+
+    // A buffer tagged empty that grows by appends releases every byte it holds when it is
+    // dropped, and a clone counts the bytes the buffer holds now.
+    //= rendered/0012-runtime/07-buffers.md#DC-0012-052
+    //= type=test
+    //# A tagged buffer MUST count against its owner the bytes it holds, for as long as it holds
+    //# them.
+    #[test]
+    fn a_dropped_buffer_releases_the_bytes_appended_to_it() {
+        let mut staging: Tagged<tag_c::Tag> = Tagged::default();
+        assert_eq!(tag_c::Tag::current(), 0);
+
+        staging.append(&mut ByteVec::from(b"hello world"));
+        assert_eq!(tag_c::Tag::current(), 11);
+
+        let head = staging.split_to(5).unwrap();
+        assert_eq!(head.len(), 5);
+        assert_eq!(tag_c::Tag::current(), 6);
+
+        let copy = staging.clone();
+        assert_eq!(
+            tag_c::Tag::current(),
+            12,
+            "a clone counts the bytes the buffer holds now"
+        );
+        drop(copy);
+        assert_eq!(tag_c::Tag::current(), 6);
+
+        drop(staging);
+        assert_eq!(
+            tag_c::Tag::current(),
+            0,
+            "a drop releases the bytes appended since the tag"
+        );
     }
 }
