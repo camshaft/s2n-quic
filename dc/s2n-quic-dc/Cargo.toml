@@ -56,9 +56,13 @@ cfg-if = "1.0"
 crossbeam-utils = { version = "0.8", default-features = false }
 # Backs the `byte_vec` module (chunked byte buffer). The fork-local `byte_vec` newtypes wrap
 # etude-bytevec's types and carry the s2n_quic_core buffer Storage bridge; the heavy buffer logic
-# lives in etude. Pinned via `[patch.crates-io]` at the workspace root to the canonical camshaft
-# rev (byte-identical to the 0.1.0 release).
-etude-bytevec = "0.1.0"
+# lives in etude. The `=0.1.0` requirement pins the 0.1.0 release, so a build of this crate
+# outside this workspace, which doesn't read the workspace root's `[patch.crates-io]`, takes
+# 0.1.0 from crates.io. Inside this workspace, that root patch points it at the canonical
+# camshaft/etude rev, whose bytevec code is byte-identical to the 0.1.0 release. Cargo uses the
+# patch only while the crate's version at that rev is 0.1.0; otherwise it warns that the patch
+# was not used and builds the 0.1.0 release.
+etude-bytevec = "=0.1.0"
 libc = "0.2"
 num-rational = { version = "0.4", default-features = false }
 pin-project-lite = "0.2"
