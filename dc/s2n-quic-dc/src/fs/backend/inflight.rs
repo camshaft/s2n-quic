@@ -100,7 +100,7 @@ mod tests {
     use super::*;
     use crate::{
         fs::{
-            config::{CostModel, DeviceConfig, OpWeights, PoolMode},
+            config::{CapacityBounds, CostModel, DeviceConfig, OpWeights, PoolMode},
             device::Device,
             op::{IoBuf, IoKind, IoOp, IoStatus},
         },
@@ -123,6 +123,7 @@ mod tests {
                 cost_model: CostModel::Bytes,
                 op_weights: OpWeights::default(),
                 lane_count: 1,
+                capacity_bounds: CapacityBounds::unbounded(),
             },
             submission,
             crate::time::DefaultClock::default(),
@@ -151,6 +152,8 @@ mod tests {
             completion: None,
             status: IoStatus::Pending,
             flow_credits: 0,
+            grant_epoch: 0,
+            granted_at: None,
             ring_id: crate::fs::device::LocalRingId(0),
             user_data: 0,
             enqueued_at: None,

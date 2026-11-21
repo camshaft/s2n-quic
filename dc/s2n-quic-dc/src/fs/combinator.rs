@@ -26,6 +26,7 @@ use crate::{
     intrusive::Entry,
     time::DefaultClock,
 };
+use core::time::Duration;
 
 /// Budget per poll cycle for the pipeline tasks — how many ops a task processes before yielding.
 pub(crate) const DRAIN_BUDGET: usize = 1024;
@@ -61,8 +62,10 @@ pub fn complete(mut op: Entry<IoOp>) {
     }
     // Sojourn: the end-to-end submit→complete latency. `enqueued_at` is stamped at admission; a
     // missing stamp (synthetic op) just skips the sample.
+    //
+    // One read of the clock serves both the sojourn sample and the completion time below.
+    let now = DefaultClock::default().now();
     if let Some(enqueued_at) = op.enqueued_at {
-        let now = DefaultClock::default().now();
         dev.sojourn_us
             .record_value(now.nanos_since(enqueued_at) / 1_000);
     }
@@ -76,6 +79,29 @@ pub fn complete(mut op: Entry<IoOp>) {
     // 2. Release the borrowed credit back to the op's own device pool — exactly once. The op carries
     //    the `Arc<Device>`, so this needs no table lookup. (See the load-bearing ordering note above:
     //    this MUST happen before step 3.)
+    //
+    //    The pool's capacity adapts first: a would-block answer may lower it, and a clean
+    //    completion counts toward the run of clean completions that raises it.
+    if op.flow_credits > 0 {
+        let pool = op.device.pool_for(kind);
+        match op.status {
+            IoStatus::Failed(std::io::ErrorKind::WouldBlock) => {
+                pool.on_would_block(op.grant_epoch);
+            }
+            IoStatus::Done(_) => {
+                // The time from the op's grant to this completion, which the pool compares
+                // across its runs of clean completions.
+                let time = match op.granted_at {
+                    Some(granted_at) => now.nanos_since(granted_at),
+                    None => 0,
+                };
+                let time = Duration::from_nanos(time);
+                let (cost, epoch) = (op.flow_credits, op.grant_epoch);
+                pool.on_clean_completion(cost, epoch, time);
+            }
+            _ => {}
+        }
+    }
     op.release_credits();
 
     // 3. Route the op to its submitter. Take the completion sender out of the op so the op (with its

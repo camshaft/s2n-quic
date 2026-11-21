@@ -157,12 +157,14 @@ impl DeviceRegistry {
     /// `label` is diagnostics only — it prefixes the device's credit gauges (`fs.credit.{label}.*`)
     /// and appears in logs. Everything that crosses to the registrar is `Send` (the submission
     /// receiver, the lane count, the `Arc<Pool>`s) — never a `!Send` future or lane. Returns
-    /// `BrokenPipe` only if the registry has been torn down (registration channel closed).
+    /// `BrokenPipe` if the registry has been torn down (registration channel closed), and
+    /// `InvalidInput` if a capacity bound of `cfg` is below the capacity it configures.
     pub fn register_device(
         &self,
         label: impl Into<Arc<str>>,
         cfg: &DeviceConfig,
     ) -> std::io::Result<Arc<Device>> {
+        cfg.validate()?;
         let inner = &self.inner;
         let label = label.into();
         let index = inner.next_device_id.fetch_add(1, Ordering::Relaxed);
