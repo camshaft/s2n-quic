@@ -7,7 +7,7 @@ use crate::{
         self,
         combinator::{
             AckProcessor, Assembler, AssemblerCounters, BatchFramesByPathSecret,
-            CompletionDispatcher, FrameBatch, PathSecretMapEntry, PickTwo,
+            CompletionDispatcher, FrameBatch, PathSecretMapEntry, PickTwo, StreamPriorityLane,
         },
         dispatch,
         frame::{self, Frame, Priority, PriorityStorage, SubmissionReceiver},
@@ -68,6 +68,9 @@ mod tests;
 /// - Input arrives through `frame_rx` as submitted frames.
 /// - Output is delivered to `worker_senders` as [`Entry<FrameBatch>`] values.
 /// - Frames from different priority classes are never merged into the same batch.
+/// - Within each priority class's lane, frames leave highest stream priority first and in
+///   arrival order within a stream priority ([`StreamPriorityLane`]), so a higher-priority
+///   stream's frames don't wait behind a backlog of lower-priority frames in front of the pacer.
 /// - The spawned tasks are the only side effect; callers do not receive a handle back and must
 ///   keep the underlying executor running for progress.
 /// - `overall_send_rate` and `budgets` bound how aggressively work is drained once the tasks are
@@ -138,7 +141,10 @@ pub fn frame_dispatch<S, Clk>(
                     .receiver("task.frame_dispatch")
                     .with_description("Frame dispatch drains per-lane queues")
                     .with_function("endpoint::tasks::frame_dispatch");
-                counter::GaugedQueueReceiver::new(rx.into_list_receiver(), receiver)
+                counter::GaugedQueueReceiver::new(
+                    StreamPriorityLane::new(rx.into_list_receiver()),
+                    receiver,
+                )
             })
             .collect();
         let rx = PriorityRx::new(priority_batch_rxs);

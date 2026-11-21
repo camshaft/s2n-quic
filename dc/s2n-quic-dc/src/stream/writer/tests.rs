@@ -3832,6 +3832,53 @@ fn priority_getter_reflects_set_priority() {
     assert_eq!(writer.priority(), crate::credit::Priority::High);
 }
 
+/// A server writer never sends init frames, so the wire format never carries its priority. Each
+/// frame's header still carries it, for the send pipeline to order the frame by.
+#[test]
+fn non_init_frames_carry_the_writer_priority() {
+    sim(|| {
+        let (mut writer, mut pusher) = PairBuilder::server()
+            .with_priority(crate::credit::Priority::Low)
+            .build();
+
+        async move {
+            let frames = pusher.recv_frames_until_fin().await;
+            let mut data_frames = 0;
+            for frame in frames.iter() {
+                let (dest_acceptor_id, priority) = match frame.header {
+                    Header::QueueData {
+                        dest_acceptor_id,
+                        priority,
+                        ..
+                    }
+                    | Header::QueueMsg {
+                        dest_acceptor_id,
+                        priority,
+                        ..
+                    } => (dest_acceptor_id, priority),
+                    _ => continue,
+                };
+                assert!(dest_acceptor_id.is_none(), "a server writer doesn't send init frames");
+                assert_eq!(priority, crate::credit::Priority::Low);
+                assert_eq!(frame.stream_priority(), crate::credit::Priority::Low);
+                data_frames += 1;
+            }
+            assert!(data_frames > 0, "the writer must send at least one data frame");
+        }
+        .primary()
+        .spawn();
+
+        async move {
+            let mut payload = Data::new(4096);
+            writer
+                .write_all_from_fin(&mut payload)
+                .await
+                .expect("server write");
+        }
+        .spawn();
+    });
+}
+
 /// Inline `WakerSink` that wakes every batched waker immediately. Mirrors the production sink's
 /// contract: after `append_wakers` returns, the batch must be empty.
 struct TestWakerSink;

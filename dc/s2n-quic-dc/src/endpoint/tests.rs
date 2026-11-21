@@ -28,6 +28,7 @@ pub mod bach_handshake;
 pub mod deterministic;
 pub mod fair_share;
 pub mod half_close;
+pub mod send_priority;
 pub mod unidirectional;
 
 #[test]

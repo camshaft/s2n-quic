@@ -355,7 +355,9 @@ struct Inner {
     metrics: Arc<WriterMetrics>,
     /// Priority tier this writer acquires credits at. Stable over the writer's
     /// lifetime; mutated only via `set_priority` (future acquires only — already
-    /// parked acquires retain the priority they were parked under).
+    /// parked acquires retain the priority they were parked under). Every data and message
+    /// frame the writer builds carries it, and the send pipeline orders this stream's queued
+    /// frames by it.
     priority: crate::credit::Priority,
     /// Endpoint-shared send credit pool. Cloned at construction so the writer's
     /// `Slot` (offset 0 of `WriterAlloc`) can stay registered with this pool.
@@ -527,6 +529,9 @@ impl Writer {
     /// acquires keep the priority they were parked under (the slot is linked
     /// in that tier's wait list and cannot be migrated without racing the
     /// distributor).
+    ///
+    /// Frames built after the call carry the new priority, so the send pipeline orders them by
+    /// it; frames already submitted keep the priority they were built with.
     #[inline]
     pub fn set_priority(&mut self, priority: crate::credit::Priority) {
         self.0.priority = priority;
@@ -873,17 +878,14 @@ impl Inner {
         }
     }
 
-    /// Priority field to encode on the next outgoing frame. Init frames (those carrying
-    /// `dest_acceptor_id`) emit the writer's actual priority; non-init frames emit the default
-    /// because the wire format only encodes priority when `dest_acceptor_id.is_some()`. Mirrors
-    /// `Header::canonicalize_for_wire` so production code never produces a non-canonical header.
+    /// Priority to put on the next outgoing data or message frame: the writer's own, on every
+    /// frame. The send pipeline orders queued frames by it, so this stream's frames go ahead of
+    /// the queued frames of lower-priority streams. The wire format encodes it only on init
+    /// frames (those carrying `dest_acceptor_id`), so on a non-init frame it stays local to this
+    /// endpoint, and the peer decodes the default.
     #[inline]
-    fn wire_priority(&self) -> crate::credit::Priority {
-        if self.dest_acceptor_id().is_some() {
-            self.priority
-        } else {
-            crate::credit::Priority::default()
-        }
+    fn header_priority(&self) -> crate::credit::Priority {
+        self.priority
     }
 }
 
@@ -1379,7 +1381,7 @@ impl Inner {
                 is_fin: true,
                 blocked: false,
                 dest_acceptor_id: self.dest_acceptor_id(),
-                priority: self.wire_priority(),
+                priority: self.header_priority(),
             },
             payload: ByteVec::new(),
             path_secret_entry: self.path_secret_entry.clone(),
@@ -1634,7 +1636,7 @@ impl Inner {
                 is_fin: actual_fin,
                 blocked: false,
                 dest_acceptor_id: Some(self.acceptor_id),
-                priority: self.wire_priority(),
+                priority: self.header_priority(),
             },
             payload,
             path_secret_entry: self.path_secret_entry.clone(),
@@ -1972,7 +1974,7 @@ impl Inner {
                     // A FIN means we sent everything we have, so we are not blocked.
                     blocked: blocked && !include_fin,
                     dest_acceptor_id: self.dest_acceptor_id(),
-                    priority: self.wire_priority(),
+                    priority: self.header_priority(),
                 },
                 payload,
                 path_secret_entry: self.path_secret_entry.clone(),
@@ -2250,7 +2252,7 @@ impl Inner {
                         // across a segment's chunks is harmless.
                         blocked: blocked && !segment_is_fin,
                         dest_acceptor_id: self.dest_acceptor_id(),
-                        priority: self.wire_priority(),
+                        priority: self.header_priority(),
                     },
                     payload,
                     path_secret_entry: self.path_secret_entry.clone(),

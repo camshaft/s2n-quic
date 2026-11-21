@@ -128,6 +128,180 @@ fn pending_frames_append_queue_uses_supplied_batch_cost_exactly() {
     assert_eq!(pending.byte_cost(), 0);
 }
 
+/// A data frame of a stream at `priority`, told apart from the others by `offset`; an init frame
+/// where `init` is set.
+fn make_stream_frame(
+    priority: crate::credit::Priority,
+    offset: u8,
+    init: bool,
+) -> crate::intrusive::Entry<Frame> {
+    Frame {
+        header: Header::QueueData {
+            queue_pair: QueuePair {
+                source_queue_id: s2n_quic_core::varint::VarInt::from_u8(1),
+                dest_queue_id: s2n_quic_core::varint::VarInt::from_u8(2),
+            },
+            binding_id: s2n_quic_core::varint::VarInt::from_u8(3),
+            offset: s2n_quic_core::varint::VarInt::from_u8(offset),
+            largest_offset: s2n_quic_core::varint::VarInt::from_u8(offset),
+            is_fin: false,
+            blocked: false,
+            dest_acceptor_id: init.then_some(s2n_quic_core::varint::VarInt::from_u8(7)),
+            priority,
+        },
+        payload: ByteVec::new(),
+        path_secret_entry: make_path_secret_entry(),
+        completion: None,
+        status: TransmissionStatus::Pending,
+        ttl: DEFAULT_TTL,
+        enqueued_at: None,
+        flow_credits: 0,
+    }
+    .into()
+}
+
+fn make_control_frame() -> crate::intrusive::Entry<Frame> {
+    Frame {
+        header: Header::QueueControl {
+            queue_pair: QueuePair {
+                source_queue_id: s2n_quic_core::varint::VarInt::from_u8(1),
+                dest_queue_id: s2n_quic_core::varint::VarInt::from_u8(2),
+            },
+            binding_id: s2n_quic_core::varint::VarInt::from_u8(3),
+        },
+        payload: ByteVec::new(),
+        path_secret_entry: make_path_secret_entry(),
+        completion: None,
+        status: TransmissionStatus::Pending,
+        ttl: DEFAULT_TTL,
+        enqueued_at: None,
+        flow_credits: 0,
+    }
+    .into()
+}
+
+/// The stream priority and offset of a data frame, and whether it is an init frame.
+fn describe(frame: &Frame) -> (crate::credit::Priority, u64, bool) {
+    match frame.header {
+        Header::QueueData {
+            offset,
+            dest_acceptor_id,
+            priority,
+            ..
+        } => (priority, offset.as_u64(), dest_acceptor_id.is_some()),
+        other => panic!("expected a data frame, got {other:?}"),
+    }
+}
+
+#[test]
+fn pending_frames_pop_higher_stream_priority_first() {
+    use crate::credit::Priority::{Background, Highest, Medium};
+
+    let mut pending = make_pending_frames();
+    for (priority, offset) in [
+        (Background, 0),
+        (Medium, 1),
+        (Background, 2),
+        (Highest, 3),
+        (Medium, 4),
+        (Highest, 5),
+    ] {
+        pending.push_back(make_stream_frame(priority, offset, false));
+    }
+    assert_eq!(pending.len(), 6);
+    assert_eq!(pending.front_level(), Some(Highest.as_u8() as usize));
+
+    // A frame that doesn't fit the segment goes back to the front of its own priority.
+    let first = pending.pop_front().expect("frame should be present");
+    assert_eq!(describe(&first), (Highest, 3, false));
+    pending.push_front(first);
+
+    let order: Vec<_> = core::iter::from_fn(|| pending.pop_front())
+        .map(|frame| describe(&frame))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (Highest, 3, false),
+            (Highest, 5, false),
+            (Medium, 1, false),
+            (Medium, 4, false),
+            (Background, 0, false),
+            (Background, 2, false),
+        ]
+    );
+    assert!(pending.is_empty());
+    assert_eq!(pending.byte_cost(), 0);
+    assert_eq!(pending.front_level(), None);
+}
+
+#[test]
+fn pending_frames_append_queue_orders_by_stream_priority() {
+    use crate::credit::Priority::{Background, Highest};
+
+    let mut pending = make_pending_frames();
+    pending.push_back(make_stream_frame(Background, 0, false));
+
+    let mut queue = crate::intrusive::Queue::new();
+    let mut batch_cost = 0;
+    for (priority, offset) in [(Background, 1), (Highest, 2), (Highest, 3)] {
+        let frame = make_stream_frame(priority, offset, false);
+        batch_cost += frame.byte_cost();
+        queue.push_back(frame);
+    }
+    pending.append_queue(queue, batch_cost);
+    assert_eq!(pending.len(), 4);
+
+    let order: Vec<_> = core::iter::from_fn(|| pending.pop_front())
+        .map(|frame| describe(&frame))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (Highest, 2, false),
+            (Highest, 3, false),
+            (Background, 0, false),
+            (Background, 1, false),
+        ]
+    );
+}
+
+/// The per-peer send context sends resets and control frames first, then init and data frames
+/// by the priority of the stream that sent them, init ahead of data at one priority.
+#[test]
+fn pop_pending_orders_init_and_data_by_stream_priority() {
+    use crate::credit::Priority::{Background, High, Highest};
+
+    let registry = Registry::default();
+    let (mut ctx, _entry) = make_context_with_sender_slots(1, &registry);
+    // In arrival order: a lower-priority stream's init and data frames, then frames of
+    // higher-priority streams, then a control frame.
+    ctx.push_back_frame(make_stream_frame(Background, 0, true));
+    ctx.push_back_frame(make_stream_frame(Background, 1, false));
+    ctx.push_back_frame(make_stream_frame(Highest, 2, false));
+    ctx.push_back_frame(make_stream_frame(High, 3, true));
+    ctx.push_back_frame(make_stream_frame(High, 4, false));
+    ctx.push_back_frame(make_control_frame());
+
+    let control = ctx.pop_pending().expect("control frame should be present");
+    assert!(matches!(control.header, Header::QueueControl { .. }));
+
+    let order: Vec<_> = core::iter::from_fn(|| ctx.pop_pending())
+        .map(|frame| describe(&frame))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (Highest, 2, false),
+            (High, 3, true),
+            (High, 4, false),
+            (Background, 0, true),
+            (Background, 1, false),
+        ]
+    );
+    assert!(!ctx.has_pending());
+}
+
 // ── ProbeState transitions ────────────────────────────────────────────────────
 
 #[test]

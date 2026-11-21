@@ -53,8 +53,13 @@ mod tests;
 /// This struct ensures that `byte_cost` always mirrors the true accumulated
 /// [`ByteCost`] of every frame in the queue. All mutations (push/pop) go through
 /// this type, so callers cannot accidentally desync the counter.
+///
+/// Frames wait in one FIFO per [`crate::credit::Priority`] of the stream that sent them
+/// ([`Frame::stream_priority`]), and [`pop_front`](Self::pop_front) takes the oldest frame of
+/// the highest priority that holds one: a frame of a higher-priority stream goes ahead of every
+/// queued frame of a lower-priority stream, and frames of one priority keep their order.
 pub(crate) struct PendingFrames {
-    queue: Queue<Frame>,
+    levels: [Queue<Frame>; crate::credit::Priority::LEVELS],
     /// Accumulated wire cost of all frames currently in the queue.
     ///
     /// Wire cost = payload bytes + header metadata bytes (type tag + routing
@@ -67,13 +72,19 @@ impl PendingFrames {
     #[inline]
     pub fn new(gauge: QueueGauge) -> Self {
         Self {
-            queue: Queue::new(),
+            levels: core::array::from_fn(|_| Queue::new()),
             byte_cost: 0,
             gauge,
         }
     }
 
-    /// Push a frame onto the back of the queue, updating the cost counter.
+    /// The index of `frame`'s queue: 0 for the highest stream priority.
+    #[inline]
+    fn level(frame: &Frame) -> usize {
+        frame.stream_priority().as_u8() as usize
+    }
+
+    /// Push a frame onto the back of its priority's queue, updating the cost counter.
     #[inline]
     pub fn push_back(&mut self, frame: intrusive::Entry<Frame>) {
         debug_assert!(
@@ -82,10 +93,11 @@ impl PendingFrames {
         );
         self.byte_cost += frame.byte_cost() as usize;
         self.gauge.enqueue(1);
-        self.queue.push_back(frame);
+        let level = Self::level(&frame);
+        self.levels[level].push_back(frame);
     }
 
-    /// Push a frame onto the front of the queue, updating the cost counter.
+    /// Push a frame onto the front of its priority's queue, updating the cost counter.
     ///
     /// Only call this with a frame that was just removed via [`pop_front`] — for
     /// example when a frame does not fit in the current segment and must be
@@ -99,13 +111,16 @@ impl PendingFrames {
         );
         self.byte_cost += frame.byte_cost() as usize;
         self.gauge.enqueue(1);
-        self.queue.push_front(frame);
+        let level = Self::level(&frame);
+        self.levels[level].push_front(frame);
     }
 
-    /// Remove the next frame from the front of the queue, updating the cost counter.
+    /// Remove the next frame, the oldest of the highest stream priority, updating the cost
+    /// counter.
     #[inline]
     pub fn pop_front(&mut self) -> Option<intrusive::Entry<Frame>> {
-        let frame = self.queue.pop_front()?;
+        let mut levels = self.levels.iter_mut();
+        let frame = levels.find_map(|level| level.pop_front())?;
         let cost = frame.byte_cost() as usize;
         debug_assert!(
             self.byte_cost >= cost,
@@ -118,16 +133,23 @@ impl PendingFrames {
         Some(frame)
     }
 
+    /// The stream priority, as a queue index (0 for the highest), of the frame
+    /// [`pop_front`](Self::pop_front) returns next; `None` while the queue is empty.
+    #[inline]
+    pub fn front_level(&self) -> Option<usize> {
+        self.levels.iter().position(|level| !level.is_empty())
+    }
+
     /// Returns the number of frames in the queue.
     #[inline]
     pub fn len(&self) -> usize {
-        self.queue.len()
+        self.levels.iter().map(|level| level.len()).sum()
     }
 
     /// Returns `true` if the queue contains no frames.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.levels.iter().all(|level| level.is_empty())
     }
 
     /// Returns the accumulated wire cost of all frames currently in the queue.
@@ -136,7 +158,8 @@ impl PendingFrames {
         self.byte_cost
     }
 
-    /// Append frames from a pre-split queue in O(1).
+    /// Append frames from a pre-split queue, each to the back of its priority's queue in the
+    /// order given.
     ///
     /// `byte_cost` is the pre-computed wire cost for all frames in `queue`, including
     /// per-packet overhead. Callers should use the values returned by
@@ -146,7 +169,10 @@ impl PendingFrames {
         let count = queue.len() as u64;
         self.byte_cost += byte_cost as usize;
         self.gauge.enqueue(count);
-        self.queue.append(&mut queue);
+        while let Some(frame) = queue.pop_front() {
+            let level = Self::level(&frame);
+            self.levels[level].push_back(frame);
+        }
     }
 }
 
@@ -943,15 +969,33 @@ impl Context {
         interest
     }
 
-    /// Pop the next pending frame, draining from highest priority first.
+    /// Pop the next pending frame.
+    ///
+    /// Resets go first, then control frames. Init and data frames go by the priority of the
+    /// stream that sent them, highest first; at one stream priority, init frames go ahead of
+    /// data so that new streams come up. Frames of one class and stream priority keep their
+    /// order.
     #[inline]
     pub fn pop_pending(&mut self) -> Option<intrusive::Entry<Frame>> {
-        for queue in &mut self.queues {
+        // Init and data are the last two classes, which the stream priority orders together.
+        let init = Priority::QueueInit.as_index();
+        let data = Priority::QueueData.as_index();
+
+        for queue in &mut self.queues[..init] {
             if let Some(frame) = queue.pop_front() {
                 return Some(frame);
             }
         }
-        None
+
+        let init_level = self.queues[init].front_level();
+        let data_level = self.queues[data].front_level();
+        let next = match (init_level, data_level) {
+            (Some(init_level), Some(data_level)) if data_level < init_level => data,
+            (Some(_), _) => init,
+            (None, Some(_)) => data,
+            (None, None) => return None,
+        };
+        self.queues[next].pop_front()
     }
 
     /// Push a frame back to the front of whichever priority queue it belongs to.
