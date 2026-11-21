@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/07-ordered-reads.md#DC-0011-071"
+
+[[spec]]
+level = "MUST"
+quote = "An ordered read MUST raise its window bound when it waits on a front block whose read hasn't completed while its window holds as many blocks as the bound, every device block of its window has been submitted to its device, and no device has answered a read of the ordered read with would-block since the bound's last change: to twice its value where the read hasn't lowered the bound yet, and by one block where it has."

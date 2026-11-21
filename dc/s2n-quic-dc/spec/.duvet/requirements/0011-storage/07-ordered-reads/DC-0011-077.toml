@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/07-ordered-reads.md#DC-0011-077"
+
+[[spec]]
+level = "MUST"
+quote = "An ordered read MUST change its window bound only as DC-0011-071 and DC-0011-072 require."

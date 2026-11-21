@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/08-observability.md#DC-0011-078"
+
+[[spec]]
+level = "MUST"
+quote = "Each ordered read MUST report its current window bound."
