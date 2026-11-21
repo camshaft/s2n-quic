@@ -104,6 +104,8 @@ s2n-codec = { path = "../../common/s2n-codec", features = ["testing"] }
 s2n-quic = { path = "../../quic/s2n-quic", features = ["unstable-provider-io-testing"] }
 s2n-quic-core = { path = "../../quic/s2n-quic-core", features = ["state-tracing", "testing"] }
 s2n-quic-platform = { path = "../../quic/s2n-quic-platform", features = ["testing"] }
+# The JSON lines of the cross-host test in tests/cross_host.rs.
+serde_json = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
