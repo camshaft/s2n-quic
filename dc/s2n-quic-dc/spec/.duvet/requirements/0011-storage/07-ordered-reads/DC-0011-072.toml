@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/07-ordered-reads.md#DC-0011-072"
+
+[[spec]]
+level = "MUST"
+quote = "On a would-block answer to a read of one of its blocks, an ordered read MUST lower its window bound to half its value, rounded up."

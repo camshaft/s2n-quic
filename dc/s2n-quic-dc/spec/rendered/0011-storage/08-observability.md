@@ -1,6 +1,6 @@
 ## Load and observability {#observability}
 
-Each device reports its load as committed credit and the current capacity of each of its pools. It counts operations and bytes for each kind of operation, and counts failures, rejections and cancellations for the device as a whole.
+Each device reports its load as committed credit and the current capacity of each of its pools. It counts operations and bytes for each kind of operation, and counts failures, rejections and cancellations for the device as a whole. Each ordered read reports its current window bound.
 
 ### DC-0011-042 {#DC-0011-042}
 
@@ -17,3 +17,7 @@ The device MUST count each operation that fails, each operation it rejects at ad
 ### DC-0011-053 {#DC-0011-053}
 
 The device MUST report the current capacity of each of its pools.
+
+### DC-0011-078 {#DC-0011-078}
+
+Each ordered read MUST report its current window bound.

@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/07-ordered-reads.md#DC-0011-076"
+
+[[spec]]
+level = "MUST"
+quote = "An ordered read MUST take the next block from the sequence while its window holds fewer blocks than its window bound and the sequence holds a block it hasn't taken."

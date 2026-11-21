@@ -3,7 +3,7 @@ anchor = "ordered-reads"
 title = "Ordered reads across devices"
 problem = "A stored object can be split into blocks spread over several devices, and some of its blocks can already sit in memory. A reader wants the object's bytes in order, while the reads of its blocks finish in any order."
 motivation = "Submitting each device's blocks independently keeps one saturated device from holding up reads on idle devices, and a reorder window delivers the bytes in order with bounded memory."
-prose = "An ordered read takes a sequence of blocks. A block is either a range of a file on a device, with a number of bytes to trim from its head and from its tail, or bytes already in memory. The ordered read reads the device blocks, buffered or direct, and delivers each block's bytes in the order of the sequence. Its window holds every block it has taken from the sequence and not yet delivered: blocks waiting for credit, blocks being read, and blocks read and waiting for their turn."
+prose = "An ordered read takes a sequence of blocks. A block is either a range of a file on a device, with a number of bytes to trim from its head and from its tail, or bytes already in memory. The ordered read reads the device blocks, buffered or direct, and delivers each block's bytes in the order of the sequence. Its window holds every block it has taken from the sequence and not yet delivered: blocks waiting for credit, blocks being read, and blocks read and waiting for their turn. The window bound is the number of blocks the window can hold. It starts at one block, or at a starting value the read's configuration sets, and changes at run time from the devices' answers to the read: it doubles when the read waits on a front block whose read hasn't completed while the window is full and every device block of the window has been submitted, and it halves, rounded up, at a would-block answer to one of the read's reads. The bound's last change is its latest raise or decrease, or the start of the read where the bound hasn't changed yet, and its last decrease is its latest decrease, or the start of the read where it hasn't been lowered yet. A read's configuration doesn't set an upper bound on the window bound: only the devices' answers stop it from rising. Blocks past the bound stay in the sequence until the window has room for them."
 
 [[requirement]]
 id = "DC-0011-036"
@@ -52,3 +52,67 @@ polarity = "required"
 binds_to = "system"
 statement = "An ordered read MUST bound the number of blocks it has taken from the sequence and not yet delivered."
 rationale = "Credit returns when a read completes, not when it is delivered, so a slow reader would otherwise pin unbounded memory."
+
+[[requirement]]
+id = "DC-0011-070"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "An ordered read MUST start its window bound at one block, or at the starting value its configuration sets where it sets one."
+rationale = "A bound that starts small and grows from the devices' answers finds how many blocks the read keeps moving without a size chosen by hand, and a configured starting value only lets a read that is known to run deep reach its depth sooner."
+
+[[requirement]]
+id = "DC-0011-071"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "An ordered read MUST double its window bound when it waits on a front block whose read hasn't completed while its window holds as many blocks as the bound, every device block of its window has been submitted to its device, and no device has answered a read of the ordered read with would-block since the bound's last change."
+rationale = "Credit returns when a read completes, not when it is delivered (DC-0011-041), so the window, and not the devices' credit, holds back the read's submissions only when every device block of a full window is already submitted. A front block whose read hasn't completed shows that the reader waits on the devices and not the devices on the reader, so a larger window keeps more reads submitted and not yet completed. A block that still waits for credit, or a front block that has completed and waits for the reader, shows that more blocks would only pin memory, so neither raises the bound. A would-block answer since the last change shows that the devices hold as much of the read's work as they take, so it holds the bound until its next change."
+
+[[requirement]]
+id = "DC-0011-072"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "On a would-block answer to a read of one of its blocks, an ordered read MUST lower its window bound to half its value, rounded up."
+rationale = "A would-block answer, such as EAGAIN, shows that a device holds more of the read's work than it can take, as it does for a pool's capacity (DC-0011-046), so halving the bound backs the read off at once. Rounding up keeps the bound at one block or more, so the read always has room for its front block and stays live."
+
+[[requirement]]
+id = "DC-0011-073"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "An ordered read MUST NOT lower its window bound for a would-block answer to a read that it submitted before the bound's last decrease."
+rationale = "Reads submitted before a decrease were taken under the larger bound, so their would-block answers report the overload that decrease already answered, and counting each one would collapse the bound, as DC-0011-047 says of a pool's capacity."
+
+[[requirement]]
+id = "DC-0011-074"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "An ordered read MUST NOT cancel or drop a block it has taken from the sequence when it lowers its window bound."
+rationale = "A block in the window already holds credit, a submitted read or read bytes, so dropping it would waste that work and leave a gap in the ordered stream; the window shrinks to the bound as it delivers its front instead."
+
+[[requirement]]
+id = "DC-0011-075"
+level = "MUST"
+polarity = "forbidden"
+binds_to = "system"
+statement = "An ordered read MUST NOT take a block from the sequence while its window holds as many blocks as its window bound, or more."
+rationale = "A lowered bound takes effect by holding new blocks back until delivery brings the window under it, which bounds the memory the read pins without touching the blocks it holds."
+
+[[requirement]]
+id = "DC-0011-076"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "An ordered read MUST take the next block from the sequence while its window holds fewer blocks than its window bound and the sequence holds a block it hasn't taken."
+rationale = "The blocks past the bound wait in the sequence, not in memory, and the read takes each one as delivering the front makes room, so the reader receives the whole object."
+
+[[requirement]]
+id = "DC-0011-077"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "An ordered read MUST change its window bound only as DC-0011-071 and DC-0011-072 require."
+rationale = "Only the devices' answers move the bound, so a configured value is where the bound starts and never an upper bound, and the bound follows the devices rather than a size chosen by hand."

@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/07-ordered-reads.md#DC-0011-073"
+
+[[spec]]
+level = "MUST"
+quote = "An ordered read MUST NOT lower its window bound for a would-block answer to a read that it submitted before the bound's last decrease."

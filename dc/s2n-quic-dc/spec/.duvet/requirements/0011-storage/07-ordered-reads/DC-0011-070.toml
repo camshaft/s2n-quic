@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/07-ordered-reads.md#DC-0011-070"
+
+[[spec]]
+level = "MUST"
+quote = "An ordered read MUST start its window bound at one block, or at the starting value its configuration sets where it sets one."

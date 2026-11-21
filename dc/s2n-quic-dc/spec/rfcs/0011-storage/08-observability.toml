@@ -3,7 +3,7 @@ anchor = "observability"
 title = "Load and observability"
 problem = "Placing new work across drives needs a measure of how loaded each device is, and operators need to see each device's traffic, failures and rejections."
 motivation = "Committed credit counts both running and waiting work, so it rises as a device falls behind, and counters kept for each device let an operator tell one device's trouble from another's."
-prose = "Each device reports its load as committed credit and the current capacity of each of its pools. It counts operations and bytes for each kind of operation, and counts failures, rejections and cancellations for the device as a whole."
+prose = "Each device reports its load as committed credit and the current capacity of each of its pools. It counts operations and bytes for each kind of operation, and counts failures, rejections and cancellations for the device as a whole. Each ordered read reports its current window bound."
 
 [[requirement]]
 id = "DC-0011-042"
@@ -36,3 +36,11 @@ polarity = "required"
 binds_to = "system"
 statement = "The device MUST report the current capacity of each of its pools."
 rationale = "The capacity moves with the device's answers, so an operator needs it to see how much work the device takes at once and to read the load against it."
+
+[[requirement]]
+id = "DC-0011-078"
+level = "MUST"
+polarity = "required"
+binds_to = "system"
+statement = "Each ordered read MUST report its current window bound."
+rationale = "The bound moves with the devices' answers, so an operator needs it to see how many blocks a read keeps in its window and to tell a read held back by its devices from one held back by its reader."

@@ -1,0 +1,5 @@
+target = "rendered/0011-storage/07-ordered-reads.md#DC-0011-074"
+
+[[spec]]
+level = "MUST"
+quote = "An ordered read MUST NOT cancel or drop a block it has taken from the sequence when it lowers its window bound."
