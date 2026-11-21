@@ -384,9 +384,7 @@ mod tests {
         );
 
         // `connect` gets the cached entry back, evicts it, drops the handshake queue's hold on
-        // the first handshake's success and handshakes again. Without that drop, the second
-        // handshake would return the held success while the map has no entry for the peer, and
-        // this connect would fail with "handshake failed to exchange credentials".
+        // the first handshake's success and handshakes again.
         let stream = client
             .connect(server_addr, acceptor_id, Priority::default())
             .await
