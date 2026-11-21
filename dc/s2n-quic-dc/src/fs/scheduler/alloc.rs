@@ -252,7 +252,19 @@ impl Drop for SubmitterAlloc {
     fn drop(&mut self) {
         // Mirror WriterAllocPtr::drop: `abandon`'s CAS is the single source of truth for ownership.
         let slot = unsafe { &(*self.0.as_ptr()).slot };
-        match unsafe { slot.abandon() } {
+        // A linked slot abandons through its pool, which ends an adaptive pool's wait where the
+        // abandon wins. Clone the pool's handle first: once the abandon wins, the distributor may
+        // free the slot and the state that holds the other handle.
+        let waiting_pool = if slot.is_linked() {
+            unsafe { (*self.0.as_ptr()).state.pool.clone() }
+        } else {
+            None
+        };
+        let result = match &waiting_pool {
+            Some(pool) => unsafe { pool.abandon(self.slot_ptr()) },
+            None => unsafe { slot.abandon() },
+        };
+        match result {
             AbandonResult::Abandoned => {
                 // Slot was LINKED, now DEAD: the pool's pop walk calls `drop_alloc_inner`.
                 return;

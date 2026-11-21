@@ -3,8 +3,8 @@
 
 use crate::{
     credit::{
-        AbandonResult, Config, DeadSlotQueue, Distributor, GrantResult, Pool, Priority, Slot,
-        WakerSink,
+        AbandonResult, Config, Counters, DeadSlotQueue, Distributor, GrantResult, Pool, Priority,
+        Slot, WakerSink,
     },
     socket::channel::Budget,
 };
@@ -140,6 +140,18 @@ struct Harness {
 impl Harness {
     fn new(config: Config) -> Self {
         let pool = Arc::new(Pool::new(config));
+        let dist = Distributor::new(pool.clone());
+        Self {
+            pool,
+            dist,
+            dist_waker: Waker::from(Arc::new(NoopWake)),
+        }
+    }
+
+    /// A harness over an adaptive pool with no upper bound on its capacity.
+    fn adaptive(config: Config) -> Self {
+        let pool = Pool::with_counters_adaptive(config, Counters::default(), None);
+        let pool = Arc::new(pool);
         let dist = Distributor::new(pool.clone());
         Self {
             pool,
@@ -539,6 +551,160 @@ fn drop_while_linked() {
     h.distribute();
     assert_eq!(counter.wakeups(), 0);
     assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn an_abandoned_waiter_doesnt_hold_a_decrease() {
+    //= rendered/0011-storage/02-admission.md#DC-0011-046
+    //= type=test
+    //# On a would-block answer to an operation, the device MUST lower the capacity of the pool the
+    //# operation drew from to half its value, rounded up, or to the largest cost among the
+    //# operations waiting for that pool's credit where that cost is higher.
+    let _drop_guard = drop_count_guard();
+
+    let mut h = Harness::adaptive(cfg(64, 64));
+    let waker = Waker::from(Arc::new(WakeCounter::default()));
+    let holder = alloc_test_slot();
+    let a = alloc_test_slot();
+    let b = alloc_test_slot();
+
+    let r = unsafe { h.poll_acquire(holder, 64, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Ready(64)));
+    let r = unsafe { h.poll_acquire(a, 40, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Pending));
+    let r = unsafe { h.poll_acquire(b, 40, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Pending));
+    assert_eq!(h.pool.debug_waiting(), 2);
+
+    // A cancelled waiter stops counting among the waiting operations at its abandon, before the
+    // distributor reaps its slot.
+    assert_eq!(unsafe { h.pool.abandon(a) }, AbandonResult::Abandoned);
+    assert_eq!(h.pool.debug_waiting(), 1);
+
+    // The decrease stops at the cost of the waiter that is still waiting.
+    h.pool.on_would_block(h.pool.decrease_epoch());
+    h.distribute();
+    assert_eq!(h.pool.debug_capacity(), 40);
+    assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
+
+    // With every waiter cancelled, the next decrease halves the capacity.
+    assert_eq!(unsafe { h.pool.abandon(b) }, AbandonResult::Abandoned);
+    assert_eq!(h.pool.debug_waiting(), 0);
+    h.pool.on_would_block(h.pool.decrease_epoch());
+    h.distribute();
+    assert_eq!(h.pool.debug_capacity(), 20);
+    assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 2);
+    unsafe { free_test_slot(holder) };
+}
+
+#[test]
+fn the_reap_doesnt_end_an_abandoned_waiters_wait_again() {
+    //= rendered/0011-storage/02-admission.md#DC-0011-046
+    //= type=test
+    //# On a would-block answer to an operation, the device MUST lower the capacity of the pool the
+    //# operation drew from to half its value, rounded up, or to the largest cost among the
+    //# operations waiting for that pool's credit where that cost is higher.
+    let _drop_guard = drop_count_guard();
+
+    let mut h = Harness::adaptive(cfg(64, 64));
+    let waker = Waker::from(Arc::new(WakeCounter::default()));
+    let holder = alloc_test_slot();
+    let a = alloc_test_slot();
+    let c = alloc_test_slot();
+
+    let r = unsafe { h.poll_acquire(holder, 64, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Ready(64)));
+    let r = unsafe { h.poll_acquire(a, 40, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Pending));
+    let r = unsafe { h.poll_acquire(c, 40, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Pending));
+
+    assert_eq!(unsafe { h.pool.abandon(a) }, AbandonResult::Abandoned);
+    assert_eq!(h.pool.debug_waiting(), 1);
+
+    // The distributor reaps the cancelled slot and leaves the other waiter's wait as it is.
+    h.distribute();
+    assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(h.pool.debug_waiting(), 1);
+    h.pool.on_would_block(h.pool.decrease_epoch());
+    h.distribute();
+    assert_eq!(h.pool.debug_capacity(), 40);
+
+    assert_eq!(unsafe { h.pool.abandon(c) }, AbandonResult::Abandoned);
+    assert_eq!(h.pool.debug_waiting(), 0);
+    h.distribute();
+    assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 2);
+    unsafe { free_test_slot(holder) };
+}
+
+#[test]
+fn an_abandoned_waiter_doesnt_make_completions_clean() {
+    //= rendered/0011-storage/02-admission.md#DC-0011-049
+    //= type=test
+    //# After each run of clean completions from a pool, the device MUST raise that pool's capacity
+    //# by the cost of the operation whose completion ends the run, up to the upper bound the
+    //# device's configuration sets for the pool where it sets one.
+    let _drop_guard = drop_count_guard();
+
+    let mut h = Harness::adaptive(cfg(8, 8));
+    let waker = Waker::from(Arc::new(WakeCounter::default()));
+    let holder = alloc_test_slot();
+    let a = alloc_test_slot();
+
+    let r = unsafe { h.poll_acquire(holder, 8, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Ready(8)));
+    let r = unsafe { h.poll_acquire(a, 4, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Pending));
+    assert_eq!(h.pool.debug_waiting(), 1);
+
+    // With the only waiter cancelled, completions don't count toward a run that raises the
+    // capacity.
+    assert_eq!(unsafe { h.pool.abandon(a) }, AbandonResult::Abandoned);
+    h.pool.on_clean_completion(4);
+    h.pool.on_clean_completion(4);
+    h.distribute();
+    assert_eq!(h.pool.debug_capacity(), 8);
+    assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
+    unsafe { free_test_slot(holder) };
+}
+
+#[test]
+fn a_close_frees_an_abandoned_waiters_slot_once() {
+    //= rendered/0011-storage/02-admission.md#DC-0011-011
+    //= type=test
+    //# The device MUST return an operation's credit to the pool it came from exactly once, whether
+    //# the operation succeeds, fails or is cancelled.
+    //= rendered/0011-storage/02-admission.md#DC-0011-046
+    //= type=test
+    //# On a would-block answer to an operation, the device MUST lower the capacity of the pool the
+    //# operation drew from to half its value, rounded up, or to the largest cost among the
+    //# operations waiting for that pool's credit where that cost is higher.
+    let _drop_guard = drop_count_guard();
+
+    let h = Harness::adaptive(cfg(64, 64));
+    let counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(counter.clone());
+    let holder = alloc_test_slot();
+    let a = alloc_test_slot();
+
+    let r = unsafe { h.poll_acquire(holder, 64, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Ready(64)));
+    let r = unsafe { h.poll_acquire(a, 40, Priority::Medium, &waker) };
+    assert!(matches!(r, Poll::Pending));
+    assert_eq!(h.pool.debug_waiting(), 1);
+
+    // The cancel ends the waiter's wait and leaves its slot linked for the distributor to free.
+    assert_eq!(unsafe { h.pool.abandon(a) }, AbandonResult::Abandoned);
+    assert_eq!(h.pool.debug_waiting(), 0);
+    assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 0);
+
+    // A close without a distribution pass, while the harness still holds the pool, frees the
+    // cancelled slot once, doesn't wake it, and leaves the pool's count of waiters at 0.
+    drop(h.dist);
+    assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(h.pool.debug_waiting(), 0);
+    assert_eq!(counter.wakeups(), 0);
+    unsafe { free_test_slot(holder) };
 }
 
 #[test]
