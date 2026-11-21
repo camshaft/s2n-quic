@@ -357,6 +357,11 @@ struct Inner {
     /// lifetime; mutated only via `set_priority` (future acquires only — already
     /// parked acquires retain the priority they were parked under).
     priority: crate::credit::Priority,
+    /// Credit tier every opening frame of this stream carries: `priority` as it stood when the
+    /// first opening frame was encoded, `None` until then. The server binds the stream on
+    /// whichever opening frame arrives first, so each one carries this tier until the stream is
+    /// confirmed, while `set_priority` changes only the tier of later credit acquires.
+    opening_priority: Option<crate::credit::Priority>,
     /// Endpoint-shared send credit pool. Cloned at construction so the writer's
     /// `Slot` (offset 0 of `WriterAlloc`) can stay registered with this pool.
     send_credit_pool: crate::sync::Arc<crate::credit::Pool>,
@@ -457,6 +462,7 @@ impl Writer {
             clock,
             metrics,
             priority,
+            opening_priority: None,
             send_credit_pool,
             pending_credits: 0,
         }))
@@ -512,6 +518,7 @@ impl Writer {
             clock,
             metrics,
             priority,
+            opening_priority: None,
             send_credit_pool,
             pending_credits: 0,
         }))
@@ -873,17 +880,25 @@ impl Inner {
         }
     }
 
-    /// Priority field to encode on the next outgoing frame. Init frames (those carrying
-    /// `dest_acceptor_id`) emit the writer's actual priority; non-init frames emit the default
-    /// because the wire format only encodes priority when `dest_acceptor_id.is_some()`. Mirrors
-    /// `Header::canonicalize_for_wire` so production code never produces a non-canonical header.
+    /// Priority field to encode on the next outgoing frame. Opening frames (those carrying
+    /// `dest_acceptor_id`) emit the tier the stream opened with (`opening_priority`); other
+    /// frames emit the default because the wire format only encodes priority when
+    /// `dest_acceptor_id.is_some()`. Mirrors `Header::canonicalize_for_wire` so production code
+    /// never produces a non-canonical header.
     #[inline]
-    fn wire_priority(&self) -> crate::credit::Priority {
+    fn wire_priority(&mut self) -> crate::credit::Priority {
         if self.dest_acceptor_id().is_some() {
-            self.priority
+            self.opening_priority()
         } else {
             crate::credit::Priority::default()
         }
+    }
+
+    /// Credit tier for an opening frame: the writer's priority when the first opening frame is
+    /// encoded, and that same tier for each later one, whatever `set_priority` changed since.
+    #[inline]
+    fn opening_priority(&mut self) -> crate::credit::Priority {
+        *self.opening_priority.get_or_insert(self.priority)
     }
 }
 
@@ -1337,7 +1352,7 @@ impl Inner {
         // is a plain reset.
         let init = self.dest_acceptor_id().map(|dest_acceptor_id| frame::Init {
             dest_acceptor_id,
-            priority: self.priority,
+            priority: self.opening_priority(),
         });
         let frame = Frame {
             header: Header::QueueReset {
