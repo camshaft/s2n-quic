@@ -9,25 +9,37 @@
 //! after senders have been cloned or moved to other threads.
 
 use crate::intrusive;
-use atomic_waker::AtomicWaker;
 use core::{marker::PhantomData, task::Poll};
-use sync::{lock, Arc, AtomicU64, AtomicUsize, Mutex, Ordering};
+use sync::{lock, register_waker, Arc, AtomicU64, AtomicUsize, AtomicWaker, Mutex, Ordering};
 
 #[cfg(all(feature = "loom", test))]
 mod sync {
-    pub use loom::sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard,
+    // Use loom's waker: `atomic_waker`'s is built on std atomics, which loom doesn't track, so
+    // loom wouldn't see a sender's wake ordered before the receiver's next registration, and
+    // the receiver could read `sender_count` from before the last sender's drop and wait forever.
+    pub use loom::{
+        future::AtomicWaker,
+        sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc, Mutex, MutexGuard,
+        },
     };
 
     #[inline(always)]
     pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         mutex.lock().unwrap()
     }
+
+    /// loom's `register` takes the waker by value, and `atomic_waker`'s takes `&Waker`.
+    #[inline(always)]
+    pub fn register_waker(recv_waker: &AtomicWaker, waker: &core::task::Waker) {
+        recv_waker.register_by_ref(waker);
+    }
 }
 
 #[cfg(not(all(feature = "loom", test)))]
 mod sync {
+    pub use atomic_waker::AtomicWaker;
     pub use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     pub use parking_lot::{Mutex, MutexGuard};
     pub use std::sync::Arc;
@@ -35,6 +47,11 @@ mod sync {
     #[inline(always)]
     pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         mutex.lock()
+    }
+
+    #[inline(always)]
+    pub fn register_waker(recv_waker: &AtomicWaker, waker: &core::task::Waker) {
+        recv_waker.register(waker);
     }
 }
 
@@ -321,7 +338,7 @@ impl<A: intrusive::Adapter, Q: Storage<A>> Receiver<A, Q> {
     /// should still register as early as possible (e.g. on first task poll) so that sends that
     /// arrive before registration are not missed.
     pub fn register(&self, waker: &core::task::Waker) {
-        self.shared.recv_waker.register(waker);
+        register_waker(&self.shared.recv_waker, waker);
     }
 
     #[inline(always)]
@@ -359,7 +376,7 @@ impl<A: intrusive::Adapter, Q: Storage<A>> Receiver<A, Q> {
     ) -> Poll<Option<()>> {
         // Register the waker before checking for items so we cannot miss a concurrent send
         // between the occupancy check and returning Poll::Pending.
-        self.shared.recv_waker.register(cx.waker());
+        register_waker(&self.shared.recv_waker, cx.waker());
 
         if let TrySwap::Ready = self.try_swap(batch) {
             return Poll::Ready(Some(()));
@@ -796,16 +813,7 @@ mod tests {
         assert_eq!(tx.send(list([1])).unwrap_err().len(), 1);
     }
 
-    // Under the real loom model checker (`--features loom`) this model deadlocks — a pre-existing
-    // problem: the sharded model had never actually run under loom before the crate gained loom
-    // support, and is tracked separately. It still exercises useful concurrency via the non-loom
-    // shim (real threads), so keep it running there and skip only the real-loom exploration. Without
-    // this the `--all-features` coverage job aborts the whole test binary on the deadlock.
     #[test]
-    #[cfg_attr(
-        feature = "loom",
-        ignore = "sharded loom model deadlocks under loom; tracked separately"
-    )]
     fn loom_concurrent_send_recv() {
         use crate::testing::loom;
 
