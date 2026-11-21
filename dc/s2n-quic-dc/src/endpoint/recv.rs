@@ -142,6 +142,8 @@ pub(crate) enum CacheError {
 
 pub(crate) mod ack_ranges;
 mod dedup;
+#[cfg(test)]
+mod receive_state_tests;
 
 /// ACK transmission state machine.
 ///
