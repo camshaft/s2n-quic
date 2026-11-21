@@ -432,8 +432,20 @@ where
     let source_control_port = packet.source_control_port();
 
     // Detect single-QueueMsg frame for the fast path (scatter-decrypt into slot buffer).
-    let single_queue_msg =
-        decode::detect_single_queue_msg(packet.application_header(), decrypt_len);
+    //
+    // The fast path writes the frame's payload into the stream's slot during decrypt, before
+    // `dedup_filter` records the packet number below. So a packet whose number the sender's
+    // receive state accepted already, or is too old for that state to check, takes the slow path:
+    // it is authenticated into a buffer of its own and refused as a duplicate before any of its
+    // frames is dispatched.
+    let remote_sender_id = crate::endpoint::id::RemoteSenderId::new(source_sender_id);
+    let packet_number_may_be_new =
+        recv_cache.may_accept_packet_number(&credentials, remote_sender_id, packet_number);
+    let single_queue_msg = if packet_number_may_be_new {
+        decode::detect_single_queue_msg(packet.application_header(), decrypt_len)
+    } else {
+        None
+    };
 
     // Get or create peer receive state, decrypting the packet on-demand.
     //
@@ -2391,3 +2403,6 @@ fn bind_for_reset(
         }
     }
 }
+
+#[cfg(test)]
+mod packet_number_tests;
