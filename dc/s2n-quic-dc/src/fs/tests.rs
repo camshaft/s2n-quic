@@ -1128,24 +1128,95 @@ fn failed_completion_surfaces_as_err() {
     });
 }
 
-/// An op whose credit cost exceeds its device pool capacity must fail fast with `Err`, not park
-/// forever (an atomic `IoOp` has no partial-submit escape).
+/// An op whose credit cost is higher than its device pool's capacity isn't rejected: the pool grants
+/// it its whole cost alone, the op completes, and the pool gets its credit back.
+//= rendered/0011-storage/02-admission.md#DC-0011-059
+//= type=test
+//# The device MUST NOT reject an operation because its cost is higher than its pool's
+//# capacity or its pool's shown capacity.
 #[test]
-fn oversize_op_fails_fast() {
+fn oversize_op_is_granted_alone() {
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
         let (_scheduler, devices) = build(vec![iops_device(4)], 1, Latency::default());
         let dev = devices[0].clone();
         async move {
-            let result = dev.read(fd(), 0, 64 * 1024, TierPriority::Medium).await;
-            assert!(
-                matches!(
-                    result.as_ref().map_err(|e| e.kind()),
-                    Err(std::io::ErrorKind::InvalidInput)
-                ),
-                "oversize op must fail fast with InvalidInput, got {result:?}"
+            // 64 KiB at a 4 KiB io unit costs 16, four times the pool's capacity of 4.
+            let buf = dev
+                .read(fd(), 0, 64 * 1024, TierPriority::Medium)
+                .await
+                .expect("an op above the pool's capacity completes");
+            assert_eq!(buf.len(), 64 * 1024);
+            assert_conserved(&dev);
+            info!("oversize op granted alone and completed");
+        }
+        .primary()
+        .spawn();
+    });
+}
+
+/// A buffered read whose cost is higher than its pool's shown capacity doesn't allocate its buffer
+/// while it waits for its credit, and allocates it once the pool grants it.
+//= rendered/0011-storage/02-admission.md#DC-0011-060
+//= type=test
+//# The device MUST NOT allocate the buffer of a buffered operation before the
+//# operation's pool grants its credit.
+#[test]
+fn waiting_read_doesnt_allocate_its_buffer() {
+    use crate::fs::device::READ_BUFFERS_ALLOCATED;
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        let latency = Latency {
+            read: Duration::from_millis(50),
+            write: Duration::from_millis(50),
+            per_byte_nanos: 0,
+        };
+        let (_scheduler, devices) = build(vec![iops_device(4)], 1, latency);
+        let dev = devices[0].clone();
+        async move {
+            let _scheduler = _scheduler;
+            let allocated = || READ_BUFFERS_ALLOCATED.with(|n| n.get());
+            let before = allocated();
+
+            // A one-unit read holds credit for 50ms, so the 16-unit read waits until it completes.
+            let dev_a = dev.clone();
+            async move {
+                dev_a
+                    .read(fd(), 0, 4096, TierPriority::Medium)
+                    .await
+                    .expect("the holder's read completes");
+            }
+            .spawn();
+            1.ms().sleep().await;
+
+            let done = Rc::new(std::cell::Cell::new(false));
+            let dev_b = dev.clone();
+            let done_b = done.clone();
+            async move {
+                dev_b
+                    .read(fd(), 4096, 64 * 1024, TierPriority::Medium)
+                    .await
+                    .expect("the read above the shown capacity completes");
+                done_b.set(true);
+            }
+            .spawn();
+
+            10.ms().sleep().await;
+            assert!(!done.get(), "the large read waits while the holder runs");
+            assert_eq!(
+                allocated() - before,
+                1,
+                "only the holder's buffer is allocated while the large read waits"
             );
-            info!("oversize op rejected fast");
+
+            200.ms().sleep().await;
+            assert!(done.get(), "the large read completes after the holder");
+            assert_eq!(
+                allocated() - before,
+                2,
+                "the large read allocates its buffer once granted"
+            );
+            assert_conserved(&dev);
         }
         .primary()
         .spawn();
@@ -1284,11 +1355,11 @@ fn trace_records_full_lifecycle_for_a_normal_op() {
     });
 }
 
-/// A pre-admission rejection (`Device::prepare` fails on an oversized op) must fire the
+/// A pre-admission rejection (`Device::prepare` fails on an end offset past `i64::MAX`) must fire the
 /// [`Rejected`](crate::fs::trace::IoLifecycle::Rejected) trace point — the row that has no `op_seq`
 /// because no `IoOp` was ever built.
 #[test]
-fn trace_records_rejected_for_oversize_op() {
+fn trace_records_rejected_for_out_of_range_op() {
     use crate::fs::trace::IoLifecycle;
     let _no_snap = crate::testing::without_snapshots();
     sim(|| {
@@ -1296,8 +1367,10 @@ fn trace_records_rejected_for_oversize_op() {
         let dev = devices[0].clone();
         async move {
             let _scheduler = _scheduler;
-            let result = dev.read(fd(), 0, 64 * 1024, TierPriority::Medium).await;
-            assert!(result.is_err(), "oversize op must be rejected");
+            let result = dev
+                .read(fd(), i64::MAX as u64, 4096, TierPriority::Medium)
+                .await;
+            assert!(result.is_err(), "an op past i64::MAX must be rejected");
             let (lifecycles, _kinds) = crate::fs::trace::resident_event_kinds();
             assert!(
                 lifecycles.contains(&IoLifecycle::Rejected.as_u8()),

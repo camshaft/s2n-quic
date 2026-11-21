@@ -232,8 +232,8 @@ impl SubmitterAlloc {
                     Poll::Ready(Ok(()))
                 } else {
                     // A partial grant (the fast path capped at `max_single_acquire`): self-wake to
-                    // re-acquire the remainder. Bounded by `ceil(cost / max_single_acquire)` since
-                    // `cost <= capacity` is enforced before acquire.
+                    // re-acquire the remainder. A device pool doesn't clamp an acquire and grants
+                    // an op whose cost is higher than its shown capacity whole, alone.
                     self.trace_credit(crate::fs::trace::IoLifecycle::CreditPartial, cost);
                     cx.waker().wake_by_ref();
                     Poll::Pending

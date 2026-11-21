@@ -120,11 +120,18 @@ pub struct Device {
     pub(crate) submission: sync_chan::Sender<IoOp>,
     /// Clock used to stamp `enqueued_at` for sojourn metrics.
     pub(crate) clock: crate::time::DefaultClock,
-    /// Capacity of the read / write pool (in the cost-model currency), recorded so `prepare` can
-    /// reject an op whose cost exceeds it (an `IoOp` is atomic — it has no partial-submit escape, so
-    /// a `cost > capacity` acquire could never be satisfied and would park forever).
+    /// Capacity the device configured for the read / write pool (in the cost-model currency). An op
+    /// may cost more than this: the pool grants such an op its whole cost alone (DC-0011-057).
     read_capacity: u64,
     write_capacity: u64,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Read buffers [`Device::read`] allocated on this thread, which the tests read to check that
+    /// a read allocates its buffer only once its pool grants its credit (DC-0011-060).
+    pub(crate) static READ_BUFFERS_ALLOCATED: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
 }
 
 impl core::fmt::Debug for Device {
@@ -216,8 +223,8 @@ impl Device {
         self.pools.pool_for(kind)
     }
 
-    /// Capacity of the pool an op of `kind` draws from. An op costing more than this can never be
-    /// admitted and must be rejected up front rather than parked.
+    /// The pool capacity the device configured for `kind`'s pool. An op may cost more than this:
+    /// the pool grants it alone, and the device doesn't reject it for its cost.
     #[inline]
     pub fn capacity_for(&self, kind: IoKind) -> u64 {
         if kind.is_read() {
@@ -249,9 +256,9 @@ impl Device {
     /// credit cost, bumping the rejection counter on failure. The hot-path admission check: the caller
     /// already holds the `Arc<Device>`, so there is no lookup here.
     ///
-    /// Rejects (with `InvalidInput`) an offset that would wrap a signed `off_t`, a misaligned direct
-    /// op, or a cost exceeding the pool capacity (an atomic `IoOp` has no partial-submit escape, so
-    /// an over-capacity op could never be admitted and would park forever).
+    /// Rejects (with `InvalidInput`) an offset that would wrap a signed `off_t` or a misaligned
+    /// direct op. An op whose cost is higher than the pool's capacity or its shown capacity isn't
+    /// rejected: the pool grants it its whole cost alone.
     pub fn prepare(
         &self,
         kind: IoKind,
@@ -308,22 +315,11 @@ impl Device {
         }
 
         let cost = self.cost(kind, len);
-        //= rendered/0011-storage/02-admission.md#DC-0011-057
-        //= type=exception
-        //= reason=the device still rejects such an op until a later change grants it alone
-        //# The device MUST grant an operation whose cost is higher than its pool's shown
-        //# capacity only while no other operation holds credit from that pool.
+        // An op whose cost is higher than the pool's capacity or its shown capacity goes to the
+        // pool as it is: the pool grants it alone (DC-0011-057, DC-0011-064).
         //= rendered/0011-storage/02-admission.md#DC-0011-059
-        //= type=exception
-        //= reason=the device still rejects such an op until a later change grants it alone
         //# The device MUST NOT reject an operation because its cost is higher than its pool's
         //# capacity or its pool's shown capacity.
-        if cost > self.capacity_for(kind) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "io scheduler: op cost exceeds device pool capacity",
-            ));
-        }
         Ok((self.pool_for(kind).clone(), cost))
     }
 
@@ -344,12 +340,20 @@ impl Device {
     ) -> impl core::future::Future<Output = std::io::Result<bytes::BytesMut>> + 'static {
         let device = self.clone();
         async move {
+            // Acquire the op's credit first, and allocate its buffer only once the pool grants it,
+            // so an op waiting for credit doesn't hold memory.
+            //= rendered/0011-storage/02-admission.md#DC-0011-060
+            //# The device MUST NOT allocate the buffer of a buffered operation before the
+            //# operation's pool grants its credit.
+            let reservation = device
+                .reserve(IoKind::Read, fd, offset, len, priority, false)
+                .await?;
             // Caller-owned, pre-sized, logically-empty buffer: the backend reads into spare capacity
             // and `set_len`s to bytes read. No allocation or memset happens inside the backend.
             let buf = bytes::BytesMut::with_capacity(len as usize);
-            let op = device
-                .submit(IoKind::Read, fd, offset, len, IoBuf::Read(buf), priority)
-                .await?;
+            #[cfg(test)]
+            READ_BUFFERS_ALLOCATED.with(|n| n.set(n.get() + 1));
+            let op = reservation.submit(IoBuf::Read(buf)).await?;
             match op.buf {
                 IoBuf::Read(buf) => Ok(buf),
                 _ => unreachable!("read op returned non-read buffer"),
@@ -430,7 +434,7 @@ impl Device {
     /// The atomic submit primitive: acquire credit, hand the op to one of this device's lanes, await
     /// completion.
     ///
-    /// Returns only **successfully completed** ops — a `Failed` completion, an oversized op, a
+    /// Returns only **successfully completed** ops — a `Failed` completion, an out-of-range offset, a
     /// misaligned direct op, or a closed lane all surface as `Err`, so callers never have to
     /// re-inspect `op.status`. Acquires the op's credit from this device's pool **before** the op is
     /// handed to the pipeline: a submitter that cannot get credit parks cooperatively on a waker
@@ -492,7 +496,7 @@ impl Device {
         is_direct: bool,
     ) -> std::io::Result<Reservation> {
         // Validate + resolve the device pool and cost directly on this device (no lookup). Done before
-        // any credit is acquired so an op that can never be admitted (oversized / misaligned) is
+        // any credit is acquired so an op that can never run (out-of-range offset / misaligned) is
         // rejected without contending the pool against live ops.
         let (pool, cost) = self.prepare(kind, offset, len, is_direct)?;
 
@@ -811,10 +815,12 @@ async fn await_completion(mut rx: CompletionReceiver) -> std::io::Result<IoOp> {
 ///   `cost > max_single_acquire` would *itself* fragment into capped partial fast-path grants that
 ///   accumulate below `cost` and pin the pool — the same wedge, reintroduced on the acquire path.
 ///
-/// So we raise `max_single_acquire` to `capacity` first. Combined with the submit-time guard that an
-/// op's `cost ≤ capacity`, every admitted op is now requested **and** granted whole in one wake — a
-/// true all-or-nothing acquisition. Fairness across streams is preserved: the distributor still walks
-/// waiters FIFO within a tier and serves whole ops round-robin.
+/// So we raise `max_single_acquire` to `capacity` first. The device builds its pools with
+/// [`Pool::with_counters_adaptive`], which doesn't clamp an acquire and grants an op whose cost is
+/// higher than the shown capacity its whole cost alone (DC-0011-057, DC-0011-064), so every op is
+/// requested **and** granted whole in one wake — a true all-or-nothing acquisition. Fairness across
+/// streams is preserved: the distributor still walks waiters FIFO within a tier and serves whole ops
+/// round-robin.
 ///
 /// (Trade-off: a larger `max_single_acquire` widens the worst-case transient negative `available`
 /// excursion to one full op per parked waiter — acceptable for an isolated per-device pool, and the
