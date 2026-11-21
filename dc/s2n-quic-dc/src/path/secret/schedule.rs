@@ -208,7 +208,7 @@ impl Secret {
         initiator: Initiator,
     ) -> (seal::Application, SealUpdate, open::Application, OpenUpdate) {
         let ciphersuite = &self.ciphersuite;
-        let mut out = [0u8; (NONCE_LEN + MAX_KEY_LEN) * 2 + MAX_KEY_LEN * 2];
+        let mut out = Zeroizing::new([0u8; (NONCE_LEN + MAX_KEY_LEN) * 2 + MAX_KEY_LEN * 2]);
         let key_len = hkdf::KeyType::len(ciphersuite);
         let out_len = (NONCE_LEN + key_len) * 2 + key_len * 2;
 
@@ -236,8 +236,8 @@ impl Secret {
         let (client_key, out) = out.split_at(key_len);
         let (server_key, out) = out.split_at(key_len);
         let (client_iv, server_iv) = out.split_at(NONCE_LEN);
-        let client_iv = client_iv.try_into().unwrap();
-        let server_iv = server_iv.try_into().unwrap();
+        let client_iv: &[u8; NONCE_LEN] = client_iv.try_into().unwrap();
+        let server_iv: &[u8; NONCE_LEN] = server_iv.try_into().unwrap();
         let aead = ciphersuite.aead();
 
         let (sealer_ku, opener_ku, sealer_key, opener_key, sealer_iv, opener_iv) =
@@ -264,7 +264,7 @@ impl Secret {
         initiator: Initiator,
     ) -> (seal::control::Stream, open::control::Stream) {
         let ciphersuite = &self.ciphersuite;
-        let mut out = [0u8; MAX_HMAC_KEY_LEN * 2];
+        let mut out = Zeroizing::new([0u8; MAX_HMAC_KEY_LEN * 2]);
         let key_len = {
             // Use the block length for the key, instead of output length for stronger security and to
             // avoid padding.
@@ -324,9 +324,9 @@ impl Secret {
     #[inline]
     fn derive_application_key<F, R>(&self, direction: Direction, key_id: VarInt, f: F) -> R
     where
-        F: FnOnce(&'static aead::Algorithm, &[u8], [u8; NONCE_LEN]) -> R,
+        F: FnOnce(&'static aead::Algorithm, &[u8], &[u8; NONCE_LEN]) -> R,
     {
-        let mut out = [0u8; NONCE_LEN + MAX_KEY_LEN];
+        let mut out = Zeroizing::new([0u8; NONCE_LEN + MAX_KEY_LEN]);
         let key_len = hkdf::KeyType::len(&self.ciphersuite);
         let out_len = NONCE_LEN + key_len;
         debug_assert!(out_len <= u16::MAX as usize);
@@ -343,7 +343,7 @@ impl Secret {
         );
         // if the hash is ever broken, it's better to put the "more secret" data at the beginning
         let (key, iv) = out.split_at(key_len);
-        let iv = iv.try_into().unwrap();
+        let iv: &[u8; NONCE_LEN] = iv.try_into().unwrap();
         f(self.ciphersuite.aead(), key, iv)
     }
 
@@ -360,7 +360,7 @@ impl Secret {
     where
         F: FnOnce(&[u8], &'static hmac::Algorithm) -> R,
     {
-        let mut out = [0u8; MAX_HMAC_KEY_LEN];
+        let mut out = Zeroizing::new([0u8; MAX_HMAC_KEY_LEN]);
         let key_len = {
             // Use the block length for the key, instead of output length for stronger security and to
             // avoid padding.
@@ -468,11 +468,11 @@ impl Updater {
     #[inline]
     fn next<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&[u8], [u8; NONCE_LEN], Updater) -> R,
+        F: FnOnce(&[u8], &[u8; NONCE_LEN], Updater) -> R,
     {
         let ciphersuite = &self.ciphersuite;
 
-        let mut out = [0u8; NONCE_LEN + MAX_KEY_LEN * 2];
+        let mut out = Zeroizing::new([0u8; NONCE_LEN + MAX_KEY_LEN * 2]);
         let key_len = hkdf::KeyType::len(ciphersuite);
         let out_len = NONCE_LEN + key_len * 2;
         let (out, _) = out.split_at_mut(out_len);
@@ -486,7 +486,7 @@ impl Updater {
         // (key_update, key, iv)
         let (ku, out) = out.split_at(key_len);
         let (key, iv) = out.split_at(key_len);
-        let iv = iv.try_into().unwrap();
+        let iv: &[u8; NONCE_LEN] = iv.try_into().unwrap();
 
         let ku = Self::new(ku, ciphersuite);
 
