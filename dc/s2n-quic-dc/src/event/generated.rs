@@ -43,7 +43,7 @@ pub mod api {
             fmt.finish()
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     pub struct ConnectionInfo<'a> {
         #[doc = " The credential ID (path secret identifier) for this stream"]
@@ -54,6 +54,16 @@ pub mod api {
         pub remote_address: SocketAddress<'a>,
         #[doc = " Whether this is the client or server side of the stream"]
         pub is_server: bool,
+    }
+    impl<'a> core::fmt::Debug for ConnectionInfo<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ConnectionInfo");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.field("remote_address", &self.remote_address);
+            fmt.field("is_server", &self.is_server);
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for ConnectionInfo<'a> {
@@ -352,12 +362,20 @@ pub mod api {
     impl<'a> Event for PathSecretMapBackgroundHandshakeRequested<'a> {
         const NAME: &'static str = "path_secret_map:background_handshake_requested";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when the entry is inserted into the path secret map"]
     pub struct PathSecretMapEntryInserted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapEntryInserted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapEntryInserted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for PathSecretMapEntryInserted<'a> {
@@ -371,12 +389,20 @@ pub mod api {
     impl<'a> Event for PathSecretMapEntryInserted<'a> {
         const NAME: &'static str = "path_secret_map:entry_inserted";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when the entry is considered ready for use"]
     pub struct PathSecretMapEntryReady<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapEntryReady<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapEntryReady");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for PathSecretMapEntryReady<'a> {
@@ -390,13 +416,22 @@ pub mod api {
     impl<'a> Event for PathSecretMapEntryReady<'a> {
         const NAME: &'static str = "path_secret_map:entry_ready";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an entry is replaced by a new one for the same `peer_address`"]
     pub struct PathSecretMapEntryReplaced<'a> {
         pub peer_address: SocketAddress<'a>,
         pub new_credential_id: &'a [u8],
         pub previous_credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapEntryReplaced<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapEntryReplaced");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("new_credential_id", &"[HIDDEN]");
+            fmt.field("previous_credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for PathSecretMapEntryReplaced<'a> {
@@ -411,7 +446,7 @@ pub mod api {
     impl<'a> Event for PathSecretMapEntryReplaced<'a> {
         const NAME: &'static str = "path_secret_map:entry_replaced";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an entry is evicted due to running out of space"]
     pub struct PathSecretMapIdEntryEvicted<'a> {
@@ -419,6 +454,15 @@ pub mod api {
         pub credential_id: &'a [u8],
         #[doc = " Time since insertion of this entry"]
         pub age: core::time::Duration,
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapIdEntryEvicted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapIdEntryEvicted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("age", &self.age);
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for PathSecretMapIdEntryEvicted<'a> {
@@ -433,7 +477,7 @@ pub mod api {
     impl<'a> Event for PathSecretMapIdEntryEvicted<'a> {
         const NAME: &'static str = "path_secret_map:id_entry_evicted";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an entry is evicted due to running out of space"]
     pub struct PathSecretMapAddressEntryEvicted<'a> {
@@ -441,6 +485,15 @@ pub mod api {
         pub credential_id: &'a [u8],
         #[doc = " Time since insertion of this entry"]
         pub age: core::time::Duration,
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapAddressEntryEvicted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapAddressEntryEvicted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("age", &self.age);
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for PathSecretMapAddressEntryEvicted<'a> {
@@ -455,12 +508,20 @@ pub mod api {
     impl<'a> Event for PathSecretMapAddressEntryEvicted<'a> {
         const NAME: &'static str = "path_secret_map:addr_entry_evicted";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an UnknownPathSecret packet was sent"]
     pub struct UnknownPathSecretPacketSent<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketSent<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketSent");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for UnknownPathSecretPacketSent<'a> {
@@ -474,12 +535,20 @@ pub mod api {
     impl<'a> Event for UnknownPathSecretPacketSent<'a> {
         const NAME: &'static str = "path_secret_map:unknown_path_secret_packet_sent";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an UnknownPathSecret packet was received"]
     pub struct UnknownPathSecretPacketReceived<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketReceived<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketReceived");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for UnknownPathSecretPacketReceived<'a> {
@@ -493,12 +562,20 @@ pub mod api {
     impl<'a> Event for UnknownPathSecretPacketReceived<'a> {
         const NAME: &'static str = "path_secret_map:unknown_path_secret_packet_received";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an UnknownPathSecret packet was authentic and processed"]
     pub struct UnknownPathSecretPacketAccepted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketAccepted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketAccepted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for UnknownPathSecretPacketAccepted<'a> {
@@ -512,12 +589,20 @@ pub mod api {
     impl<'a> Event for UnknownPathSecretPacketAccepted<'a> {
         const NAME: &'static str = "path_secret_map:unknown_path_secret_packet_accepted";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an UnknownPathSecret packet was rejected as invalid"]
     pub struct UnknownPathSecretPacketRejected<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketRejected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketRejected");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for UnknownPathSecretPacketRejected<'a> {
@@ -531,12 +616,20 @@ pub mod api {
     impl<'a> Event for UnknownPathSecretPacketRejected<'a> {
         const NAME: &'static str = "path_secret_map:unknown_path_secret_packet_rejected";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an UnknownPathSecret packet was dropped due to a missing entry"]
     pub struct UnknownPathSecretPacketDropped<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketDropped<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketDropped");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for UnknownPathSecretPacketDropped<'a> {
@@ -550,7 +643,7 @@ pub mod api {
     impl<'a> Event for UnknownPathSecretPacketDropped<'a> {
         const NAME: &'static str = "path_secret_map:unknown_path_secret_packet_dropped";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when a credential is accepted (i.e., post packet authentication and passes replay"]
     #[doc = " check)."]
@@ -566,6 +659,16 @@ pub mod api {
         #[doc = " Zero if this didn't change the leading edge."]
         pub forward_shift: u64,
     }
+    impl<'a> core::fmt::Debug for KeyAccepted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("KeyAccepted");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.field("gap", &self.gap);
+            fmt.field("forward_shift", &self.forward_shift);
+            fmt.finish()
+        }
+    }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for KeyAccepted<'a> {
         fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -580,12 +683,20 @@ pub mod api {
     impl<'a> Event for KeyAccepted<'a> {
         const NAME: &'static str = "path_secret_map:key_accepted";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when credential replay was definitely detected"]
     pub struct ReplayDefinitelyDetected<'a> {
         pub credential_id: &'a [u8],
         pub key_id: u64,
+    }
+    impl<'a> core::fmt::Debug for ReplayDefinitelyDetected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDefinitelyDetected");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for ReplayDefinitelyDetected<'a> {
@@ -599,7 +710,7 @@ pub mod api {
     impl<'a> Event for ReplayDefinitelyDetected<'a> {
         const NAME: &'static str = "path_secret_map:replay_definitely_detected";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when credential replay was potentially detected, but could not be verified"]
     #[doc = " due to a limiting tracking window"]
@@ -607,6 +718,15 @@ pub mod api {
         pub credential_id: &'a [u8],
         pub key_id: u64,
         pub gap: u64,
+    }
+    impl<'a> core::fmt::Debug for ReplayPotentiallyDetected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayPotentiallyDetected");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.field("gap", &self.gap);
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for ReplayPotentiallyDetected<'a> {
@@ -621,12 +741,20 @@ pub mod api {
     impl<'a> Event for ReplayPotentiallyDetected<'a> {
         const NAME: &'static str = "path_secret_map:replay_potentially_detected";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an ReplayDetected packet was sent"]
     pub struct ReplayDetectedPacketSent<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketSent<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketSent");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for ReplayDetectedPacketSent<'a> {
@@ -640,12 +768,20 @@ pub mod api {
     impl<'a> Event for ReplayDetectedPacketSent<'a> {
         const NAME: &'static str = "path_secret_map:replay_detected_packet_sent";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an ReplayDetected packet was received"]
     pub struct ReplayDetectedPacketReceived<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketReceived<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketReceived");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for ReplayDetectedPacketReceived<'a> {
@@ -659,13 +795,22 @@ pub mod api {
     impl<'a> Event for ReplayDetectedPacketReceived<'a> {
         const NAME: &'static str = "path_secret_map:replay_detected_packet_received";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an StaleKey packet was authentic and processed"]
     pub struct ReplayDetectedPacketAccepted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
         pub key_id: u64,
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketAccepted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketAccepted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for ReplayDetectedPacketAccepted<'a> {
@@ -680,12 +825,20 @@ pub mod api {
     impl<'a> Event for ReplayDetectedPacketAccepted<'a> {
         const NAME: &'static str = "path_secret_map:replay_detected_packet_accepted";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an ReplayDetected packet was rejected as invalid"]
     pub struct ReplayDetectedPacketRejected<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketRejected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketRejected");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for ReplayDetectedPacketRejected<'a> {
@@ -699,12 +852,20 @@ pub mod api {
     impl<'a> Event for ReplayDetectedPacketRejected<'a> {
         const NAME: &'static str = "path_secret_map:replay_detected_packet_rejected";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an ReplayDetected packet was dropped due to a missing entry"]
     pub struct ReplayDetectedPacketDropped<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketDropped<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketDropped");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for ReplayDetectedPacketDropped<'a> {
@@ -718,12 +879,20 @@ pub mod api {
     impl<'a> Event for ReplayDetectedPacketDropped<'a> {
         const NAME: &'static str = "path_secret_map:replay_detected_packet_dropped";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an StaleKey packet was sent"]
     pub struct StaleKeyPacketSent<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketSent<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketSent");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for StaleKeyPacketSent<'a> {
@@ -737,12 +906,20 @@ pub mod api {
     impl<'a> Event for StaleKeyPacketSent<'a> {
         const NAME: &'static str = "path_secret_map:stale_key_packet_sent";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an StaleKey packet was received"]
     pub struct StaleKeyPacketReceived<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketReceived<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketReceived");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for StaleKeyPacketReceived<'a> {
@@ -756,12 +933,20 @@ pub mod api {
     impl<'a> Event for StaleKeyPacketReceived<'a> {
         const NAME: &'static str = "path_secret_map:stale_key_packet_received";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an StaleKey packet was authentic and processed"]
     pub struct StaleKeyPacketAccepted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketAccepted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketAccepted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for StaleKeyPacketAccepted<'a> {
@@ -775,12 +960,20 @@ pub mod api {
     impl<'a> Event for StaleKeyPacketAccepted<'a> {
         const NAME: &'static str = "path_secret_map:stale_key_packet_accepted";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an StaleKey packet was rejected as invalid"]
     pub struct StaleKeyPacketRejected<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketRejected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketRejected");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for StaleKeyPacketRejected<'a> {
@@ -794,12 +987,20 @@ pub mod api {
     impl<'a> Event for StaleKeyPacketRejected<'a> {
         const NAME: &'static str = "path_secret_map:stale_key_packet_rejected";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when an StaleKey packet was dropped due to a missing entry"]
     pub struct StaleKeyPacketDropped<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketDropped<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketDropped");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for StaleKeyPacketDropped<'a> {
@@ -855,7 +1056,7 @@ pub mod api {
     impl<'a> Event for PathSecretMapAddressCacheAccessedHit<'a> {
         const NAME: &'static str = "path_secret_map:address_cache_accessed_entry";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when the cache is accessed by path secret ID"]
     #[doc = ""]
@@ -863,6 +1064,14 @@ pub mod api {
     pub struct PathSecretMapIdCacheAccessed<'a> {
         pub credential_id: &'a [u8],
         pub hit: bool,
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapIdCacheAccessed<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapIdCacheAccessed");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("hit", &self.hit);
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for PathSecretMapIdCacheAccessed<'a> {
@@ -876,7 +1085,7 @@ pub mod api {
     impl<'a> Event for PathSecretMapIdCacheAccessed<'a> {
         const NAME: &'static str = "path_secret_map:id_cache_accessed";
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[non_exhaustive]
     #[doc = " Emitted when the cache is accessed by path secret ID successfully"]
     #[doc = ""]
@@ -884,6 +1093,14 @@ pub mod api {
     pub struct PathSecretMapIdCacheAccessedHit<'a> {
         pub credential_id: &'a [u8],
         pub age: core::time::Duration,
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapIdCacheAccessedHit<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapIdCacheAccessedHit");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("age", &self.age);
+            fmt.finish()
+        }
     }
     #[cfg(any(test, feature = "testing"))]
     impl<'a> crate::event::snapshot::Fmt for PathSecretMapIdCacheAccessedHit<'a> {
@@ -1242,9 +1459,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapEntryInserted {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "path_secret_map_entry_inserted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "path_secret_map_entry_inserted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_path_secret_map_entry_ready(
@@ -1255,9 +1472,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapEntryReady {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "path_secret_map_entry_ready" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "path_secret_map_entry_ready" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_path_secret_map_entry_replaced(
@@ -1268,10 +1485,10 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapEntryReplaced {
                 peer_address,
-                new_credential_id,
-                previous_credential_id,
+                new_credential_id: _,
+                previous_credential_id: _,
             } = event;
-            tracing :: event ! (target : "path_secret_map_entry_replaced" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , new_credential_id = tracing :: field :: debug (new_credential_id) , previous_credential_id = tracing :: field :: debug (previous_credential_id) });
+            tracing :: event ! (target : "path_secret_map_entry_replaced" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , new_credential_id = tracing :: field :: debug (& "[HIDDEN]") , previous_credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_path_secret_map_id_entry_evicted(
@@ -1282,10 +1499,10 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapIdEntryEvicted {
                 peer_address,
-                credential_id,
+                credential_id: _,
                 age,
             } = event;
-            tracing :: event ! (target : "path_secret_map_id_entry_evicted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) , age = tracing :: field :: debug (age) });
+            tracing :: event ! (target : "path_secret_map_id_entry_evicted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") , age = tracing :: field :: debug (age) });
         }
         #[inline]
         fn on_path_secret_map_address_entry_evicted(
@@ -1296,10 +1513,10 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::PathSecretMapAddressEntryEvicted {
                 peer_address,
-                credential_id,
+                credential_id: _,
                 age,
             } = event;
-            tracing :: event ! (target : "path_secret_map_address_entry_evicted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) , age = tracing :: field :: debug (age) });
+            tracing :: event ! (target : "path_secret_map_address_entry_evicted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") , age = tracing :: field :: debug (age) });
         }
         #[inline]
         fn on_unknown_path_secret_packet_sent(
@@ -1310,9 +1527,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::UnknownPathSecretPacketSent {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "unknown_path_secret_packet_sent" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "unknown_path_secret_packet_sent" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_unknown_path_secret_packet_received(
@@ -1323,9 +1540,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::UnknownPathSecretPacketReceived {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "unknown_path_secret_packet_received" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "unknown_path_secret_packet_received" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_unknown_path_secret_packet_accepted(
@@ -1336,9 +1553,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::UnknownPathSecretPacketAccepted {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "unknown_path_secret_packet_accepted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "unknown_path_secret_packet_accepted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_unknown_path_secret_packet_rejected(
@@ -1349,9 +1566,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::UnknownPathSecretPacketRejected {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "unknown_path_secret_packet_rejected" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "unknown_path_secret_packet_rejected" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_unknown_path_secret_packet_dropped(
@@ -1362,20 +1579,20 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::UnknownPathSecretPacketDropped {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "unknown_path_secret_packet_dropped" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "unknown_path_secret_packet_dropped" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_key_accepted(&self, meta: &api::EndpointMeta, event: &api::KeyAccepted) {
             let parent = self.parent(meta);
             let api::KeyAccepted {
-                credential_id,
+                credential_id: _,
                 key_id,
                 gap,
                 forward_shift,
             } = event;
-            tracing :: event ! (target : "key_accepted" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (credential_id) , key_id = tracing :: field :: debug (key_id) , gap = tracing :: field :: debug (gap) , forward_shift = tracing :: field :: debug (forward_shift) });
+            tracing :: event ! (target : "key_accepted" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (& "[HIDDEN]") , key_id = tracing :: field :: debug (key_id) , gap = tracing :: field :: debug (gap) , forward_shift = tracing :: field :: debug (forward_shift) });
         }
         #[inline]
         fn on_replay_definitely_detected(
@@ -1385,10 +1602,10 @@ pub mod tracing {
         ) {
             let parent = self.parent(meta);
             let api::ReplayDefinitelyDetected {
-                credential_id,
+                credential_id: _,
                 key_id,
             } = event;
-            tracing :: event ! (target : "replay_definitely_detected" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (credential_id) , key_id = tracing :: field :: debug (key_id) });
+            tracing :: event ! (target : "replay_definitely_detected" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (& "[HIDDEN]") , key_id = tracing :: field :: debug (key_id) });
         }
         #[inline]
         fn on_replay_potentially_detected(
@@ -1398,11 +1615,11 @@ pub mod tracing {
         ) {
             let parent = self.parent(meta);
             let api::ReplayPotentiallyDetected {
-                credential_id,
+                credential_id: _,
                 key_id,
                 gap,
             } = event;
-            tracing :: event ! (target : "replay_potentially_detected" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (credential_id) , key_id = tracing :: field :: debug (key_id) , gap = tracing :: field :: debug (gap) });
+            tracing :: event ! (target : "replay_potentially_detected" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (& "[HIDDEN]") , key_id = tracing :: field :: debug (key_id) , gap = tracing :: field :: debug (gap) });
         }
         #[inline]
         fn on_replay_detected_packet_sent(
@@ -1413,9 +1630,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::ReplayDetectedPacketSent {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "replay_detected_packet_sent" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "replay_detected_packet_sent" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_replay_detected_packet_received(
@@ -1426,9 +1643,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::ReplayDetectedPacketReceived {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "replay_detected_packet_received" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "replay_detected_packet_received" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_replay_detected_packet_accepted(
@@ -1439,10 +1656,10 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::ReplayDetectedPacketAccepted {
                 peer_address,
-                credential_id,
+                credential_id: _,
                 key_id,
             } = event;
-            tracing :: event ! (target : "replay_detected_packet_accepted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) , key_id = tracing :: field :: debug (key_id) });
+            tracing :: event ! (target : "replay_detected_packet_accepted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") , key_id = tracing :: field :: debug (key_id) });
         }
         #[inline]
         fn on_replay_detected_packet_rejected(
@@ -1453,9 +1670,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::ReplayDetectedPacketRejected {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "replay_detected_packet_rejected" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "replay_detected_packet_rejected" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_replay_detected_packet_dropped(
@@ -1466,9 +1683,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::ReplayDetectedPacketDropped {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "replay_detected_packet_dropped" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "replay_detected_packet_dropped" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_stale_key_packet_sent(
@@ -1479,9 +1696,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::StaleKeyPacketSent {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "stale_key_packet_sent" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "stale_key_packet_sent" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_stale_key_packet_received(
@@ -1492,9 +1709,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::StaleKeyPacketReceived {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "stale_key_packet_received" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "stale_key_packet_received" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_stale_key_packet_accepted(
@@ -1505,9 +1722,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::StaleKeyPacketAccepted {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "stale_key_packet_accepted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "stale_key_packet_accepted" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_stale_key_packet_rejected(
@@ -1518,9 +1735,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::StaleKeyPacketRejected {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "stale_key_packet_rejected" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "stale_key_packet_rejected" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_stale_key_packet_dropped(
@@ -1531,9 +1748,9 @@ pub mod tracing {
             let parent = self.parent(meta);
             let api::StaleKeyPacketDropped {
                 peer_address,
-                credential_id,
+                credential_id: _,
             } = event;
-            tracing :: event ! (target : "stale_key_packet_dropped" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (credential_id) });
+            tracing :: event ! (target : "stale_key_packet_dropped" , parent : parent , tracing :: Level :: DEBUG , { peer_address = tracing :: field :: debug (peer_address) , credential_id = tracing :: field :: debug (& "[HIDDEN]") });
         }
         #[inline]
         fn on_path_secret_map_address_cache_accessed(
@@ -1562,8 +1779,11 @@ pub mod tracing {
             event: &api::PathSecretMapIdCacheAccessed,
         ) {
             let parent = self.parent(meta);
-            let api::PathSecretMapIdCacheAccessed { credential_id, hit } = event;
-            tracing :: event ! (target : "path_secret_map_id_cache_accessed" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (credential_id) , hit = tracing :: field :: debug (hit) });
+            let api::PathSecretMapIdCacheAccessed {
+                credential_id: _,
+                hit,
+            } = event;
+            tracing :: event ! (target : "path_secret_map_id_cache_accessed" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (& "[HIDDEN]") , hit = tracing :: field :: debug (hit) });
         }
         #[inline]
         fn on_path_secret_map_id_cache_accessed_hit(
@@ -1572,8 +1792,11 @@ pub mod tracing {
             event: &api::PathSecretMapIdCacheAccessedHit,
         ) {
             let parent = self.parent(meta);
-            let api::PathSecretMapIdCacheAccessedHit { credential_id, age } = event;
-            tracing :: event ! (target : "path_secret_map_id_cache_accessed_hit" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (credential_id) , age = tracing :: field :: debug (age) });
+            let api::PathSecretMapIdCacheAccessedHit {
+                credential_id: _,
+                age,
+            } = event;
+            tracing :: event ! (target : "path_secret_map_id_cache_accessed_hit" , parent : parent , tracing :: Level :: DEBUG , { credential_id = tracing :: field :: debug (& "[HIDDEN]") , age = tracing :: field :: debug (age) });
         }
         #[inline]
         fn on_path_secret_map_cleaner_cycled(
@@ -1655,7 +1878,7 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     pub struct ConnectionInfo<'a> {
         #[doc = " The credential ID (path secret identifier) for this stream"]
         pub credential_id: &'a [u8],
@@ -1665,6 +1888,16 @@ pub mod builder {
         pub remote_address: &'a s2n_quic_core::inet::SocketAddress,
         #[doc = " Whether this is the client or server side of the stream"]
         pub is_server: bool,
+    }
+    impl<'a> core::fmt::Debug for ConnectionInfo<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ConnectionInfo");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.field("remote_address", &self.remote_address);
+            fmt.field("is_server", &self.is_server);
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::ConnectionInfo<'a>> for ConnectionInfo<'a> {
         #[inline]
@@ -1978,11 +2211,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when the entry is inserted into the path secret map"]
     pub struct PathSecretMapEntryInserted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapEntryInserted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapEntryInserted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::PathSecretMapEntryInserted<'a>> for PathSecretMapEntryInserted<'a> {
         #[inline]
@@ -1997,11 +2238,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when the entry is considered ready for use"]
     pub struct PathSecretMapEntryReady<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapEntryReady<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapEntryReady");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::PathSecretMapEntryReady<'a>> for PathSecretMapEntryReady<'a> {
         #[inline]
@@ -2016,12 +2265,21 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an entry is replaced by a new one for the same `peer_address`"]
     pub struct PathSecretMapEntryReplaced<'a> {
         pub peer_address: SocketAddress<'a>,
         pub new_credential_id: &'a [u8],
         pub previous_credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapEntryReplaced<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapEntryReplaced");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("new_credential_id", &"[HIDDEN]");
+            fmt.field("previous_credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::PathSecretMapEntryReplaced<'a>> for PathSecretMapEntryReplaced<'a> {
         #[inline]
@@ -2038,13 +2296,22 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an entry is evicted due to running out of space"]
     pub struct PathSecretMapIdEntryEvicted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
         #[doc = " Time since insertion of this entry"]
         pub age: core::time::Duration,
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapIdEntryEvicted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapIdEntryEvicted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("age", &self.age);
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::PathSecretMapIdEntryEvicted<'a>> for PathSecretMapIdEntryEvicted<'a> {
         #[inline]
@@ -2061,13 +2328,22 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an entry is evicted due to running out of space"]
     pub struct PathSecretMapAddressEntryEvicted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
         #[doc = " Time since insertion of this entry"]
         pub age: core::time::Duration,
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapAddressEntryEvicted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapAddressEntryEvicted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("age", &self.age);
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::PathSecretMapAddressEntryEvicted<'a>>
         for PathSecretMapAddressEntryEvicted<'a>
@@ -2086,11 +2362,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an UnknownPathSecret packet was sent"]
     pub struct UnknownPathSecretPacketSent<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketSent<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketSent");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::UnknownPathSecretPacketSent<'a>> for UnknownPathSecretPacketSent<'a> {
         #[inline]
@@ -2105,11 +2389,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an UnknownPathSecret packet was received"]
     pub struct UnknownPathSecretPacketReceived<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketReceived<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketReceived");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::UnknownPathSecretPacketReceived<'a>>
         for UnknownPathSecretPacketReceived<'a>
@@ -2126,11 +2418,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an UnknownPathSecret packet was authentic and processed"]
     pub struct UnknownPathSecretPacketAccepted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketAccepted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketAccepted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::UnknownPathSecretPacketAccepted<'a>>
         for UnknownPathSecretPacketAccepted<'a>
@@ -2147,11 +2447,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an UnknownPathSecret packet was rejected as invalid"]
     pub struct UnknownPathSecretPacketRejected<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketRejected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketRejected");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::UnknownPathSecretPacketRejected<'a>>
         for UnknownPathSecretPacketRejected<'a>
@@ -2168,11 +2476,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an UnknownPathSecret packet was dropped due to a missing entry"]
     pub struct UnknownPathSecretPacketDropped<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for UnknownPathSecretPacketDropped<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("UnknownPathSecretPacketDropped");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::UnknownPathSecretPacketDropped<'a>> for UnknownPathSecretPacketDropped<'a> {
         #[inline]
@@ -2187,7 +2503,7 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when a credential is accepted (i.e., post packet authentication and passes replay"]
     #[doc = " check)."]
     pub struct KeyAccepted<'a> {
@@ -2201,6 +2517,16 @@ pub mod builder {
         #[doc = ""]
         #[doc = " Zero if this didn't change the leading edge."]
         pub forward_shift: u64,
+    }
+    impl<'a> core::fmt::Debug for KeyAccepted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("KeyAccepted");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.field("gap", &self.gap);
+            fmt.field("forward_shift", &self.forward_shift);
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::KeyAccepted<'a>> for KeyAccepted<'a> {
         #[inline]
@@ -2219,11 +2545,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when credential replay was definitely detected"]
     pub struct ReplayDefinitelyDetected<'a> {
         pub credential_id: &'a [u8],
         pub key_id: u64,
+    }
+    impl<'a> core::fmt::Debug for ReplayDefinitelyDetected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDefinitelyDetected");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::ReplayDefinitelyDetected<'a>> for ReplayDefinitelyDetected<'a> {
         #[inline]
@@ -2238,13 +2572,22 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when credential replay was potentially detected, but could not be verified"]
     #[doc = " due to a limiting tracking window"]
     pub struct ReplayPotentiallyDetected<'a> {
         pub credential_id: &'a [u8],
         pub key_id: u64,
         pub gap: u64,
+    }
+    impl<'a> core::fmt::Debug for ReplayPotentiallyDetected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayPotentiallyDetected");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.field("gap", &self.gap);
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::ReplayPotentiallyDetected<'a>> for ReplayPotentiallyDetected<'a> {
         #[inline]
@@ -2261,11 +2604,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an ReplayDetected packet was sent"]
     pub struct ReplayDetectedPacketSent<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketSent<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketSent");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::ReplayDetectedPacketSent<'a>> for ReplayDetectedPacketSent<'a> {
         #[inline]
@@ -2280,11 +2631,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an ReplayDetected packet was received"]
     pub struct ReplayDetectedPacketReceived<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketReceived<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketReceived");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::ReplayDetectedPacketReceived<'a>> for ReplayDetectedPacketReceived<'a> {
         #[inline]
@@ -2299,12 +2658,21 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an StaleKey packet was authentic and processed"]
     pub struct ReplayDetectedPacketAccepted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
         pub key_id: u64,
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketAccepted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketAccepted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("key_id", &self.key_id);
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::ReplayDetectedPacketAccepted<'a>> for ReplayDetectedPacketAccepted<'a> {
         #[inline]
@@ -2321,11 +2689,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an ReplayDetected packet was rejected as invalid"]
     pub struct ReplayDetectedPacketRejected<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketRejected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketRejected");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::ReplayDetectedPacketRejected<'a>> for ReplayDetectedPacketRejected<'a> {
         #[inline]
@@ -2340,11 +2716,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an ReplayDetected packet was dropped due to a missing entry"]
     pub struct ReplayDetectedPacketDropped<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for ReplayDetectedPacketDropped<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("ReplayDetectedPacketDropped");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::ReplayDetectedPacketDropped<'a>> for ReplayDetectedPacketDropped<'a> {
         #[inline]
@@ -2359,11 +2743,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an StaleKey packet was sent"]
     pub struct StaleKeyPacketSent<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketSent<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketSent");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::StaleKeyPacketSent<'a>> for StaleKeyPacketSent<'a> {
         #[inline]
@@ -2378,11 +2770,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an StaleKey packet was received"]
     pub struct StaleKeyPacketReceived<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketReceived<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketReceived");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::StaleKeyPacketReceived<'a>> for StaleKeyPacketReceived<'a> {
         #[inline]
@@ -2397,11 +2797,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an StaleKey packet was authentic and processed"]
     pub struct StaleKeyPacketAccepted<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketAccepted<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketAccepted");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::StaleKeyPacketAccepted<'a>> for StaleKeyPacketAccepted<'a> {
         #[inline]
@@ -2416,11 +2824,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an StaleKey packet was rejected as invalid"]
     pub struct StaleKeyPacketRejected<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketRejected<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketRejected");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::StaleKeyPacketRejected<'a>> for StaleKeyPacketRejected<'a> {
         #[inline]
@@ -2435,11 +2851,19 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when an StaleKey packet was dropped due to a missing entry"]
     pub struct StaleKeyPacketDropped<'a> {
         pub peer_address: SocketAddress<'a>,
         pub credential_id: &'a [u8],
+    }
+    impl<'a> core::fmt::Debug for StaleKeyPacketDropped<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("StaleKeyPacketDropped");
+            fmt.field("peer_address", &self.peer_address);
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::StaleKeyPacketDropped<'a>> for StaleKeyPacketDropped<'a> {
         #[inline]
@@ -2494,13 +2918,21 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when the cache is accessed by path secret ID"]
     #[doc = ""]
     #[doc = " This can be used to track cache hit ratios"]
     pub struct PathSecretMapIdCacheAccessed<'a> {
         pub credential_id: &'a [u8],
         pub hit: bool,
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapIdCacheAccessed<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapIdCacheAccessed");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("hit", &self.hit);
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::PathSecretMapIdCacheAccessed<'a>> for PathSecretMapIdCacheAccessed<'a> {
         #[inline]
@@ -2512,13 +2944,21 @@ pub mod builder {
             }
         }
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     #[doc = " Emitted when the cache is accessed by path secret ID successfully"]
     #[doc = ""]
     #[doc = " Provides more information about the accessed entry."]
     pub struct PathSecretMapIdCacheAccessedHit<'a> {
         pub credential_id: &'a [u8],
         pub age: core::time::Duration,
+    }
+    impl<'a> core::fmt::Debug for PathSecretMapIdCacheAccessedHit<'a> {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            let mut fmt = fmt.debug_struct("PathSecretMapIdCacheAccessedHit");
+            fmt.field("credential_id", &"[HIDDEN]");
+            fmt.field("age", &self.age);
+            fmt.finish()
+        }
     }
     impl<'a> IntoEvent<api::PathSecretMapIdCacheAccessedHit<'a>>
         for PathSecretMapIdCacheAccessedHit<'a>
