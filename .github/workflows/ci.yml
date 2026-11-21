@@ -5,6 +5,9 @@ on:
   pull_request:
     branches:
       - main
+    # A pull request that changes only the dc specification doesn't run ci; partimento check reads those files.
+    paths-ignore:
+      - 'dc/s2n-quic-dc/spec/**'
   schedule:
     # Run daily job at 8:00 AM and 8:00 PM PT.
     # The workflow is run in the morning to allow for the clippy job to resolve lints from new Rust
@@ -13,6 +16,12 @@ on:
   workflow_dispatch:
 
 name: ci
+
+# A newer push to a pull request cancels that pull request's run in progress; any other run has a group of its own.
+# The group is keyed on the pull request's number, which its author can't choose, not on its branch's name.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_INCREMENTAL: 0
