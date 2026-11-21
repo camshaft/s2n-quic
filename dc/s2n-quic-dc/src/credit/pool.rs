@@ -186,6 +186,15 @@ pub struct Pool {
     epoch: AtomicU64,
     /// The adaptive capacity, or `None` for a pool whose capacity stays at its configured value.
     adapt: Option<Mutex<Adapt>>,
+    /// An adaptive pool's shown capacity, mirrored for the lock-free read of each acquire. The
+    /// pool grants an operation whose cost is higher alone.
+    shown: AtomicU64,
+    /// 1 while an operation whose cost is higher than the shown capacity waits for the pool's
+    /// credit, mirrored from the adaptive capacity's waiting costs.
+    alone_waiting: AtomicU64,
+    /// 1 while an operation the pool granted alone holds its credit. The distributor alone writes
+    /// it.
+    alone_holding: AtomicU64,
     /// Whether a test holds the pool's capacity at its configured value; see `hold_capacity`.
     #[cfg(test)]
     held: core::sync::atomic::AtomicBool,
@@ -217,7 +226,9 @@ impl Pool {
     }
 
     /// Construct a pool whose capacity adapts at run time from the device's answers, starting at
-    /// `config.capacity`.
+    /// `config.capacity`. An adaptive pool grants each request its whole cost, without the
+    /// per-request ceiling, and grants a request whose cost is higher than its shown capacity
+    /// alone.
     pub fn with_counters_adaptive(config: Config, counters: Counters) -> Self {
         Self::build(config, counters, true)
     }
@@ -233,6 +244,9 @@ impl Pool {
             capacity_target: AtomicU64::new(config.capacity),
             epoch: AtomicU64::new(0),
             adapt: adaptive.then(|| Mutex::new(Adapt::new(config.capacity))),
+            shown: AtomicU64::new(config.capacity),
+            alone_waiting: AtomicU64::new(0),
+            alone_holding: AtomicU64::new(0),
             #[cfg(test)]
             held: core::sync::atomic::AtomicBool::new(false),
             config,
@@ -350,18 +364,34 @@ impl Pool {
         n: u64,
         priority: Priority,
     ) -> Poll<u64> {
-        let n = self.config.clamp_request(n, priority);
+        // An adaptive pool grants each operation its whole cost, so it doesn't clamp the request
+        // to the per-request ceiling.
+        let n = if self.adapt.is_some() {
+            n
+        } else {
+            self.config.clamp_request(n, priority)
+        };
         if n == 0 {
             return Poll::Ready(0);
         }
+        // An operation whose cost is higher than an adaptive pool's shown capacity isn't refused:
+        // the distributor grants it alone, so it always parks.
+        //= rendered/0011-storage/02-admission.md#DC-0011-057
+        //# The device MUST grant an operation whose cost is higher than its pool's shown capacity
+        //# only while no other operation holds credit from that pool.
+        let alone = self.adapt.is_some() && n > self.shown_capacity();
 
         // Fast path: a single debit. Success if the pool had the credit.
         //
         // Acquire pairs with the distributor's writeback at end-of-pass so a successful debit
         // observes returned credit promptly. The park branch publishes via
         // `parked_demand.fetch_add(Release)` below, so no Release is needed here.
+        //
+        // While an operation the pool grants alone waits or holds its credit, the fast path
+        // doesn't grant: the distributor decides each grant, as DC-0011-061 and DC-0011-066 say.
         let prev = self.available.fetch_sub(n as i64, Ordering::Acquire);
-        if prev >= n as i64 {
+        let afforded = prev >= n as i64;
+        if afforded && !alone && !self.alone_waiting() && !self.alone_holding() {
             self.counters.acquire_fast_path.add(1);
             self.counters.acquire_bytes.add(n);
             return Poll::Ready(n);
@@ -376,9 +406,10 @@ impl Pool {
         // `-n` and thus never over-counts free credit. See `Distributor::pass`.
         let slot_ref = &*slot.as_ptr();
         slot_ref.prepare_park(n, cx.waker());
-        // A waiter whose cost is higher than an adaptive pool's capacity raises it to its cost; the
-        // distributor applies the raise to `available` once woken, after the slot links below.
-        let raised = self.adapt_with(|adapt| adapt.on_wait(n).is_some());
+        // A waiter whose cost is higher than an adaptive pool's capacity, and not higher than its
+        // shown capacity, raises the capacity to its cost; the distributor applies the raise to
+        // `available` once woken, after the slot links below.
+        let raised = self.begin_wait(n);
 
         let mut tier = lock(&self.tiers[priority as usize]);
         // Once the distributor has marked this tier closed, the drain walk has either run or is
@@ -402,7 +433,10 @@ impl Pool {
         tier.list.push_back(SlotPtr::new(slot));
         slot_ref.transition_to_linked();
         drop(tier);
-        if raised {
+        // A park adds demand, not credit, so it wakes the distributor only where the distributor
+        // has something to decide: a raise, an operation it grants alone, or a park while the pool
+        // had the credit.
+        if raised || alone || afforded {
             self.waker.wake();
         }
 
@@ -459,6 +493,32 @@ impl Pool {
         self.capacity.load(Ordering::Relaxed)
     }
 
+    /// The shown capacity of an adaptive pool, which grants an operation whose cost is higher
+    /// alone; a fixed pool shows its configured capacity.
+    #[inline]
+    pub fn shown_capacity(&self) -> u64 {
+        self.shown.load(Ordering::Acquire)
+    }
+
+    /// Whether an operation whose cost is higher than the shown capacity waits for the pool's
+    /// credit.
+    #[inline]
+    fn alone_waiting(&self) -> bool {
+        self.alone_waiting.load(Ordering::Acquire) != 0
+    }
+
+    /// Whether an operation the pool granted alone holds its credit.
+    #[inline]
+    fn alone_holding(&self) -> bool {
+        self.alone_holding.load(Ordering::Acquire) != 0
+    }
+
+    #[inline]
+    fn set_alone_holding(&self, holding: bool) {
+        self.alone_holding
+            .store(u64::from(holding), Ordering::Release);
+    }
+
     /// The number of decreases of an adaptive pool's capacity so far, always 0 for a fixed pool.
     /// An operation reads it just after its credit is granted and passes the value back to
     /// [`on_would_block`](Self::on_would_block).
@@ -476,9 +536,13 @@ impl Pool {
     }
 
     /// An operation of `cost` completed without a would-block answer. An adaptive pool counts it
-    /// toward a run of clean completions while a submitter waits; a fixed pool ignores it.
+    /// toward a run of clean completions while a submitter waits, and raises its shown capacity
+    /// where it granted the operation alone; a fixed pool ignores it.
     pub fn on_clean_completion(&self, cost: u64) {
-        if self.adapt_with(|adapt| adapt.on_clean_completion(cost).is_some()) {
+        if self.adapt_with(|adapt| {
+            let shown = adapt.shown();
+            adapt.on_clean_completion(cost).is_some() || adapt.shown() != shown
+        }) {
             self.waker.wake();
         }
     }
@@ -500,13 +564,47 @@ impl Pool {
             self.capacity_target
                 .store(adapt.capacity(), Ordering::Release);
         }
+        self.publish_shown(&adapt);
         changed
+    }
+
+    /// Mirror an adaptive pool's shown capacity, and whether an operation above it waits, for the
+    /// lock-free reads.
+    fn publish_shown(&self, adapt: &Adapt) {
+        self.shown.store(adapt.shown(), Ordering::Release);
+        self.alone_waiting
+            .store(u64::from(adapt.waits_above_shown()), Ordering::Release);
+    }
+
+    /// An operation of `cost` begins to wait for the pool's credit. Returns whether it raised an
+    /// adaptive pool's capacity. A pool whose capacity a test holds still records the wait, so the
+    /// distributor grants an operation above the shown capacity alone.
+    fn begin_wait(&self, cost: u64) -> bool {
+        let adapt = match &self.adapt {
+            Some(adapt) => adapt,
+            None => return false,
+        };
+        let mut adapt = lock(adapt);
+        let raised = if self.capacity_held() {
+            adapt.record_wait(cost);
+            false
+        } else {
+            adapt.on_wait(cost).is_some()
+        };
+        if raised {
+            self.capacity_target
+                .store(adapt.capacity(), Ordering::Release);
+        }
+        self.publish_shown(&adapt);
+        raised
     }
 
     /// An operation of `cost` that waited for the pool's credit stops waiting.
     fn end_wait(&self, cost: u64) {
         if let Some(adapt) = &self.adapt {
-            lock(adapt).on_wait_end(cost);
+            let mut adapt = lock(adapt);
+            adapt.on_wait_end(cost);
+            self.publish_shown(&adapt);
         }
     }
 
@@ -997,6 +1095,41 @@ impl Distributor {
             (self.pool.parked_demand.load(Ordering::Acquire) - self.paid_demand) as i64;
         let mut free = self.pool.available.load(Ordering::Acquire) + outstanding + pull as i64;
 
+        // An adaptive pool grants an operation whose cost is higher than its shown capacity alone.
+        // `held` is the credit operations hold from the pool now; an operation granted alone has
+        // returned its credit once nothing is held.
+        let adaptive = self.pool.adapt.is_some();
+        let shown = self.pool.shown_capacity();
+        let capacity = self.pool.capacity();
+        if adaptive && self.pool.alone_holding() && free >= capacity as i64 {
+            self.pool.set_alone_holding(false);
+        }
+        let mut held = (capacity as i64 - free).max(0) as u64;
+        // The highest tier whose front waits to be granted alone. The tiers above it are granted
+        // only within the shown capacity.
+        let mut alone_tier = None;
+        if adaptive && self.pool.alone_waiting() {
+            for (index, (local, tier)) in self
+                .local
+                .iter_mut()
+                .zip(&self.pool.tiers)
+                .enumerate()
+            {
+                {
+                    let mut shared = lock(tier);
+                    local.append(&mut shared.list);
+                }
+                if let Some(front) = local.front() {
+                    // SAFETY: the slot is in our mirror, so it is linked; `requested` is stable
+                    // until we grant or reap it.
+                    if unsafe { front.requested() } > shown {
+                        alone_tier = Some(index);
+                        break;
+                    }
+                }
+            }
+        }
+
         // Avail-debits the walk reclaimed this pass that MUST write back to `available` in full (in
         // contrast to `pull`, whose writeback is capped to preserve no-snipe). Three sources, all
         // balancing a park-time `available -= req`: a reaped dead slot's `req`, an abandon-race
@@ -1005,11 +1138,12 @@ impl Distributor {
         let mut reclaimed_avail: u64 = 0;
         let mut granted_any = false;
 
-        'walk: for ((local, tier), &min_slice) in self
+        'walk: for (index, ((local, tier), &min_slice)) in self
             .local
             .iter_mut()
             .zip(&self.pool.tiers)
             .zip(&self.pool.config.min_grant_slice)
+            .enumerate()
         {
             // Pull the shared tier into the mirror up-front, before computing the slice. This both
             // refills a drained mirror and merges fresh arrivals that landed behind cached leftovers
@@ -1084,11 +1218,86 @@ impl Distributor {
                     continue;
                 }
 
+                //= rendered/0011-storage/02-admission.md#DC-0011-066
+                //# While an operation that DC-0011-064 granted holds credit from its pool, the
+                //# device MUST NOT grant another operation from that pool.
+                if adaptive && self.pool.alone_holding() {
+                    break 'walk;
+                }
+
+                if adaptive && req > shown {
+                    //= rendered/0011-storage/02-admission.md#DC-0011-061
+                    //# While an operation whose cost is higher than its pool's shown capacity waits
+                    //# at the front of that pool, the device MUST NOT grant an operation of its
+                    //# priority tier or of a lower tier from that pool.
+                    if held > 0 {
+                        break 'walk;
+                    }
+                    if !budget.consume() {
+                        self.pool.counters.distributor_budget_exhausted.add(1);
+                        break 'walk;
+                    }
+                    let ptr = local.pop_front().unwrap().take();
+                    // SAFETY: as for the grant below.
+                    unsafe {
+                        let slot = &*ptr.as_ptr();
+                        let res = slot.grant(req);
+                        self.paid_demand += req;
+                        self.pool.end_wait(req);
+                        match res {
+                            Some(waker) => {
+                                // The whole cost becomes in flight, though it is higher than
+                                // `free`: the park-time `available -= req` debit stays, and the
+                                // pool's capacity doesn't change.
+                                //= rendered/0011-storage/02-admission.md#DC-0011-064
+                                //# When an operation whose cost is higher than its pool's shown
+                                //# capacity is at the front of the pool, no other operation holds
+                                //# credit from that pool and no operation of a higher priority tier
+                                //# waits for that pool's credit, the device MUST grant that
+                                //# operation its whole cost, though its cost is higher than the
+                                //# pool's free credit, without changing the pool's capacity.
+                                self.pool.set_alone_holding(true);
+                                granted_any = true;
+                                self.pool.counters.distributor_granted.add(1);
+                                trace!(target: "credit::pool", req, "grant alone");
+                                self.pending_wakers.push_back(waker);
+                                break 'walk;
+                            }
+                            None => {
+                                reclaimed_avail += req;
+                                free += req as i64;
+                                self.pool.counters.abandon_granted_race.add(1);
+                                trace!(target: "credit::pool", req, "abandon_granted_race");
+                                dead.push_back(DeadSlot::new(ptr));
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 if free <= 0 {
                     break 'walk;
                 }
 
-                let grant_amount = req.min(slice);
+                // An adaptive pool grants each operation its whole cost; its slice floor is its
+                // capacity, so only an operation above the configured capacity needs this.
+                let grant_amount = if adaptive && req > min_slice {
+                    req
+                } else {
+                    req.min(slice)
+                };
+
+                //= rendered/0011-storage/02-admission.md#DC-0011-065
+                //# While an operation whose cost is higher than its pool's shown capacity waits at
+                //# the front of that pool, the device MUST grant an operation of a higher priority
+                //# tier whose cost isn't higher than the shown capacity only while the credit that
+                //# operations hold from the pool, with that operation's cost, is at most the shown
+                //# capacity.
+                if matches!(alone_tier, Some(alone) if index < alone)
+                    && held + grant_amount > shown
+                {
+                    break 'walk;
+                }
 
                 // If we can't cover this head's slice right now, stop and let releases refill `free`.
                 // A head wanting at least the slice must get the whole slice (no sub-slice dribble);
@@ -1132,6 +1341,7 @@ impl Distributor {
                             // hand the remainder back. Stash the waker locally; the batch ships at
                             // end of the poll cycle via `WakerSink::append_wakers`.
                             free -= grant_amount as i64;
+                            held += grant_amount;
                             let refund = req - grant_amount;
                             if refund > 0 {
                                 reclaimed_avail += refund;

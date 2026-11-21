@@ -148,6 +148,19 @@ impl Harness {
         }
     }
 
+    /// A harness over an adaptive pool, whose capacity and shown capacity start at the
+    /// configured capacity.
+    fn adaptive(config: Config) -> Self {
+        let counters = crate::credit::Counters::default();
+        let pool = Arc::new(Pool::with_counters_adaptive(config, counters));
+        let dist = Distributor::new(pool.clone());
+        Self {
+            pool,
+            dist,
+            dist_waker: Waker::from(Arc::new(NoopWake)),
+        }
+    }
+
     /// Acquire `n` at `priority`, parking with the given waker if necessary.
     ///
     /// # Safety
@@ -1865,5 +1878,288 @@ fn phantom_pacer_credit_released_back_does_not_drive_available_past_capacity() {
         free_test_slot(real_a);
         free_test_slot(real_b);
         free_test_slot(waiter);
+    }
+}
+
+// ── Operations above the shown capacity ──────────────────────────────────────────────────────────
+
+/// A test slot with a waker that counts its wakeups.
+fn waiter() -> (NonNull<Slot>, Arc<WakeCounter>, Waker) {
+    let counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(counter.clone());
+    (alloc_test_slot(), counter, waker)
+}
+
+/// The grant a parked test slot received, read once its waker fired. The slot is idle again.
+fn grant_of(slot: NonNull<Slot>) -> GrantResult {
+    unsafe { (*slot.as_ptr()).poll_granted() }
+}
+
+//= rendered/0011-storage/02-admission.md#DC-0011-059
+//= type=test
+//# The device MUST NOT reject an operation because its cost is higher than its pool's capacity or
+//# its pool's shown capacity.
+//= rendered/0011-storage/02-admission.md#DC-0011-064
+//= type=test
+//# When an operation whose cost is higher than its pool's shown capacity is at the front of the
+//# pool, no other operation holds credit from that pool and no operation of a higher priority tier
+//# waits for that pool's credit, the device MUST grant that operation its whole cost, though its
+//# cost is higher than the pool's free credit, without changing the pool's capacity.
+#[test]
+fn an_operation_above_the_shown_capacity_is_granted_its_whole_cost_alone() {
+    let mut h = Harness::adaptive(cfg(4, 4));
+    let (op, op_count, op_waker) = waiter();
+
+    // The cost is higher than the capacity, the shown capacity and the per-request ceiling. The
+    // pool doesn't clamp or refuse it: it parks for a grant alone.
+    let r = unsafe { h.poll_acquire(op, 5, Priority::Medium, &op_waker) };
+    assert!(matches!(r, Poll::Pending));
+
+    h.distribute();
+    assert_eq!(op_count.wakeups(), 1);
+    assert_eq!(grant_of(op), GrantResult::Granted(5));
+    // The whole cost is in flight, so the free credit is below zero, and the capacity and the
+    // shown capacity are as they were.
+    assert_eq!(h.pool.debug_available(), -1);
+    assert_eq!(h.pool.capacity(), 4);
+    assert_eq!(h.pool.shown_capacity(), 4);
+
+    h.release(5);
+    h.distribute();
+    assert_conserved(&h, 4);
+    unsafe { free_test_slot(op) };
+}
+
+//= rendered/0011-storage/02-admission.md#DC-0011-057
+//= type=test
+//# The device MUST grant an operation whose cost is higher than its pool's shown capacity only
+//# while no other operation holds credit from that pool.
+//= rendered/0011-storage/02-admission.md#DC-0011-066
+//= type=test
+//# While an operation that DC-0011-064 granted holds credit from its pool, the device MUST NOT
+//# grant another operation from that pool.
+#[test]
+fn an_operation_above_the_shown_capacity_waits_for_the_holders_and_then_holds_the_pool_alone() {
+    let mut h = Harness::adaptive(cfg(4, 4));
+    let (holder, _, holder_waker) = waiter();
+    let (big, big_count, big_waker) = waiter();
+    let (first, first_count, first_waker) = waiter();
+    let (second, second_count, second_waker) = waiter();
+
+    // Another operation holds 1 of the pool's 4, so the operation of cost 8 waits.
+    let r = unsafe { h.poll_acquire(holder, 1, Priority::Medium, &holder_waker) };
+    assert_eq!(r, Poll::Ready(1));
+    let r = unsafe { h.poll_acquire(big, 8, Priority::Medium, &big_waker) };
+    assert!(matches!(r, Poll::Pending));
+    h.distribute();
+    assert_eq!(big_count.wakeups(), 0);
+
+    // An operation that arrives behind it waits too.
+    let r = unsafe { h.poll_acquire(first, 1, Priority::Medium, &first_waker) };
+    assert!(matches!(r, Poll::Pending));
+    h.distribute();
+    assert_eq!(big_count.wakeups(), 0);
+    assert_eq!(first_count.wakeups(), 0);
+
+    // Once the holder returns its credit, the operation is granted its whole cost alone.
+    h.release(1);
+    h.distribute();
+    assert_eq!(big_count.wakeups(), 1);
+    assert_eq!(grant_of(big), GrantResult::Granted(8));
+
+    // While it holds its credit, no other operation is granted: not the one behind it, and not
+    // one that arrives now.
+    h.distribute();
+    let r = unsafe { h.poll_acquire(second, 1, Priority::Medium, &second_waker) };
+    assert!(matches!(r, Poll::Pending));
+    h.distribute();
+    assert_eq!(first_count.wakeups(), 0);
+    assert_eq!(second_count.wakeups(), 0);
+
+    // Its return lets the pool grant the others.
+    h.release(8);
+    h.distribute();
+    assert_eq!(first_count.wakeups(), 1);
+    assert_eq!(second_count.wakeups(), 1);
+    assert_eq!(grant_of(first), GrantResult::Granted(1));
+    assert_eq!(grant_of(second), GrantResult::Granted(1));
+
+    h.release(2);
+    h.distribute();
+    assert_conserved(&h, 4);
+    unsafe {
+        free_test_slot(holder);
+        free_test_slot(big);
+        free_test_slot(first);
+        free_test_slot(second);
+    }
+}
+
+//= rendered/0011-storage/02-admission.md#DC-0011-061
+//= type=test
+//# While an operation whose cost is higher than its pool's shown capacity waits at the front of
+//# that pool, the device MUST NOT grant an operation of its priority tier or of a lower tier from
+//# that pool.
+//= rendered/0011-storage/02-admission.md#DC-0011-065
+//= type=test
+//# While an operation whose cost is higher than its pool's shown capacity waits at the front of
+//# that pool, the device MUST grant an operation of a higher priority tier whose cost isn't higher
+//# than the shown capacity only while the credit that operations hold from the pool, with that
+//# operation's cost, is at most the shown capacity.
+#[test]
+fn while_an_operation_above_the_shown_capacity_waits_only_higher_tiers_within_it_are_granted() {
+    let mut h = Harness::adaptive(cfg(4, 4));
+    let (holder, _, holder_waker) = waiter();
+    let (big, big_count, big_waker) = waiter();
+    let (same, same_count, same_waker) = waiter();
+    let (lower, lower_count, lower_waker) = waiter();
+    let (first, first_count, first_waker) = waiter();
+    let (second, second_count, second_waker) = waiter();
+
+    // Another operation holds 1 of the pool's 4, so the operation of cost 8 waits at the front of
+    // its tier.
+    let r = unsafe { h.poll_acquire(holder, 1, Priority::Medium, &holder_waker) };
+    assert_eq!(r, Poll::Ready(1));
+    let r = unsafe { h.poll_acquire(big, 8, Priority::Medium, &big_waker) };
+    assert!(matches!(r, Poll::Pending));
+    // A run of clean completions raises the capacity to 8 while the shown capacity stays 4, so the
+    // free credit covers more than the shown capacity lets the pool grant.
+    h.pool.on_clean_completion(4);
+
+    let r = unsafe { h.poll_acquire(same, 1, Priority::Medium, &same_waker) };
+    assert!(matches!(r, Poll::Pending));
+    let r = unsafe { h.poll_acquire(lower, 1, Priority::Low, &lower_waker) };
+    assert!(matches!(r, Poll::Pending));
+    let r = unsafe { h.poll_acquire(first, 3, Priority::Highest, &first_waker) };
+    assert!(matches!(r, Poll::Pending));
+    let r = unsafe { h.poll_acquire(second, 2, Priority::Highest, &second_waker) };
+    assert!(matches!(r, Poll::Pending));
+
+    h.distribute();
+    assert_eq!(h.pool.capacity(), 8);
+    assert_eq!(h.pool.shown_capacity(), 4);
+    // The first operation of the higher tier is granted: the held credit with its cost is 4, the
+    // shown capacity. The second would take the held credit to 6, though the free credit, 4 after
+    // the first grant, covers its cost.
+    assert_eq!(first_count.wakeups(), 1);
+    assert_eq!(second_count.wakeups(), 0);
+    // Neither the operation behind it in its tier nor one of a lower tier is granted.
+    assert_eq!(same_count.wakeups(), 0);
+    assert_eq!(lower_count.wakeups(), 0);
+    assert_eq!(big_count.wakeups(), 0);
+
+    // Once the first returns its credit, the held credit with the second's cost is 3, and the
+    // second is granted; the operation above the shown capacity still waits for the holders.
+    assert_eq!(grant_of(first), GrantResult::Granted(3));
+    h.release(3);
+    h.distribute();
+    assert_eq!(second_count.wakeups(), 1);
+    assert_eq!(big_count.wakeups(), 0);
+    assert_eq!(same_count.wakeups(), 0);
+    assert_eq!(lower_count.wakeups(), 0);
+
+    // With nothing held, it is granted alone, and the others follow its return.
+    assert_eq!(grant_of(second), GrantResult::Granted(2));
+    h.release(1 + 2);
+    h.distribute();
+    assert_eq!(big_count.wakeups(), 1);
+    assert_eq!(same_count.wakeups(), 0);
+    assert_eq!(lower_count.wakeups(), 0);
+    assert_eq!(grant_of(big), GrantResult::Granted(8));
+
+    h.release(8);
+    h.distribute();
+    assert_eq!(same_count.wakeups(), 1);
+    assert_eq!(lower_count.wakeups(), 1);
+    assert_eq!(grant_of(same), GrantResult::Granted(1));
+    assert_eq!(grant_of(lower), GrantResult::Granted(1));
+
+    h.release(2);
+    h.distribute();
+    assert_conserved(&h, 8);
+    unsafe {
+        free_test_slot(holder);
+        free_test_slot(big);
+        free_test_slot(same);
+        free_test_slot(lower);
+        free_test_slot(first);
+        free_test_slot(second);
+    }
+}
+
+//= rendered/0011-storage/02-admission.md#DC-0011-058
+//= type=test
+//# When an operation that DC-0011-057 granted alone completes and the device took it without a
+//# would-block answer, the device MUST raise its pool's shown capacity to that operation's cost or
+//# to twice the shown capacity, whichever is lower.
+#[test]
+fn a_clean_completion_granted_alone_raises_the_shown_capacity() {
+    let mut h = Harness::adaptive(cfg(4, 4));
+    let (op, op_count, op_waker) = waiter();
+
+    let r = unsafe { h.poll_acquire(op, 16, Priority::Medium, &op_waker) };
+    assert!(matches!(r, Poll::Pending));
+    h.distribute();
+    assert_eq!(op_count.wakeups(), 1);
+    assert_eq!(grant_of(op), GrantResult::Granted(16));
+    h.release(16);
+    h.pool.on_clean_completion(16);
+    // Twice the shown capacity is lower than the cost.
+    assert_eq!(h.pool.shown_capacity(), 8);
+
+    // Still above the shown capacity, the next operation of cost 16 is granted alone, and its
+    // clean completion raises the shown capacity to its cost.
+    let r = unsafe { h.poll_acquire(op, 16, Priority::Medium, &op_waker) };
+    assert!(matches!(r, Poll::Pending));
+    h.distribute();
+    assert_eq!(op_count.wakeups(), 2);
+    assert_eq!(grant_of(op), GrantResult::Granted(16));
+    h.release(16);
+    h.pool.on_clean_completion(16);
+    assert_eq!(h.pool.shown_capacity(), 16);
+    // The shown capacity doesn't change the capacity.
+    assert_eq!(h.pool.capacity(), 4);
+
+    h.distribute();
+    assert_conserved(&h, 4);
+    unsafe { free_test_slot(op) };
+}
+
+//= rendered/0011-storage/02-admission.md#DC-0011-048
+//= type=test
+//# When an operation whose cost is higher than its pool's capacity, and not higher than its
+//# pool's shown capacity, begins to wait for the pool's credit, the device MUST raise the pool's
+//# capacity to that operation's cost.
+#[test]
+fn after_a_decrease_a_wait_within_the_shown_capacity_raises_the_capacity_and_is_granted() {
+    let mut h = Harness::adaptive(cfg(8, 8));
+    let (holder, _, holder_waker) = waiter();
+    let (op, op_count, op_waker) = waiter();
+
+    // A would-block answer lowers the capacity to half, and the shown capacity stays 8.
+    let r = unsafe { h.poll_acquire(holder, 2, Priority::Medium, &holder_waker) };
+    assert_eq!(r, Poll::Ready(2));
+    h.pool.on_would_block(h.pool.decrease_epoch());
+    h.release(2);
+    h.distribute();
+    assert_eq!(h.pool.capacity(), 4);
+    assert_eq!(h.pool.shown_capacity(), 8);
+    assert_conserved(&h, 4);
+
+    // An operation of cost 6, above the capacity and within the shown capacity, raises the
+    // capacity to its cost as it waits, and is granted its whole cost.
+    let r = unsafe { h.poll_acquire(op, 6, Priority::Medium, &op_waker) };
+    assert!(matches!(r, Poll::Pending));
+    h.distribute();
+    assert_eq!(h.pool.capacity(), 6);
+    assert_eq!(op_count.wakeups(), 1);
+    assert_eq!(grant_of(op), GrantResult::Granted(6));
+
+    h.release(6);
+    h.distribute();
+    assert_conserved(&h, 6);
+    unsafe {
+        free_test_slot(holder);
+        free_test_slot(op);
     }
 }

@@ -10,6 +10,12 @@
 //! from the same pool. A *run* ends once the costs of its clean completions add up to the capacity
 //! at its start; a would-block answer or a raise starts a new run.
 //!
+//! An adaptive pool also keeps a *shown capacity*, which starts at the configured capacity. An
+//! operation whose cost is higher than the shown capacity isn't rejected: the pool grants it alone,
+//! its whole cost, while no other operation holds the pool's credit. When such an operation
+//! completes without a would-block answer, the shown capacity rises to its cost or to twice the
+//! shown capacity, whichever is lower.
+//!
 //! [`Adapt`] holds the arithmetic alone. The pool keeps it under a mutex, and the distributor
 //! applies each change of the capacity to the pool's free credit.
 
@@ -32,12 +38,20 @@ pub(crate) struct Adapt {
     run_sum: u64,
     /// Each cost among the operations waiting for the pool's credit, with how many wait at it.
     waiting: BTreeMap<u64, usize>,
+    /// The shown capacity: the pool grants an operation whose cost is higher alone.
+    //= rendered/0011-storage/02-admission.md#DC-0011-068
+    //# After the device starts a pool's shown capacity at its configured capacity, the device MUST
+    //# change the shown capacity only as DC-0011-058, DC-0011-062 and DC-0011-063 require.
+    shown: u64,
 }
 
 impl Adapt {
     //= rendered/0011-storage/02-admission.md#DC-0011-045
     //# The device MUST start each pool's capacity at the capacity the device's configuration sets
     //# for that pool.
+    //= rendered/0011-storage/02-admission.md#DC-0011-067
+    //# The device MUST start each pool's shown capacity at the capacity the device's configuration
+    //# sets for that pool.
     pub(crate) fn new(capacity: u64) -> Self {
         Self {
             capacity,
@@ -45,7 +59,21 @@ impl Adapt {
             run_start: capacity,
             run_sum: 0,
             waiting: BTreeMap::new(),
+            shown: capacity,
         }
+    }
+
+    /// The current shown capacity.
+    #[inline]
+    pub(crate) fn shown(&self) -> u64 {
+        self.shown
+    }
+
+    /// Whether an operation whose cost is higher than the shown capacity waits for the pool's
+    /// credit.
+    #[inline]
+    pub(crate) fn waits_above_shown(&self) -> bool {
+        matches!(self.waiting.keys().next_back(), Some(&cost) if cost > self.shown)
     }
 
     /// The current capacity.
@@ -65,23 +93,32 @@ impl Adapt {
         self.run_sum = 0;
     }
 
-    fn largest_waiting(&self) -> u64 {
-        self.waiting.keys().next_back().copied().unwrap_or(0)
+    /// The largest cost among the waiting operations whose cost isn't higher than the shown
+    /// capacity.
+    fn largest_waiting_within_shown(&self) -> u64 {
+        self.waiting
+            .range(..=self.shown)
+            .next_back()
+            .map_or(0, |(&cost, _)| cost)
+    }
+
+    /// Records that an operation of `cost` waits for the pool's credit, without changing the
+    /// capacity.
+    pub(crate) fn record_wait(&mut self, cost: u64) {
+        *self.waiting.entry(cost).or_insert(0) += 1;
     }
 
     /// An operation of `cost` begins to wait for the pool's credit. Returns the raised capacity
-    /// where the cost is higher than the capacity.
-    ///
-    /// The shown capacity stays at the configured capacity until the device builds DC-0011-058,
-    /// DC-0011-062 and DC-0011-063, and the device refuses an operation whose cost is higher than
-    /// the configured capacity, so no waiting cost is higher than the shown capacity.
+    /// where the cost is higher than the capacity and not higher than the shown capacity; an
+    /// operation whose cost is higher than the shown capacity is granted alone and doesn't raise
+    /// the capacity.
     //= rendered/0011-storage/02-admission.md#DC-0011-048
     //# When an operation whose cost is higher than its pool's capacity, and not higher than its
     //# pool's shown capacity, begins to wait for the pool's credit, the device MUST raise the
     //# pool's capacity to that operation's cost.
     pub(crate) fn on_wait(&mut self, cost: u64) -> Option<u64> {
-        *self.waiting.entry(cost).or_insert(0) += 1;
-        if cost <= self.capacity {
+        self.record_wait(cost);
+        if cost <= self.capacity || cost > self.shown {
             return None;
         }
         self.capacity = cost;
@@ -100,8 +137,8 @@ impl Adapt {
     }
 
     /// The device answered would-block to an operation that the pool granted in `grant_epoch`.
-    /// Returns the lowered capacity where the answer lowers it.
-    /// No waiting cost is higher than the shown capacity, as `on_wait` says, so none is left out.
+    /// Returns the lowered capacity where the answer lowers it. Each waiting operation whose cost
+    /// is higher than the shown capacity is left out of the largest waiting cost.
     //= rendered/0011-storage/02-admission.md#DC-0011-046
     //# On a would-block answer to an operation, the device MUST lower the capacity of the pool the
     //# operation drew from to half its value, rounded up, or to the largest cost among the
@@ -118,7 +155,7 @@ impl Adapt {
             return None;
         }
         let half = self.capacity - self.capacity / 2;
-        let lowered = half.max(self.largest_waiting());
+        let lowered = half.max(self.largest_waiting_within_shown());
         if lowered >= self.capacity {
             return None;
         }
@@ -129,14 +166,22 @@ impl Adapt {
     }
 
     /// An operation of `cost` completed without a would-block answer and returned its credit.
-    /// Returns the raised capacity where its completion ends a run that raises it.
+    /// Where its cost is higher than the shown capacity, the pool granted it alone, and the shown
+    /// capacity rises. Returns the raised capacity where its completion ends a run that raises it.
     /// This module doesn't build DC-0011-054, so no completion lowers the capacity.
+    //= rendered/0011-storage/02-admission.md#DC-0011-058
+    //# When an operation that DC-0011-057 granted alone completes and the device took it without
+    //# a would-block answer, the device MUST raise its pool's shown capacity to that operation's
+    //# cost or to twice the shown capacity, whichever is lower.
     //= rendered/0011-storage/02-admission.md#DC-0011-055
     //# When a clean completion from a pool brings the summed cost of the clean completions in the
     //# pool's current run to at least the capacity the pool had when that run began, the device
     //# MUST raise the pool's capacity by the cost of that completion's operation, except where
     //# DC-0011-054 lowers the pool's capacity at that completion.
     pub(crate) fn on_clean_completion(&mut self, cost: u64) -> Option<u64> {
+        if cost > self.shown {
+            self.shown = cost.min(self.shown.saturating_mul(2));
+        }
         // A completion is clean only while a submitter waits for the pool's credit.
         if self.waiting.is_empty() {
             return None;
