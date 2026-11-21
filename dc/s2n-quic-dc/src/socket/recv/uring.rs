@@ -363,8 +363,9 @@ fn build_eventfd_poll(efd: RawFd) -> squeue::Entry {
 /// The recv ring thread. Takes the already-created ring + registered buffer ring (built fallibly in
 /// [`spawn`] before this thread starts, so registration failures fall back cleanly), owns the socket
 /// fd and the bid→descriptor map, keeps the ring full of provided buffers, reaps recv completions into
-/// `Filled` segments, and routes them, recording each completion in `counters`. Returns when
-/// `shutdown.closed` is observed.
+/// `Filled` segments, and routes them, recording each completion in `counters`. Once its first
+/// window is provided and its recv submitted, it sends `started` the count of descriptors it
+/// provided, so [`spawn`] returns a ring that receives. Returns when `shutdown.closed` is observed.
 #[allow(clippy::too_many_arguments)]
 fn ring_loop<R: Router>(
     mut ring: IoUring,
@@ -375,6 +376,7 @@ fn ring_loop<R: Router>(
     mut router: R,
     counters: Counters,
     shutdown: Arc<Shutdown>,
+    started: std::sync::mpsc::SyncSender<u16>,
 ) {
     let depth = buf_ring.entries;
     let bgid = buf_ring.bgid;
@@ -388,6 +390,7 @@ fn ring_loop<R: Router>(
     let msg = recv_msghdr();
 
     // Fill the window: allocate a descriptor per bid, publish its recv region, park it in bid_map.
+    let mut provided = 0u16;
     for bid in window.bids() {
         let Some(unfilled) = reuse.alloc_or_reuse(&pool) else {
             // Pool exhausted at startup — provide what we have; the loop replenishes as CQEs free bids.
@@ -398,6 +401,7 @@ fn ring_loop<R: Router>(
         // `addr`/`len` stay valid and exclusively owned by the kernel until the CQE.
         unsafe { buf_ring.publish(addr, len, bid) };
         bid_map[bid as usize] = Some(unfilled);
+        provided += 1;
     }
     buf_ring.commit();
 
@@ -414,6 +418,13 @@ fn ring_loop<R: Router>(
         unsafe { sq.push(&build_recv_sqe(fd, &msg, bgid)) }
             .expect("SQ has room for the multishot recv on a fresh ring");
     }
+
+    // Hand the first window's recv to the kernel before the loop waits, then report the start to
+    // `spawn`. Where the submit fails, the loop's `submit_and_wait` submits the entries again.
+    if let Err(err) = ring.submit() {
+        tracing::warn!(%err, "io_uring recv submit error");
+    }
+    let _ = started.send(provided);
 
     let mut recv_armed = true;
     // Scratch list of bids freed this reap pass, replenished after routing.
@@ -623,6 +634,10 @@ fn parse_control(control: &[u8], recv: &mut cmsg::Receiver) {
 pub struct RecvRing {
     shutdown: Arc<Shutdown>,
     join: Option<std::thread::JoinHandle<()>>,
+    /// The descriptors the ring thread provided at start, as it reported them to [`spawn`]; `None`
+    /// where the thread ended before it reported.
+    #[cfg(test)]
+    provided_at_start: Option<u16>,
 }
 
 impl Drop for RecvRing {
@@ -703,6 +718,8 @@ where
         efd,
     });
     let ring_shutdown = shutdown.clone();
+    // The ring thread reports here once it has provided its first window and submitted its recv.
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let join = std::thread::Builder::new()
         .name(format!("s2n-dc-recv-uring-{idx}"))
         .spawn(move || {
@@ -719,13 +736,23 @@ where
                 router,
                 counters,
                 ring_shutdown,
+                started_tx,
             );
         });
     match join {
-        Ok(join) => Ok(RecvRing {
-            shutdown,
-            join: Some(join),
-        }),
+        Ok(join) => {
+            // Return a ring that receives: wait for the thread's report. A thread that ends before
+            // it reports drops its sender, so `recv` returns at once.
+            let provided_at_start = started_rx.recv().ok();
+            #[cfg(not(test))]
+            let _ = provided_at_start;
+            Ok(RecvRing {
+                shutdown,
+                join: Some(join),
+                #[cfg(test)]
+                provided_at_start,
+            })
+        }
         Err(err) => Err(SpawnError::Fatal(err)),
     }
 }
@@ -795,9 +822,6 @@ mod tests {
         let ring = spawn(0, socket, 64, pool, reuse, router, counters)
             .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
 
-        // Give the ring thread a moment to register the buffer ring and arm the multishot recv.
-        std::thread::sleep(Duration::from_millis(50));
-
         let send_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let send_addr = send_sock.local_addr().unwrap();
         let payloads: &[&[u8]] = &[b"hello uring", b"second datagram", &[0xab; 1200]];
@@ -858,6 +882,36 @@ mod tests {
         assert_eq!(window.bids(), 0..INITIAL_FILL);
     }
 
+    /// `spawn` returns once the ring thread has provided its first window and submitted its recv, so
+    /// its caller holds a started ring without a wait of its own. Skipped (passes trivially) if
+    /// io_uring is unavailable.
+    #[test]
+    fn spawn_returns_a_started_ring() {
+        if probe().is_err() {
+            eprintln!("io_uring unavailable; skipping spawn_returns_a_started_ring");
+            return;
+        }
+
+        let recv_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        recv_sock.set_nonblocking(true).unwrap();
+        let router = CaptureRouter {
+            received: Arc::new(Mutex::new(Vec::new())),
+        };
+        let counters = Counters::register(&crate::counter::Registry::new(), 0);
+        let ring = spawn(
+            0,
+            BusyPoll(recv_sock),
+            64,
+            Pool::new(u16::MAX),
+            SyncReuseRing::new(),
+            router,
+            counters,
+        )
+        .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
+
+        assert_eq!(ring.provided_at_start, Some(INITIAL_FILL));
+    }
+
     /// A burst far past the first window all arrives, in order. Skipped if io_uring is unavailable.
     #[test]
     fn uring_burst_past_window() {
@@ -881,9 +935,6 @@ mod tests {
         let counters = Counters::register(&crate::counter::Registry::new(), 0);
         let ring = spawn(0, socket, 64, pool, reuse, router, counters)
             .unwrap_or_else(|_| panic!("recv ring spawn must succeed when io_uring is available"));
-
-        // Give the ring thread a moment to register the buffer ring and arm the multishot recv.
-        std::thread::sleep(Duration::from_millis(50));
 
         let send_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let count = 64u8;
