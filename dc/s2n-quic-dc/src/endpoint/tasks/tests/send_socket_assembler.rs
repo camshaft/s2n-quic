@@ -133,6 +133,7 @@ async fn assembler_pipeline(
         crate::endpoint::id::LocalSenderId::from_index(0),
     );
     let (freed_batch_tx, _freed_batch_rx) = crate::queue::freed_batch_channel();
+    let (completed_tx, _completed_rx) = unsync::new::<frame::Frame>();
     let send_credit_pool =
         crate::sync::Arc::new(crate::credit::Pool::new(crate::credit::Config::default()));
     let rx = tasks::send_socket_assembler(
@@ -144,6 +145,7 @@ async fn assembler_pipeline(
         Gso::default(),
         Pool::new(u16::MAX),
         cancelled_tx,
+        completed_tx.into_list_sender(),
         ack_completions_tx,
         freed_batch_tx,
         asm_counters,

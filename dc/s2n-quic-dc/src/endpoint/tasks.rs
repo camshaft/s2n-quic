@@ -318,6 +318,8 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
     let q_ack_to_completion =
         counter_registry.register_queue_gauge_nominal("q.ack_to_completion", &variant);
     let (completed_tx, completed_rx) = unsync::new::<Frame>();
+    // The assemblers fail the frames that a probe finds at their bound on transmissions.
+    let assembler_completed_tx = completed_tx.clone();
     let q_ack_to_cancelled =
         counter_registry.register_queue_gauge_nominal("q.ack_to_cancelled", &variant);
     let (cancelled_tx, cancelled_rx) = unsync::new::<Frame>();
@@ -676,6 +678,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
                 .with_function("endpoint::tasks::send_worker"),
         );
         let cancelled_tx = cancelled_tx.clone().into_list_sender();
+        let completed_tx = assembler_completed_tx.clone().into_list_sender();
         let ack_completions_tx = ack_completions_tx.clone();
         let asm_counters = asm_counters.clone();
         let send_counters = send_caches[local_id].borrow().send_counters().clone();
@@ -689,6 +692,7 @@ pub fn send_worker<Socket, Clk, WakerSink, AckComp>(
             st.gso,
             st.pool,
             cancelled_tx,
+            completed_tx,
             ack_completions_tx,
             freed_batch_tx.clone(),
             asm_counters,
@@ -1120,6 +1124,7 @@ pub fn send_socket_assembler<ImmediateRx, ContextRx, Clk, Socket, C, A, ImmW, Tx
     gso: Gso,
     pool: crate::socket::pool::Pool,
     cancelled_tx: C,
+    completed_tx: C,
     ack_completions_tx: A,
     freed_batch_tx: crate::queue::FreedBatchTx,
     asm_counters: AssemblerCounters,
@@ -1153,6 +1158,7 @@ where
         gso,
         pool,
         cancelled_tx,
+        completed_tx,
         ack_completions_tx,
         freed_batch_tx,
         asm_counters,
