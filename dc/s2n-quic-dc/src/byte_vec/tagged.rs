@@ -35,18 +35,29 @@ macro_rules! static_bytevec_tag {
             }
         }
 
+        /// The bytes this handle counts against the tag: `increment` and `decrement` keep them
+        /// in step with the bytes its buffer holds, so a clone counts, and a drop releases, the
+        /// bytes the buffer holds now, and not the length it was tagged with.
         #[derive(Debug)]
         pub struct Handle(usize);
 
+        //= rendered/0012-runtime/07-buffers.md#DC-0012-052
+        //# A tagged buffer MUST count against its owner the bytes it holds, for as long as it holds
+        //# them.
         impl $($tagged_path)*::Handle for Handle {
             fn increment(&mut self, len: usize) {
                 if len > 0 {
+                    self.0 = self.0.saturating_add(len);
                     COUNT.fetch_add(len as _, core::sync::atomic::Ordering::Relaxed);
                 }
             }
 
             fn decrement(&mut self, len: usize) {
+                // A handle releases at most the bytes it counts, so the counter never falls below
+                // the bytes the other handles hold.
+                let len = len.min(self.0);
                 if len > 0 {
+                    self.0 -= len;
                     COUNT.fetch_sub(len as _, core::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -179,6 +190,14 @@ mod tests {
         static_bytevec_tag!(crate::byte_vec::tagged);
     }
 
+    mod tag_c {
+        static_bytevec_tag!(crate::byte_vec::tagged);
+    }
+
+    mod tag_d {
+        static_bytevec_tag!(crate::byte_vec::tagged);
+    }
+
     #[test]
     fn tag_test() {
         let chunk = ByteVec::from(b"hello!");
@@ -205,5 +224,62 @@ mod tests {
 
         assert_eq!(tag_a::Tag::current(), 0);
         assert_eq!(tag_b::Tag::current(), 0);
+    }
+
+    // A buffer tagged empty that grows by appends releases every byte it holds when it is
+    // dropped, and a clone counts the bytes the buffer holds now.
+    //= rendered/0012-runtime/07-buffers.md#DC-0012-052
+    //= type=test
+    //# A tagged buffer MUST count against its owner the bytes it holds, for as long as it holds
+    //# them.
+    #[test]
+    fn a_dropped_buffer_releases_the_bytes_appended_to_it() {
+        let mut staging: Tagged<tag_c::Tag> = Tagged::default();
+        assert_eq!(tag_c::Tag::current(), 0);
+
+        staging.append(&mut ByteVec::from(b"hello world"));
+        assert_eq!(tag_c::Tag::current(), 11);
+
+        let head = staging.split_to(5).unwrap();
+        assert_eq!(head.len(), 5);
+        assert_eq!(tag_c::Tag::current(), 6);
+
+        let copy = staging.clone();
+        assert_eq!(
+            tag_c::Tag::current(),
+            12,
+            "a clone counts the bytes the buffer holds now"
+        );
+        drop(copy);
+        assert_eq!(tag_c::Tag::current(), 6);
+
+        drop(staging);
+        assert_eq!(
+            tag_c::Tag::current(),
+            0,
+            "a drop releases the bytes appended since the tag"
+        );
+    }
+
+    // A handle releases at most the bytes it counts: a decrement past them leaves the bytes the
+    // other handles hold counted.
+    #[test]
+    fn a_handle_releases_at_most_the_bytes_it_counts() {
+        let other: Tagged<tag_d::Tag> = ByteVec::from(b"hello!").tag(&tag_d::Tag);
+        let mut handle = tag_d::Tag.tag(2);
+        assert_eq!(tag_d::Tag::current(), 8);
+
+        handle.decrement(5);
+        assert_eq!(
+            tag_d::Tag::current(),
+            6,
+            "the bytes the other buffer holds stay counted"
+        );
+
+        drop(handle);
+        assert_eq!(tag_d::Tag::current(), 6);
+
+        drop(other);
+        assert_eq!(tag_d::Tag::current(), 0);
     }
 }
