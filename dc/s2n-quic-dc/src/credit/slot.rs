@@ -301,12 +301,10 @@ impl Slot {
         // Try to transition LINKED → DEAD. If the slot is APP-owned (never parked, or the pool just
         // raced us to APP), the CAS fails and the caller owns the allocation. The expected-current
         // value is `RC_LINKED` so a successful CAS proves we transitioned a live LINKED slot.
-        match self.refcount.compare_exchange(
-            RC_LINKED,
-            dead,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
+        match self
+            .refcount
+            .compare_exchange(RC_LINKED, dead, Ordering::Release, Ordering::Acquire)
+        {
             Ok(_) => AbandonResult::Abandoned,
             Err(rc) => {
                 debug_assert_eq!(
