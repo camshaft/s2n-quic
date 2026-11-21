@@ -1635,3 +1635,6 @@ fn ack_only_segment_must_not_consume_pto_probe_budget() {
         pn0.as_u64(),
     );
 }
+
+/// Tests that cite RFC 0005's assembly requirements.
+mod assembly_requirements;
