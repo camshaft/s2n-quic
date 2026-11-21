@@ -59,7 +59,7 @@
 use super::{
     config::Config,
     counters::Counters,
-    slot::{DeadSlot, DeadSlotQueue, Slot, SlotAdapter, SlotPtr},
+    slot::{AbandonResult, DeadSlot, DeadSlotQueue, Slot, SlotAdapter, SlotPtr},
     waker::TaskWaker,
 };
 use crate::{
@@ -529,6 +529,39 @@ impl Pool {
         false
     }
 
+    /// Abandon `slot` from the application side, as [`Slot::abandon`] does. Where the abandon
+    /// wins over a grant, an adaptive pool ends the slot's wait for its credit at once: a
+    /// cancelled operation stops counting among the waiting operations, and the distributor's
+    /// reap of the dead slot leaves the wait as it is.
+    ///
+    /// # Safety
+    ///
+    /// As [`Slot::abandon`], and `slot` is either idle or linked in this pool's wait list.
+    //= rendered/0011-storage/02-admission.md#DC-0011-046
+    //# On a would-block answer to an operation, the device MUST lower the capacity of the pool the
+    //# operation drew from to half its value, rounded up, or to the largest cost among the
+    //# operations waiting for that pool's credit where that cost is higher, leaving out each
+    //# operation whose cost is higher than the pool's shown capacity as DC-0011-062 lowers it at
+    //# that answer.
+    //= rendered/0011-storage/02-admission.md#DC-0011-055
+    //# When a clean completion from a pool brings the summed cost of the clean completions in the
+    //# pool's current run to at least the capacity the pool had when that run began, the device
+    //# MUST raise the pool's capacity by the cost of that completion's operation, except where
+    //# DC-0011-054 lowers the pool's capacity at that completion.
+    pub unsafe fn abandon(&self, slot: NonNull<Slot>) -> AbandonResult {
+        let slot = &*slot.as_ptr();
+        if self.adapt.is_none() {
+            return slot.abandon();
+        }
+        // The application wrote `requested` before it linked the slot; the pool only reads it.
+        let cost = slot.requested();
+        let result = slot.abandon_wait_ended();
+        if result == AbandonResult::Abandoned {
+            self.end_wait(cost);
+        }
+        result
+    }
+
     /// Apply an adaptive pool's capacity target. A raise returns its difference for the
     /// distributor's pass to add to its pull; a decrease takes its difference from `available` at
     /// once, which lowers only the free credit. The distributor alone calls it.
@@ -592,6 +625,17 @@ impl Pool {
     #[allow(dead_code)]
     pub(crate) fn debug_capacity(&self) -> u64 {
         self.capacity()
+    }
+
+    /// The number of operations waiting for an adaptive pool's credit, for conservation
+    /// assertions; always 0 for a fixed pool.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn debug_waiting(&self) -> usize {
+        match &self.adapt {
+            Some(adapt) => lock(adapt).debug_waiting(),
+            None => 0,
+        }
     }
 }
 
@@ -1071,13 +1115,23 @@ impl Distributor {
                 let req = unsafe { front.requested() };
 
                 if front.is_dead() {
+                    // An abandon through an adaptive pool ended the slot's wait already.
+                    let wait_ended = front.wait_ended();
                     let ptr = local.pop_front().unwrap().take();
                     self.paid_demand += req;
-                    self.pool.end_wait(req);
+                    if !wait_ended {
+                        self.pool.end_wait(req);
+                    }
+                    //= rendered/0011-storage/02-admission.md#DC-0011-011
+                    //# The device MUST return an operation's credit to the pool it came from
+                    //# exactly once, whether the operation succeeds, fails or is cancelled.
+                    // The reap leaves `free` as it is: the slot's debit of `available` and its
+                    // share of `outstanding` cancel in `free`, and `reclaimed_avail` returns the
+                    // debit to `available` at the writeback. Adding `req` to `free` here would
+                    // count the cancelled slot's credit twice and grant credit the pool lacks.
                     reclaimed_avail += req;
-                    free += req as i64;
                     self.pool.counters.distributor_reaped.add(1);
-                    // SAFETY: a dead slot (refcount=0) has been popped from every list and is owned
+                    // SAFETY: a dead slot has been popped from every list and is owned
                     // by us; wrapping it in `DeadSlot` transfers ownership to the dead queue, which
                     // runs the drop_fn at end-of-poll outside the work loop.
                     dead.push_back(unsafe { DeadSlot::new(ptr) });
@@ -1119,7 +1173,11 @@ impl Distributor {
                     // parked list. The un-granted remainder (`req - grant_amount`) is refunded
                     // below; the slot's caller re-acquires for the rest.
                     self.paid_demand += req;
-                    self.pool.end_wait(req);
+                    // The grant ends the slot's wait. Where the abandon won the race through an
+                    // adaptive pool, the abandon ended the wait already.
+                    if res.is_some() || !slot.wait_ended() {
+                        self.pool.end_wait(req);
+                    }
 
                     match res {
                         Some(waker) => {
@@ -1143,10 +1201,10 @@ impl Distributor {
                         }
                         None => {
                             // Raced: the app abandoned between our `is_dead` check and the CAS.
-                            // `grant` returning None means refcount=0 and the slot is ours to free.
+                            // `grant` returning None means the slot is dead and ours to free.
                             // Push into the dead queue; its drop at end-of-poll frees the slot.
                             reclaimed_avail += req;
-                            free += req as i64;
+                            // `free` stays as it is, as in a dead-slot reap above.
                             self.pool.counters.abandon_granted_race.add(1);
                             trace!(target: "credit::pool", req, "abandon_granted_race");
                             dead.push_back(DeadSlot::new(ptr));
