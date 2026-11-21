@@ -630,6 +630,12 @@ fn the_reap_doesnt_end_an_abandoned_waiters_wait_again() {
     h.distribute();
     assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
     assert_eq!(h.pool.debug_waiting(), 1);
+    //= rendered/0011-storage/02-admission.md#DC-0011-011
+    //= type=test
+    //# The device MUST return an operation's credit to the pool it came from exactly once, whether
+    //# the operation succeeds, fails or is cancelled.
+    // The reap returns the cancelled slot's credit once: the holder's 64 is the only credit held.
+    assert_eq!(h.pool.observed_in_flight(), 64);
     h.pool.on_would_block(h.pool.decrease_epoch());
     h.distribute();
     assert_eq!(h.pool.debug_capacity(), 40);
