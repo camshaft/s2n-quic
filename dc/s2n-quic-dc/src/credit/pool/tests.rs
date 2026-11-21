@@ -148,6 +148,18 @@ impl Harness {
         }
     }
 
+    /// A harness over an adaptive pool, whose capacity follows the device's answers.
+    fn adaptive(config: Config) -> Self {
+        let counters = crate::credit::Counters::default();
+        let pool = Arc::new(Pool::with_counters_adaptive(config, counters));
+        let dist = Distributor::new(pool.clone());
+        Self {
+            pool,
+            dist,
+            dist_waker: Waker::from(Arc::new(NoopWake)),
+        }
+    }
+
     /// Acquire `n` at `priority`, parking with the given waker if necessary.
     ///
     /// # Safety
@@ -1865,5 +1877,88 @@ fn phantom_pacer_credit_released_back_does_not_drive_available_past_capacity() {
         free_test_slot(real_a);
         free_test_slot(real_b);
         free_test_slot(waiter);
+    }
+}
+
+/// How a waiter that raised an adaptive pool's capacity stops waiting.
+#[derive(Clone, Copy, Debug)]
+enum WaitEnd {
+    /// Its caller drops the acquire, and the distributor reaps the dead slot.
+    Dropped,
+    /// The distributor grants it the credit it asked for.
+    Granted,
+}
+
+//= rendered/0011-storage/02-admission.md#DC-0011-046
+//= type=test
+//# On a would-block answer to an operation, the device MUST lower the capacity of the pool the
+//# operation drew from to half its value, rounded up, or to the largest cost among the
+//# operations waiting for that pool's credit where that cost is higher, leaving out each
+//# operation whose cost is higher than the pool's shown capacity as DC-0011-062 lowers it at
+//# that answer.
+//= rendered/0011-storage/02-admission.md#DC-0011-048
+//= type=test
+//# When an operation whose cost is higher than its pool's capacity, and not higher than its
+//# pool's shown capacity, begins to wait for the pool's credit, the device MUST raise the
+//# pool's capacity to that operation's cost.
+#[test]
+fn a_waiter_that_stops_waiting_doesnt_hold_a_decrease() {
+    // The reaped slot runs `drop_test_alloc`, which counts in the shared `DROP_COUNT`.
+    let _drop_guard = drop_count_guard();
+
+    for end in [WaitEnd::Dropped, WaitEnd::Granted] {
+        let mut h = Harness::adaptive(cfg(64, 64));
+        // A would-block answer lowers the capacity to 32.
+        h.pool.on_would_block(h.pool.decrease_epoch());
+        h.distribute();
+        assert_eq!(h.pool.capacity(), 32, "{end:?}");
+
+        // An operation holds all 32 credits.
+        let holder_waker = Waker::from(Arc::new(NoopWake));
+        let holder = alloc_test_slot();
+        let r = unsafe { h.poll_acquire(holder, 32, Priority::Medium, &holder_waker) };
+        assert_eq!(r, Poll::Ready(32), "{end:?}");
+
+        // An acquire of 48 waits past the capacity, and raises the capacity to its cost.
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(counter.clone());
+        let waiter = alloc_test_slot();
+        let r = unsafe { h.poll_acquire(waiter, 48, Priority::Medium, &waker) };
+        assert!(matches!(r, Poll::Pending), "{end:?}");
+        h.distribute();
+        assert_eq!(h.pool.capacity(), 48, "{end:?}");
+        assert_eq!(counter.wakeups(), 0, "{end:?}");
+
+        match end {
+            WaitEnd::Dropped => {
+                assert_eq!(
+                    unsafe { (*waiter.as_ptr()).abandon() },
+                    AbandonResult::Abandoned,
+                    "{end:?}"
+                );
+                // The distributor reaps the dead slot and frees it.
+                h.distribute();
+                assert_eq!(counter.wakeups(), 0, "{end:?}");
+            }
+            WaitEnd::Granted => {
+                h.release(32);
+                h.distribute();
+                assert_eq!(counter.wakeups(), 1, "{end:?}");
+                let waiter_ref = unsafe { &*waiter.as_ptr() };
+                assert_eq!(waiter_ref.poll_granted(), GrantResult::Granted(48), "{end:?}");
+            }
+        }
+
+        // No operation waits now, so the next would-block answer halves the capacity: the
+        // waiter's cost of 48 doesn't hold it at 48.
+        h.pool.on_would_block(h.pool.decrease_epoch());
+        h.distribute();
+        assert_eq!(h.pool.capacity(), 24, "{end:?}");
+        assert_eq!(h.pool.decrease_epoch(), 2, "{end:?}");
+
+        unsafe { free_test_slot(holder) };
+        if matches!(end, WaitEnd::Granted) {
+            unsafe { free_test_slot(waiter) };
+        }
     }
 }
