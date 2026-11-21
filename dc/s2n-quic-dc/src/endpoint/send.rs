@@ -1537,6 +1537,15 @@ impl Cache {
         Some(ctx.drain_frames(Some(reason), cancelled))
     }
 
+    /// Acts on a stale-key or replay notice for `id`: removes the send context and drains its
+    /// frames into `retransmit`, so that they go out on a new context with a newer key id.
+    ///
+    /// Leaves the cache as it is, and counts why, where it doesn't hold a context for `id`
+    /// (`send.stale_key.no_context`) or where its context already seals with a key id newer than
+    /// `rejected_key_id` (`send.stale_key.already_advanced`). Either way the notice rejects a key
+    /// id this sender no longer seals with, such as a later notice for a key id it already acted
+    /// on: the path secret map moves the sender's next key id past the rejected one before the
+    /// notice gets here, so the next context seals with a key id the peer accepts.
     pub fn invalidate_stale_key(
         &mut self,
         id: &credentials::Id,
@@ -1557,6 +1566,7 @@ impl Cache {
         }
 
         let Some(ctx) = self.contexts.get(id) else {
+            self.send_counters.on_stale_key_no_context();
             trace!(
                 %id,
                 sender_idx = %self.sender_idx,
@@ -1569,6 +1579,7 @@ impl Cache {
         // If the send context's key_id is already past the rejected one, this
         // invalidation is stale (e.g. a delayed/replayed control packet) — ignore it.
         if ctx.borrow().credentials.key_id > rejected_key_id {
+            self.send_counters.on_stale_key_already_advanced();
             trace!(
                 %id,
                 sender_idx = %self.sender_idx,

@@ -2071,6 +2071,29 @@ impl Registry {
         self.inner.try_take_current_metrics_line_sparse(false)
     }
 
+    /// Drains the current metrics line, as [`Self::take_current_metrics_line`] does, and returns
+    /// the value of each entry whose value is a whole number, by its label, summed over the
+    /// label's variants. Test-only: lets a test read how many times something was counted without
+    /// parsing the line itself.
+    #[cfg(test)]
+    pub fn take_counter_totals(&self) -> HashMap<String, u64> {
+        let mut totals = HashMap::new();
+        let Some(line) = self.take_current_metrics_line() else {
+            return totals;
+        };
+        for entry in line.split(',') {
+            let Some((label, value)) = entry.split_once('=') else {
+                continue;
+            };
+            // A nominal entry's variant, and a unit, follow its value after a space.
+            let value = value.split(' ').next().unwrap_or_default();
+            if let Ok(value) = value.parse::<u64>() {
+                *totals.entry(label.to_string()).or_insert(0) += value;
+            }
+        }
+        totals
+    }
+
     /// Register a task in the topology.
     pub(crate) fn register_task_topology(&self, task: TaskRegistration) {
         self.topology.lock().unwrap().tasks.push(task);
