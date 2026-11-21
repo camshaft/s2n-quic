@@ -1215,6 +1215,8 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let now = clock.now();
                 let ctx = context.borrow();
 
+                //= rendered/0005-endpoint/06-peers.md#DC-0005-045
+                //# A sender MUST discard a send state once neither an acknowledgement nor any other packet has arrived from its peer for the idle timeout.
                 // Compute the reschedule target. If it's in a future wheel tick,
                 // reschedule and return early.
                 if !ctx.is_peer_idle(now) {
@@ -1306,6 +1308,8 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                     );
                 }
 
+                //= rendered/0005-endpoint/06-peers.md#DC-0005-047
+                //# When a send state discarded for idleness still held packets its peer never acknowledged, and the cooldown of an earlier declaration of the peer as dead isn't running, the endpoint MUST reset every stream with that peer.
                 // Mark the peer dead only when we have packets in flight that
                 // were never acknowledged — that's evidence the peer is
                 // unreachable. If there are no inflight packets, both sides
@@ -1313,6 +1317,8 @@ pub async fn send_idle_wheel_drain<Clk, WakerSink, AckComp>(
                 let marked_dead = has_inflight
                     && path_secret_entry.mark_dead_if_cooldown_elapsed(now, dead_peer_cooldown);
 
+                //= rendered/0005-endpoint/06-peers.md#DC-0005-046
+                //# When a sender discards a send state for idleness, it MUST fail each of its pending and unacknowledged frames with the peer dead reason.
                 let result = send_caches[local_id].borrow_mut().invalidate(
                     &id,
                     frame::FailureReason::PeerDead,
@@ -1398,6 +1404,8 @@ pub async fn recv_idle_wheel_drain<Clk>(
                 let lifetime = now.duration_since(ctx.created_at);
                 drop(ctx);
                 recv_cache.borrow_mut().remove(&key);
+                //= rendered/0005-endpoint/06-peers.md#DC-0005-049
+                //# A receiver MUST NOT declare a peer dead because its receive state went idle.
                 // The recv side does not mark the peer dead. An idle recv context
                 // only means the peer stopped sending — it cannot distinguish
                 // "nothing to say" from "actually unreachable". Only the send
@@ -1658,6 +1666,8 @@ fn on_packet_dispatch_error(
             control_out,
         } => {
             counters.rx_process_err_peer_lookup.add(1);
+            //= rendered/0005-endpoint/02-receive.md#DC-0005-011
+            //# When a receiver doesn't hold the path secret that a packet's credential names, it MUST send the packet's sender an unknown path secret notice at the sender's control port.
             if !control_out.is_empty() {
                 let response = endpoint::ups::Response {
                     dest_addr,
@@ -1704,6 +1714,8 @@ fn on_packet_dispatch_error(
             control_out,
         } => {
             counters.rx_process_err_stale_key.add(1);
+            //= rendered/0005-endpoint/02-receive.md#DC-0005-012
+            //# When the first packet a receiver authenticates under a new key fails the replay check, the receiver MUST send the packet's sender a replay notice.
             if !control_out.is_empty() {
                 // In the endpoint `ups_tx` is a `ups::PendingSender`, which keeps one response
                 // in the queue for each credential and sender id, however many of the peer's
@@ -1865,11 +1877,15 @@ where
         counters.events.add(1);
         let peer_dead = entry.into_inner();
 
+        //= rendered/0005-endpoint/06-peers.md#DC-0005-047
+        //# When a send state discarded for idleness still held packets its peer never acknowledged, and the cooldown of an earlier declaration of the peer as dead isn't running, the endpoint MUST reset every stream with that peer.
         match peer_dead.path_secret_entry.queue_state() {
             QueueState::Client(state) => {
                 state.broadcast_reset(IDLE_TIMEOUT, &mut |aw| {
                     let _ = waker_sink.send(aw);
                 });
+                //= rendered/0005-endpoint/06-peers.md#DC-0005-048
+                //# When the peer of a client path is declared dead, the client MUST request a new handshake with that peer.
                 // Only a client handshakes, so only a client path asks for a new handshake.
                 request_rehandshake(*peer_dead.path_secret_entry.peer());
             }
@@ -1900,6 +1916,8 @@ where
         invalidation_rx,
         move |entry: Entry<Invalidation>| match *entry {
             Invalidation::UnknownPathSecret { credential_id } => {
+                //= rendered/0005-endpoint/06-peers.md#DC-0005-041
+                //# On a validated unknown path secret notice, the endpoint MUST fail every pending and unacknowledged frame sent under that credential with the unknown path secret reason.
                 counters.unknown_path_secret_events.add(1);
                 for (_, cache) in &send_caches {
                     let mut cache = cache.borrow_mut();
@@ -1975,6 +1993,8 @@ where
         invalidation_rx,
         move |entry: Entry<Invalidation>| match *entry {
             Invalidation::UnknownPathSecret { credential_id } => {
+                //= rendered/0005-endpoint/06-peers.md#DC-0005-042
+                //# On a validated unknown path secret notice, the endpoint MUST discard its receive state for that credential.
                 recv_cache.borrow_mut().invalidate_by_id(&credential_id);
             }
             msg => {
@@ -2025,6 +2045,8 @@ where
             debug!(%peer, "ignored invalidation control packet: decode failed");
             return;
         };
+        //= rendered/0005-endpoint/06-peers.md#DC-0005-040
+        //# The endpoint MUST NOT change any send or receive state on a notice from a peer that fails validation against its path secrets.
         let Some(invalidation) = (match packet {
             secret_control::Packet::UnknownPathSecret(packet) => {
                 let Some(validated) =

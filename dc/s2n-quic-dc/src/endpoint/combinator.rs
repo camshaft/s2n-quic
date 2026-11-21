@@ -485,6 +485,8 @@ use crate::endpoint::edt::{
     PICK_TWO_FLOOR_LN_RATIO, PICK_TWO_WORSE_FLOOR, PICK_TWO_WORST_CASE_GAP_NANOS,
 };
 
+//= rendered/0005-endpoint/05-assembly.md#DC-0005-039
+//# A sender MAY spread one peer's frames across several of its senders, each with its own sender identifier and packet number space.
 /// Receiver combinator that routes items to socket senders using a hybrid round-robin +
 /// random pick-two path scheduling strategy from the path secret map entry associated
 /// with each item.
@@ -961,6 +963,8 @@ where
 
 // ── CompletionDispatcher ─────────────────────────────────────────────────
 
+//= rendered/0005-endpoint/01-frames.md#DC-0005-002
+//# For each frame its writer hasn't cancelled, the endpoint MUST report exactly one outcome to the writer: acknowledged, or failed with its reason.
 /// Receiver combinator that groups frames by completion channel and delivers each group
 /// as a single batch (one lock acquisition per channel).
 ///
