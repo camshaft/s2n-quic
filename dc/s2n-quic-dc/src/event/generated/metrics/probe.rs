@@ -61,6 +61,9 @@ mod counter {
                 109usize => Self(path_secret_map_cleaner_cycled),
                 126usize => Self(path_secret_map_id_write_lock),
                 129usize => Self(path_secret_map_address_write_lock),
+                132usize => Self(creditless_window_frame_refused),
+                136usize => Self(creditless_window_limit_grew),
+                140usize => Self(creditless_window_limit_halved),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -160,6 +163,12 @@ mod counter {
             fn path_secret_map_id_write_lock(value: u64);
             # [link_name = s2n_quic_dc__event__counter__path_secret_map_address_write_lock]
             fn path_secret_map_address_write_lock(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__creditless_window_frame_refused]
+            fn creditless_window_frame_refused(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__creditless_window_limit_grew]
+            fn creditless_window_limit_grew(value: u64);
+            # [link_name = s2n_quic_dc__event__counter__creditless_window_limit_halved]
+            fn creditless_window_limit_halved(value: u64);
         }
     );
     pub mod bool {
@@ -517,6 +526,15 @@ mod measure {
                 128usize => Self(path_secret_map_id_write_lock__duration),
                 130usize => Self(path_secret_map_address_write_lock__acquire),
                 131usize => Self(path_secret_map_address_write_lock__duration),
+                133usize => Self(creditless_window_frame_refused__frame_bytes),
+                134usize => Self(creditless_window_frame_refused__held_bytes),
+                135usize => Self(creditless_window_frame_refused__limit_bytes),
+                137usize => Self(creditless_window_limit_grew__released_bytes),
+                138usize => Self(creditless_window_limit_grew__held_bytes),
+                139usize => Self(creditless_window_limit_grew__limit_bytes),
+                141usize => Self(creditless_window_limit_halved__held_bytes),
+                142usize => Self(creditless_window_limit_halved__previous_limit_bytes),
+                143usize => Self(creditless_window_limit_halved__limit_bytes),
                 _ => unreachable!("invalid info: {info:?}"),
             }
         }
@@ -632,6 +650,24 @@ mod measure {
             fn path_secret_map_address_write_lock__acquire(value: u64);
             # [link_name = s2n_quic_dc__event__measure__path_secret_map_address_write_lock__duration]
             fn path_secret_map_address_write_lock__duration(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_frame_refused__frame_bytes]
+            fn creditless_window_frame_refused__frame_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_frame_refused__held_bytes]
+            fn creditless_window_frame_refused__held_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_frame_refused__limit_bytes]
+            fn creditless_window_frame_refused__limit_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_grew__released_bytes]
+            fn creditless_window_limit_grew__released_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_grew__held_bytes]
+            fn creditless_window_limit_grew__held_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_grew__limit_bytes]
+            fn creditless_window_limit_grew__limit_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_halved__held_bytes]
+            fn creditless_window_limit_halved__held_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_halved__previous_limit_bytes]
+            fn creditless_window_limit_halved__previous_limit_bytes(value: u64);
+            # [link_name = s2n_quic_dc__event__measure__creditless_window_limit_halved__limit_bytes]
+            fn creditless_window_limit_halved__limit_bytes(value: u64);
         }
     );
 }
