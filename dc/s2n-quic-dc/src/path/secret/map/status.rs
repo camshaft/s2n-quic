@@ -95,9 +95,17 @@ impl Dedup {
                     key_id,
                     queue_id,
                     map,
-                }) => map
-                    .store
-                    .check_dedup(&entry, key_id, queue_id, &mut Vec::new()),
+                }) => {
+                    let result = map
+                        .store
+                        .check_dedup(&entry, key_id, queue_id, &mut Vec::new());
+                    // `check` runs once the packet has opened, so where the replay check passes
+                    // the packet counts as use of the entry for the cleaner's eviction order.
+                    if result.is_ok() {
+                        entry.set_accessed_authenticated();
+                    }
+                    result
+                }
                 None => {
                     // Dedup has been poisoned! TODO log this
                     Err(crypto::open::Error::ReplayPotentiallyDetected { gap: None })

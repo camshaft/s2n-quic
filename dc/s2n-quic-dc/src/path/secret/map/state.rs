@@ -460,9 +460,11 @@ where
     // All known entries.
     pub(super) ids: IdMap,
 
-    // We evict entries based on FIFO order. When an entry is created, it gets added to the queue.
-    // Entries can die in one of two ways: exiting the queue, and replacement due to re-handshaking
-    // (if the peer address is the same).
+    // We evict entries from the front of this queue. When an entry is created, it gets added to
+    // the back. Each cleaner cycle moves the entries used since its previous cycle (a packet on
+    // the entry authenticated, or the local endpoint looked the entry up by address), other than
+    // retired ones, to the back in their order. Entries can die in one of two ways: exiting the
+    // queue, and replacement due to re-handshaking (if the peer address is the same).
     pub(super) eviction_queue: Mutex<VecDeque<Weak<Entry>>>,
 
     pub(super) signer: stateless_reset::Signer,
@@ -852,9 +854,12 @@ where
 
             // We went beyond queue limit, need to prune some entries.
             if queue.len() > self.max_capacity {
-                // FIXME: Consider a more interesting algorithm, e.g., scanning the first N entries
-                // if the popped entry is still live to see if we can avoid dropping a live entry.
-                // May not be worth it in practice.
+                // The cleaner keeps the entries used since its previous cycle behind the ones
+                // that weren't, so the front entry is the one that wasn't used as of that cycle
+                // and has gone longest since its last use or its insert. Entries inserted since
+                // then wait behind the ones in use until the next cycle, and once the unused ones
+                // are gone the insert evicts an entry in use, in the order the cleaner left them.
+                // Popping the front keeps an insert's cost independent of the number of entries.
                 let element = queue.pop_front().unwrap();
                 // Drop the queue lock prior to dropping element in case we wind up deallocating
                 // This reduces lock contention and avoids interleaving locks (requiring careful
