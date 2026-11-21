@@ -1195,13 +1195,24 @@ where
             return None;
         };
 
+        // A minimum key id past the last one the sender can use would make its next key id
+        // panic, so the packet is refused and the sender keeps its current key id.
+        if !entry.sender().update_for_stale_key(packet.min_key_id) {
+            self.subscriber().on_stale_key_packet_rejected(
+                event::builder::StaleKeyPacketRejected {
+                    credential_id: packet.credential_id.into_event(),
+                    peer_address,
+                },
+            );
+
+            return None;
+        }
+
         self.subscriber()
             .on_stale_key_packet_accepted(event::builder::StaleKeyPacketAccepted {
                 credential_id: packet.credential_id.into_event(),
                 peer_address,
             });
-
-        entry.sender().update_for_stale_key(packet.min_key_id);
 
         Some(packet)
     }
@@ -1245,6 +1256,31 @@ where
             return None;
         };
 
+        // Advance the sender past the rejected key-id so retransmissions use a fresh key-id the
+        // peer hasn't seen. Where the rejected key-id is the last one the sender can use, or past
+        // it, the sender has nothing to advance to: the packet is refused, it doesn't request a
+        // handshake, and the sender keeps its current key-id.
+        let Some(next) = packet
+            .rejected_key_id
+            .checked_add_usize(1)
+            .filter(|&next| entry.sender().update_for_stale_key(next))
+        else {
+            self.subscriber().on_replay_detected_packet_rejected(
+                event::builder::ReplayDetectedPacketRejected {
+                    credential_id: packet.credential_id.into_event(),
+                    peer_address,
+                },
+            );
+            return None;
+        };
+
+        debug!(
+            credential_id = %packet.credential_id,
+            rejected_key_id = packet.rejected_key_id.as_u64(),
+            new_min_key_id = next.as_u64(),
+            "handle_replay_detected: advanced sender key-id"
+        );
+
         self.subscriber().on_replay_detected_packet_accepted(
             event::builder::ReplayDetectedPacketAccepted {
                 credential_id: packet.credential_id.into_event(),
@@ -1266,18 +1302,6 @@ where
         // Handshaking will be rate limited per destination peer (and at least
         // de-duplicated).
         self.request_handshake(*entry.peer(), HandshakeReason::Remote);
-
-        // Advance the sender past the rejected key-id so retransmissions use a
-        // fresh key-id the peer hasn't seen.
-        if let Some(next) = packet.rejected_key_id.checked_add_usize(1) {
-            debug!(
-                credential_id = %packet.credential_id,
-                rejected_key_id = packet.rejected_key_id.as_u64(),
-                new_min_key_id = next.as_u64(),
-                "handle_replay_detected: advancing sender key-id"
-            );
-            entry.sender().update_for_stale_key(next);
-        }
 
         Some(packet)
     }
