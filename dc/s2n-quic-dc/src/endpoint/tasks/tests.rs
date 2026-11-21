@@ -64,6 +64,7 @@ mod helpers;
 mod idle_wheel;
 mod invalidation;
 mod invalidation_validator;
+mod peers;
 mod send_socket_assembler;
 mod send_worker;
 mod socket_recv;
