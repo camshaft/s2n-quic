@@ -449,3 +449,72 @@ fn send_invalidation_stale_key_targets_matching_sender_only() {
         .spawn();
     });
 }
+
+/// A send cache acts on the first stale-key or replay notice that rejects the key id its context
+/// seals with, and leaves its context as it is for each later notice for that key id: while it
+/// doesn't hold a context for the credential, and once the next send makes a context with a
+/// newer key id.
+#[test]
+fn stale_key_invalidation_leaves_a_context_it_already_replaced() {
+    let _no_snap = crate::testing::without_snapshots();
+    sim(|| {
+        async move {
+            use send::StaleKeyOutcome::{AlreadyAdvanced, Invalidated, NoContext};
+
+            let registry = crate::counter::Registry::default();
+            let clock = Clock::default();
+            let sender = LocalSenderId::from_index(0);
+            let mut cache = send::Cache::new(&registry, sender);
+            let pse = test_entry();
+            pse.touch_activity(precision::Clock::now(&clock));
+            let id = *pse.id();
+            let (mut retransmit_tx, _retransmit_rx) = unsync::new::<Frame>();
+            let rejected = VarInt::ZERO;
+            send::take_stale_key_outcomes();
+
+            // The first context seals with key id 0.
+            let ctx = cache.get_or_insert(&pse, &clock).unwrap();
+            assert_eq!(ctx.borrow().credentials.key_id, rejected);
+            drop(ctx);
+
+            assert!(
+                cache
+                    .invalidate_stale_key(&id, sender, rejected, &mut retransmit_tx)
+                    .is_some(),
+                "a notice that rejects the key id the context seals with removes the context"
+            );
+            assert!(
+                cache
+                    .invalidate_stale_key(&id, sender, rejected, &mut retransmit_tx)
+                    .is_none(),
+                "a second notice for that key id doesn't find a context"
+            );
+
+            // The next send makes a context with a newer key id.
+            let ctx = cache.get_or_insert(&pse, &clock).unwrap();
+            assert!(ctx.borrow().credentials.key_id > rejected);
+            drop(ctx);
+
+            assert!(
+                cache
+                    .invalidate_stale_key(&id, sender, rejected, &mut retransmit_tx)
+                    .is_none(),
+                "a third notice leaves the context with the newer key id in place"
+            );
+            assert_eq!(cache.context_count(), 1);
+
+            let outcomes: Vec<_> = send::take_stale_key_outcomes()
+                .into_iter()
+                .map(|record| (record.sender, record.outcome))
+                .collect();
+            let expected = [
+                (sender, Invalidated),
+                (sender, NoContext),
+                (sender, AlreadyAdvanced),
+            ];
+            assert_eq!(outcomes, expected);
+        }
+        .primary()
+        .spawn();
+    });
+}
