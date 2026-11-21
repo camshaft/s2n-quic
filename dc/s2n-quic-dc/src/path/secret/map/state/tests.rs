@@ -195,7 +195,9 @@ impl Model {
                 state
                     .handle_unknown_path_secret_packet(&packet, &"127.0.0.1:1234".parse().unwrap());
 
-                if state.should_evict_on_unknown_path_secret()
+                // A client entry is evicted whatever the map's setting.
+                if (state.should_evict_on_unknown_path_secret()
+                    || local_id.endpoint_type() == s2n_quic_core::endpoint::Type::Client)
                     && self.invariants.contains(&Invariant::ContainsId(local_id))
                 {
                     self.invariants.retain(|invariant| {
@@ -377,6 +379,108 @@ fn no_memory_growth() {
         // FIXME: this ends up 2**16 peers in the `peers` map
         map.test_insert(fake_entry(idx as u64));
     }
+}
+
+/// An accepted UnknownPathSecret evicts a client entry whatever the map's
+/// `with_evict_on_unknown_path_secret` setting, so the client's next connect handshakes again
+/// once the handshake queue doesn't hold a recent success for the peer.
+/// For a server entry the setting still decides.
+#[test]
+fn unknown_path_secret_evicts_client_entry_by_default() {
+    use s2n_quic_core::endpoint::Type;
+
+    for (endpoint_type, evict_setting, evicted) in [
+        (Type::Client, false, true),
+        (Type::Server, false, false),
+        (Type::Server, true, true),
+    ] {
+        let map = State::builder()
+            .with_signer(stateless_reset::Signer::new(b"secret"))
+            .with_capacity(5)
+            .with_evict_on_unknown_path_secret(evict_setting)
+            .with_clock(Clock)
+            .with_subscriber(tracing::Subscriber::default())
+            .build_state()
+            .unwrap();
+        map.cleaner.stop();
+
+        let entry = Entry::builder((Ipv4Addr::LOCALHOST, 1).into())
+            .endpoint_type(endpoint_type)
+            .build(None);
+        map.test_insert(entry.clone());
+        let peers = match endpoint_type {
+            Type::Client => &map.client_peers,
+            Type::Server => &map.server_peers,
+        };
+        assert!(peers.contains_key(entry.peer()), "{endpoint_type:?}");
+
+        // The peer's UnknownPathSecret: our peer_id on the wire, tagged with the entry's
+        // stateless-reset token.
+        let packet = crate::packet::secret_control::unknown_path_secret::Packet::new_for_test(
+            entry.id().for_peer(),
+            &entry.sender().stateless_reset,
+        );
+        let accepted = map
+            .handle_unknown_path_secret_packet(&packet, &"127.0.0.1:1234".parse().unwrap())
+            .is_some();
+        assert!(accepted, "{endpoint_type:?}");
+
+        let case = format!("{endpoint_type:?}, setting {evict_setting}");
+        assert_eq!(!map.ids.contains_key(entry.id()), evicted, "{case}");
+        assert_eq!(!peers.contains_key(entry.peer()), evicted, "{case}");
+    }
+}
+
+/// An accepted UnknownPathSecret for an older client entry, with the map's setting off, evicts
+/// that entry by its id and leaves the peer's address to a newer entry for the same peer, such
+/// as one a handshake that finished meanwhile inserted: `State::evict` removes the address
+/// mapping only where it still points at the evicted entry.
+#[test]
+fn unknown_path_secret_eviction_keeps_newer_client_entry_for_same_peer() {
+    let map = State::builder()
+        .with_signer(stateless_reset::Signer::new(b"secret"))
+        .with_capacity(5)
+        .with_evict_on_unknown_path_secret(false)
+        .with_clock(Clock)
+        .with_subscriber(tracing::Subscriber::default())
+        .build_state()
+        .unwrap();
+    map.cleaner.stop();
+
+    let older = fake_entry(0);
+    let newer = fake_entry(1);
+    assert_eq!(older.peer(), newer.peer());
+    assert_ne!(older.id(), newer.id());
+    assert_eq!(
+        older.id().endpoint_type(),
+        s2n_quic_core::endpoint::Type::Client
+    );
+
+    map.test_insert(older.clone());
+    map.test_insert(newer.clone());
+
+    // The newer entry took the peer's address from the older one; both stay in the id map.
+    let by_addr = map.get_by_addr_untracked(newer.peer()).unwrap();
+    assert!(Arc::ptr_eq(&by_addr, &newer));
+    assert!(map.ids.contains_key(older.id()));
+    assert!(map.ids.contains_key(newer.id()));
+
+    // The peer's UnknownPathSecret for the older entry: its peer_id on the wire, tagged with
+    // its stateless-reset token.
+    let packet = crate::packet::secret_control::unknown_path_secret::Packet::new_for_test(
+        older.id().for_peer(),
+        &older.sender().stateless_reset,
+    );
+    let accepted = map
+        .handle_unknown_path_secret_packet(&packet, &"127.0.0.1:1234".parse().unwrap())
+        .is_some();
+    assert!(accepted);
+
+    // The older entry is evicted by its id; the newer entry keeps its id and the address.
+    assert!(!map.ids.contains_key(older.id()), "{:?}", map.ids);
+    assert!(map.ids.contains_key(newer.id()), "{:?}", map.ids);
+    let by_addr = map.get_by_addr_untracked(newer.peer()).unwrap();
+    assert!(Arc::ptr_eq(&by_addr, &newer));
 }
 
 #[test]
