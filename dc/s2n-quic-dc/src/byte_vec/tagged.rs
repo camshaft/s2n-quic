@@ -194,6 +194,10 @@ mod tests {
         static_bytevec_tag!(crate::byte_vec::tagged);
     }
 
+    mod tag_d {
+        static_bytevec_tag!(crate::byte_vec::tagged);
+    }
+
     #[test]
     fn tag_test() {
         let chunk = ByteVec::from(b"hello!");
@@ -255,5 +259,27 @@ mod tests {
             0,
             "a drop releases the bytes appended since the tag"
         );
+    }
+
+    // A handle releases at most the bytes it counts: a decrement past them leaves the bytes the
+    // other handles hold counted.
+    #[test]
+    fn a_handle_releases_at_most_the_bytes_it_counts() {
+        let other: Tagged<tag_d::Tag> = ByteVec::from(b"hello!").tag(&tag_d::Tag);
+        let mut handle = tag_d::Tag.tag(2);
+        assert_eq!(tag_d::Tag::current(), 8);
+
+        handle.decrement(5);
+        assert_eq!(
+            tag_d::Tag::current(),
+            6,
+            "the bytes the other buffer holds stay counted"
+        );
+
+        drop(handle);
+        assert_eq!(tag_d::Tag::current(), 6);
+
+        drop(other);
+        assert_eq!(tag_d::Tag::current(), 0);
     }
 }
