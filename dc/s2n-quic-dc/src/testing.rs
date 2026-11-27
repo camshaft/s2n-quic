@@ -131,6 +131,28 @@ pub fn server_name() -> Name {
     SNI.get_or_init(|| "localhost".into()).clone()
 }
 
+/// True when the environment asks slow tests to be skipped (`S2N_SKIP_SLOW_TESTS` set to anything).
+///
+/// A handful of `sim()` tests run for tens of seconds each even uncontended; under the ASAN,
+/// `llvm-cov`, and `cargo insta` builds that instrumentation multiplies wall-clock several-fold, so
+/// those jobs exhaust their runner time on the sim suite alone. Those jobs set `S2N_SKIP_SLOW_TESTS`
+/// so the heaviest sims early-return, while the ordinary `test` jobs (which set nothing) still run
+/// them — no coverage is lost for correctness, only for the instrumentation dimensions where these
+/// particular liveness/fairness sims add little. Gate a test with:
+///
+/// ```rust,ignore
+/// if crate::testing::skip_if_slow() {
+///     return;
+/// }
+/// ```
+pub fn skip_if_slow() -> bool {
+    let skip = std::env::var_os("S2N_SKIP_SLOW_TESTS").is_some();
+    if skip {
+        eprintln!("skipping slow test: S2N_SKIP_SLOW_TESTS is set");
+    }
+    skip
+}
+
 pub fn assert_debug<T: core::fmt::Debug>(_v: &T) {}
 pub fn assert_send<T: Send>(_v: &T) {}
 pub fn assert_sync<T: Sync>(_v: &T) {}
